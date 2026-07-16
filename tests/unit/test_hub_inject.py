@@ -159,6 +159,190 @@ def test_approve_permission_sends_digit_one_then_separate_enter(tmp_path: Path) 
     assert not any(ln.split()[-1] == "2" for ln in sends), sends
 
 
+# ── issue #299 finding 3: approve_permission's lost-keypress retry ─────────────
+# The sibling inject_and_verify retries a lost Enter; approve_permission gave up after one
+# attempt. The retry canNOT be a copy of the sibling's, though: a bare Enter into a *composer*
+# is a harmless no-op, but approve_permission drives a *menu*, where Enter selects whatever is
+# CURRENTLY highlighted. Option 2 is "Yes, don't ask again" and must never be selected, so the
+# retry re-asserts "1" instead of trusting a highlight it never set — and is gated on the same
+# dialog still being pending, so a "1" can never leak into a composer whose dialog was consumed.
+_PROMPT = "Do you want to proceed?"
+
+
+def _pane_tmux_landing_on_nth_enter(
+    tmp_path: Path, *, pane_path: Path, capture: str, jsonl: Path, n: int
+) -> tuple[Path, Path]:
+    """A tmux stub modelling a LOST keypress: the transcript appears only on the nth Enter.
+
+    Nothing here touches the real clock — the transcript's mere APPEARANCE is the advance
+    (_transcript_advanced reads an empty `before` as "any mtime is progress"), so the outcome is
+    pinned by the stub rather than by wall-time (#294: an approve's only success signal is an
+    mtime move, which must never be raced against a real second boundary in a test).
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "tmux.log"
+    counter = tmp_path / "enters"
+    cap_file = tmp_path / "capture.txt"
+    cap_file.write_text(capture)
+    script = f"""#!/usr/bin/env bash
+case "$1" in
+  list-panes)   printf 'hub:0\\t%s\\n' "{pane_path}" ;;
+  capture-pane) cat "{cap_file}" ;;
+  *)
+    printf '%s\\n' "$*" >> "{log}"
+    case "$*" in
+      *Enter)
+        printf 'x' >> "{counter}"
+        if [ "$(wc -c < "{counter}" | tr -d ' ')" -ge {n} ]; then
+          mkdir -p "$(dirname "{jsonl}")"
+          printf '{{}}\\n' >> "{jsonl}"
+        fi ;;
+    esac ;;
+esac
+exit 0
+"""
+    (fake_bin / "tmux").write_text(script)
+    (fake_bin / "tmux").chmod(0o755)
+    return fake_bin, log
+
+
+def _sends(log: Path) -> list[str]:
+    return [ln for ln in log.read_text().splitlines() if "send-keys" in ln]
+
+
+def _keys(log: Path) -> list[str]:
+    return [ln.split()[-1] for ln in _sends(log)]
+
+
+def test_approve_permission_re_asserts_the_selection_when_the_first_attempt_is_lost(
+    tmp_path: Path,
+) -> None:
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    # The dialog is STILL on the pane after the first attempt: the keypress was lost, not consumed.
+    fake_bin, log = _pane_tmux(tmp_path, pane_path=wt, capture=_PROMPT)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_VERIFY_SECONDS": "0",  # never confirms: force the retry path
+        "CLAUDE_PROJECTS_DIR": str(tmp_path / "projects"),
+    }
+
+    _call(f"approve_permission '{wt}'", env=env)
+
+    assert _keys(log) == ["1", "Enter", "1", "Enter"], (
+        "the retry must re-assert '1' before its Enter, never send a bare Enter into a menu"
+    )
+
+
+def test_approve_permission_never_sends_an_enter_it_did_not_precede_with_one(
+    tmp_path: Path,
+) -> None:
+    # The "never option 2" invariant (hub-inject.sh:375-378), pinned on the keystroke sequence
+    # itself rather than by reading the code: every Enter this function sends is IMMEDIATELY
+    # preceded by an explicit '1', so a highlight that has drifted off option 1 cannot be
+    # submitted. Asserting the invariant (not just the count) is what would catch a future
+    # bare-Enter retry being reintroduced.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fake_bin, log = _pane_tmux(tmp_path, pane_path=wt, capture=_PROMPT)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "CLAUDE_PROJECTS_DIR": str(tmp_path / "projects"),
+    }
+
+    _call(f"approve_permission '{wt}'", env=env)
+
+    keys = _keys(log)
+    assert "2" not in keys, f"option 2 broadens the approval and must never be sent: {keys}"
+    for i, key in enumerate(keys):
+        if key == "Enter":
+            assert i > 0 and keys[i - 1] == "1", f"bare Enter at index {i}: {keys}"
+
+
+def test_approve_permission_sends_nothing_more_once_the_dialog_is_gone(tmp_path: Path) -> None:
+    # An empty pane capture = no dialog pending. The first attempt may well have landed and the
+    # spoke moved on, so there is nothing to approve: retrying would either approve a dialog no
+    # classifier ever saw, or type a stray '1' into the spoke's composer.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fake_bin, log = _pane_tmux(tmp_path, pane_path=wt, capture="")
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "CLAUDE_PROJECTS_DIR": str(tmp_path / "projects"),
+    }
+
+    result = _call(f"approve_permission '{wt}'", env=env)
+
+    assert _keys(log) == ["1", "Enter"], "no dialog on the pane ⇒ no retry keys at all"
+    assert result.returncode == 1, "unconfirmed stays rc 1 so the caller re-serves next tick"
+
+
+def test_approve_permission_does_not_retry_into_a_dialog_it_never_classified(
+    tmp_path: Path,
+) -> None:
+    # The hazard the byte-identity gate exists for: a permission prompt is STILL on the pane, but
+    # it is a DIFFERENT one (the #269 unflushed-dialog window renders a dialog the transcript does
+    # not yet reflect, so "no transcript advance" alone does not prove nothing moved). Retrying
+    # here would approve a command no classifier ever read. A changed pane must draw no keys.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "tmux.log"
+    counter = tmp_path / "captures"
+    # Every capture-pane returns a DIFFERENT dialog, both matching the permission-prompt regex.
+    script = f"""#!/usr/bin/env bash
+case "$1" in
+  list-panes)   printf 'hub:0\\t%s\\n' "{wt}" ;;
+  capture-pane) printf 'x' >> "{counter}"
+                printf 'rm -rf /tmp/run-%s\\n{_PROMPT}\\n' "$(wc -c < "{counter}" | tr -d ' ')" ;;
+  *)            printf '%s\\n' "$*" >> "{log}" ;;
+esac
+exit 0
+"""
+    (fake_bin / "tmux").write_text(script)
+    (fake_bin / "tmux").chmod(0o755)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "CLAUDE_PROJECTS_DIR": str(tmp_path / "projects"),
+    }
+
+    result = _call(f"approve_permission '{wt}'", env=env)
+
+    assert _keys(log) == ["1", "Enter"], (
+        "a pane showing a DIFFERENT dialog must draw no retry — approving it would authorize a "
+        "command the classifier never saw"
+    )
+    assert result.returncode == 1
+
+
+def test_approve_permission_recovers_a_lost_enter_on_the_retry(tmp_path: Path) -> None:
+    # The payoff: the first Enter is lost, the retry lands, and the approve reports success —
+    # instead of costing a whole tick of drain latency and a re-run of the classifier.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    projects = tmp_path / "projects"
+    jsonl = _project_dir_for(projects, wt) / "session.jsonl"
+    jsonl.unlink(missing_ok=True)
+    fake_bin, log = _pane_tmux_landing_on_nth_enter(
+        tmp_path, pane_path=wt, capture=_PROMPT, jsonl=jsonl, n=2
+    )
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "CLAUDE_PROJECTS_DIR": str(projects),
+    }
+
+    result = _call(f"approve_permission '{wt}'", env=env)
+
+    assert result.returncode == 0, f"the retry landed; approve must report success: {result.stderr}"
+    assert _keys(log) == ["1", "Enter", "1", "Enter"]
+
+
 def test_inject_and_verify_retries_with_bare_enter_never_repastes(tmp_path: Path) -> None:
     # No transcript ever appears, so verification never confirms; the retry MUST be a bare
     # Enter, and the literal paste must happen exactly once (#133: a re-paste duplicated the

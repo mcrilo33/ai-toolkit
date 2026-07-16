@@ -981,7 +981,11 @@ def test_a_failed_approve_delivery_records_no_served_park(spoke_repo: Path, tmp_
 
     _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
-    assert len(_yes_keystrokes(env)) == 1, "sanity: the approve really was attempted"
+    # TWO since #299: this stub's pane keeps rendering the SAME dialog byte-for-byte, which is
+    # exactly the lost-keypress shape approve_permission now retries once (re-asserting "1" before
+    # its Enter, never a bare Enter). The retry changes nothing about what this test pins — an
+    # unconfirmed delivery still records no served park — only how many attempts it takes to fail.
+    assert len(_yes_keystrokes(env)) == 2, "sanity: the approve was attempted, then retried once"
     assert not _served_marker(env).exists(), (
         "a delivery the broker could not confirm must never read as served"
     )
