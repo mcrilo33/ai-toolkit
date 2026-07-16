@@ -10,11 +10,13 @@ from pathlib import Path
 
 import pytest
 from _gate_broker_support import (
+    _DISPLAY_CASE,
     _PERMISSION_PROMPT,
     _SMOKE_COMPOUND,
     AFK_PERMISSION_HOOK,
     DANGER_GUARD_HOOK,
     REPO_ROOT,
+    _agent_ps_stub,
     _bash_tool_record,
     _call,
     _classify_with_wt,
@@ -468,9 +470,11 @@ def test_decide_permission_classifies_the_whole_long_command(
         'case "$1" in\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
         "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     statedir = tmp_path / "sd"
     statedir.mkdir()
     answerer_log = tmp_path / "answerer.log"
@@ -965,9 +969,11 @@ def _break_the_keypress(spoke_repo: Path, tmp_path: Path, env: dict[str, str]) -
         f'  send-keys) printf "%s\\n" "$*" >> "{env["_KEYLOG"]}" ;;\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
         "esac\nexit 0\n"
     )
     tmux.chmod(0o755)
+    _agent_ps_stub(tmux.parent)
 
 
 def test_a_failed_approve_delivery_records_no_served_park(spoke_repo: Path, tmp_path: Path) -> None:

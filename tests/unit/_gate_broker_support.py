@@ -703,9 +703,11 @@ def _perm_env(tmp_path: Path, spoke_repo: Path, command: str, answerer: str) -> 
         f'    case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
         "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     statedir = tmp_path / "sd"
     statedir.mkdir(exist_ok=True)
     ready_log = tmp_path / "ready.log"

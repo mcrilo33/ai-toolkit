@@ -11,9 +11,11 @@ from shlex import quote as shlex_quote
 
 import pytest
 from _gate_broker_support import (
+    _DISPLAY_CASE,
     _PERMISSION_PROMPT,
     FIXTURES,
     RULE_FILE,
+    _agent_ps_stub,
     _ask_record,
     _assistant_tool_use,
     _bash_tool_record,
@@ -1077,10 +1079,12 @@ def test_decide_permission_logs_auto_approve(spoke_repo: Path, tmp_path: Path) -
         'case "$1" in\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
         f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
         "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     statedir = tmp_path / "sd"
     statedir.mkdir()
     env = {
@@ -1883,9 +1887,11 @@ def test_permission_approve_delivery_failure_warns_not_blocks(
         'case "$1" in\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
         "esac\nexit 0\n"  # send-keys is a no-op: the transcript never advances -> delivery fails
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     statedir = tmp_path / "sd"
     statedir.mkdir()
     ready_log = tmp_path / "ready.log"
@@ -2092,9 +2098,11 @@ def test_permission_approve_journals_before_inject(spoke_repo: Path, tmp_path: P
         f'    case "$*" in *" 1") [ -f "{journal}" ] && echo EXISTS >> "{probe}" || echo MISSING >> "{probe}" ;; esac ;;\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
         "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
     ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
@@ -2268,9 +2276,11 @@ def test_ceiling_mechanical_approve_is_paced_not_every_tick(
         f'  send-keys) case "$*" in *" 1") printf "1\\n" >> "{keylog}" ;; esac ;;\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
         "esac\nexit 0\n"  # the approve never advances the transcript → the dialog re-appears
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     ready_stub = tmp_path / "spoke-ready.sh"
     ready_stub.write_text("#!/usr/bin/env bash\n:\n")
     ready_stub.chmod(0o755)
@@ -2348,9 +2358,11 @@ def test_permission_deny_delivery_failure_journaled_distinctly(
         f'  send-keys) printf "%s\\n" "$*" >> "{env["_KEYLOG"]}" ;;\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
         "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     jsonl = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo) / "session.jsonl"
     os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # no external advance masks the failure
 
@@ -2643,9 +2655,11 @@ def test_broker_service_gate_fastpath_inject_failure_falls_through(
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
         "esac\nexit 0\n"  # never advances the transcript -> verify fails
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
