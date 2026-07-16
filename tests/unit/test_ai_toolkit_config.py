@@ -303,6 +303,85 @@ def test_base_branch_empty_when_absent(tmp_path: Path) -> None:
     assert cfg.base_branch(config) == ""
 
 
+# ─── base_branch camelCase key guard (issue #309) ───
+
+
+@pytest.mark.parametrize("key", ["baseBranch", "basebranch", "base-branch"])
+def test_base_branch_camelcase_warning_flags_variant_key(tmp_path: Path, key: str) -> None:
+    # A mis-cased key is a DISTINCT key from `base_branch`, so its value is silently
+    # ignored → the warning names it and the canonical key.
+    config = cfg.load_config(_write(tmp_path, f"{key}: develop\n").as_posix())
+
+    warning = cfg.base_branch_camelcase_warning(config)
+
+    assert warning is not None
+    assert "base_branch" in warning
+    assert key in warning
+
+
+def test_base_branch_camelcase_warning_none_for_canonical_key(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "base_branch: develop\n").as_posix())
+
+    assert cfg.base_branch_camelcase_warning(config) is None
+
+
+def test_base_branch_camelcase_warning_none_when_canonical_also_set(tmp_path: Path) -> None:
+    # The canonical key present ⇒ no footgun (it wins), even alongside a variant.
+    config = cfg.load_config(
+        _write(tmp_path, "base_branch: develop\nbaseBranch: wrongcase\n").as_posix()
+    )
+
+    assert cfg.base_branch_camelcase_warning(config) is None
+
+
+def test_base_branch_camelcase_warning_none_when_variant_blank(tmp_path: Path) -> None:
+    # A blank variant carries no value to ignore, so nothing to warn about.
+    config = cfg.load_config(_write(tmp_path, "baseBranch:\n").as_posix())
+
+    assert cfg.base_branch_camelcase_warning(config) is None
+
+
+def test_base_branch_cli_warns_on_variant_key_via_stderr(tmp_path: Path) -> None:
+    # stdout carries ONLY the value (empty, since the variant is ignored); the warning
+    # goes to stderr so the bash consumer's captured value stays clean.
+    path = _write(tmp_path, "baseBranch: develop\n")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "ai_toolkit_config.py"),
+            "base-branch",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == ""
+    assert "base_branch" in result.stderr
+    assert "baseBranch" in result.stderr
+
+
+def test_base_branch_cli_silent_for_canonical_key(tmp_path: Path) -> None:
+    path = _write(tmp_path, "base_branch: develop\n")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "ai_toolkit_config.py"),
+            "base-branch",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "develop"
+    assert result.stderr.strip() == ""
+
+
 # ─── model_for_label ───
 
 

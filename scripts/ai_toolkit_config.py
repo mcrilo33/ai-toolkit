@@ -230,6 +230,40 @@ def base_branch(config: dict) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+# The canonical yml key for the integration branch. A mis-cased hand-edit
+# (`baseBranch`, `base-branch`, …) is a DISTINCT key, so its value is silently
+# ignored — the same footgun the git-config key has (issue #309).
+_BASE_BRANCH_KEY = "base_branch"
+
+
+def _normalize_key(key: str) -> str:
+    """Collapse a config key to compare across camelCase/kebab/snake spellings."""
+    return key.replace("-", "").replace("_", "").lower()
+
+
+def base_branch_camelcase_warning(config: dict) -> str | None:
+    """Warn text when a mis-cased key shadows the canonical ``base_branch`` (#309).
+
+    A hand-edited yml key like ``baseBranch`` or ``base-branch`` is a distinct key
+    from the canonical ``base_branch`` the resolver reads, so its value is silently
+    ignored and the base branch falls through to auto-detection. Returns a warning
+    naming the offending key when such a variant carries a value while
+    ``base_branch`` itself is unset/blank; otherwise None (the canonical key present,
+    or no variant, means there is no footgun).
+    """
+    if base_branch(config):
+        return None
+    for key, value in config.items():
+        if key == _BASE_BRANCH_KEY:
+            continue
+        if _normalize_key(key) == "basebranch" and isinstance(value, str) and value.strip():
+            return (
+                f"config key {key!r} is ignored; the canonical key is 'base_branch'. "
+                f"Rename it to: base_branch: {value.strip()}"
+            )
+    return None
+
+
 # --- telemetry: client-side Langfuse settings (issue #228) --------------------
 # The config carries only the NON-SECRET, client-facing "where/whether to send"
 # telemetry settings; the Langfuse secret (LANGFUSE_BASIC_AUTH / secret key) stays
@@ -320,6 +354,10 @@ def _cli(argv: list[str]) -> str:
     command = argv[1] if len(argv) > 1 else ""
     config = load_config(argv[2] if len(argv) > 2 else None)
     if command == "base-branch":
+        warning = base_branch_camelcase_warning(config)
+        if warning:
+            # stderr only — stdout carries just the value the bash consumer evals.
+            print(f"ai-toolkit: WARNING: {warning}", file=sys.stderr)
         return base_branch(config)
     if command == "enabled":
         return "true" if enabled(config) else "false"
