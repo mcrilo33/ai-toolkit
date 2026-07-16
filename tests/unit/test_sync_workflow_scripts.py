@@ -186,3 +186,36 @@ def test_gate_broker_module_source_exists_and_is_executable(module: str) -> None
     src = HUB_SCRIPTS_DIR / f"gate-broker-{module}.sh"
     assert src.is_file(), f"shared/skills/hub/scripts/gate-broker-{module}.sh missing"
     assert os.access(src, os.X_OK), f"gate-broker-{module}.sh is not executable"
+
+
+# ── hub-afk functional modules (issue #307) ───────────────────────────────────
+# hub-afk.sh sources each hub-afk-<lane>.sh as a co-located sibling; a module absent from a
+# synced target sets _AFK_MODULES_OK=0 and the drain refuses to arm there. So every module
+# must be in the loop, take the hub-skill case mapping, and exist executable — mirroring the
+# gate-broker-module guards. Extend this tuple as each lane is extracted.
+HUB_AFK_MODULES = ("land", "dispatch", "arm", "supervise", "recover")
+
+
+@pytest.mark.parametrize("module", HUB_AFK_MODULES)
+def test_hub_afk_module_registered_in_sync_loop(module: str) -> None:
+    assert f"hub-afk-{module}.sh" in _for_name_list(), (
+        f"hub-afk-{module}.sh is not registered in sync_workflow_scripts() — the entry lib "
+        "would source a missing sibling in a synced target and the drain would refuse to arm"
+    )
+
+
+@pytest.mark.parametrize("module", HUB_AFK_MODULES)
+def test_hub_afk_module_takes_the_hub_skill_source_case(module: str) -> None:
+    body = _sync_workflow_scripts_body()
+    hub_case = re.search(rf"\n\s*([\w.|-]*hub-afk-{module}\.sh[\w.|-]*)\)\s+src=", body)
+    assert hub_case is not None, (
+        f"hub-afk-{module}.sh must have the hub-skill case mapping "
+        '(src="$SHARED_DIR/skills/hub/scripts/$name"), not the toolkit-root default'
+    )
+
+
+@pytest.mark.parametrize("module", HUB_AFK_MODULES)
+def test_hub_afk_module_source_exists_and_is_executable(module: str) -> None:
+    src = HUB_SCRIPTS_DIR / f"hub-afk-{module}.sh"
+    assert src.is_file(), f"shared/skills/hub/scripts/hub-afk-{module}.sh missing"
+    assert os.access(src, os.X_OK), f"hub-afk-{module}.sh is not executable"

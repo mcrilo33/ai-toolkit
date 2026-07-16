@@ -32,7 +32,6 @@ LINE_BUDGET = 1200
 # here ONLY while its split is an open, tracked commitment — this is a countdown, not
 # a parking lot. Removing the entry (by landing the split) is the goal.
 KNOWN_OVER_BUDGET = {
-    "hub-afk.sh": "#307 — split into dispatch/recover/land modules behind a thin entry",
     "hub-watchdog.sh": "#308 — split into detect/intervene modules (may shrink under budget via #300)",
 }
 
