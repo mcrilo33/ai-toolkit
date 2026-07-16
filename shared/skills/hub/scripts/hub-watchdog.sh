@@ -796,6 +796,34 @@ _wd_terminal_marker_kind() {
   return 0
 }
 
+# _wd_log_terminal_kind <issue> -> `ready`, `accept`, or empty — the terminal marker kind read from
+# the #300 transition log's RECORDED state instead of the tip tag (#303/#292). spoke-ready records
+# `accepted` as a state DISTINCT from `ready` (its _tlog_state_for_kind), so this is the log-native,
+# structurally-unambiguous classifier: a human-sign-off close is `accepted`, which the caller routes
+# to the non-escalating accept-unsigned path — a tag that is stale or mid-move can no longer make it
+# read as a ready drain shortfall. Empty when the log records no terminal state (unknown, or a
+# non-terminal state like landing/pushing), so the caller falls back to the tip-tag probe
+# (_wd_terminal_marker_kind) — never firing NOR reclassifying on unknown alone (#300 contract). Maps
+# the recorded `accepted` to the classifier's `accept` vocabulary so both readers speak one language.
+_wd_log_terminal_kind() {
+  case "$(_wd_current_state "$1")" in
+    ready)    printf 'ready\n' ;;
+    accepted) printf 'accept\n' ;;
+  esac
+}
+
+# _wd_terminal_onset <issue> -> the onset ts of the last transition ONLY when it is a terminal marker
+# (ready|accepted); empty otherwise (#303). This is the log-native replacement for condition 4's
+# done-epoch staleness base: the transition is stamped when the spoke actually reached ready/accepted
+# (spoke-ready), whereas the done epoch is a slot_state side-effect that pre-ages during a pre-ready
+# park (#263). Empty for a non-terminal/unknown state so the caller falls back to the done epoch —
+# the log adds precision on the healthy path without ever becoming a firing basis on its own.
+_wd_terminal_onset() {
+  case "$(_wd_current_state "$1")" in
+    ready | accepted) afk_state_onset "$1" 2>/dev/null ;;
+  esac
+}
+
 # _wd_base_name <wt> -> the bare base-branch name (no origin/ prefix); defaults to main.
 _wd_base_name() {
   local wt="$1" base=""
@@ -877,20 +905,25 @@ _wd_land_conflicts() {
 
 # Condition 4: a mergeable (ready-at-tip) branch auto_land terminal-skipped. NOT blocked-at-tip
 # (a deliberate skip is never a false-skip), issue still open, un-landed past the ceiling.
-# Staleness is measured from the DONE epoch — stamped when slot_state first reads the spoke
-# `done` — not the progress epoch, which is stamped only on tip advances and pre-ages during a
-# pre-ready park (#263): a parked-then-ready spoke would otherwise trip an instant false-skip.
-# slot_state itself stamps the done epoch on that first done tick, so the ceiling starts here.
-# The LAND-lane servicing defer (#285 AC5) and the mergeability probe both live in the DISPATCHER,
-# NOT here: a servicing tick must neither fire NOR clear the fire-dedup marker (clearing mid-service
-# would let one persistent conflict re-fire and double-count in the ledger, #263), so it is gated
-# BEFORE this detector — mirroring how the answer lane defers the INTERVENTION, not the detector.
+# #303 (#300 step 4): staleness is measured from the RECORDED terminal transition (ready/accepted
+# onset, _wd_terminal_onset) — stamped by spoke-ready when the spoke actually reached the state — in
+# preference to the DONE epoch. The done epoch is a slot_state side-effect and remains the FALLBACK
+# when the log is unknown/absent (never fire on unknown alone, #300): a standalone watchdog, or a
+# spoke that pre-dates the writer layer, still measures from the epoch exactly as before. Both bases
+# already dodge the #263 pre-ready-park pre-aging the progress epoch caused — the done epoch is
+# stamped on the first `done` tick, the transition when the state is entered, so neither reads stale
+# during the park. The LAND-lane servicing defer (#285 AC5) and the mergeability probe both live in
+# the DISPATCHER, NOT here: a servicing tick must neither fire NOR clear the fire-dedup marker
+# (clearing mid-service would let one persistent conflict re-fire and double-count, #263), so it is
+# gated BEFORE this detector — mirroring how the answer lane defers the INTERVENTION, not the detector.
 _wd_detect_mergeable_skipped() {
-  local wt="$1" issue="$2" now="$3"
+  local wt="$1" issue="$2" now="$3" base
   command -v slot_state >/dev/null 2>&1 || return 1
   [ "$(slot_state "$wt" "$issue")" = "done" ] || return 1
   _wd_tag_at_tip "$wt" blocked "$issue" && return 1              # deliberately blocked → not a skip
-  _wd_epoch_stale "$(read_done_epoch "$issue" 2>/dev/null)" "$now" "$HUB_WATCHDOG_LAND_CEILING" || return 1
+  base="$(_wd_terminal_onset "$issue")"                          # #303: the recorded ready/accepted onset
+  [ -n "$base" ] || base="$(read_done_epoch "$issue" 2>/dev/null)"   # unknown log → today's done-epoch base
+  _wd_epoch_stale "$base" "$now" "$HUB_WATCHDOG_LAND_CEILING" || return 1
   _wd_issue_open "$issue"                                        # a closed issue was landed, not skipped
 }
 
@@ -1353,7 +1386,7 @@ _wd_fire() {
 # intervention. Supervisor-dead is a single global check; the other four run per in-flight spoke.
 # Best-effort throughout: a missing drain reader (standalone watchdog) simply skips its condition.
 _wd_run_conditions() {
-  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts wd_done wd_base wd_state
+  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts wd_done wd_base wd_state wd_kind wd_tag_kind
   local wd_seen=""   # the issues this tick saw in flight — the sweep below leaves them alone
   # Use the drain state the loop already read (passed as $2) rather than re-probing — the loop
   # reads it once per tick, and a second _wd_drain_state call would double-count under stubs.
@@ -1458,7 +1491,18 @@ _wd_run_conditions() {
       # is normally eyeball-then-land, and this is the only probe it ever gets, so its reason must
       # name the conflicting files too or an approving human walks into an unannounced conflict.
       wd_conflicts="$(_wd_land_conflicts "$wt")"; wd_conflicts="${wd_conflicts% }"
-      if [ "$(_wd_terminal_marker_kind "$wt" "$issue")" = "accept" ]; then
+      # #303 (#300 step 4): classify accept-vs-ready from the RECORDED transition (log-authoritative,
+      # #292) with the tip-tag probe as the unknown/absent fallback — never reclassify on unknown
+      # alone (#300). On a log-vs-tag disagreement, log a divergence line and let the LOG win: the
+      # recorded state is what the actor set, and `accepted` is the SAFE direction (escalate-only,
+      # never auto-landed), whereas a tag can be stale or mid-move. Silent on agreement (healthy path).
+      wd_kind="$(_wd_log_terminal_kind "$issue")"
+      wd_tag_kind="$(_wd_terminal_marker_kind "$wt" "$issue")"
+      if [ -n "$wd_kind" ] && [ "$wd_kind" != "$wd_tag_kind" ]; then
+        _wd_log "auto-land-skipped classify divergence on #$issue: transition-log='$wd_kind' tip-tag='${wd_tag_kind:-none}' — log wins (#292/#300)"
+      fi
+      [ -n "$wd_kind" ] || wd_kind="$wd_tag_kind"   # unknown log → today's tip-tag probe
+      if [ "$wd_kind" = "accept" ]; then
         _wd_fire accept-unsigned "$issue" "$(_wd_accept_unsigned_reason "$wt" "$issue" "$wd_conflicts")" "$wt"
         _wd_clear_fired auto-land-skipped "$issue"   # not a drain skip → drop any stale skip firing
         _wd_clear_fired conflicted-land "$issue"
