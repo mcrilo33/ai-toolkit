@@ -5948,6 +5948,123 @@ def test_self_copy_copies_sibling_set(tmp_path: Path) -> None:
     )
 
 
+def _stage_synced_scripts_dir(tmp_path: Path, *, model: str = "claude-sonnet-5") -> Path:
+    # Mimic a synced .ai-toolkit/scripts dir: the real hub-afk.sh next to the two
+    # config files sync co-locates there (spoke-model.env rendered from the config,
+    # plus the ai_toolkit_config.py seam). Sourcing it with cwd=REPO_ROOT lets the
+    # top-of-file sibling resolution fall through _AFK_TOPLEVEL to the real repo, so
+    # only these files need staging.
+    src_dir = tmp_path / "scripts"
+    src_dir.mkdir()
+    (src_dir / "hub-afk.sh").write_text(HUB_AFK.read_text())
+    (src_dir / "spoke-model.env").write_text(
+        f"WT_AGENT_MODEL_DEFAULT={model}\nWT_AGENT_EFFORT_DEFAULT=high\n"
+    )
+    (src_dir / "ai_toolkit_config.py").write_text("# stand-in for the config seam (#306)\n")
+    return src_dir
+
+
+def _self_copy_env(tmpdir: Path) -> dict[str, str]:
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        # Strip the resolution overrides (so siblings resolve via _AFK_TOPLEVEL) and the
+        # self-copy guards (a leaked AFK_RUNNING_COPY=1 / AFK_SELF_COPY=0 from the #124
+        # sweep would no-op the very copy these tests exercise — #169).
+        if k
+        not in (
+            "AFK_HUB_INJECT",
+            "AFK_GATE_BROKER",
+            "AFK_WT_LIB",
+            "AFK_RUNNING_COPY",
+            "AFK_SELF_COPY",
+        )
+    }
+    env.update(
+        {
+            "TZ": "UTC",
+            "TMPDIR": str(tmpdir),
+            "AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0",
+            # A fresh, empty state dir so `--status` reports `off` (not the real hub's
+            # DRAIN DEAD) — the self-copy exec is what these tests exercise, not the state.
+            "AFK_STATE_DIR": str(tmpdir / "state"),
+            "AFK_STATE": str(tmpdir / "state"),
+        }
+    )
+    return env
+
+
+def test_self_copy_seeds_model_config_manifest(tmp_path: Path) -> None:
+    # AC#3 (issue #306): the arm-time self-copy is built with a `*.sh` glob, which SKIPS the
+    # co-located spoke-model.env (rendered by sync, not a .sh) and ai_toolkit_config.py. A
+    # config-less self-copy makes worktree-new.sh's wt_resolve_agent_model fall to the literal
+    # fallback, dispatching every freshly-armed spoke on the wrong tier until the first resync
+    # reseeds. Stage a synced-style src dir, run the REAL self-copy path, and assert BOTH
+    # config files ride along into the temp copy — parity with what _afk_resync re-renders.
+    src_dir = _stage_synced_scripts_dir(tmp_path)
+    tmpdir = tmp_path / "selfcopy"
+    tmpdir.mkdir()
+    result = subprocess.run(
+        ["bash", "-c", f'source "{src_dir / "hub-afk.sh"}"; _afk_exec_self_copy --status'],
+        capture_output=True,
+        text=True,
+        env=_self_copy_env(tmpdir),
+        cwd=str(REPO_ROOT),
+    )
+
+    assert "/afk: off" in result.stdout, result.stdout + result.stderr
+    assert _wait_for_glob(tmpdir, "hub-afk-self.*/spoke-model.env"), (
+        "spoke-model.env must ride along in the arm-time self-copy (#306)"
+    )
+    assert _wait_for_glob(tmpdir, "hub-afk-self.*/ai_toolkit_config.py"), (
+        "ai_toolkit_config.py must ride along in the arm-time self-copy (#306 parity)"
+    )
+
+
+def test_freshly_armed_self_copy_dispatches_on_config_model(tmp_path: Path) -> None:
+    # AC#1 (issue #306) replay pin: a freshly-armed drain (no prior resync) must dispatch on
+    # the CONFIG model, not the worktree-lib literal fallback. The drain resolves worktree-new.sh
+    # to its own self-copy dir, so wt_resolve_agent_model reads spoke-model.env from THERE. Build
+    # the real self-copy from a synced-style src carrying a Sonnet-budget spoke-model.env, then
+    # resolve the model against the self-copy dir and assert it is the config's model — never the
+    # opus[1m] literal the config-less fallback would otherwise pick.
+    src_dir = _stage_synced_scripts_dir(tmp_path, model="claude-sonnet-5")
+    tmpdir = tmp_path / "selfcopy"
+    tmpdir.mkdir()
+    env = _self_copy_env(tmpdir)
+    build = subprocess.run(
+        ["bash", "-c", f'source "{src_dir / "hub-afk.sh"}"; _afk_exec_self_copy --status'],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+
+    assert "/afk: off" in build.stdout, build.stdout + build.stderr
+    copies = _wait_for_glob(tmpdir, "hub-afk-self.*/spoke-model.env")
+    assert copies, "the self-copy must carry spoke-model.env (#306)"
+    copy_dir = copies[0].parent
+
+    wt_lib = REPO_ROOT / "scripts" / "worktree-lib.sh"
+    resolve = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{wt_lib}"; wt_resolve_agent_model "{copy_dir}" /nonexistent-config; '
+            'echo "M=$WT_AGENT_MODEL E=$WT_AGENT_EFFORT"',
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+
+    assert "M=claude-sonnet-5 E=high" in resolve.stdout, resolve.stdout + resolve.stderr
+    assert "[1m]" not in resolve.stdout, (
+        "a seeded self-copy must never dispatch on the 1M tier fallback (#306)"
+    )
+
+
 def _wait_for_file(path: Path, timeout: float = 15.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
