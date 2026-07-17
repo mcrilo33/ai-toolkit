@@ -6106,6 +6106,38 @@ def test_freshly_armed_self_copy_dispatches_on_config_model(tmp_path: Path) -> N
     )
 
 
+def test_self_copy_carries_telemetry_package(tmp_path: Path) -> None:
+    # AC (issue #319): the drain's land-time ingest imports the telemetry package from
+    # $SCRIPT_DIR/telemetry — the self-copy's tmp dir is not a git checkout, so the ingest's
+    # repo-relative candidate resolves to nothing and the co-located sibling is the ONLY
+    # candidate left. #316's whole-dir copy carries a nested DIRECTORY, not just top-level
+    # files, so once the sync ships the package it rides along for free. This pins that: a
+    # revert to the old `*.sh` glob would silently strip the package from the drain runtime
+    # and every drain land would skip ingestion again (51 lands / 4 days, the #319 outage).
+    # Note the completeness gate cannot catch this regression for us — it enumerates
+    # `find -maxdepth 1 -type f`, so a dropped SUBDIR is invisible to it (see #319 follow-up).
+    src_dir = _stage_synced_scripts_dir(tmp_path)
+    pkg = src_dir / "telemetry" / "spoke_tree"
+    pkg.mkdir(parents=True)
+    (src_dir / "telemetry" / "__init__.py").write_text("# the ingest's import root (#319)\n")
+    (pkg / "steps.py").write_text("# a NESTED module — the copy must recurse (#319)\n")
+    tmpdir = tmp_path / "selfcopy"
+    tmpdir.mkdir()
+    result = subprocess.run(
+        ["bash", "-c", f'source "{src_dir / "hub-afk.sh"}"; _afk_exec_self_copy --status'],
+        capture_output=True,
+        text=True,
+        env=_self_copy_env(tmpdir),
+        cwd=str(REPO_ROOT),
+    )
+
+    assert "/afk: off" in result.stdout, result.stdout + result.stderr
+    assert _wait_for_glob(tmpdir, "hub-afk-self.*/telemetry/spoke_tree/steps.py"), (
+        "the drain's self-copy must carry the telemetry package (nested modules included) or "
+        "every drain land silently skips the post-run Langfuse ingestion (#319)"
+    )
+
+
 def test_self_copy_carries_arbitrary_sibling(tmp_path: Path) -> None:
     # AC (issue #316): the drain runtime must be COMPLETE BY CONSTRUCTION — a NEW sibling of
     # ANY extension co-located with the scripts rides along, with no per-file manifest to
