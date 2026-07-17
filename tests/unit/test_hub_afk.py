@@ -9242,6 +9242,77 @@ def test_auto_land_lands_despite_an_answer_lane_backoff(spoke_repo: Path, tmp_pa
     )
 
 
+def _seed_land_lane_event(statedir: Path, next_due: int, issue: int = 5) -> None:
+    """Record a land-lane arm the way _afk_warned_arm now does (#318): a land_failed event
+    carrying the next-due epoch the arm computed."""
+    log = statedir / "transitions" / f"{issue}.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(
+        f'{{"v":1,"ts":1000,"issue":{issue},"kind":"event","event":"land_failed",'
+        f'"actor":"hub-afk.sh","lane":"land","evidence":{{"attempt":1,"next":{next_due}}}}}\n'
+    )
+
+
+def test_auto_land_paces_on_the_land_lane_log_event(spoke_repo: Path, tmp_path: Path) -> None:
+    # #318 AC2: auto_land's pacing reads the LAND LANE'S recorded events, not
+    # warned-state-<issue>-land. A recorded arm whose next-due epoch is still ahead skips the
+    # land (expensive; retried at low frequency), exactly as the file's epoch used to.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    _seed_land_lane_event(statedir, next_due=9000)
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+            "AFK_NOW": "5000",
+        },
+    )
+
+    assert not land_log.exists(), (
+        "a land-lane arm recorded in the log, still inside its window, paces the land (#318 AC2)"
+    )
+
+
+def test_auto_land_lands_when_the_land_lane_log_event_is_due(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #274 starvation, post-conversion: the answer lane's backoff lives in a FILE armed to its
+    # far-future cap while the land lane's own recorded arm has come due. The land must run. The
+    # two lanes now sit in different stores entirely, so an answer-lane backoff cannot pace the
+    # land lane even in principle — #274's fix made structural rather than conventional.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5").write_text("7\t9999999999\n")  # answer lane at the far-future cap
+    _seed_land_lane_event(statedir, next_due=4000)  # land lane: due as of now=5000
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+            "AFK_NOW": "5000",
+        },
+    )
+
+    assert land_log.exists() and land_log.read_text().split() == ["5"], (
+        "a due land lane lands, however far out the ANSWER lane's backoff is armed (#274)"
+    )
+
+
 def test_ready_at_tip_lands_within_the_watchdog_window_after_ship_park(
     spoke_repo: Path, tmp_path: Path
 ) -> None:

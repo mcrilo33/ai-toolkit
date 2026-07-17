@@ -206,13 +206,78 @@ def test_lane_event_count_scoped_to_episode(tmp_path: Path) -> None:
     assert _call("afk_lane_event_count 42 review", env=env).stdout.strip() == "0"
 
 
+# --- afk_lane_last_event: the last event on a lane (issue #318) ---------------
+# afk_lane_event_count already reads a lane with the episode OPTIONAL, but the only
+# last-event reader (afk_last_service_event) requires a NON-EMPTY episode: it matches
+# `"episode":"<ep>"` unconditionally, so an episode-LESS event can never match it. A per-ISSUE
+# lane — the drain's land lane, which has no park episode to key on (#318/#274) — therefore had
+# no way to read back its own most recent record. This is the symmetric partner of
+# afk_lane_event_count: same lane+optional-episode filter, last matching line instead of a count.
+
+
+def test_lane_last_event_reads_an_episodeless_lane(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    _call("afk_tlog_event 42 land_failed hub-afk.sh land", env=env)
+    _call("afk_tlog_event 42 land_cleared hub-afk.sh land", env=env)
+
+    result = _call("afk_lane_last_event 42 land", env=env)
+
+    assert '"event":"land_cleared"' in result.stdout, "the LAST event on the lane wins"
+    assert '"event":"land_failed"' not in result.stdout
+
+
+def test_lane_last_event_empty_when_the_lane_has_no_events(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    _call("afk_tlog_event 42 answer_computed broker answer sigA:100", env=env)
+
+    assert _call("afk_lane_last_event 42 land", env=env).stdout.strip() == ""
+    assert _call("afk_lane_last_event 42 land", env=env).returncode == 0, (
+        "an absent record reads as unknown, never an error (#300 contract)"
+    )
+
+
+def test_lane_last_event_ignores_other_lanes_and_transitions(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    _call("afk_tlog_event 42 land_failed hub-afk.sh land", env=env)
+    _call("afk_tlog_event 42 answer_computed broker answer sigA:100", env=env)
+    _call("afk_tlog_transition 42 landing hub-afk.sh cause", env=env)
+
+    result = _call("afk_lane_last_event 42 land", env=env)
+
+    assert '"event":"land_failed"' in result.stdout, (
+        "a later event on another lane, and a later transition, must not shadow the lane's last"
+    )
+
+
+def test_lane_last_event_scoped_to_episode_when_given(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    _call("afk_tlog_event 42 a broker answer sigA:100", env=env)
+    _call("afk_tlog_event 42 b broker answer sigB:200", env=env)
+
+    assert '"event":"a"' in _call("afk_lane_last_event 42 answer sigA:100", env=env).stdout
+    assert '"event":"b"' in _call("afk_lane_last_event 42 answer", env=env).stdout
+
+
+def test_lane_last_event_evidence_cannot_masquerade_as_a_lane(tmp_path: Path) -> None:
+    # The _tlog_head discipline: evidence is caller-supplied free text appended strictly LAST, so
+    # matching the whole line would let an evidence "lane" hijack the filter (the same shadowing
+    # the 2026-07-15 validation findings closed for afk_current_state / the ts fields).
+    env = _env(tmp_path)
+    _call(
+        'afk_tlog_event 42 probe broker diagnostics sigC:300 \'{"lane":"land"}\'',
+        env=env,
+    )
+
+    assert _call("afk_lane_last_event 42 land", env=env).stdout.strip() == ""
+
+
 # --- evidence must never shadow top-level fields (validation findings, 2026-07-15) ---
 
 
 def test_evidence_to_key_does_not_hijack_current_state(tmp_path: Path) -> None:
     env = _env(tmp_path)
 
-    _call("afk_tlog_transition 42 working reconciler heal '{\"to\":\"somewhere\"}'", env=env)
+    _call('afk_tlog_transition 42 working reconciler heal \'{"to":"somewhere"}\'', env=env)
 
     assert _call("afk_current_state 42", env=env).stdout.strip() == "working"
 
@@ -229,7 +294,7 @@ def test_evidence_ts_key_does_not_corrupt_age(tmp_path: Path) -> None:
 def test_evidence_episode_key_does_not_mint_an_episode(tmp_path: Path) -> None:
     env = _env(tmp_path)
     _call('afk_tlog_transition 42 parked-gate a b "" sigA:100', env=env)
-    _call("afk_tlog_transition 42 working a b '{\"episode\":\"bogus:999\"}'", env=env)
+    _call('afk_tlog_transition 42 working a b \'{"episode":"bogus:999"}\'', env=env)
 
     assert _call("afk_current_episode 42", env=env).stdout.strip() == "sigA:100"
 
