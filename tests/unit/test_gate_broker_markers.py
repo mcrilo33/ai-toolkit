@@ -294,6 +294,229 @@ def test_reanswer_ceiling_resets_after_tip_advances(
     assert calls.read_text().count("x") == 2, "a tip advance must reset the ceiling"
 
 
+def test_reanswer_ceiling_resets_on_a_tip_move_before_any_onset_restamp(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #318 ordering pin. The ceiling's reset must be computed from the LIVE tip, inline, by the
+    # ceiling itself — never inherited from a park-onset another actor re-stamps.
+    #
+    # The park episode the OTHER lanes key on is "<sig>:<onset>", and its onset only rolls when
+    # note_park_episode runs (gate-broker-markers.sh:269) — driven by slot_state/the watchdog's
+    # park probe, a DIFFERENT actor on a DIFFERENT schedule. Keying the ceiling on that alone
+    # would leave a tip-moved-but-not-yet-re-stamped spoke throttled at a ceiling it has already
+    # earned its way out of: a committing spoke, denied the reasoner, because a detector had not
+    # run yet. So the tip is folded into the ceiling's OWN key.
+    #
+    # Nothing here calls note_park_episode: the onset is deliberately left exactly as it was.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_REANSWER_CEILING": "1"}
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    _call("stamp_park_onset_epoch 5", env=env)
+    assert (
+        _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA; echo rc=$?", env=env)
+        .stdout.strip()
+        .endswith("rc=1")
+    )
+    onset_before = (statedir / "park-onset-5.epoch").read_text()
+    assert (
+        _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA; echo rc=$?", env=env)
+        .stdout.strip()
+        .endswith("rc=0")
+    ), "ceiling=1 exhausts the second attempt on the unchanged park"
+
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "chore: progress"],
+        cwd=spoke_repo,
+        check=True,
+        env=git_env,
+        capture_output=True,
+    )
+
+    result = _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA; echo rc=$?", env=env)
+
+    assert (statedir / "park-onset-5.epoch").read_text() == onset_before, (
+        "precondition: the onset is UNCHANGED — no actor re-stamped it between the two calls"
+    )
+    assert result.stdout.strip().endswith("rc=1"), (
+        "the live tip moved → fresh budget on this very tick, without waiting for a re-stamp"
+    )
+
+
+# ── issue #318 (#300 step 6): the ceiling counts its OWN transition-log lane ──
+#
+# The ceiling's attempt count moves off the `reanswer-<issue>` side-channel file and into the
+# transition log, per #300's "record the transition where it happens" contract. It counts a
+# `service_attempt` event on lane `ceiling` — a lane with exactly ONE writer (this choke point)
+# and ONE meaning ("the ceiling admitted one service attempt for this episode").
+#
+# WHY ITS OWN LANE, and not the answer/permission lanes the issue text names. The ceiling bumps
+# exactly ONCE per tick at gate-broker.sh:608, upstream of both lanes; the lanes' own events are
+# not 1:1 with that:
+#   - UNDER-count: the fast-path gate waive (gate-broker.sh:660) bumps the ceiling but records
+#     `waived` on lane `gate` (answerer.sh:422), and hub-inject's delivery events carry NO
+#     episode (AFK_TLOG_EPISODE is set only at permission.sh:223/:321) — so an episode-keyed
+#     answer-lane count sits at 0 forever and the ceiling never engages: #203's doom-loop, back.
+#   - OVER-count: answer_computed (:849) and answer_dropped (:570) both land on lane `answer`
+#     within ONE tick.
+#   - afk_lane_event_count has no ACTOR filter, so hub-inject.sh's writes count too.
+# Counting another actor's events would be exactly the cross-lane reinterpretation AFK Design
+# Principle 5 forbids (the answer-attempt-<n>.epoch mistake, #241/#274/#288/#294).
+
+_CEILING_LANE_EVENT = '"event":"service_attempt"'
+
+
+def _tlog(statedir: Path, issue: int = 5) -> str:
+    f = statedir / "transitions" / f"{issue}.jsonl"
+    return f.read_text() if f.exists() else ""
+
+
+def test_reanswer_ceiling_counts_ceiling_lane_events_and_writes_no_file(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The conversion's core: two attempts are ADMITTED (rc 1, each recording one event), the
+    # third is EXHAUSTED (rc 0) — the same one-bump-per-tick cadence the file gave, now read
+    # back from the log. The `reanswer-` side-channel is gone entirely.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_REANSWER_CEILING": "2"}
+
+    rcs = [
+        _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA; echo rc=$?", env=env).stdout
+        for _ in range(3)
+    ]
+
+    assert [r.strip() for r in rcs] == ["rc=1", "rc=1", "rc=0"], (
+        "two attempts admitted, the third exhausted — the file's cadence, read from the log"
+    )
+    assert not (statedir / "reanswer-5").exists(), "the reanswer- side-channel file is retired"
+    assert _tlog(statedir).count(_CEILING_LANE_EVENT) == 2, (
+        "exactly one service_attempt event per ADMITTED attempt; the exhausted call records none"
+    )
+    assert '"lane":"ceiling"' in _tlog(statedir)
+
+
+def test_reanswer_ceiling_ignores_other_lanes_and_other_actors_events(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AFK Design Principle 5: the ceiling reads ITS OWN lane only. Pre-seed the log with the
+    # answer/permission/gate-lane events a single real tick emits (answer_computed + the
+    # answer_dropped that follows it, a permission approve, hub-inject's episode-less delivery)
+    # — none may move the ceiling's count, or the over/under-count this design exists to avoid
+    # comes back through the side door.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_REANSWER_CEILING": "2"}
+    ep = _call(f"_reanswer_episode_key '{spoke_repo}' 5 sigA", env=env).stdout.strip()
+    assert ep, (
+        "the seeded events must carry the ceiling's REAL episode key, or this pin passes "
+        "vacuously by keying on an episode the ceiling would never have counted anyway"
+    )
+    log = statedir / "transitions" / "5.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(
+        "".join(
+            f'{{"v":1,"ts":1700000000,"issue":5,"kind":"event","event":"{event}",'
+            f'"actor":"{actor}","lane":"{lane}"{episode}}}\n'
+            for event, actor, lane, episode in (
+                ("answer_computed", "gate-broker.sh", "answer", f',"episode":"{ep}"'),
+                ("answer_dropped", "gate-broker.sh", "answer", f',"episode":"{ep}"'),
+                ("approve_decided", "gate-broker.sh", "permission", f',"episode":"{ep}"'),
+                ("waived", "gate-broker.sh", "gate", f',"episode":"{ep}"'),
+                ("answer_delivered", "hub-inject.sh", "answer", ""),
+            )
+        )
+    )
+
+    rcs = [
+        _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA; echo rc=$?", env=env).stdout
+        for _ in range(3)
+    ]
+
+    assert [r.strip() for r in rcs] == ["rc=1", "rc=1", "rc=0"], (
+        "five foreign lane events must not consume a single unit of ceiling budget"
+    )
+
+
+def test_reanswer_ceiling_counts_a_reserviced_approval_in_the_same_episode(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #294 re-service shape. The ceiling sits UPSTREAM of both the permission and answer paths,
+    # so a MECHANICAL approve re-serviced within one episode (the served-marker window elapsed →
+    # one supervised re-serve) burns the same budget an answer attempt does, and the ceiling
+    # engages. The permission lane records its own approve_decided separately; the ceiling does
+    # not read it (see the Principle-5 pin above) — the choke point counts the SERVICE, whoever
+    # performs it. Without this the broker re-approved an identical command forever (#135/#188).
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_REANSWER_CEILING": "2"}
+    sig = "perm:abc123"
+
+    first = _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 '{sig}'; echo rc=$?", env=env)
+    reserve = _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 '{sig}'; echo rc=$?", env=env)
+    third = _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 '{sig}'; echo rc=$?", env=env)
+
+    assert first.stdout.strip() == "rc=1", "the first serve is admitted"
+    assert reserve.stdout.strip() == "rc=1", "the re-serve of the SAME episode is admitted too"
+    assert third.stdout.strip() == "rc=0", (
+        "a re-serviced approval counts, so the ceiling engages on the same episode (#294)"
+    )
+    assert _tlog(statedir).count(_CEILING_LANE_EVENT) == 2
+
+
+def test_reanswer_ceiling_fails_closed_when_the_transition_log_lib_is_absent(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The log write API is a best-effort no-op when transition-log.sh is absent
+    # (worktree-lib.sh:1300), and today's file-backed ceiling has NO dependency on it. Reading
+    # the count from the log makes lib-absence a NEW dependency, so its behavior is decided and
+    # pinned here rather than left to silently sit at 0 — which would un-engage the ceiling
+    # forever and re-run the 900s reasoner every tick (#203's doom-loop, AFK Principle 2's
+    # "never silently fall back to the worst case": that fallback is the PRICIEST one).
+    #
+    # It fails CLOSED (exhausted) and LOUDLY. Closed is safe, not a stall: post-#241 the caller
+    # treats exhaustion as warn + back off + ONE supervised retry per window
+    # (gate-broker.sh:615-637), so the spoke is still answered, just paced from the first tick.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_REANSWER_CEILING": "2"}
+
+    result = _call(
+        f"unset -f afk_lane_event_count; _broker_reanswer_exhausted '{spoke_repo}' 5 sigA; "
+        "echo rc=$?",
+        env=env,
+    )
+
+    assert result.stdout.strip().endswith("rc=0"), (
+        "no count is substantiable → EXHAUSTED (cheap+bounded), never fail-open to the reasoner"
+    )
+    warned = statedir / "warned-5.txt"
+    assert warned.exists(), "the fallback is LOUD — a silent one hides the broken deployment"
+    assert "transition log" in warned.read_text(), (
+        "the warn names the REAL cause; the caller's generic 'ceiling reached' warn would lie"
+    )
+
+
+def test_read_reanswer_count_projects_the_log_count(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # read_reanswer_count is the watchdog's servicing-evidence probe (#288 AC2,
+    # hub-watchdog-detect.sh:242 — out of this issue's scope). It stays as the PROJECTION over
+    # the same query, so that call site never learns the count moved into the log.
+    statedir = tmp_path / "sd"
+    env = {**waiting_spoke_env, "AFK_STATE_DIR": str(statedir), "AFK_REANSWER_CEILING": "5"}
+    sig = _call(f"_broker_park_signature '{spoke_repo}' 5", env=env).stdout.strip()
+    assert sig, "the fixture's parked spoke has an extractable signature"
+
+    _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 '{sig}'", env=env)
+    _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 '{sig}'", env=env)
+
+    assert _call(f"read_reanswer_count '{spoke_repo}' 5", env=env).stdout.strip() == "2", (
+        "the projection reports the CURRENT episode's admitted attempts, as the file's did"
+    )
+
+
 # ── issue #237 + #241 §5: mutation-void backs off (not terminal) + log-once ────
 
 
