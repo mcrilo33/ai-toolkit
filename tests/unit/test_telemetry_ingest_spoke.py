@@ -300,7 +300,12 @@ def test_non_git_install_falls_back_to_script_sibling(worktree: Path, tmp_path: 
     assert f"PYTHONPATH={repo / 'scripts'} " in tree
 
 
-def test_skips_when_telemetry_package_missing(worktree: Path, tmp_path: Path) -> None:
+def test_broken_install_says_so_on_stderr(worktree: Path, tmp_path: Path) -> None:
+    # Was test_skips_when_telemetry_package_missing (#319). Renamed, not merely moved: this
+    # is not a "skip". Past the OTel and auth gates ingestion was expected, so a missing
+    # package is a broken install — and the old name encoded exactly the mental model that
+    # let 51 lands pass unnoticed. The land log stays the forensic record even though it is
+    # no longer the alarm, so it must read as a breakage.
     # Arrange: a foreign synced target — no toolkit checkout, no package anywhere
     repo = _make_repo(tmp_path, script_dir=".ai-toolkit/scripts")
     shutil.rmtree(repo / "scripts" / "telemetry")
