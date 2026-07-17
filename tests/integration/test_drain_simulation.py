@@ -602,19 +602,22 @@ def _v_park(world: World, issue: int, now: int, step: dict, mutation: dict | Non
 def _v_answer(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
     """The drain services the park — SCRIPTED as the drain-authored records a real
     answer_pass writes. `via` selects which recency signal the watchdog reads:
-    `journal` (a decision-journal entry, default) or `progress` (a progress-epoch
-    advance). Both are paired with an episode-keyed `answer_delivered` event. A
-    mutation `drop`s these to reintroduce the pre-#300 unrecorded-service that
-    false-fired the watchdog (#263/#265/#283/#288)."""
+    `journal` (a decision-journal entry, default), `progress` (a progress-epoch
+    advance), or `dropped` (the drain reasoned but the delivery DROPPED — a journal +
+    an `answer_dropped` event instead of `answer_delivered`, the #288 shape). The
+    recorded service still proves the drain acted, so park-UNANSWERED ("no answer")
+    must not fire. A mutation `drop`s these to reintroduce the pre-#300 unrecorded
+    service that false-fired the watchdog (#263/#265/#283/#288)."""
     via = step.get("via", "journal")
     if via == "progress":
         if "progress" not in world.dropped:
             world.write_epoch("progress", issue, now)
     else:
         world.write_journal(issue, now)
+    outcome = "answer_dropped" if via == "dropped" else "answer_delivered"
     world.event(
         issue,
-        "answer_delivered",
+        outcome,
         "hub-inject.sh",
         lane="answer",
         episode=world.spokes[issue].episode,
@@ -787,22 +790,20 @@ def inv_unserviced_park_backstopped(world: World, scenario: dict) -> list[Violat
 
 def inv_answered_park_advances(world: World, scenario: dict) -> list[Violation]:
     """I4 (#312): once a park episode is serviced (`answer_delivered`), the spoke
-    ADVANCES — a forward transition follows — and the same episode is never re-fired
-    park-unanswered by the watchdog (principles 5, 6: a serviced episode is settled;
-    never re-interpret it as still-unanswered)."""
+    ADVANCES — a forward transition follows — never silently re-parking on the same
+    episode (principle 5: a serviced episode is settled). The complementary property
+    "a serviced episode is never re-FIRED park-unanswered" is covered by I6 (which has
+    a negative control); this invariant owns the positive advance."""
     out: list[Violation] = []
     for issue in _scenario_issues(scenario):
+        if not _spoke_truth(scenario, issue).get("advances"):
+            continue
         records = world.records(issue)
-        delivered = [(i, r) for i, r in enumerate(records) if r.get("event") == "answer_delivered"]
+        delivered = [i for i, r in enumerate(records) if r.get("event") == "answer_delivered"]
         if not delivered:
             continue
-        first = delivered[0][0]
-        later = [r.get("to") for r in records[first + 1 :] if r.get("kind") == "transition"]
-        # The POSITIVE advance is asserted where the scenario declares the spoke should
-        # advance after the answer (truth.advances) — never merely "no bad fire" (the
-        # #314 guidance). A suppression-only scenario (#263) legitimately ends at the
-        # answer and does not opt in.
-        if _spoke_truth(scenario, issue).get("advances") and not (set(later) & _FORWARD_STATES):
+        later = [r.get("to") for r in records[delivered[0] + 1 :] if r.get("kind") == "transition"]
+        if not (set(later) & _FORWARD_STATES):
             out.append(
                 Violation(
                     "I4",
@@ -812,19 +813,6 @@ def inv_answered_park_advances(world: World, scenario: dict) -> list[Violation]:
                     f"advance, not re-park (principle 5).",
                 )
             )
-        # Re-fire half: an episode serviced by the drain must not be re-fired.
-        episodes = {r.get("episode") for _, r in delivered if r.get("episode")}
-        for fire in world.fires(issue):
-            if fire.get("condition") == "park-unanswered" and episodes:
-                out.append(
-                    Violation(
-                        "I4",
-                        issue,
-                        f"#{issue} was re-fired park-unanswered after a recorded "
-                        f"answer_delivered — the serviced episode was re-interpreted "
-                        f"as unanswered (principle 6: absence is not evidence).",
-                    )
-                )
     return out
 
 

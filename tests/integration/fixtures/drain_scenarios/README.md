@@ -67,6 +67,22 @@ mutation:                       # AC5 negative control (optional)
 | `epoch` | stamp a bare-epoch marker (`name:` selects which, e.g. `dispatch`) |
 | `journal` | a bare decision-journal entry (a stale false-service suppressor) |
 
+## Scenario-authoring rules
+
+- **The fake clock (`AFK_NOW = t0 + t`) governs READS, not writes.** Scripted records
+  (`world.tlog`/`event`, the `park`/`push`/`land_start`/... verbs) are stamped with a
+  fake `ts = t0 + t`. But records the REAL drain/watchdog write use real `date +%s`.
+  So do not assert a **time-sensitive** property (an age, an ordering by `ts`) over a
+  transition the drain WROTE during a `run: [drain]` step — only over scripted
+  transitions. Presence/membership assertions over drain-written records are fine
+  (I2/I5 do exactly that). This holds because scenario `t` values (hundreds of
+  seconds) dwarf a test's real wall-clock (a few seconds), so the fake clock
+  dominates every age the watchdog computes.
+- **`park-undeliverable` is not reachable hermetically.** It is episode-keyed on the
+  reconciler's `_gb_episode_key` hash, which the harness must not reproduce (no
+  internals). #288 therefore pins the observable property — a serviced-but-dropped
+  park is never mislabelled park-UNANSWERED (I6) — not the undeliverable label itself.
+
 ## Invariants (declared once in the harness, mirror the AFK Design Principles)
 
 - **I1** a spoke in a recorded `landing`/`pushing` phase is never dead-pane-fired (#290)
