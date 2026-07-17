@@ -1542,6 +1542,194 @@ def test_warned_backoff_lanes_are_independent(tmp_path: Path) -> None:
     assert "D7-WAIT" in out, out
 
 
+# ── issue #318 (#300 step 6): the LAND lane paces on transition-log events ────
+# auto_land's pacing moves off warned-state-<issue>-land and onto the land lane's own recorded
+# events (AFK Principle 1: the actor that decides the backoff records it). _afk_warned_arm is
+# the single choke point every land-lane warn flows through (broker_warn_continue, and
+# _warn_parked_last via it), so it is where the record is written.
+#
+# The arm RECORDS the next-due epoch it computes rather than leaving the reader to re-derive the
+# curve from a timestamp: one writer of the math, no reader that can drift from it (the same
+# single-parse-site rationale _afk_warned_next already carries), and it keeps AFK_NOW-pinned
+# tests honest — afk_tlog_event stamps a real `date +%s`, which a derived curve would read
+# instead of the pinned clock.
+#
+# The records live on their own `land-backoff` lane, NOT on `land`: broker_warn_continue already
+# writes an `escalated` event to `land` for every land/review park, so a shared lane would have
+# two writers with two meanings and the last-record read would pick up the wrong one (AFK
+# Principle 5). See test_land_lane_pacing_survives_the_escalated_event_on_the_land_lane.
+#
+# warned-state-<issue>-land stays WRITTEN as a pure projection: _afk_warn_attempt
+# (hub-afk-recover.sh:511, out of this issue's scope) still reads its attempt field for #305's
+# warn-escalate bound. It is no longer READ for pacing — that is the conversion.
+
+
+def _land_log(statedir: Path, issue: int = 5) -> str:
+    f = statedir / "transitions" / f"{issue}.jsonl"
+    return f.read_text() if f.exists() else ""
+
+
+def test_land_lane_arm_records_a_land_failed_event(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_WARN_BACKOFF_BASE": "60", "AFK_NOW": "1000"}
+
+    r = _call("_afk_warned_arm 5 land 600", env=env)
+
+    assert r.returncode == 0, r.stderr
+    log = _land_log(statedir)
+    assert '"event":"land_failed"' in log, "the land-lane arm records the pacing decision"
+    assert '"lane":"land-backoff"' in log, "the pacing lane is the arm's own, single-writer lane"
+    assert '"next":1060' in log, "the arm records the next-due epoch it computed (now + base)"
+    assert (statedir / "warned-state-5-land").exists(), (
+        "the file stays WRITTEN as the projection for _afk_warn_attempt's out-of-scope #305 read"
+    )
+
+
+def test_land_lane_pacing_survives_the_escalated_event_on_the_land_lane(tmp_path: Path) -> None:
+    # Regression pin. broker_warn_continue arms the backoff and THEN records an `escalated` event
+    # on lane `land` (answerer.sh, #300 step 3b) — so `land` has a second writer with a different
+    # meaning. A pacing reader that took the last event on `land` would read that escalation,
+    # find no `next` key, and conclude "never armed" — re-running an expensive worktree-land on
+    # every tick, the very pacing #241 added. The pacing lane must stay the arm's own.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_NOW": "1000",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    _call("broker_warn_continue '' 5 land 'auto-land failed (exit 1)' reversible", env=env)
+
+    log = _land_log(statedir)
+    assert '"lane":"land"' in log, "precondition: the escalation IS recorded on the land lane"
+    r = _call(
+        "_afk_warned_due 5 1000 land && echo DUE || echo WAIT; _afk_warned_next 5 land", env=env
+    )
+    assert "WAIT" in r.stdout, (
+        "a land warn must pace the next land; the sibling escalation on lane `land` must not "
+        "read back as 'never armed'"
+    )
+    assert "1060" in r.stdout
+
+
+def test_land_lane_due_reads_the_log_not_the_warned_state_file(tmp_path: Path) -> None:
+    # The conversion's load-bearing pin. The log says "not due until 9000"; the FILE says
+    # "due at 1" — the file must not be consulted. If this ever passes by reading the file, the
+    # pacing never moved.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "warned-state-5-land").write_text("1\t1\n")  # file: long since due
+    log = statedir / "transitions" / "5.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        '{"v":1,"ts":1000,"issue":5,"kind":"event","event":"land_failed",'
+        '"actor":"hub-afk.sh","lane":"land-backoff","evidence":{"attempt":1,"next":9000}}\n'
+    )
+
+    r = _call(
+        "_afk_warned_due 5 5000 land && echo DUE || echo WAIT; _afk_warned_next 5 land",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert "WAIT" in r.stdout, "the LOG's next-due epoch paces the land lane, not the file's"
+    assert "9000" in r.stdout, "_afk_warned_next projects the log's recorded epoch"
+
+
+def test_land_lane_clear_is_recorded_so_progress_unpaces_it(tmp_path: Path) -> None:
+    # The log is append-only, so _afk_clear_warned cannot delete the pacing record — it RECORDS
+    # the clear (Principle 1: a reset is a fact, not an absence). Without this a genuine-progress
+    # clear would leave the land lane paced by a stale arm forever: the #299 shape, a land that
+    # silently never retries.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_WARN_BACKOFF_BASE": "1000000", "AFK_NOW": "1000"}
+
+    _call("_afk_warned_arm 5 land 600", env=env)
+    assert "WAIT" in _call("_afk_warned_due 5 1000 land && echo DUE || echo WAIT", env=env).stdout
+
+    _call("_afk_clear_warned 5", env=env)
+
+    r = _call("_afk_warned_due 5 1000 land && echo DUE || echo WAIT", env=env)
+    assert "DUE" in r.stdout, "a genuine-progress clear must un-pace the land lane immediately"
+    assert '"event":"land_cleared"' in _land_log(statedir), (
+        "the clear is RECORDED on the lane, not inferred from the file's absence"
+    )
+
+
+def test_land_lane_clear_records_nothing_when_the_lane_was_never_armed(tmp_path: Path) -> None:
+    # _afk_clear_warned fires on EVERY tip advance for every spoke (8 call sites). Recording a
+    # clear unconditionally would spam the log with one event per progress tick; the projection
+    # file's presence is the exact "this lane is armed" test, and it costs one stat.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+
+    _call("_afk_clear_warned 5", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert '"event":"land_cleared"' not in _land_log(statedir)
+
+
+def test_land_lane_falls_back_to_the_file_when_the_log_has_no_record(tmp_path: Path) -> None:
+    # AFK Principle 6: an absent record reads "unknown", and unknown alone is never a basis to
+    # ACT — here acting means running an expensive worktree-land and dropping the watchdog's #285
+    # servicing defer. Two real ways the log goes silent about a lane that IS armed: _tlog_append
+    # drops a line it cannot lock in ~5s, and a mid-window self-copy cutover leaves every backoff
+    # armed by the PRE-#318 code with a file and no event. Reading that as "never armed" would
+    # fire every paced spoke's land in one tick. The projection file answers instead.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "warned-state-5-land").write_text("2\t9000\n")  # armed by the old code, no event
+
+    r = _call(
+        "_afk_warned_due 5 5000 land && echo DUE || echo WAIT; _afk_warned_next 5 land",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert "WAIT" in r.stdout, "a log with no record for the lane must not un-pace an armed land"
+    assert "9000" in r.stdout
+
+
+def test_fresh_window_clear_records_the_land_lane_clear(tmp_path: Path) -> None:
+    # _clear_progress_state's contract: a freshly-armed window inherits no cadence (a leftover
+    # backoff would skip the clean first re-service). The land lane's pacing is a RECORD in an
+    # append-only log, so the glob delete cannot reach it — a fresh window would otherwise sit
+    # inside the last arm's window, up to the land cap, before its first land attempt.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_WARN_BACKOFF_BASE": "1000000", "AFK_NOW": "1000"}
+    _call("_afk_warned_arm 5 land 600; _afk_warned_arm 7 land 600", env=env)
+    assert "WAIT" in _call("_afk_warned_due 5 1000 land && echo DUE || echo WAIT", env=env).stdout
+
+    _call("_clear_warned_records", env=env)
+
+    for issue in (5, 7):
+        r = _call(f"_afk_warned_due {issue} 1000 land && echo DUE || echo WAIT", env=env)
+        assert "DUE" in r.stdout, f"#{issue}: a fresh window must not inherit the land cadence"
+        assert '"event":"land_cleared"' in _land_log(statedir, issue)
+
+
+def test_land_lane_falls_back_to_the_file_when_the_log_lib_is_absent(tmp_path: Path) -> None:
+    # The land lane's fail direction is the OPPOSITE of the re-answer ceiling's, and deliberately
+    # so: each lane fails toward its BOUNDED outcome. A stalled land jams every scope-dependent
+    # issue behind it for the whole window (#299) — unbounded. So the land lane never fails
+    # closed. The projection file is still written by the same arm, so falling back to it keeps
+    # the correct cadence rather than merely fail-opening to a re-land every tick.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "warned-state-5-land").write_text("1\t9000\n")
+
+    r = _call(
+        "unset -f afk_lane_last_event; "
+        "_afk_warned_due 5 5000 land && echo DUE || echo WAIT; _afk_warned_next 5 land",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert "WAIT" in r.stdout, "with no log to read, the still-written projection paces the lane"
+    assert "9000" in r.stdout
+
+
 def test_clear_warned_drops_both_lanes(tmp_path: Path) -> None:
     statedir = tmp_path / "sd"
     statedir.mkdir()

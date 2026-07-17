@@ -500,8 +500,14 @@ _afk_warned_lane_cap() {
 # prior attempt count (0 if none), schedule the next retry at now + min(BASE * 2^attempt, CAP), and
 # persist "<attempt+1>\t<next>". Exponential so a standing failure is retried ever more rarely. An
 # empty cap falls back to AFK_WARN_BACKOFF_CAP (the land lane passes a lower cap, #274 AC4).
+#
+# #318 (#300 step 6): the LAND lane additionally RECORDS the arm on the transition log, and that
+# record — not the file — is what paces auto_land (see _afk_warned_next). The file is still
+# written for BOTH lanes: the answer lane reads it whole, and the land lane keeps it as a pure
+# PROJECTION for _afk_warn_attempt (hub-afk-recover.sh, out of #318's scope), which reads the
+# attempt field for #305's warn-escalate bound. One writer either way — this function.
 _afk_warned_arm() {
-  local issue="$1" lane="${2:-}" cap_override="${3:-}" f base cap attempt=0 delay now i=0
+  local issue="$1" lane="${2:-}" cap_override="${3:-}" f base cap attempt=0 delay now i=0 next
   base="${AFK_WARN_BACKOFF_BASE:-60}"; case "$base" in '' | *[!0-9]*) base=60 ;; esac
   cap="${cap_override:-${AFK_WARN_BACKOFF_CAP:-1800}}"; case "$cap" in '' | *[!0-9]*) cap=1800 ;; esac
   f="$(_afk_warned_state_file "$issue" "$lane")"
@@ -511,19 +517,81 @@ _afk_warned_arm() {
   while [ "$i" -lt "$attempt" ] && [ "$delay" -lt "$cap" ]; do delay=$(( delay * 2 )); i=$(( i + 1 )); done
   [ "$delay" -gt "$cap" ] && delay="$cap"
   now="$(afk_now)"
+  next=$(( now + delay ))
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
-  printf '%s\t%s\n' "$(( attempt + 1 ))" "$(( now + delay ))" >"$f" 2>/dev/null || true
+  printf '%s\t%s\n' "$(( attempt + 1 ))" "$next" >"$f" 2>/dev/null || true
+  # The arm RECORDS the epoch it just computed rather than leaving a reader to re-derive the
+  # curve from the event's timestamp: the math has one writer, so no reader can drift from it
+  # (the single-parse-site rationale _afk_warned_next already carries), and the recorded epoch
+  # honors afk_now — the log's own ts is a real `date +%s`, which would ignore a pinned clock.
+  [ "$lane" = land ] \
+    && _afk_tlog_land_event "$issue" land_failed "{\"attempt\":$(( attempt + 1 )),\"next\":$next}"
+  return 0
+}
+
+# The land backoff's pacing records live on their OWN lane, not on `land`.
+#
+# Lane `land` is ALREADY written by broker_warn_continue, which records an `escalated` event for
+# every land/review park right after arming the backoff (see below). Putting the pacing records
+# there too would give one lane two writers with two meanings — and the reader below, which takes
+# the lane's LAST event, would read that `escalated` (no `next` key) as "never armed" and re-run
+# an expensive land every tick. That is AFK Principle 5 exactly: a lane means ONE thing, set by
+# ONE writer. So the backoff gets `land-backoff`, whose only events are this module's own arm and
+# clear — which makes "the last record wins" the whole truth about pacing.
+_AFK_LAND_BACKOFF_LANE=land-backoff
+
+# _afk_tlog_land_event <issue> <event> <evidence-json> -> record one land-backoff pacing decision.
+# Best-effort by the #300 contract: no-ops when the log is unavailable and never fails the caller.
+_afk_tlog_land_event() {
+  command -v wt_tlog_event >/dev/null 2>&1 || return 0
+  wt_tlog_event "$1" "$2" hub-afk.sh "$_AFK_LAND_BACKOFF_LANE" "" "$3" || true
 }
 
 # _afk_warned_next <issue> [lane] -> echo the lane's next-due epoch (empty when never armed). The
 # single reader of the backoff record's <next> field: _afk_warned_due gates on it and the auto_land
 # skip log names it, so a paced land is visible, not a silent continue (#274 AC3). One parse site so
 # the two callers can never diverge on the record format (#274 review).
+#
+# #318: the LAND lane reads its epoch from the transition log — the lane's own recorded arm — so
+# auto_land paces on a recorded fact, visible to anything reading the lifecycle log, instead of a
+# side-channel file only the drain could see. Every other lane still reads the file.
+#
+# THE LOG WINS WHEN IT HAS A RECORD; ITS SILENCE IS NOT AN ANSWER. A missing record means
+# "unknown", and AFK Principle 6 forbids acting on unknown alone — here "act" means running an
+# expensive worktree-land AND dropping the watchdog's #285 AC5 servicing defer. Two ways the log
+# can be silent about a lane that IS armed: _tlog_append drops a record it cannot lock in ~5s
+# (best-effort by contract), and a self-copy cutover mid-window leaves every backoff armed by the
+# PRE-#318 code with a file but no event — which, read as "never armed", would fire every paced
+# spoke's land in a single tick. So fall through to the projection file, which _afk_warned_arm
+# still writes for exactly this reason. It cannot resurrect a cleared lane: _afk_clear_warned
+# deletes the file in the same breath as it records the clear.
 _afk_warned_next() {
-  local f next=""
-  f="$(_afk_warned_state_file "$1" "${2:-}")"
+  local issue="$1" lane="${2:-}" f next=""
+  if [ "$lane" = land ] && command -v afk_lane_last_event >/dev/null 2>&1; then
+    next="$(_afk_land_next_from_log "$issue")"
+    if [ -n "$next" ]; then printf '%s\n' "$next"; return 0; fi
+  fi
+  f="$(_afk_warned_state_file "$issue" "$lane")"
   [ -f "$f" ] || return 0
   IFS=$'\t' read -r _ next <"$f" 2>/dev/null || true
+  printf '%s\n' "$next"
+}
+
+# _afk_land_next_from_log <issue> -> the land lane's next-due epoch as its last recorded event
+# states it; empty when the lane has no record at all, or when that record is a CLEAR — which
+# deliberately carries no `next` key, so it reads back as exactly the "never armed" the retired
+# file expressed by not existing. Both mean due now.
+#
+# The epoch is read from the event's EVIDENCE, which is safe here precisely because it is this
+# module's own single-writer record (_afk_tlog_land_event) on a lane nothing else writes: the
+# `next` key is ours, and the builders append evidence strictly LAST, so no top-level field can
+# be confused for it. A non-numeric parse degrades to empty = due, never to a stall.
+_afk_land_next_from_log() {
+  local line next
+  line="$(afk_lane_last_event "$1" "$_AFK_LAND_BACKOFF_LANE" 2>/dev/null)"
+  [ -n "$line" ] || return 0
+  next="$(printf '%s' "$line" | sed -n -E 's/.*"next":([0-9]+).*/\1/p')"
+  case "$next" in '' | *[!0-9]*) return 0 ;; esac
   printf '%s\n' "$next"
 }
 
@@ -540,13 +608,43 @@ _afk_warned_due() {
 # _afk_clear_warned <issue> -> drop one spoke's warned record + backoff for EVERY lane (called on
 # genuine progress: a tip advance or a fresh marker means the warned state is stale). Clears both
 # the default (answer) lane and the land lane so no stale record in either keeps pacing (#274).
+#
+# #318: the land lane's pacing record lives in an APPEND-ONLY log, so its clear cannot be a
+# delete — it is RECORDED (Principle 1: a reset is a fact, not an absence). Skipping the record
+# would leave a genuine-progress clear paced by a stale arm for the rest of the window: a land
+# that silently never retries, the #299 shape. Gated on the projection file's presence so the
+# log gets ONE clear per arm cycle rather than one per progress tick — _afk_clear_warned fires
+# on every tip advance for every spoke, and that file existing is exactly "this lane is armed".
+#
+# RESIDUAL, bounded and deliberate: the record is best-effort (_tlog_append drops a line it
+# cannot lock in ~5s) while the rm below always succeeds, so a dropped clear leaves the previous
+# land_failed as the lane's last word and paces the land until that epoch — at most
+# AFK_LAND_BACKOFF_CAP (600s), still inside the watchdog's 900s land ceiling, so it delays a
+# land by one cadence and can never strand one. Making the pair atomic would need a lock across
+# two stores; the bound is cheaper than the machinery, and the alternative (deleting nothing
+# until the record lands) would strand the answer lane's file on the same drop.
 _afk_clear_warned() {
-  rm -f "$(_afk_warned_state_file "$1")" "$(_afk_warned_state_file "$1" land)" \
-        "$(_broker_warned_record "$1")" 2>/dev/null || true
+  local issue="$1"
+  [ -f "$(_afk_warned_state_file "$issue" land)" ] \
+    && _afk_tlog_land_event "$issue" land_cleared '{"cleared":true}'
+  rm -f "$(_afk_warned_state_file "$issue")" "$(_afk_warned_state_file "$issue" land)" \
+        "$(_broker_warned_record "$issue")" 2>/dev/null || true
+  return 0
 }
 # _clear_warned_records -> drop every warned record + backoff for a freshly-armed window.
+#
+# #318: the land lane's pacing is a RECORD in an append-only log, so the glob delete below cannot
+# reach it — a fresh window would inherit the last arm's cadence (up to the land cap), and
+# _clear_progress_state's contract is that a fresh window inherits none. So record a clear for
+# every armed land lane first. The projection files are exactly the per-issue armed set, so this
+# needs no worktree enumeration; an unmatched glob falls through the -f guard.
 _clear_warned_records() {
-  local dir; dir="$(_afk_state_dir)"
+  local dir f issue; dir="$(_afk_state_dir)"
+  for f in "$dir"/warned-state-*-land; do
+    [ -f "$f" ] || continue
+    issue="${f##*/warned-state-}"; issue="${issue%-land}"
+    _afk_tlog_land_event "$issue" land_cleared '{"cleared":true,"reason":"fresh afk window"}'
+  done
   rm -f "$dir"/warned-*.txt "$dir"/warned-state-* 2>/dev/null || true
 }
 

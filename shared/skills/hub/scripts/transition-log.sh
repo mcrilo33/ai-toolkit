@@ -249,6 +249,31 @@ afk_last_service_event() {
     END { if (l != "") print l }'
 }
 
+# afk_lane_last_event <issue> <lane> [episode] -> the last complete event line on
+# this lane (optionally within one episode), whole line on stdout; empty when the
+# lane has no events (rc 0 always — an absent record reads "unknown", never an
+# error). The symmetric partner of afk_lane_event_count: same lane + OPTIONAL
+# episode filter, last matching line instead of a count.
+#
+# afk_last_service_event cannot serve a lane whose events carry no episode: it
+# matches `"episode":"<ep>"` unconditionally, so an episode-LESS record never
+# matches. A per-ISSUE lane — the drain's land lane, which has no park episode to
+# key on (#318) — needs to read back its own most recent record, hence this.
+# Matching is on the pre-evidence head only (see _tlog_head), so a caller's
+# free-text evidence naming a lane cannot masquerade as one.
+afk_lane_last_event() {
+  local issue="$1" lane="$2" episode="${3:-}"
+  _tlog_complete_lines "$issue" | awk -v ln="\"lane\":\"$lane\"" -v ep="$episode" '{
+      h = $0; i = index(h, ",\"evidence\":"); if (i) h = substr(h, 1, i - 1)
+      if (index(h, "\"kind\":\"event\"") == 0) next
+      if (index(h, ln) == 0) next
+      if (ep != "" && index(h, "\"episode\":\"" ep "\"") == 0) next
+      l = $0
+    }
+    END { if (l != "") print l }'
+  return 0
+}
+
 # afk_lane_event_count <issue> <lane> [episode] -> how many events this lane
 # recorded (optionally within one episode). 0 when none.
 afk_lane_event_count() {

@@ -885,9 +885,41 @@ def _head(wt: Path) -> str:
 
 # ── issue #288 AC2: never-attempted suppression when the drain HAS attempted + is paced ────────
 # answer-attempt-<issue>.epoch (stamped only at DELIVERY) is blind to every pre-inject drop path.
-# Two records the re-answer-ceiling code ALREADY writes prove otherwise: reanswer-<issue> (an
-# attempt genuinely ran on the CURRENT (tip, sig)) and an armed, not-yet-due warned-retry backoff
+# Two records the re-answer-ceiling code ALREADY writes prove otherwise: an admitted ceiling
+# attempt on the CURRENT (tip, sig) episode, and an armed, not-yet-due warned-retry backoff
 # (the drain is paced to retry, not abandoned). Together, firing "never-attempted" would be a lie.
+#
+# #318 (#300 step 6): the attempt record moved out of the reanswer-<issue> file and into the
+# transition log's `ceiling` lane. read_reanswer_count still projects it, so the detector under
+# test is unchanged — only the fixture's storage moved (see _seed_ceiling_attempt).
+
+
+def _seed_ceiling_attempt(sd: Path, wt: Path, issue: int, sig: str) -> None:
+    """Record one ADMITTED re-answer attempt exactly as the ceiling now does (#318).
+
+    A `service_attempt` event on the ceiling's own lane, keyed by its own episode. Replaces the
+    retired `reanswer-<issue>` file these fixtures used to write — seeding that file instead
+    would leave the pins passing vacuously, since nothing reads it any more.
+
+    The episode is DERIVED by asking the code for it rather than spelled out here: it is the
+    ceiling's private key format, it has already changed once during #318, and a hand-written
+    copy that drifts from it would not fail — it would silently stop matching, which reads as
+    "never attempted" and passes the counter-case tests for the wrong reason.
+    """
+    ep = _call(
+        f"_broker_park_signature() {{ printf '%s' '{sig}'; }}; "
+        f"_reanswer_episode_key '{wt}' {issue} '{sig}'",
+        env={"AFK_STATE_DIR": str(sd)},
+    ).stdout.strip()
+    assert ep, "the ceiling must yield an episode key for a substantiable signature"
+    log = sd / "transitions" / f"{issue}.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a") as fh:
+        fh.write(
+            f'{{"v":1,"ts":{int(NOW) - 60},"issue":{issue},"kind":"event",'
+            f'"event":"service_attempt","actor":"gate-broker.sh","lane":"reanswer-ceiling",'
+            f'"episode":"{ep}"}}\n'
+        )
 
 
 def test_park_unanswered_never_attempted_suppressed_when_attempted_and_backing_off(
@@ -896,9 +928,9 @@ def test_park_unanswered_never_attempted_suppressed_when_attempted_and_backing_o
     wt = _git_repo(tmp_path)
     sd = tmp_path / "sd"
     sd.mkdir()
-    (sd / "reanswer-5").write_text(f"{_head(wt)}\tsigA\t1\n")
-    (sd / "warned-state-5").write_text(f"1\t{int(NOW) + 300}\n")  # armed, not due for 300s
     old = str(int(NOW) - 700)  # past the 600s ceiling
+    _seed_ceiling_attempt(sd, wt, 5, "sigA")
+    (sd / "warned-state-5").write_text(f"1\t{int(NOW) + 300}\n")  # armed, not due for 300s
     prelude = (
         f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
         "_broker_park_signature() { printf '%s' 'sigA'; }; "
@@ -929,9 +961,9 @@ def test_park_unanswered_fires_when_attempted_but_backoff_already_due(tmp_path: 
     wt = _git_repo(tmp_path)
     sd = tmp_path / "sd"
     sd.mkdir()
-    (sd / "reanswer-5").write_text(f"{_head(wt)}\tsigA\t1\n")
-    (sd / "warned-state-5").write_text(f"1\t{int(NOW) - 10}\n")  # already due
     old = str(int(NOW) - 700)
+    _seed_ceiling_attempt(sd, wt, 5, "sigA")
+    (sd / "warned-state-5").write_text(f"1\t{int(NOW) - 10}\n")  # already due
     prelude = (
         f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
         "_broker_park_signature() { printf '%s' 'sigA'; }; "
@@ -1801,15 +1833,33 @@ def _run_conditions_ledger(
     accumulate in the same ledger — the dedup / servicing-toggle tests rely on that. When
     ``servicing_next`` is given, the drain's LAND-lane backoff is armed to that epoch (a future
     epoch models mid-service); otherwise any prior servicing record is cleared.
+
+    #318 (#300 step 6): an armed land-lane backoff IS the drain's recorded land_failed event on
+    the land-backoff lane — warned-state-5-land no longer paces anything, so seeding it would
+    leave every servicing-defer test below passing vacuously. The clear writes a land_cleared
+    rather than deleting: the log is append-only, and that is exactly what _afk_clear_warned does.
+    The record is APPENDED, never written over the file: callers seed their own transitions into
+    the same per-issue log first (a recorded `accepted`, say), and the last land-backoff record
+    is what paces — so appending both preserves their seed and models the real writer.
     """
     ledger = tmp_path / "ledger.jsonl"
     statedir = tmp_path / "statedir"
     statedir.mkdir(exist_ok=True)
-    land_lane = statedir / "warned-state-5-land"
+    log = statedir / "transitions" / "5.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
     if servicing_next is not None:
-        land_lane.write_text(f"2\t{servicing_next}\n")
-    elif land_lane.exists():
-        land_lane.unlink()
+        record = (
+            f'{{"v":1,"ts":{int(NOW) - 10},"issue":5,"kind":"event","event":"land_failed",'
+            f'"actor":"hub-afk.sh","lane":"land-backoff",'
+            f'"evidence":{{"attempt":2,"next":{servicing_next}}}}}\n'
+        )
+    else:
+        record = (
+            f'{{"v":1,"ts":{int(NOW) - 10},"issue":5,"kind":"event","event":"land_cleared",'
+            f'"actor":"hub-afk.sh","lane":"land-backoff","evidence":{{"cleared":true}}}}\n'
+        )
+    with log.open("a") as fh:
+        fh.write(record)
     old = str(int(NOW) - 1000)
     prelude = (
         f'inflight_worktrees() {{ printf "%s\\t5\\n" "{wt}"; }}; '
