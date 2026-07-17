@@ -528,6 +528,19 @@ _retire_abandoned_gate_park() {
     "spoke coded past its PLAN gate without a reply (#117) — retired the abandoned gate episode" reversible
 }
 
+# _broker_retire_if_coded_past_gate <wt> <issue> <was_gate> -> rc 0 (retired — the caller must
+# then return) when this is a PLAN-gate park the spoke coded PAST without a reply (#117/#312); rc 1
+# otherwise (the caller falls through to its plain moved-on drop, unchanged). Shared by BOTH
+# moved-on drop sites — the ANSWER pre-inject drop and the ESCALATE/no-decision drop — so an
+# abandoned gate is retired whatever the reasoner returned, not only on an ANSWER.
+_broker_retire_if_coded_past_gate() {
+  local wt="$1" issue="$2" was_gate="$3"
+  [ "$was_gate" -eq 1 ] || return 1
+  _gate_spoke_coded_past "$wt" || return 1
+  log "  #$issue coded past its PLAN gate without a reply (#117) — retiring the abandoned gate episode"
+  _retire_abandoned_gate_park "$wt" "$issue"
+}
+
 # decide_and_act <wt_path> <issue> -> reason about a parked spoke and act: inject the
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
@@ -768,11 +781,7 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
       # age into a watchdog park-undeliverable fire (and a reasoner run) every tick. Extends the
       # #204 self-heal (top of this function) to the shape its typed-reply detector can't see; an
       # ambiguous / non-coded-past read falls through to the plain drop below, unchanged.
-      if [ "$was_gate" -eq 1 ] && _gate_spoke_coded_past "$wt"; then
-        log "  #$issue coded past its PLAN gate without a reply (#117) — retiring the abandoned gate episode"
-        _retire_abandoned_gate_park "$wt" "$issue"
-        return 0
-      fi
+      if _broker_retire_if_coded_past_gate "$wt" "$issue" "$was_gate"; then return 0; fi
       log "  #$issue is no longer parked on that prompt — dropping the stale answer (spoke moved on)"
       note_answer_drop "$wt" "$issue" "$park_sig" "no longer parked on that prompt (spoke moved on)"
       return 0
@@ -861,6 +870,9 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   # it as "moved on" would drop every #201 escalation and re-paste onto the wedged composer
   # forever, with no blocked/<issue> ever stamped (#201 review, CONFIRMED).
   if [ "$inject_diagnosed" -eq 0 ] && _spoke_moved_on "$wt" "$parked_mtime"; then
+    # #312: same as the ANSWER-branch drop — a gate the spoke coded past is retired here too, so an
+    # ESCALATE/no-decision outcome on an abandoned gate stops re-running the reasoner every tick.
+    if _broker_retire_if_coded_past_gate "$wt" "$issue" "$was_gate"; then return 0; fi
     log "  #$issue transcript advanced while reasoning — dropping the escalation (spoke moved on)"
     return 0
   fi

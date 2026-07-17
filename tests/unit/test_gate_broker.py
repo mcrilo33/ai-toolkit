@@ -785,6 +785,33 @@ def test_broker_service_gate_retires_gate_the_spoke_coded_past(
     assert journal.exists() and "gate-abandoned" in journal.read_text()
 
 
+def test_broker_service_gate_retires_coded_past_gate_on_escalate(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC2 completeness: a coded-past gate whose reasoner ESCALATEs (rather than ANSWERs) reaches
+    # the ESCALATE moved-on drop — it must retire the abandoned gate there too, not just re-escalate
+    # and leave the tag to age. _spoke_moved_on is the positive signal that branch gates on.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [_gate_bash_turn("PLAN -- then keeps coding"), _spoke_coded_past_turn()],
+    )
+    _tag_gate_at_head(spoke_repo, 5)
+    env = _retire_gate_env(spoke_repo, tmp_path, projects)
+    env["AFK_ANSWERER_CMD"] = "printf 'reasoning\\nESCALATE: genuinely your call'"
+
+    result = _call(
+        f"_spoke_moved_on() {{ return 0; }}; broker_service_gate '{spoke_repo}' 5 unattended",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _gate_tag_list(spoke_repo) == "", "an abandoned gate must be retired on ESCALATE too"
+    journal = tmp_path / "sd" / "decision-journal.jsonl"
+    assert journal.exists() and "gate-abandoned" in journal.read_text()
+
+
 def test_broker_service_gate_does_not_retire_a_bare_gate_park(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
