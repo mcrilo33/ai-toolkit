@@ -51,8 +51,18 @@ def hub(tmp_path: Path) -> Path:
     """A main checkout ('hub') on `main` with an `origin` bare remote."""
     remote = tmp_path / "remote.git"
     hub = tmp_path / "hub"
+    # Pin the bare remote's HEAD to `main` explicitly (-b main). Without it the
+    # bare inherits the runner's compiled init.defaultBranch — `main` on Apple
+    # git but `master` on upstream/Ubuntu — leaving HEAD dangling at a nonexistent
+    # `master`. A later `git clone` of this bare (the sibling-land helpers) then
+    # cannot check out `main`, lands on an unborn `master`, and its `push origin
+    # main` fails "src refspec main does not match any" — green locally, red on CI
+    # (issue #317).
     subprocess.run(
-        ["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True, env=_GIT_ENV
+        ["git", "init", "-q", "--bare", "-b", "main", str(remote)],
+        check=True,
+        capture_output=True,
+        env=_GIT_ENV,
     )
     subprocess.run(
         ["git", "init", "-q", "-b", "main", str(hub)], check=True, capture_output=True, env=_GIT_ENV
