@@ -555,11 +555,21 @@ _afk_tlog_land_event() {
 # #318: the LAND lane reads its epoch from the transition log — the lane's own recorded arm — so
 # auto_land paces on a recorded fact, visible to anything reading the lifecycle log, instead of a
 # side-channel file only the drain could see. Every other lane still reads the file.
+#
+# THE LOG WINS WHEN IT HAS A RECORD; ITS SILENCE IS NOT AN ANSWER. A missing record means
+# "unknown", and AFK Principle 6 forbids acting on unknown alone — here "act" means running an
+# expensive worktree-land AND dropping the watchdog's #285 AC5 servicing defer. Two ways the log
+# can be silent about a lane that IS armed: _tlog_append drops a record it cannot lock in ~5s
+# (best-effort by contract), and a self-copy cutover mid-window leaves every backoff armed by the
+# PRE-#318 code with a file but no event — which, read as "never armed", would fire every paced
+# spoke's land in a single tick. So fall through to the projection file, which _afk_warned_arm
+# still writes for exactly this reason. It cannot resurrect a cleared lane: _afk_clear_warned
+# deletes the file in the same breath as it records the clear.
 _afk_warned_next() {
   local issue="$1" lane="${2:-}" f next=""
   if [ "$lane" = land ] && command -v afk_lane_last_event >/dev/null 2>&1; then
-    _afk_land_next_from_log "$issue"
-    return 0
+    next="$(_afk_land_next_from_log "$issue")"
+    if [ -n "$next" ]; then printf '%s\n' "$next"; return 0; fi
   fi
   f="$(_afk_warned_state_file "$issue" "$lane")"
   [ -f "$f" ] || return 0
@@ -605,6 +615,14 @@ _afk_warned_due() {
 # that silently never retries, the #299 shape. Gated on the projection file's presence so the
 # log gets ONE clear per arm cycle rather than one per progress tick — _afk_clear_warned fires
 # on every tip advance for every spoke, and that file existing is exactly "this lane is armed".
+#
+# RESIDUAL, bounded and deliberate: the record is best-effort (_tlog_append drops a line it
+# cannot lock in ~5s) while the rm below always succeeds, so a dropped clear leaves the previous
+# land_failed as the lane's last word and paces the land until that epoch — at most
+# AFK_LAND_BACKOFF_CAP (600s), still inside the watchdog's 900s land ceiling, so it delays a
+# land by one cadence and can never strand one. Making the pair atomic would need a lock across
+# two stores; the bound is cheaper than the machinery, and the alternative (deleting nothing
+# until the record lands) would strand the answer lane's file on the same drop.
 _afk_clear_warned() {
   local issue="$1"
   [ -f "$(_afk_warned_state_file "$issue" land)" ] \

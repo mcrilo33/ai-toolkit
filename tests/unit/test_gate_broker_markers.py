@@ -397,7 +397,11 @@ def test_reanswer_ceiling_counts_ceiling_lane_events_and_writes_no_file(
     assert _tlog(statedir).count(_CEILING_LANE_EVENT) == 2, (
         "exactly one service_attempt event per ADMITTED attempt; the exhausted call records none"
     )
-    assert '"lane":"ceiling"' in _tlog(statedir)
+    assert '"lane":"reanswer-ceiling"' in _tlog(statedir), (
+        "the ceiling lane's name is deliberately one no PARK KIND can produce: "
+        "broker_warn_continue names its escalation lane after the park kind, and `ceiling` is a "
+        "live park kind — a shared name would hand this lane a second writer (#318)"
+    )
 
 
 def test_reanswer_ceiling_ignores_other_lanes_and_other_actors_events(
@@ -426,6 +430,12 @@ def test_reanswer_ceiling_ignores_other_lanes_and_other_actors_events(
                 ("answer_dropped", "gate-broker.sh", "answer", f',"episode":"{ep}"'),
                 ("approve_decided", "gate-broker.sh", "permission", f',"episode":"{ep}"'),
                 ("waived", "gate-broker.sh", "gate", f',"episode":"{ep}"'),
+                # The park-kind collision the lane name defends against: broker_warn_continue
+                # names its escalation lane after the PARK KIND, and `ceiling` is a live one
+                # (gate-broker.sh journals the ceiling's own warn under it). If the ceiling ever
+                # counted a lane a park kind can name, converting that stop site to the #241
+                # warn-and-continue shape would silently throttle spokes early.
+                ("escalated", "gate-broker.sh", "ceiling", f',"episode":"{ep}"'),
                 ("answer_delivered", "hub-inject.sh", "answer", ""),
             )
         )
@@ -437,7 +447,8 @@ def test_reanswer_ceiling_ignores_other_lanes_and_other_actors_events(
     ]
 
     assert [r.strip() for r in rcs] == ["rc=1", "rc=1", "rc=0"], (
-        "five foreign lane events must not consume a single unit of ceiling budget"
+        "six foreign lane events — including one on a lane a PARK KIND could name `ceiling` — "
+        "must not consume a single unit of ceiling budget"
     )
 
 
@@ -495,6 +506,66 @@ def test_reanswer_ceiling_fails_closed_when_the_transition_log_lib_is_absent(
     assert warned.exists(), "the fallback is LOUD — a silent one hides the broken deployment"
     assert "transition log" in warned.read_text(), (
         "the warn names the REAL cause; the caller's generic 'ceiling reached' warn would lie"
+    )
+
+
+def test_reanswer_ceiling_survives_a_park_onset_flap_at_an_unchanged_park(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #203 regression pin. park-onset is NOT in the ceiling's episode key, and this is why: it has
+    # two stampers on two schedules (the drain's park probe and the watchdog's), and slot_state's
+    # clear_park_onset_epoch wipes it on any tick that reads the spoke as not-parked. The #269
+    # capture-pane load flake does exactly that to a spoke that never moved. If the onset were in
+    # the key, the wipe+re-mint would re-key the episode, zero the count, and hand the 900s
+    # reasoner two more runs on the identical prompt — every flake buying two more. The tip and
+    # the sig have not changed, so the ceiling must hold straight through the flap.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_REANSWER_CEILING": "2"}
+    _call("stamp_park_onset_epoch 5", env={**env, "AFK_NOW": "1000"})
+    for _ in range(2):
+        _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA", env=env)
+    assert (
+        _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA; echo rc=$?", env=env)
+        .stdout.strip()
+        .endswith("rc=0")
+    ), "precondition: the ceiling is exhausted on this park"
+
+    # The flap: a not-parked tick clears the onset, a later tick re-stamps a DIFFERENT one. The
+    # two stamps must land on distinct epochs — re-stamping within the same second would leave
+    # the onset byte-identical and this pin would hold no matter what the key contains.
+    _call("clear_park_onset_epoch 5", env=env)
+    _call("stamp_park_onset_epoch 5", env={**env, "AFK_NOW": "2000"})
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == "2000", (
+        "precondition: the onset genuinely moved, so a key carrying it WOULD re-key"
+    )
+
+    result = _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA; echo rc=$?", env=env)
+
+    assert result.stdout.strip().endswith("rc=0"), (
+        "an onset flap at an unchanged (tip, sig) must NOT hand back ceiling budget — that is "
+        "#203's doom-loop returning through a detector's flake"
+    )
+
+
+def test_reanswer_ceiling_resets_for_a_fresh_afk_window(spoke_repo: Path, tmp_path: Path) -> None:
+    # The retired reanswer- file got its fresh start from _clear_progress_state's rm. The log
+    # forgets nothing, so the reset is a new WINDOW GENERATION in the episode key instead —
+    # minted by the arm, the one actor that should decide a window boundary.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_REANSWER_CEILING": "2"}
+    for _ in range(2):
+        _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA", env=env)
+    assert (
+        _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA; echo rc=$?", env=env)
+        .stdout.strip()
+        .endswith("rc=0")
+    ), "precondition: exhausted in this window"
+
+    _call("_clear_progress_state", env=env)
+
+    result = _call(f"_broker_reanswer_exhausted '{spoke_repo}' 5 sigA; echo rc=$?", env=env)
+    assert result.stdout.strip().endswith("rc=1"), (
+        "a fresh window starts the count clean, as _clear_progress_state's contract promises"
     )
 
 

@@ -1671,6 +1671,26 @@ def test_land_lane_clear_records_nothing_when_the_lane_was_never_armed(tmp_path:
     assert '"event":"land_cleared"' not in _land_log(statedir)
 
 
+def test_land_lane_falls_back_to_the_file_when_the_log_has_no_record(tmp_path: Path) -> None:
+    # AFK Principle 6: an absent record reads "unknown", and unknown alone is never a basis to
+    # ACT — here acting means running an expensive worktree-land and dropping the watchdog's #285
+    # servicing defer. Two real ways the log goes silent about a lane that IS armed: _tlog_append
+    # drops a line it cannot lock in ~5s, and a mid-window self-copy cutover leaves every backoff
+    # armed by the PRE-#318 code with a file and no event. Reading that as "never armed" would
+    # fire every paced spoke's land in one tick. The projection file answers instead.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "warned-state-5-land").write_text("2\t9000\n")  # armed by the old code, no event
+
+    r = _call(
+        "_afk_warned_due 5 5000 land && echo DUE || echo WAIT; _afk_warned_next 5 land",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert "WAIT" in r.stdout, "a log with no record for the lane must not un-pace an armed land"
+    assert "9000" in r.stdout
+
+
 def test_fresh_window_clear_records_the_land_lane_clear(tmp_path: Path) -> None:
     # _clear_progress_state's contract: a freshly-armed window inherits no cadence (a leftover
     # backoff would skip the clean first re-service). The land lane's pacing is a RECORD in an

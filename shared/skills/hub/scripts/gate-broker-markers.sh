@@ -323,12 +323,15 @@ _afk_refresh_offline_clocks() {
 # the clean first-exhaustion re-service; a leftover served record (#294) would skip the first
 # serve of a park whose approve was delivered in a window that is already over.
 #
-# The re-answer counter (#203) is NOT cleared here any more — it lives in the append-only
-# transition log now (#318). Dropping park-onset-*/park-sig- below is what gives it the same
-# fresh start: the ceiling's episode key carries the onset, so the next park mints a new key
-# and counts from zero, without the log having to forget anything.
+# The re-answer counter (#203) is NOT rm'd here any more — it lives in the append-only
+# transition log now (#318), which forgets nothing. Its fresh start comes from MINTING a new
+# window generation below instead: the ceiling's episode key carries it, so every count starts
+# at zero for the new window without the log having to lose a record. The mint is what the
+# retired `reanswer-*` glob used to do, and it must stay in this function — the two are the same
+# guarantee, so a future edit that drops one has to confront the other.
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
+  _afk_mint_window_id
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/done-*.epoch "$dir"/tip-* \
     "$dir"/park-onset-*.epoch "$dir"/park-sig-* "$dir"/parked-total-*.seconds \
     "$dir"/answer-drop-* "$dir"/served-* "$dir"/gate-voided-* \
@@ -375,8 +378,17 @@ _broker_park_signature() {
 # --- the ceiling reads the transition log (#318, #300 step 6) -----------------
 # The attempt count lives in the transition log, not a `reanswer-<issue>` side-channel: the
 # choke point RECORDS the attempt it admits, and counts them back (AFK Principle 1). It uses
-# its OWN lane, `ceiling`, with exactly one writer (_broker_reanswer_exhausted) and one meaning
-# — "the ceiling admitted one service attempt for this episode".
+# its OWN lane, `reanswer-ceiling`, with exactly one writer (_broker_reanswer_exhausted) and one
+# meaning — "the ceiling admitted one service attempt for this episode".
+#
+# THE LANE NAME IS NOT `ceiling` ON PURPOSE. broker_warn_continue records an `escalated` event on
+# a lane named after its PARK KIND, and `ceiling` is a live park kind (gate-broker.sh journals the
+# ceiling's own warn under it). Today no broker_warn_continue caller passes it — but converting
+# that stop site to the #241 warn-and-continue shape, as every other stop site already was, would
+# silently add a second writer to this lane and over-count the ceiling into throttling spokes
+# early. The land backoff paid exactly this bug on lane `land` mid-#318. A lane whose name no
+# park kind can produce cannot acquire that second writer by accident (AFK Principle 5).
+_BROKER_CEILING_LANE=reanswer-ceiling
 #
 # WHY ITS OWN LANE and not the answer/permission lanes' events. The ceiling bumps exactly ONCE
 # per tick, upstream of both paths; those lanes' events are not 1:1 with it. The fast-path gate
@@ -387,30 +399,56 @@ _broker_park_signature() {
 # writes would count too. Reading another lane's events to mean "an attempt happened" is the
 # cross-lane reinterpretation AFK Principle 5 forbids (the answer-attempt-<n>.epoch mistake).
 
-# _reanswer_episode_key <wt> <issue> <sig> -> the ceiling lane's episode "<tip>:<sig>:<onset>",
-# or empty when no signature is substantiable.
+# _reanswer_episode_key <wt> <issue> <sig> -> the ceiling lane's episode
+# "<window>:<tip>:<sig>", or empty when no signature is substantiable.
 #
-# The TIP IS FOLDED IN DELIBERATELY, and read LIVE here rather than inherited from the park
-# episode the other lanes key on ("<sig>:<onset>", _gb_episode_key). That onset only rolls when
-# note_park_episode runs — driven by slot_state/the watchdog's park probe, a DIFFERENT actor on
-# a DIFFERENT schedule. Keying the ceiling on it would leave a spoke that just COMMITTED
-# throttled at an already-earned-out ceiling until some detector happened to re-stamp: a
-# reset riding another actor is exactly the inferred-state trap #300 exists to close. The tip is
-# the ceiling's own business, so the ceiling reads it (#318 amendment 2).
+# EVERY COMPONENT HAS ONE WRITER, AND NONE OF THEM IS A DETECTOR. That is the whole design
+# constraint here, and it is why park-onset — which the OTHER lanes' episode key uses — is
+# deliberately absent:
 #
-# The onset rides along so a fresh window starts clean: _clear_progress_state drops
-# park-onset-*/park-sig-* at every arm, so the next park mints a new onset -> a new key -> a
-# fresh count, which is what the retired file got from its own `rm`. It also means an
-# unpark->repark cycle re-keys (clear_park_onset_epoch drops the epoch on a not-parked tick);
-# that is a genuine state change slot_state OBSERVED, and re-serving a truly re-parked spoke
-# once more is the "act when unattended" posture (Principle 3) — bounded by the ceiling either
-# way.
+#   - <tip>    read LIVE from git, inline, by the ceiling itself. So a spoke that just COMMITTED
+#              gets fresh budget on that very tick, never waiting for some detector to re-stamp
+#              (#318 amendment 2).
+#   - <sig>    the caller's already-captured park signature: a changed prompt is a new episode.
+#   - <window> minted once per /afk arm by _clear_progress_state, so a fresh window starts the
+#              count clean — what the retired `reanswer-` file got from being rm'd at arm.
+#
+# NOT park-onset. It looks like a free window reset (it is cleared at arm too), but it has TWO
+# stampers on two schedules — the drain's _afk_note_park_context and the watchdog's own
+# _wd_park_base -> note_park_episode — and slot_state's clear_park_onset_epoch wipes it on any
+# tick that reads the spoke as not-parked. The #269 capture-pane load flake does exactly that to
+# a spoke that never moved: onset wiped, re-minted, key changed, count back to zero, and the
+# 900s reasoner runs twice more on the identical prompt. Every flake buys two more runs. Folding
+# in the live tip does not save it — it only flips the foreign-actor dependency from
+# stuck-throttle to premature reset, and premature reset IS #203's doom-loop. The retired file
+# keyed (tip, sig) alone and held the count straight through such a flap; so does this.
 _reanswer_episode_key() {
-  local wt="$1" issue="$2" sig="$3" tip onset
+  local wt="$1" issue="$2" sig="$3" tip
   [ -n "$sig" ] || return 0
   tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
-  onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
-  printf '%s:%s:%s\n' "$tip" "$sig" "$onset"
+  printf '%s:%s:%s\n' "$(_afk_window_id)" "$tip" "$sig"
+}
+
+# _afk_window_id -> the current /afk window's generation stamp; empty before the first arm.
+# Minted by _clear_progress_state and read by the ceiling's episode key, so a fresh window starts
+# every count clean while nothing a detector touches can re-key mid-window. Empty is a fine key
+# component: it is byte-stable, so a never-armed hub (a test, a bare broker run) simply keys on
+# (tip, sig) — exactly the retired file's behavior.
+_afk_window_file() { printf '%s\n' "$(_afk_state_dir)/window.epoch"; }
+_afk_window_id() {
+  local f; f="$(_afk_window_file)"
+  [ -f "$f" ] && cat "$f" 2>/dev/null || true
+}
+
+# _afk_mint_window_id -> stamp a NEW window generation (called once per fresh arm, from
+# _clear_progress_state). The epoch alone would collide if two arms landed in the same second, so
+# a pid rides along: two arms a second apart must not share a generation, or the second window
+# would inherit the first's counts. Best-effort — a failed mint degrades to the previous
+# generation (a count that carries over), never to a crash.
+_afk_mint_window_id() {
+  local dir; dir="$(_afk_state_dir)"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s-%s\n' "$(afk_now)" "$$" > "$(_afk_window_file)" 2>/dev/null || true
 }
 
 # _broker_reanswer_exhausted <wt> <issue> <sig> -> rc 0 (EXHAUSTED — warn + back off, the
@@ -440,24 +478,37 @@ _broker_reanswer_exhausted() {
   case "$ceiling" in '' | *[!0-9]*) ceiling=2 ;; esac
   [ "$ceiling" -lt 1 ] && ceiling=1   # floor at 1: a 0 ceiling would strand every gate unanswered
   if ! command -v afk_lane_event_count >/dev/null 2>&1; then
-    command -v broker_warn >/dev/null 2>&1 && broker_warn "$issue" \
-      "the transition log is unavailable (transition-log.sh absent) — the re-answer ceiling cannot count attempts and is failing CLOSED onto the retry backoff; the reasoner is paced, not free-running (#318)"
+    _broker_warn_no_tlog "$issue"
     return 0
   fi
   episode="$(_reanswer_episode_key "$wt" "$issue" "$sig")"
-  [ -n "$episode" ] || return 1                                   # unsubstantiable → fail-open
-  n="$(afk_lane_event_count "$issue" ceiling "$episode" 2>/dev/null)"
+  n="$(afk_lane_event_count "$issue" "$_BROKER_CEILING_LANE" "$episode" 2>/dev/null)"
   case "$n" in '' | *[!0-9]*) n=0 ;; esac
   [ "$n" -ge "$ceiling" ] && return 0                             # exhausted
   _broker_tlog_ceiling_attempt "$issue" "$episode" "$(( n + 1 ))"
   return 1
 }
 
+# _broker_warn_no_tlog <issue> -> say, loudly, that the ceiling has no log to count and is
+# failing closed. On the #241 CADENCE, not every tick: this fires once per parked spoke per tick
+# otherwise, and #241 §5 mandates silence inside the backoff window — a warn per tick per spoke
+# for a whole window is the kind of noise an operator learns to filter, which is the opposite of
+# loud. _afk_warned_due is true when the lane was never armed (the first tick, so the failure is
+# never missed) and again each time the backoff elapses. Best-effort: never fails the caller.
+_broker_warn_no_tlog() {
+  command -v broker_warn >/dev/null 2>&1 || return 0
+  command -v _afk_warned_due >/dev/null 2>&1 && ! _afk_warned_due "$1" && return 0
+  broker_warn "$1" \
+    "the transition log is unavailable (transition-log.sh absent) — the re-answer ceiling cannot count attempts and is failing CLOSED onto the retry backoff; the reasoner is paced, not free-running (#318)"
+  return 0
+}
+
 # _broker_tlog_ceiling_attempt <issue> <episode> <n> -> record ONE admitted attempt on the
 # ceiling lane. Best-effort by the #300 contract: never fails the caller.
 _broker_tlog_ceiling_attempt() {
   command -v wt_tlog_event >/dev/null 2>&1 || return 0
-  wt_tlog_event "$1" service_attempt gate-broker.sh ceiling "$2" "{\"attempt\":$3}" || true
+  wt_tlog_event "$1" service_attempt gate-broker.sh "$_BROKER_CEILING_LANE" "$2" \
+    "{\"attempt\":$3}" || true
 }
 
 # read_reanswer_count <wt> <issue> -> the re-answer attempt COUNT admitted for the CURRENT
@@ -473,7 +524,7 @@ read_reanswer_count() {
   sig="$(_broker_park_signature "$wt" "$issue" 2>/dev/null)"
   episode="$(_reanswer_episode_key "$wt" "$issue" "$sig")"
   [ -n "$episode" ] || return 0
-  n="$(afk_lane_event_count "$issue" ceiling "$episode" 2>/dev/null)"
+  n="$(afk_lane_event_count "$issue" "$_BROKER_CEILING_LANE" "$episode" 2>/dev/null)"
   case "$n" in '' | *[!0-9]*) return 0 ;; esac
   [ "$n" -gt 0 ] || return 0
   printf '%s\n' "$n"
