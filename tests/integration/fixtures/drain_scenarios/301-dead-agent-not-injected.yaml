@@ -1,0 +1,27 @@
+id: 301-dead-agent-not-injected
+stresses:
+  incident: 301
+  invariant: I5
+  principle: "4"
+spokes:
+  - issue: 301
+    slug: crash
+    truth:
+      agent: dead
+      recovers: true
+timeline:
+  # The spoke parks on a question, then its agent (claude) dies — but the launcher
+  # zsh keeps the pane alive, so the dialog lingers in scrollback (the #301 shape).
+  - { t: 0, spoke: 301, do: park }
+  - { t: 10, spoke: 301, do: kill_agent }
+  # The drain must read the DEAD agent (a claude descendant absent from the pane pid's
+  # tree), never inject into the surviving zsh, and recover it instead.
+  - { t: 20, run: [drain] }
+expect:
+  violations: []
+mutation:
+  # Reintroduce the pre-#301 pane_current_command=zsh proxy: the liveness probe LIES
+  # and reports the dead agent alive, so the drain injects into a dead pane.
+  env:
+    AFK_SIM_PS_FORCE_ALIVE: "1"
+  expect_violation: I5

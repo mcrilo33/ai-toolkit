@@ -1,0 +1,26 @@
+id: 263-park-unanswered-suppressed
+stresses:
+  incident: 263
+  invariant: I6
+  principle: "1,6"
+spokes:
+  - issue: 263
+    slug: gate
+    truth:
+      serviced: true
+timeline:
+  # The spoke parks at the gate.
+  - { t: 0, spoke: 263, do: park }
+  # First watchdog tick establishes the park-episode onset (age 0 — never fires yet).
+  - { t: 10, run: [watchdog] }
+  # The drain services it — a decision-journal entry + an episode-keyed
+  # answer_delivered (the records a real answer_pass writes).
+  - { t: 500, spoke: 263, do: answer }
+  # ~690s past onset (over the 600s park ceiling — a naive detector WOULD fire), but
+  # the service was 200s ago: the recorded service must suppress the fire.
+  - { t: 700, run: [watchdog] }
+expect:
+  violations: []
+mutation:
+  drop: [journal, answer_delivered]
+  expect_violation: I6

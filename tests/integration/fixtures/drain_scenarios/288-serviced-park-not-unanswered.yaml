@@ -1,0 +1,26 @@
+id: 288-serviced-park-not-unanswered
+stresses:
+  incident: 288
+  invariant: I6
+  principle: "1,6"
+spokes:
+  - issue: 288
+    slug: gate
+    truth:
+      serviced: true
+timeline:
+  - { t: 0, spoke: 288, do: park }
+  - { t: 10, run: [watchdog] }
+  # The drain REASONED about this park but the delivery DROPPED (answer_dropped, not
+  # answer_delivered) — the #288 shape. The journal still proves the drain acted, so
+  # the honest reason is park-undeliverable; the misleading park-UNANSWERED ("no answer
+  # delivered") must never fire.
+  - { t: 500, spoke: 288, do: answer, via: dropped }
+  - { t: 700, run: [watchdog] }
+expect:
+  violations: []
+mutation:
+  # No record of the drain acting at all: the pre-#300 unrecorded-service that made a
+  # serviced-but-dropped park read as silent — the false park-unanswered.
+  drop: [journal, answer_dropped]
+  expect_violation: I6

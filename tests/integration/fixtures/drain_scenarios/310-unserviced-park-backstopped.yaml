@@ -1,0 +1,25 @@
+id: 310-unserviced-park-backstopped
+stresses:
+  incident: 310
+  invariant: I3
+  principle: "3"
+spokes:
+  - issue: 310
+    slug: gate
+    truth:
+      parked_past_ceiling: true
+timeline:
+  - { t: 0, spoke: 310, do: park }
+  # First watchdog tick establishes the park-episode onset.
+  - { t: 10, run: [watchdog] }
+  # Past the ceiling with NO service recorded: the watchdog backstop MUST fire so the
+  # jam is escalated rather than left silent for hours (#299/#310).
+  - { t: 700, run: [watchdog] }
+expect:
+  violations: []
+mutation:
+  # A stale decision-journal entry with no real service behind it makes the watchdog
+  # read the spoke as "being handled" and skip the backstop — the #310 silent jam.
+  inject:
+    - { t: 650, spoke: 310, do: journal }
+  expect_violation: I3
