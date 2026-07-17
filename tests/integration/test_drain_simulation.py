@@ -33,6 +33,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -56,6 +57,11 @@ SCENARIO_DIR = Path(__file__).parent / "fixtures" / "drain_scenarios"
 _PANE_PID = 4242
 _AGENT_PID = 4243
 
+# Wall-clock cap per real drain/watchdog tick (see World.run_drain). Generous for
+# legitimate stubbed work; cuts a post-answer poll that would otherwise wait out a
+# ~30s timeout against a scripted spoke that never changes.
+_DRAIN_TICK_CAP_SECONDS = 10
+
 
 # --------------------------------------------------------------------------- world
 
@@ -68,7 +74,9 @@ class Spoke:
     slug: str
     path: Path
     agent_alive: bool = True
+    pane_exists: bool = True
     truth: dict = field(default_factory=dict)
+    episode: str = ""
 
 
 @dataclass
@@ -86,8 +94,13 @@ class World:
     spokes: dict[int, Spoke] = field(default_factory=dict)
     env_extra: dict[str, str] = field(default_factory=dict)
     dropped: set[str] = field(default_factory=set)
+    t0: int = field(init=False)
 
     def __post_init__(self) -> None:
+        # Anchor the fake clock at real time: the drain/stubs stamp their own records
+        # from real `date +%s`, so AFK_NOW(step) = t0 + step keeps scripted records,
+        # epoch files, and drain-written records on one consistent timeline.
+        self.t0 = int(time.time())
         self.main = self.root / "main"
         self.origin = self.root / "origin.git"
         self.state_dir = self.root / "state"
@@ -151,6 +164,16 @@ class World:
         # gh / claude: never reached with real args in a stubbed tick; no-op.
         (b / "gh").write_text("#!/usr/bin/env bash\nexit 0\n")
         (b / "claude").write_text("#!/usr/bin/env bash\nexit 0\n")
+        # timeout: this host ships no coreutils timeout, so the drain's timeout wrapper
+        # falls to a killer-subshell that holds a bounded command's capture pipe open for
+        # the whole budget (30s per answerer call in CI). A stub that execs the command
+        # directly restores the fast path — every bounded command here is an instant stub.
+        (b / "timeout").write_text(
+            "#!/usr/bin/env bash\n"
+            'while [ "$1" = "-k" ]; do shift 2; done\n'  # drop -k <grace>
+            "shift\n"  # drop the <secs> bound
+            'exec "$@"\n'
+        )
         # sibling scripts.
         (b / "batch-plan.sh").write_text("#!/usr/bin/env bash\nexit 0\n")  # no dispatch
         (b / "worktree-new.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
@@ -184,10 +207,16 @@ class World:
         return spoke
 
     def _sync_pane_state(self, spoke: Spoke) -> None:
-        """Write the per-spoke ground-truth files the tmux/ps stubs read."""
+        """Write the per-spoke ground-truth files the tmux/ps stubs read.
+
+        Two INDEPENDENT facts (#301): `pane_exists` — tmux still shows a pane (the
+        launcher `zsh` outlives the agent) — and `alive` — a `claude` descendant is
+        in the process tree. A dead agent is pane_exists=1, alive=0 (the #301 shape);
+        a gone pane is pane_exists=0 (the #290 dead-idle shape)."""
         d = self.state_dir / "panes"
         d.mkdir(exist_ok=True)
         (d / f"{spoke.issue}.alive").write_text("1" if spoke.agent_alive else "0")
+        (d / f"{spoke.issue}.pane_exists").write_text("1" if spoke.pane_exists else "0")
         (d / f"{spoke.issue}.path").write_text(str(spoke.path))
         pane = d / f"{spoke.issue}.pane.txt"
         if not pane.exists():
@@ -210,26 +239,62 @@ class World:
             WT_LAND=str(self.fake_bin / "worktree-land.sh"),
             WT_DONE=str(self.fake_bin / "worktree-done.sh"),
             HUB_WATCHDOG_LEDGER=str(self.ledger),
+            # A fast plain-text answerer stub: `ANSWER: <text>` is the reasoner's decision
+            # contract (parse_decision), and a plain-text stub passes through the
+            # stream-json normalizer untouched. Overriding this is REQUIRED — the default
+            # command shells the real `claude`, which burns the timeout in CI.
+            AFK_ANSWERER_CMD=r"printf 'ANSWER: proceed\n'",
             AFK_AUTH_PROBE_CMD="true",
             AFK_NET_PROBE_CMD="true",
             AI_TOOLKIT_OTEL="0",
             AI_TOOLKIT_GH_LIFECYCLE_LABELS="0",
             AFK_REVIEW_GATE="0",
             HUB_WATCHDOG_FILE="0",
+            # Keep the drain's answer/inject/judge paths from spending CI budget on
+            # retry/verify sleeps against the stubs (the fake clock only governs reads).
+            AFK_INJECT_VERIFY_SECONDS="3",
+            AFK_INJECT_POLL_SECONDS="1",
+            AFK_INJECT_MENU_PAUSE="0",
+            AFK_ANSWERER_TIMEOUT="10",
+            AFK_JUDGE_TIMEOUT="5",
+            AFK_AUTH_PROBE_TIMEOUT="3",
+            AFK_GH_TIMEOUT="3",
+            AFK_PLANNER_TIMEOUT="3",
+            AFK_NET_PROBE_TIMEOUT="3",
         )
         for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
             env.pop(k, None)
+        # Strip inherited telemetry/OTel env: the harness may run inside a
+        # telemetry-on spoke whose OTEL_EXPORTER_OTLP_ENDPOINT points at a shared,
+        # busy collector — the drain would inherit it and intermittently block up to
+        # ~30s trying to export a span. AI_TOOLKIT_OTEL=0 alone does not cover the
+        # raw OTEL_*/CLAUDE_CODE_*TELEMETRY* vars.
+        for k in list(env):
+            if k.startswith("OTEL_") or ("TELEMETRY" in k) or k.startswith("AI_TOOLKIT_OTEL"):
+                env.pop(k, None)
+        env["AI_TOOLKIT_OTEL"] = "0"
         env.update(self.env_extra)
         return env
 
-    def run_drain(self, now: int) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+    def run_drain(self, now: int) -> None:
+        """Run one real drain tick, wall-clock-capped. A tick's lifecycle records are
+        written at the moment each transition happens (the #300 intent-first
+        discipline), so a tick that then blocks polling a stub that never changes
+        (e.g. waiting for a scripted spoke to `resume`) has already written everything
+        the invariants read. The cap keeps CI bounded (the AC) without losing a record;
+        it is a harness bound, never asserted on."""
+        proc = subprocess.Popen(
             ["bash", str(HUB_AFK), "--once"],
             cwd=str(self.main),
-            capture_output=True,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             env=self.env(now),
         )
+        try:
+            proc.wait(timeout=_DRAIN_TICK_CAP_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
     # -- transition-log writes (the scripted spoke side) --------------------
 
@@ -240,11 +305,13 @@ class World:
         actor: str,
         cause: str,
         *,
-        evidence: str = "",
         episode: str = "",
         now: int,
     ) -> None:
-        """Append a spoke-side transition exactly as the real actor would.
+        """Append a spoke-side transition exactly as the real actor would — authored
+        DIRECTLY with a controlled `ts` (the fake clock), since `afk_tlog_transition`
+        stamps `ts` from real `date +%s`. The record is byte-identical to the real
+        writer's (compact, no-space JSON; the awk/sed readers match `"kind":"..."`).
 
         A mutation may `drop` a transition name: withholding a recorded state
         reintroduces the pre-#300 "inference over recorded state" world (principle
@@ -252,23 +319,75 @@ class World:
         the (out-of-scope) watchdog."""
         if to in self.dropped:
             return
-        args = [str(issue), to, actor, cause]
-        if evidence or episode:
-            args.append(evidence)
+        rec = {
+            "v": 1,
+            "ts": now,
+            "issue": issue,
+            "kind": "transition",
+            "to": to,
+            "actor": actor,
+            "cause": cause,
+        }
         if episode:
-            args.append(episode)
-        quoted = " ".join(_shq(a) for a in args)
-        subprocess.run(
-            ["bash", "-c", f'. "{TLOG_LIB}"; afk_tlog_transition {quoted}'],
-            env={**self.env(now), "AFK_STATE_DIR": str(self.state_dir)},
-            check=True,
+            rec["episode"] = episode
+        self._append(issue, rec)
+
+    def event(
+        self,
+        issue: int,
+        event: str,
+        actor: str,
+        *,
+        lane: str = "",
+        episode: str = "",
+        now: int,
+    ) -> None:
+        """Append a within-state event (answer_delivered, escalated, nudge, ...)."""
+        if event in self.dropped:
+            return
+        rec = {"v": 1, "ts": now, "issue": issue, "kind": "event", "event": event, "actor": actor}
+        if lane:
+            rec["lane"] = lane
+        if episode:
+            rec["episode"] = episode
+        self._append(issue, rec)
+
+    def _append(self, issue: int, rec: dict) -> None:
+        f = self.state_dir / "transitions" / f"{issue}.jsonl"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with f.open("a") as fh:
+            fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+    def write_epoch(self, name: str, issue: int, epoch: int) -> None:
+        """A bare-integer epoch marker under the state dir (the drain/watchdog seam)."""
+        (self.state_dir / f"{name}-{issue}.epoch").write_text(f"{epoch}\n")
+
+    def write_journal(self, issue: int, ts: int, park: str = "gate") -> None:
+        """A decision-journal record — the drain's 'I serviced this' evidence."""
+        if "journal" in self.dropped:
+            return
+        line = json.dumps(
+            {
+                "ts": ts,
+                "issue": str(issue),
+                "park": park,
+                "decision": "answered",
+                "reversibility": "reversible",
+            },
+            separators=(",", ":"),
         )
+        with (self.state_dir / "decision-journal.jsonl").open("a") as fh:
+            fh.write(line + "\n")
 
     def git(self, issue: int, *args: str) -> None:
         self._git(*args, cwd=self.spokes[issue].path)
 
     def set_agent_alive(self, issue: int, alive: bool) -> None:
         self.spokes[issue].agent_alive = alive
+        self._sync_pane_state(self.spokes[issue])
+
+    def set_pane_exists(self, issue: int, exists: bool) -> None:
+        self.spokes[issue].pane_exists = exists
         self._sync_pane_state(self.spokes[issue])
 
     # -- record readers (the assertion surface) -----------------------------
@@ -294,35 +413,68 @@ class World:
         return [r for r in rows if str(r.get("issue")) == str(issue)]
 
 
-def _shq(s: str) -> str:
-    return "'" + s.replace("'", "'\\''") + "'"
-
-
 _TMUX_STUB = r"""#!/usr/bin/env bash
-# Scripted tmux: reads per-spoke ground truth under {state}/panes/.
+# Scripted tmux: reads per-spoke ground truth under {state}/panes/. The window index
+# IS the issue, so a pane target round-trips to a stable per-spoke pane pid
+# (40000+issue). A pane is listed while its window EXISTS (pane_exists=1) —
+# independent of agent liveness, since the launcher zsh outlives a dead claude (#301).
 panes_dir="{state}/panes"
 case "$1" in
   list-panes)
-    i=1
     for pf in "$panes_dir"/*.path; do
       [ -f "$pf" ] || continue
       iss="$(basename "$pf" .path)"
-      [ "$(cat "$panes_dir/$iss.alive" 2>/dev/null)" = "1" ] || continue
-      printf 'afk:%s\t%s\n' "$i" "$(cat "$pf")"
-      i=$((i+1))
+      [ "$(cat "$panes_dir/$iss.pane_exists" 2>/dev/null)" = "1" ] || continue
+      printf 'afk:%s\t%s\n' "$iss" "$(cat "$pf")"
     done
     ;;
-  display-message) printf '%s\n' "4242" ;;
-  capture-pane)
-    # -t <target> is a worktree path in list-panes output; find its pane file.
+  display-message)
     tgt=""
     while [ $# -gt 0 ]; do case "$1" in -t) shift; tgt="$1" ;; esac; shift; done
+    printf '%s\n' "$(( 40000 + ${{tgt##*:}} ))"
+    ;;
+  capture-pane)
+    tgt=""
+    while [ $# -gt 0 ]; do case "$1" in -t) shift; tgt="$1" ;; esac; shift; done
+    iss="${{tgt##*:}}"
     for pf in "$panes_dir"/*.path; do
       [ -f "$pf" ] || continue
-      if [ "$(cat "$pf")" = "$tgt" ]; then
-        cat "$panes_dir/$(basename "$pf" .path).pane.txt" 2>/dev/null; break
-      fi
+      if [ "$(cat "$pf")" = "$tgt" ]; then iss="$(basename "$pf" .path)"; break; fi
     done
+    cat "$panes_dir/$iss.pane.txt" 2>/dev/null
+    ;;
+  send-keys)
+    # Model the two-keystroke submit: a literal `-l` paste is remembered, and the
+    # following Enter appends it as a type:"user" record to the pane's spoke transcript
+    # (what Claude Code writes on submit — the sole proof of delivery, #281), advancing
+    # the transcript mtime so the drain's inject-verification registers.
+    tgt=""; paste=""; mode=""; enter=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -t) shift; tgt="$1" ;;
+        -l) mode="paste" ;;
+        --) : ;;
+        Enter) enter="1" ;;
+        *) [ "$mode" = "paste" ] && paste="$1" ;;
+      esac
+      shift
+    done
+    iss="${{tgt##*:}}"
+    pbuf="$panes_dir/$iss.paste"
+    [ "$mode" = "paste" ] && printf '%s' "$paste" > "$pbuf"
+    if [ -n "$enter" ]; then
+      wt="$(cat "$panes_dir/$iss.path" 2>/dev/null)"
+      [ -n "$wt" ] || exit 0
+      munged="$(printf '%s' "$wt" | sed 's/[^A-Za-z0-9]/-/g')"
+      jsonl="${{CLAUDE_PROJECTS_DIR}}/$munged/session.jsonl"
+      mkdir -p "$(dirname "$jsonl")" 2>/dev/null || true
+      if [ -s "$pbuf" ]; then
+        _AFK_TXT="$(cat "$pbuf")" python3 -c 'import json,os,sys; sys.stdout.write(json.dumps({{"type":"user","message":{{"content":[{{"type":"text","text":os.environ["_AFK_TXT"]}}]}}}},ensure_ascii=False)+chr(10))' >> "$jsonl" 2>/dev/null
+        : > "$pbuf"
+      else
+        printf '{{}}\n' >> "$jsonl"
+      fi
+    fi
     ;;
   *) : ;;
 esac
@@ -330,15 +482,21 @@ exit 0
 """
 
 _PS_STUB = r"""#!/usr/bin/env bash
-# #301 probe: answer only the exact -eo form; build the table from live spokes.
+# #301 probe: answer only the exact -eo form; build a per-spoke table. A `claude`
+# child of pane pid 40000+issue exists iff that spoke's agent is alive.
+# AFK_SIM_PS_FORCE_ALIVE=1 makes the probe LIE (report a live agent for a dead one)
+# — the pre-#301 pane_current_command=zsh proxy, the #301 mutation seam.
 case "$*" in
   "-eo pid=,ppid=,comm=")
-    printf '%s 1 -zsh\n' "4242"
-    for af in "{state}"/panes/*.alive; do
-      [ -f "$af" ] || continue
-      [ "$(cat "$af")" = "1" ] || continue
-      printf '%s %s claude\n' "4243" "4242"
-      break
+    for pe in "{state}"/panes/*.pane_exists; do
+      [ -f "$pe" ] || continue
+      [ "$(cat "$pe")" = "1" ] || continue
+      iss="$(basename "$pe" .pane_exists)"
+      ppid=$(( 40000 + iss )); apid=$(( 50000 + iss ))
+      printf '%s 1 -zsh\n' "$ppid"
+      if [ "$(cat "{state}/panes/$iss.alive" 2>/dev/null)" = "1" ] || [ "${{AFK_SIM_PS_FORCE_ALIVE:-0}}" = "1" ]; then
+        printf '%s %s claude\n' "$apid" "$ppid"
+      fi
     done
     printf '999 1 /Applications/Other.app/Contents/MacOS/claude\n'
     ;;
@@ -403,7 +561,7 @@ def _pane_text(world: World, issue: int, text: str) -> None:
 # The declarative timeline verbs. Each mutates scripted ground truth (git tags, the
 # transition log, pane/agent state) OR runs a real drain/watchdog tick.
 def apply_step(world: World, step: dict, *, mutation: dict | None) -> None:
-    now = int(step["t"])
+    now = world.t0 + int(step["t"])  # absolute fake-clock epoch for this step
     do = step.get("do")
     if do:
         assert "spoke" in step, f"step {step!r} has `do` but no `spoke`"
@@ -428,9 +586,35 @@ def _run_watchdog(world: World, now: int) -> subprocess.CompletedProcess[str]:
 
 
 def _v_park(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
+    """A PLAN-gate park: a gate/<issue> tag at tip (slot_state=waiting, answer lane),
+    a live agent (pane + ps), a `parked` transition with a minted episode, and the
+    pre-stamped park-onset epoch the watchdog's ceiling clock measures from."""
+    spoke = world.spokes[issue]
     _seed_transcript(world, issue)
-    _pane_text(world, issue, "Do you want to proceed?\n1. Yes\n2. No")
-    world.tlog(issue, "parked", "afk-notify-wake", "parked on a question", now=now)
+    # A PLAN-gate pane shows a plan awaiting approval — NOT a yes/no permission dialog
+    # (which would classify as the broker's permission lane, not the answer lane the
+    # park-unanswered detector owns).
+    _pane_text(world, issue, "Here is my implementation plan for review.\nAwaiting gate approval.")
+    world.git(issue, "tag", "-f", f"gate/{issue}")
+    spoke.episode = f"sig{issue}:{now}"
+    world.write_epoch("park-onset", issue, now)
+    world.tlog(issue, "parked", "reconciler", "parked on the gate", episode=spoke.episode, now=now)
+
+
+def _v_answer(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
+    """The drain services the park — SCRIPTED as the drain-authored records a real
+    answer_pass writes: a decision-journal entry (the watchdog's recency signal) and
+    an episode-keyed `answer_delivered` event. A mutation `drop`s these to reintroduce
+    the pre-#300 unrecorded-service that false-fired the watchdog (#263/#288)."""
+    world.write_journal(issue, now)
+    world.event(
+        issue,
+        "answer_delivered",
+        "hub-inject.sh",
+        lane="answer",
+        episode=world.spokes[issue].episode,
+        now=now,
+    )
 
 
 def _v_push(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
@@ -448,6 +632,13 @@ def _v_commit(world: World, issue: int, now: int, step: dict, mutation: dict | N
 
 
 def _v_kill_agent(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
+    """#301: the agent (claude) dies but its launcher zsh keeps the pane alive."""
+    world.set_agent_alive(issue, False)
+
+
+def _v_kill_pane(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
+    """#290: the whole tmux window is gone (a reboot/crash) — the dead-idle shape."""
+    world.set_pane_exists(issue, False)
     world.set_agent_alive(issue, False)
 
 
@@ -464,14 +655,23 @@ def _v_block(world: World, issue: int, now: int, step: dict, mutation: dict | No
     world.tlog(issue, "blocked", "spoke-ready.sh", "escalated to a human", now=now)
 
 
+def _v_epoch(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
+    """Stamp a bare-epoch drain marker at the fake-clock time (e.g. the dispatch
+    epoch the watchdog's dead-idle clock ages from)."""
+    world.write_epoch(step["name"], issue, now)
+
+
 _VERBS = {
     "park": _v_park,
     "push": _v_push,
     "ready": _v_ready,
     "commit": _v_commit,
     "kill_agent": _v_kill_agent,
+    "kill_pane": _v_kill_pane,
     "land_start": _v_land_start,
     "block": _v_block,
+    "answer": _v_answer,
+    "epoch": _v_epoch,
 }
 
 
@@ -538,11 +738,169 @@ def inv_landing_never_dead_pane(world: World, scenario: dict) -> list[Violation]
     return out
 
 
+_FORWARD_STATES = {
+    "ready",
+    "accepted",
+    "pushing",
+    "pushed",
+    "landing",
+    "landed",
+    "reaped",
+    "revived",
+    "redispatched",
+}
+_INJECT_EVENTS = {"answer_injected", "approval_injected", "nudge"}
+_SERVICE_EVENTS = {"answer_delivered", "approval_injected", "waived"}
+_ESCALATE = {"escalated", "answer_dropped"}
+
+
+def inv_park_ceiling_escalates(world: World, scenario: dict) -> list[Violation]:
+    """I3 (#310): a spoke that parked and whose scenario declares the park outlived
+    the answer ceiling is never left silently parked — the drain records a service
+    (`answer_delivered`), an escalation (`escalated`/`blocked`), or a forward
+    transition (principle 3: act when unattended; escalate only the irreversible)."""
+    out: list[Violation] = []
+    for issue in _scenario_issues(scenario):
+        if not _spoke_truth(scenario, issue).get("parked_past_ceiling"):
+            continue
+        states = {t["to"] for t in world.transitions(issue)}
+        events = {e.get("event") for e in world.events(issue)}
+        serviced = bool(events & _SERVICE_EVENTS) or bool(events & _ESCALATE)
+        escalated = "blocked" in states
+        advanced = bool(states & _FORWARD_STATES)
+        if not (serviced or escalated or advanced):
+            out.append(
+                Violation(
+                    "I3",
+                    issue,
+                    f"#{issue} parked past the ceiling but the drain recorded no "
+                    f"answer, escalation, or advance (states={sorted(states)}, "
+                    f"events={sorted(e for e in events if e)}) — a stall jams every "
+                    f"dependent (principle 3).",
+                )
+            )
+    return out
+
+
+def inv_answered_park_advances(world: World, scenario: dict) -> list[Violation]:
+    """I4 (#312): once a park episode is serviced (`answer_delivered`), the spoke
+    ADVANCES — a forward transition follows — and the same episode is never re-fired
+    park-unanswered by the watchdog (principles 5, 6: a serviced episode is settled;
+    never re-interpret it as still-unanswered)."""
+    out: list[Violation] = []
+    for issue in _scenario_issues(scenario):
+        records = world.records(issue)
+        delivered = [(i, r) for i, r in enumerate(records) if r.get("event") == "answer_delivered"]
+        if not delivered:
+            continue
+        first = delivered[0][0]
+        later = [r.get("to") for r in records[first + 1 :] if r.get("kind") == "transition"]
+        # The POSITIVE advance is asserted where the scenario declares the spoke should
+        # advance after the answer (truth.advances) — never merely "no bad fire" (the
+        # #314 guidance). A suppression-only scenario (#263) legitimately ends at the
+        # answer and does not opt in.
+        if _spoke_truth(scenario, issue).get("advances") and not (set(later) & _FORWARD_STATES):
+            out.append(
+                Violation(
+                    "I4",
+                    issue,
+                    f"#{issue} was answered (answer_delivered) but recorded no forward "
+                    f"transition afterward (later={later}) — an answered park must "
+                    f"advance, not re-park (principle 5).",
+                )
+            )
+        # Re-fire half: an episode serviced by the drain must not be re-fired.
+        episodes = {r.get("episode") for _, r in delivered if r.get("episode")}
+        for fire in world.fires(issue):
+            if fire.get("condition") == "park-unanswered" and episodes:
+                out.append(
+                    Violation(
+                        "I4",
+                        issue,
+                        f"#{issue} was re-fired park-unanswered after a recorded "
+                        f"answer_delivered — the serviced episode was re-interpreted "
+                        f"as unanswered (principle 6: absence is not evidence).",
+                    )
+                )
+    return out
+
+
+def inv_serviced_park_never_fired(world: World, scenario: dict) -> list[Violation]:
+    """I6 (#263/#265/#283/#288): a park the scenario declares the drain SERVICED is
+    never fired park-unanswered/undeliverable by the watchdog. The drain records its
+    service (a decision-journal entry / an episode-keyed answer_delivered); the
+    watchdog reads that record and suppresses. Reintroducing the pre-#300 unrecorded
+    service (dropping the record) is what false-fired four times (principles 1, 6:
+    recorded state over inference; absence is not evidence)."""
+    out: list[Violation] = []
+    for issue in _scenario_issues(scenario):
+        if not _spoke_truth(scenario, issue).get("serviced"):
+            continue
+        bad = [
+            f
+            for f in world.fires(issue)
+            if f.get("condition") in {"park-unanswered", "park-undeliverable"}
+        ]
+        if bad:
+            out.append(
+                Violation(
+                    "I6",
+                    issue,
+                    f"#{issue} park was serviced by the drain but the watchdog fired "
+                    f"{[f['condition'] for f in bad]} — a recorded service was read as "
+                    f"unanswered (principle 1).",
+                )
+            )
+    return out
+
+
+def inv_dead_agent_never_injected(world: World, scenario: dict) -> list[Violation]:
+    """I5 (#301): a spoke whose scenario declares the agent DEAD never receives an
+    inject (text into a dead pane executes as shell) and is instead recovered
+    (`revived`/`redispatched`); a live parked agent is serviced, never revived-as-dead
+    (principle 4: probe the real process, never a `zsh`/pane proxy)."""
+    out: list[Violation] = []
+    for issue in _scenario_issues(scenario):
+        agent = _spoke_truth(scenario, issue).get("agent")
+        events = [e.get("event") for e in world.events(issue)]
+        states = {t["to"] for t in world.transitions(issue)}
+        if agent == "dead":
+            injected = [e for e in events if e in _INJECT_EVENTS]
+            if injected:
+                out.append(
+                    Violation(
+                        "I5",
+                        issue,
+                        f"#{issue} agent was DEAD but received inject events "
+                        f"{injected} — injecting into a dead pane runs prose as shell "
+                        f"in a worktree (principle 4).",
+                    )
+                )
+            # Positive advance: a dead agent must be RECOVERED, not left (principle 3).
+            if _spoke_truth(scenario, issue).get("recovers") and not (
+                states & {"revived", "redispatched"}
+            ):
+                out.append(
+                    Violation(
+                        "I5",
+                        issue,
+                        f"#{issue} agent was DEAD but the drain recorded no "
+                        f"revived/redispatched recovery (states={sorted(states)}) — a "
+                        f"dead agent must be recovered, never left (principle 3).",
+                    )
+                )
+    return out
+
+
 # The fixed registry: declared ONCE, checked against EVERY scenario. Adding a
 # scenario never touches this list; only a change to an AFK Design PRINCIPLE does.
 INVARIANTS = [
     inv_pushed_ready_lands,
     inv_landing_never_dead_pane,
+    inv_park_ceiling_escalates,
+    inv_answered_park_advances,
+    inv_dead_agent_never_injected,
+    inv_serviced_park_never_fired,
 ]
 
 

@@ -1,0 +1,25 @@
+id: 290-landing-not-dead-pane
+stresses:
+  incident: 290
+  invariant: I1
+  principle: "1,4"
+spokes:
+  - issue: 290
+    slug: land
+    truth:
+      phase: landing
+timeline:
+  # A dispatch epoch far in the past — the dead-idle base the watchdog ages from.
+  - { t: 0, spoke: 290, do: epoch, name: dispatch }
+  # The spoke's land process records `landing` intent-first (the #290 fix), then the
+  # tmux window vanishes mid-land — exactly the dead-pane shape (gone pane + stale base).
+  - { t: 500, spoke: 290, do: land_start }
+  - { t: 550, spoke: 290, do: kill_pane }
+  # 3600s after dispatch (base stale) but only 3500s after `landing` (phase fresh):
+  # the recorded phase must suppress the dead-pane fire.
+  - { t: 4000, run: [watchdog] }
+expect:
+  violations: []
+mutation:
+  drop: [landing]
+  expect_violation: I1
