@@ -6139,13 +6139,20 @@ def test_self_copy_complete_predicate_detects_missing(tmp_path: Path) -> None:
     src.mkdir()
     (src / "hub-afk.sh").write_text("x")
     (src / "spoke-model.env").write_text("x")
+    (src / ".hidden-config").write_text("x")  # a dotfile sibling must be enumerated too (#316)
     full = tmp_path / "full"
     full.mkdir()
     (full / "hub-afk.sh").write_text("x")
     (full / "spoke-model.env").write_text("x")
+    (full / ".hidden-config").write_text("x")
     partial = tmp_path / "partial"
     partial.mkdir()
     (partial / "hub-afk.sh").write_text("x")  # spoke-model.env deliberately absent
+    (partial / ".hidden-config").write_text("x")
+    dotless = tmp_path / "dotless"
+    dotless.mkdir()
+    (dotless / "hub-afk.sh").write_text("x")
+    (dotless / "spoke-model.env").write_text("x")  # .hidden-config absent
 
     ok = _call(f'_afk_self_copy_complete "{src}" "{full}"')
     assert ok.returncode == 0, ok.stdout + ok.stderr
@@ -6154,19 +6161,23 @@ def test_self_copy_complete_predicate_detects_missing(tmp_path: Path) -> None:
     assert "spoke-model.env" in bad.stdout, (
         f"the predicate must name the missing file so the warn can report it; got {bad.stdout!r}"
     )
+    dot = _call(f'_afk_self_copy_complete "{src}" "{dotless}"')
+    assert dot.returncode != 0, (
+        "a copy missing a DOTFILE sibling must be reported incomplete (#316)"
+    )
 
 
 def test_self_copy_incomplete_falls_back_loud(tmp_path: Path) -> None:
     # AFK Design Principle 2: an incomplete copy must be LOUD and fall back to the complete
     # original, never a silent exec into a config-less runtime (the #306 worst-default). Force
-    # a partial copy (only hub-afk.sh) via the AFK_SELF_COPY_CP_CMD test seam and assert (a)
-    # control returns to the caller — no exec into the broken copy — and (b) a loud wt_warn.
+    # a partial copy via the AFK_SELF_COPY_OMIT test seam (drop spoke-model.env after the copy)
+    # and assert (a) control returns to the caller — no exec into the broken copy — (b) a loud
+    # wt_warn, and (c) the orphaned temp copy is reclaimed on the fallback path.
     src_dir = _stage_synced_scripts_dir(tmp_path)
     tmpdir = tmp_path / "selfcopy"
     tmpdir.mkdir()
     env = _self_copy_env(tmpdir)
-    # $1 = src_dir, $2 = dest dir: copy ONLY hub-afk.sh, dropping spoke-model.env.
-    env["AFK_SELF_COPY_CP_CMD"] = 'cp "$1/hub-afk.sh" "$2/"'
+    env["AFK_SELF_COPY_OMIT"] = "spoke-model.env"
     result = subprocess.run(
         [
             "bash",
@@ -6185,6 +6196,15 @@ def test_self_copy_incomplete_falls_back_loud(tmp_path: Path) -> None:
     )
     assert "incomplete" in result.stderr.lower(), (
         f"an incomplete copy must warn loudly (wt_warn); stderr was: {result.stderr!r}"
+    )
+    assert not list(tmpdir.glob("hub-afk-self.*")), (
+        "the incomplete-copy fallback must reclaim its temp copy, not orphan it in TMPDIR (#316)"
+    )
+    # Durably recorded, not only wt_warn'd: the nohup'd respawn/resume launches redirect stderr
+    # to /dev/null, so the "protection disabled" event must survive in the decision journal.
+    journal = tmpdir / "state" / "decision-journal.jsonl"
+    assert journal.exists() and "self-copy incomplete" in journal.read_text(), (
+        "the incomplete-copy fallback must journal durably (survives nohup's /dev/null stderr)"
     )
 
 

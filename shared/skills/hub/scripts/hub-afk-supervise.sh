@@ -170,18 +170,41 @@ _afk_kill_wedged_supervisor() {
 # relaunches the ORIGINAL — picking up any newer code — and re-copies itself fresh.
 _afk_self() { printf '%s\n' "${AFK_ORIG_SCRIPT:-${_AFK_ENTRY:-${BASH_SOURCE[0]}}}"; }
 
+# _afk_self_copy_complete <src_dir> <dst_dir> -> true iff <dst_dir> carries every top-level
+# regular file of <src_dir>. The completeness invariant is a SET check, NOT an enumerated
+# manifest: a new sibling co-located in the scripts dir (a .sh module, spoke-model.env, any
+# future file of any extension) cannot be silently absent from the drain runtime -- if it is
+# in the source and missing from the copy, this fails, and the caller runs loudly from the
+# complete original rather than exec an incomplete copy (#316; AFK Design Principle 2). Uses
+# `find -type f` (not a bare `*` glob) so DOTFILES are enumerated too, and so a symlink -- which
+# `cp -R` copies as a symlink, not the target -- is not treated as a required regular file.
+# Prints the FIRST missing basename to stdout so the caller's warn can name what was dropped.
+# Pure (no side effects) so it is unit-testable in isolation.
+_afk_self_copy_complete() {
+  local src="$1" dst="$2" f base
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    base="${f##*/}"
+    [ -f "$dst/$base" ] || { printf '%s\n' "$base"; return 1; }
+  done <<EOF
+$(find "$src" -maxdepth 1 -type f 2>/dev/null)
+EOF
+  return 0
+}
+
 # _afk_exec_self_copy <argv...> -> re-exec THIS script from a private tmp COPY, so a
 # hub sync/land rewriting hub-afk.sh mid-run cannot corrupt the running interpreter
 # — bash lazily re-reads the script file past main() on the exit path, and the
 # 2026-07-04 drain died there with `line 1465: unexpected token` (#133). Called at
 # every loop-entering start (arm, no-arg resume, --watchdog); short-lived
 # subcommands skip it. No-op when already running from a copy (AFK_RUNNING_COPY=1)
-# or opted out (AFK_SELF_COPY=0); fail-OPEN on a copy failure (run from the
-# original rather than refuse to arm). On success the exec never returns.
+# or opted out (AFK_SELF_COPY=0). The copy is validated COMPLETE before the exec; on
+# an incomplete copy it warns + journals and runs from the original (never refuses to
+# arm, never execs a partial runtime). On success the exec never returns.
 _afk_exec_self_copy() {
   [ "${AFK_SELF_COPY:-1}" = "0" ] && return 0
   [ "${AFK_RUNNING_COPY:-}" = "1" ] && return 0
-  local src src_dir dir copy cfg
+  local src src_dir dir copy missing omit
   # The ENTRY's path, not THIS module's BASH_SOURCE[0] (#307): the self-copy must re-exec
   # hub-afk.sh and stamp AFK_ORIG_SCRIPT with the entry, or the resumed process would resolve
   # _afk_self to hub-afk-supervise.sh. src_dir is the same scripts dir either way (co-located).
@@ -189,26 +212,42 @@ _afk_exec_self_copy() {
   src_dir="$(cd "$(dirname "$src")" && pwd)" || return 0
   dir="$(mktemp -d "${TMPDIR:-/tmp}/hub-afk-self.XXXXXX" 2>/dev/null)" || return 0
   copy="$dir/hub-afk.sh"
-  # Copy the WHOLE sibling set (gate-broker.sh, hub-inject.sh, and anything else hub-afk
-  # sources transitively), not hub-afk.sh alone -- a helper moved to a new sibling file must
-  # ride along or the drain strands with `command not found` (#262). A generic glob, not an
-  # enumerated list, so a future sibling needs no registration here. Fail-OPEN: on a glob
-  # copy failure fall back to the lone script, and if even that leaves no hub-afk.sh copy,
-  # run from the original rather than refuse to arm.
-  cp "$src_dir"/*.sh "$dir"/ 2>/dev/null || cp "$src" "$copy" 2>/dev/null || return 0
-  [ -f "$copy" ] || cp "$src" "$copy" 2>/dev/null || return 0
-  # Seed the model-config manifest too (#306): spoke-model.env / ai_toolkit_config.py are
-  # NOT *.sh, so the glob above skips them. Without spoke-model.env, worktree-new.sh -- which
-  # the drain resolves to THIS self-copy dir -- finds no config in wt_resolve_agent_model and
-  # falls to the literal fallback, dispatching EVERY freshly-armed spoke on the wrong tier
-  # until the first _afk_resync reseeds. Parity with _afk_resync (which re-renders both).
-  # Best-effort / fail-open: a source-run hub has neither, and the copy proceeds regardless.
-  for cfg in spoke-model.env ai_toolkit_config.py; do
-    [ -f "$src_dir/$cfg" ] && cp "$src_dir/$cfg" "$dir"/ 2>/dev/null
-  done
-  export AFK_RUNNING_COPY=1
-  export AFK_ORIG_SCRIPT="$src"
-  exec bash "$copy" "$@"
+  # Copy the WHOLE scripts dir (the `/.` form takes dotfiles too), not a *.sh glob + a
+  # hand-listed config seed (#316): every co-located sibling -- the .sh modules hub-afk sources
+  # transitively (#262), the spoke-model.env / ai_toolkit_config.py the drain resolves for
+  # wt_resolve_agent_model (#306), and any FUTURE file of any extension -- rides along by
+  # construction. A forgotten manifest entry that silently dispatched drain spokes on the
+  # priciest tier (#291/#305/#306) becomes impossible, not a thing to remember.
+  cp -R "$src_dir"/. "$dir"/ 2>/dev/null || true
+  # AFK_SELF_COPY_OMIT is a narrow test seam (space-separated basenames to drop from the fresh
+  # copy) so the incomplete-copy fallback below is exercisable. It runs no arbitrary code, and
+  # a leak degrades LOUD not silent: the completeness gate catches the dropped file and falls
+  # back to the complete original.
+  for omit in ${AFK_SELF_COPY_OMIT:-}; do rm -f "$dir/$omit" 2>/dev/null || true; done
+  # Fail LOUD, never silently exec an incomplete runtime (AFK Design Principle 2): cp -R is not
+  # atomic, so verify the copy carries every source file before handing the drain to it. On an
+  # incomplete copy, run from the ORIGINAL (complete by definition) rather than exec a
+  # config-less copy that would fall to the literal model fallback. This is ORTHOGONAL to the
+  # #296 stale-daemon path: the watchdog proves a daemon stale by hashing the ORIGIN source
+  # bundle (_wd_daemon_is_stale), never the self-copy's contents, so changing what the copy
+  # carries cannot revive that path.
+  # UPGRADE: the gate checks file PRESENCE, not content; a cp truncated mid-file (disk full)
+  # could leave a hub-afk.sh that exists yet is corrupt. Add a `bash -n "$copy"` parse-check to
+  # the gate if that ever bites -- the old code shared this gap, so it is no regression.
+  if [ -f "$copy" ] && missing="$(_afk_self_copy_complete "$src_dir" "$dir")"; then
+    export AFK_RUNNING_COPY=1
+    export AFK_ORIG_SCRIPT="$src"
+    exec bash "$copy" "$@"
+  fi
+  # Signal DURABLY (a bare wt_warn/log is stderr-only, lost on the nohup'd `>/dev/null 2>&1`
+  # respawn/resume launches where this matters most) AND loudly for the interactive arm, then
+  # reclaim the orphaned temp copy before running from the original.
+  _broker_journal_line self-copy self-copy \
+    "self-copy incomplete (missing ${missing:-hub-afk.sh}); running unprotected from the original" scope \
+    2>/dev/null || true
+  wt_warn "hub-afk: self-copy incomplete (missing ${missing:-hub-afk.sh}) -- running from the original checkout"
+  rm -rf "$dir" 2>/dev/null || true
+  return 0
 }
 
 # _afk_resume_launch -> the shell command the watchdog runs to respawn a crashed
