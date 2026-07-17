@@ -1016,3 +1016,25 @@ def test_mutation_reddens_exactly_one_invariant(tmp_path: Path, scenario: dict) 
     assert got == [want], (
         f"{_scenario_id(scenario)}: mutation must redden exactly [{want}], got {got}"
     )
+
+
+# The invariant ids the registry can emit — the single source a fixture's
+# `mutation.expect_violation` must name (a typo would otherwise silently never match).
+INVARIANT_IDS = frozenset({"I1", "I2", "I3", "I4", "I5", "I6"})
+
+
+def test_scenarios_are_well_formed() -> None:
+    """Structural guard so a malformed fixture fails loudly rather than passing
+    vacuously — the price of AC4 (adding a scenario is pure data): every scenario has
+    the required keys, and every mutation targets a real invariant id."""
+    assert _SCENARIOS, "no scenarios discovered under fixtures/drain_scenarios/"
+    for scenario in _SCENARIOS:
+        sid = _scenario_id(scenario)
+        assert scenario.get("spokes"), f"{sid}: no spokes"
+        assert "timeline" in scenario, f"{sid}: no timeline"
+        for exp in scenario.get("expect", {}).get("violations", []):
+            assert exp in INVARIANT_IDS, f"{sid}: unknown expected invariant {exp!r}"
+        mutation = scenario.get("mutation")
+        if mutation:
+            want = mutation.get("expect_violation")
+            assert want in INVARIANT_IDS, f"{sid}: mutation targets unknown invariant {want!r}"
