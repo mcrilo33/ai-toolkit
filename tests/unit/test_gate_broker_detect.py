@@ -68,6 +68,7 @@ DETECT_SURFACE = (
     "spoke_over_ceiling",
     "_gate_parked",
     "_gate_answer_landed",
+    "_gate_spoke_coded_past",
     "_gate_artifact_path",
     "_read_gate_artifact",
     "_spoke_still_parked",
@@ -311,6 +312,69 @@ def test_extract_pending_question_clears_plan_on_list_content_reply(
     assert result.stdout.strip() == "", (
         f"a list-content text-block reply must still un-latch the plan: {result.stdout!r}"
     )
+
+
+# ── issue #312: _gate_spoke_coded_past — the #117 keeps-coding proof ───────────────────────────
+# _gate_answer_landed (#204) proves a TYPED reply landed after the gate. The #117 shape — the
+# spoke emits gate/<n> then keeps coding WITHOUT a reply — leaves no typed turn, so a distinct
+# detector proves it: assistant activity AFTER the gate emission means the spoke coded past the
+# gate. The moved-on drop uses this to RETIRE the abandoned episode instead of aging it. Fail-
+# closed: no transcript / no python3 / no post-gate assistant activity → rc 1 (never retire on
+# an ambiguous read).
+
+
+def _coded_past(spoke_repo: Path, projects: Path) -> str:
+    return (
+        _call(
+            f"_gate_spoke_coded_past '{spoke_repo}' && echo CODED || echo NO",
+            env={"CLAUDE_PROJECTS_DIR": str(projects)},
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+
+
+def test_gate_spoke_coded_past_true_after_keeps_coding(spoke_repo: Path, tmp_path: Path) -> None:
+    # The #117 shape: a gate emission, then the spoke's OWN assistant work with no reply.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects, spoke_repo, [_gate_bash_turn("PLAN — then I keep coding"), _spoke_activity_turn()]
+    )
+
+    assert _coded_past(spoke_repo, projects) == "CODED"
+
+
+def test_gate_spoke_coded_past_false_for_bare_park(spoke_repo: Path, tmp_path: Path) -> None:
+    # Only the plan + gate Bash, and the gate's own tool_result — no assistant turn after the
+    # emission. The spoke is genuinely parked; retiring it would strand a real gate.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [_gate_bash_turn("PLAN awaiting approval"), _gate_tool_result(is_error=False)],
+    )
+
+    assert _coded_past(spoke_repo, projects) == "NO"
+
+
+def test_gate_spoke_coded_past_false_for_typed_reply_only(spoke_repo: Path, tmp_path: Path) -> None:
+    # A typed reply then nothing is the #204 path (handled by _gate_answer_landed + the top
+    # self-heal), NOT the keeps-coding shape — coded-past must stay false so the two do not conflate.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("PLAN — a human then approves"),
+            {
+                "type": "user",
+                "promptSource": "typed",
+                "message": {"content": "Approved — proceed."},
+            },
+        ],
+    )
+
+    assert _coded_past(spoke_repo, projects) == "NO"
 
 
 def test_spoke_idle_seconds_not_refreshed_by_reasoner_write(

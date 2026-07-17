@@ -19,17 +19,21 @@ from _gate_broker_support import (
     _bash_tool_record,
     _call,
     _fake_tmux_pane,
+    _gate_bash_turn,
     _gate_broker_env,
     _gate_park_transcript,
+    _gate_tool_result,
     _inject_env,
     _perm_env,
     _project_dir_for,
     _resumed_gate_transcript,
     _seed_transcript,
     _session,
+    _spoke_activity_turn,
     _tag_gate_at_head,
     _user_record,
     _write_fake_tmux,
+    _write_transcript,
 )
 
 
@@ -696,6 +700,136 @@ def test_gate_answer_landed_false_while_still_parked(spoke_repo: Path, tmp_path:
     )
 
     assert result.stdout.strip().splitlines()[-1] == "NO", result.stdout + result.stderr
+
+
+# ── issue #312: retire an abandoned PLAN-gate episode at the moved-on drop ─────────────────────
+# A spoke that emits gate/<n> then keeps coding (#117) leaves the tag at the tip and the park
+# onset aging: the moved-on drop wrote answer-drop-<n> and returned, retiring nothing, so the
+# watchdog fired park-undeliverable off the stale onset (#312) and burned a reasoner run every
+# tick. The broker now RETIRES the episode at the drop when the transcript proves the spoke coded
+# past the gate: consume the tag, credit+clear the onset, drop the warned backoff and the drop
+# ledger, and journal `gate-abandoned` so the outcome is auditable (#241).
+
+# Force the moved-on drop deterministically; _still_parked_same / _spoke_still_parked have their
+# own tests, and an instant stub answerer cannot advance the transcript the way a minutes-long
+# real reasoner run does.
+_MOVED_ON = "_still_parked_same() { return 1; }; _spoke_still_parked() { return 1; }; "
+
+
+def _retire_gate_env(spoke_repo: Path, tmp_path: Path, projects: Path) -> dict[str, str]:
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text("#!/usr/bin/env bash\ntrue\n")
+    ready_stub.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text("#!/usr/bin/env bash\ntrue\n")
+    (fake_bin / "gh").chmod(0o755)
+    return {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(tmp_path / "sd"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_ANSWERER_CMD": "printf 'reasoning\\nANSWER: Approved -- proceed.'",
+    }
+
+
+def _gate_tag_list(spoke_repo: Path) -> str:
+    return subprocess.run(
+        ["git", "tag", "--list", "gate/5"], cwd=spoke_repo, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_retire_abandoned_gate_park_clears_all_episode_state(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The helper the drop path delegates to: consume the tag, clear the onset + drop ledger, and
+    # journal `gate-abandoned`. Consuming the tag is what stops the same (tip, sig) being re-served.
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    _tag_gate_at_head(spoke_repo, 5)
+    (sd / "park-onset-5.epoch").write_text("1000\n")
+    (sd / "answer-drop-5").write_text("tip\tsig\t3\tno longer parked on that prompt\n")
+    env = {"AFK_STATE_DIR": str(sd), "AFK_JOURNAL_GH_COMMENT": "0", "AFK_NOW": "2000"}
+
+    result = _call(f"_retire_abandoned_gate_park '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert _gate_tag_list(spoke_repo) == "", "the abandoned gate tag must be consumed"
+    assert not (sd / "park-onset-5.epoch").exists(), "the park onset must be credited + cleared"
+    assert not (sd / "answer-drop-5").exists(), "the drop ledger must be cleared"
+    assert "gate-abandoned" in (sd / "decision-journal.jsonl").read_text()
+
+
+def test_broker_service_gate_retires_gate_the_spoke_coded_past(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC1/AC2 replay: a gate park the spoke coded past (#117), reached at the moved-on drop, is
+    # retired — the gate tag is consumed so the next tick reads the spoke as busy, not a gate to
+    # re-serve, and the retirement is journaled.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects, spoke_repo, [_gate_bash_turn("PLAN -- then keeps coding"), _spoke_activity_turn()]
+    )
+    _tag_gate_at_head(spoke_repo, 5)
+    env = _retire_gate_env(spoke_repo, tmp_path, projects)
+
+    result = _call(f"{_MOVED_ON} broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert _gate_tag_list(spoke_repo) == "", "the abandoned gate tag must be retired at the drop"
+    journal = tmp_path / "sd" / "decision-journal.jsonl"
+    assert journal.exists() and "gate-abandoned" in journal.read_text()
+
+
+def test_broker_service_gate_does_not_retire_a_bare_gate_park(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # No post-gate assistant activity → not the #117 shape → today's plain moved-on drop is
+    # preserved (tag stays, a drop is recorded). Retiring here would strand a real awaiting park.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [_gate_bash_turn("PLAN awaiting a reply"), _gate_tool_result(is_error=False)],
+    )
+    _tag_gate_at_head(spoke_repo, 5)
+    env = _retire_gate_env(spoke_repo, tmp_path, projects)
+
+    result = _call(f"{_MOVED_ON} broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert _gate_tag_list(spoke_repo) == "gate/5", "a bare gate park must NOT be retired"
+    assert (tmp_path / "sd" / "answer-drop-5").exists(), "a plain moved-on drop is still recorded"
+
+
+def test_broker_service_gate_204_self_heal_unchanged_on_typed_reply(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC5 regression: a TYPED reply after the gate is the #204 path — the top self-heal consumes
+    # the tag WITHOUT running the answerer, and this stays DISTINCT from the #312 retirement (no
+    # answerer run, no `gate-abandoned` journal line).
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("PLAN -- a human then approves"),
+            {"type": "user", "promptSource": "typed", "message": {"content": "Approved -- go."}},
+        ],
+    )
+    _tag_gate_at_head(spoke_repo, 5)
+    calls = tmp_path / "answerer.calls"
+    env = _retire_gate_env(spoke_repo, tmp_path, projects)
+    env["AFK_ANSWERER_CMD"] = f"printf x >> '{calls}'; printf 'ESCALATE: x'"
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert _gate_tag_list(spoke_repo) == "", "the #204 typed-reply self-heal must consume the tag"
+    assert not calls.exists(), "the self-heal short-circuits before the answerer runs"
+    journal = tmp_path / "sd" / "decision-journal.jsonl"
+    assert not journal.exists() or "gate-abandoned" not in journal.read_text()
 
 
 def test_gate_answer_landed_false_for_synthetic_post_park_turn(
