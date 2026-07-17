@@ -475,17 +475,24 @@ PYEOF
 }
 
 # _gate_spoke_coded_past <wt> -> rc 0 when the spoke emitted its PLAN gate and then KEPT CODING
-# without a reply (the #117 shape): an assistant turn AFTER the last `spoke-ready.sh --gate`
-# emission proves the spoke generated new work past the gate. This is the keeps-coding twin of
-# _gate_answer_landed (#204): that proves a TYPED reply landed; this proves the spoke moved on
-# under its own steam, which the typed-reply detector can never see. The moved-on drop uses it to
-# RETIRE the abandoned gate episode (#312) instead of leaving gate/<n> at the tip to age. The
-# gate emission's OWN tool_result (a user turn) does not count — only a later ASSISTANT turn does,
-# so a spoke genuinely parked right after the emission stays "not coded past". A re-park (another
-# gate emission) resets the evidence, so a spoke sitting at a fresh gate is not read as coded past.
-# Fail-CLOSED (rc 1): no transcript, no python3, or no post-gate assistant turn means "cannot
-# prove the spoke coded past" -> the caller does NOT retire (an ambiguous read never retires a
-# real park).
+# without a reply (the #117 shape): a MUTATING tool_use (Edit/Write/NotebookEdit/MultiEdit — the
+# write operations the PLAN gate exists to block) in an assistant turn AFTER the last
+# `spoke-ready.sh --gate` emission proves the spoke wrote code past the gate. This is the
+# keeps-coding twin of _gate_answer_landed (#204): that proves a TYPED reply landed; this proves
+# the spoke moved on under its own steam, which the typed-reply detector can never see. The
+# moved-on drop uses it to RETIRE the abandoned gate episode (#312) instead of leaving gate/<n> at
+# the tip to age.
+#
+# A WRITE — not merely "an assistant turn after the gate" — is the bar ON PURPOSE (#312 review): a
+# COMPLIANT parked spoke still emits the agent loop's trailing text-only "awaiting review" reply to
+# the gate Bash's tool_result, and may make read-only calls (Read) before idling; neither is coding
+# past, and reading them as such would tear down a live gate and discard a pending answer/amendment.
+# A commit moves the tip, so the gate tag leaves it (`_gate_parked` -> false) and the caller's
+# `was_gate` guard never reaches here — the stable-tip write is the case this must catch. A re-park
+# (another gate emission) resets the evidence, so a spoke sitting at a fresh gate is not coded past.
+# Fail-CLOSED (rc 1): no transcript, no python3, or no post-gate WRITE means "cannot prove the spoke
+# coded past" -> the caller does NOT retire (a missed retirement is caught by the watchdog's
+# drain-touched suppression, #312; a wrongful one tears down a live gate — so bias to not-retire).
 _gate_spoke_coded_past() {
   local wt="$1" jsonl
   jsonl="$(_spoke_jsonl "$wt")"
@@ -494,6 +501,9 @@ _gate_spoke_coded_past() {
   _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
 import json, os, sys
 
+# The write tools the PLAN gate blocks. A commit (Bash) advances the tip and is handled by the
+# caller's was_gate guard, so Bash is deliberately NOT here — it is too often read-only to trust.
+MUTATING = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 parked = False
 advanced = False
 try:
@@ -507,18 +517,23 @@ try:
                 continue
             content = (obj.get("message") or {}).get("content")
             blocks = content if isinstance(content, list) else []
-            is_gate = any(
-                isinstance(b, dict)
-                and b.get("type") == "tool_use"
-                and b.get("name") == "Bash"
-                and "spoke-ready.sh --gate" in ((b.get("input") or {}).get("command") or "")
-                for b in blocks
-            )
+            is_gate = False
+            wrote = False
+            for b in blocks:
+                if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                    continue
+                name = b.get("name")
+                if name == "Bash" and "spoke-ready.sh --gate" in (
+                    (b.get("input") or {}).get("command") or ""
+                ):
+                    is_gate = True
+                elif name in MUTATING:
+                    wrote = True
             if is_gate:
                 parked = True        # a (re-)park resets the "advanced past it" evidence
                 advanced = False
-            elif parked:
-                advanced = True      # an assistant turn AFTER the emission = the spoke kept coding
+            elif parked and wrote:
+                advanced = True      # a WRITE after the emission = the spoke coded past the gate
 except Exception:
     sys.exit(1)
 sys.exit(0 if advanced else 1)

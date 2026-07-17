@@ -29,7 +29,8 @@ from _gate_broker_support import (
     _resumed_gate_transcript,
     _seed_transcript,
     _session,
-    _spoke_activity_turn,
+    _spoke_await_review_turn,
+    _spoke_coded_past_turn,
     _tag_gate_at_head,
     _user_record,
     _write_fake_tmux,
@@ -769,7 +770,9 @@ def test_broker_service_gate_retires_gate_the_spoke_coded_past(
     # re-serve, and the retirement is journaled.
     projects = tmp_path / "projects"
     _write_transcript(
-        projects, spoke_repo, [_gate_bash_turn("PLAN -- then keeps coding"), _spoke_activity_turn()]
+        projects,
+        spoke_repo,
+        [_gate_bash_turn("PLAN -- then keeps coding"), _spoke_coded_past_turn()],
     )
     _tag_gate_at_head(spoke_repo, 5)
     env = _retire_gate_env(spoke_repo, tmp_path, projects)
@@ -785,13 +788,19 @@ def test_broker_service_gate_retires_gate_the_spoke_coded_past(
 def test_broker_service_gate_does_not_retire_a_bare_gate_park(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
-    # No post-gate assistant activity → not the #117 shape → today's plain moved-on drop is
-    # preserved (tag stays, a drop is recorded). Retiring here would strand a real awaiting park.
+    # A compliant park (gate + tool_result + the agent loop's trailing "awaiting review" text
+    # turn, no WRITE past the gate) → not the #117 shape → today's plain moved-on drop is preserved
+    # (tag stays, a drop is recorded). Retiring here would strand a real awaiting park and discard
+    # a pending answer/amendment (the #312 review's blocker).
     projects = tmp_path / "projects"
     _write_transcript(
         projects,
         spoke_repo,
-        [_gate_bash_turn("PLAN awaiting a reply"), _gate_tool_result(is_error=False)],
+        [
+            _gate_bash_turn("PLAN awaiting a reply"),
+            _gate_tool_result(is_error=False),
+            _spoke_await_review_turn(),
+        ],
     )
     _tag_gate_at_head(spoke_repo, 5)
     env = _retire_gate_env(spoke_repo, tmp_path, projects)

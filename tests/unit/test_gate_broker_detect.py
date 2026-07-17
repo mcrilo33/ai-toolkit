@@ -25,6 +25,8 @@ from _gate_broker_support import (
     _project_dir_for,
     _seed_task_output,
     _spoke_activity_turn,
+    _spoke_await_review_turn,
+    _spoke_coded_past_turn,
     _tag_gate_at_head,
     _write_transcript,
 )
@@ -317,10 +319,13 @@ def test_extract_pending_question_clears_plan_on_list_content_reply(
 # ── issue #312: _gate_spoke_coded_past — the #117 keeps-coding proof ───────────────────────────
 # _gate_answer_landed (#204) proves a TYPED reply landed after the gate. The #117 shape — the
 # spoke emits gate/<n> then keeps coding WITHOUT a reply — leaves no typed turn, so a distinct
-# detector proves it: assistant activity AFTER the gate emission means the spoke coded past the
-# gate. The moved-on drop uses this to RETIRE the abandoned episode instead of aging it. Fail-
-# closed: no transcript / no python3 / no post-gate assistant activity → rc 1 (never retire on
-# an ambiguous read).
+# detector proves it: a MUTATING tool_use (Edit/Write/NotebookEdit/MultiEdit) AFTER the gate
+# emission — the operation the PLAN gate exists to block — means the spoke wrote code past the
+# gate. A text-only "awaiting review" turn or a read-only tool call is NOT proof (the review's
+# false-positive case): a compliant park still emits the agent loop's trailing reply to the gate
+# Bash's tool_result. The moved-on drop uses this to RETIRE the abandoned episode instead of aging
+# it. Fail-closed: no transcript / no python3 / no post-gate WRITE → rc 1 (never retire on an
+# ambiguous read; a missed retirement is caught by the watchdog's drain-touched suppression).
 
 
 def _coded_past(spoke_repo: Path, projects: Path) -> str:
@@ -334,19 +339,55 @@ def _coded_past(spoke_repo: Path, projects: Path) -> str:
     )
 
 
-def test_gate_spoke_coded_past_true_after_keeps_coding(spoke_repo: Path, tmp_path: Path) -> None:
-    # The #117 shape: a gate emission, then the spoke's OWN assistant work with no reply.
+def test_gate_spoke_coded_past_true_after_a_write(spoke_repo: Path, tmp_path: Path) -> None:
+    # The #117 shape: a gate emission, then the spoke WROTE to the worktree (an Edit) with no reply.
     projects = tmp_path / "projects"
     _write_transcript(
-        projects, spoke_repo, [_gate_bash_turn("PLAN — then I keep coding"), _spoke_activity_turn()]
+        projects,
+        spoke_repo,
+        [_gate_bash_turn("PLAN — then I keep coding"), _spoke_coded_past_turn()],
     )
 
     assert _coded_past(spoke_repo, projects) == "CODED"
 
 
+def test_gate_spoke_coded_past_false_for_compliant_awaiting_review_turn(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The review's blocker: a genuinely parked spoke ends with the agent loop's trailing text-only
+    # "awaiting review" reply to the gate Bash's tool_result. That is NOT coding past — retiring
+    # here would tear down a live gate and discard a pending answer/amendment.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("PLAN awaiting approval"),
+            _gate_tool_result(is_error=False),
+            _spoke_await_review_turn(),
+        ],
+    )
+
+    assert _coded_past(spoke_repo, projects) == "NO"
+
+
+def test_gate_spoke_coded_past_false_for_read_only_activity(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A read-only tool call (Read) past the gate is not proof the spoke proceeded to implement —
+    # a spoke may inspect something then still wait. Only a WRITE counts.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [_gate_bash_turn("PLAN awaiting approval"), _spoke_activity_turn()],
+    )
+
+    assert _coded_past(spoke_repo, projects) == "NO"
+
+
 def test_gate_spoke_coded_past_false_for_bare_park(spoke_repo: Path, tmp_path: Path) -> None:
-    # Only the plan + gate Bash, and the gate's own tool_result — no assistant turn after the
-    # emission. The spoke is genuinely parked; retiring it would strand a real gate.
+    # Only the plan + gate Bash, and the gate's own tool_result — no activity after the emission.
     projects = tmp_path / "projects"
     _write_transcript(
         projects,
