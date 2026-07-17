@@ -52,10 +52,8 @@ HUB_WATCHDOG = HUB_SCRIPTS / "hub-watchdog.sh"
 TLOG_LIB = HUB_SCRIPTS / "transition-log.sh"
 SCENARIO_DIR = Path(__file__).parent / "fixtures" / "drain_scenarios"
 
-# A pane pid the fake tmux advertises; the scripted agent hangs off it so the #301
-# ancestor-walk resolves (mirrors tests/unit/_gate_broker_support.py).
-_PANE_PID = 4242
-_AGENT_PID = 4243
+# The fake tmux/ps stubs advertise a per-spoke pane pid of 40000+issue with a
+# `claude` child at 50000+issue, so the #301 ancestor-walk resolves per spoke.
 
 # Wall-clock cap per real drain/watchdog tick (see World.run_drain). Generous for
 # legitimate stubbed work; cuts a post-answer poll that would otherwise wait out a
@@ -700,14 +698,6 @@ class Violation:
     message: str
 
 
-def _last_index(records: list[dict], **match) -> int:
-    idx = -1
-    for i, r in enumerate(records):
-        if all(r.get(k) == v for k, v in match.items()):
-            idx = i
-    return idx
-
-
 def inv_pushed_ready_lands(world: World, scenario: dict) -> list[Violation]:
     """I2 (#299): a spoke that reached `pushed` and `ready` eventually reaches a
     terminal (`landed`/`reaped`); it never silently stalls (principles 2, 3)."""
@@ -765,8 +755,6 @@ _FORWARD_STATES = {
     "redispatched",
 }
 _INJECT_EVENTS = {"answer_injected", "approval_injected", "nudge"}
-_SERVICE_EVENTS = {"answer_delivered", "approval_injected", "waived"}
-_ESCALATE = {"escalated", "answer_dropped"}
 
 
 def inv_unserviced_park_backstopped(world: World, scenario: dict) -> list[Violation]:
