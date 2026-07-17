@@ -317,17 +317,21 @@ _afk_refresh_offline_clocks() {
 }
 
 # Fresh window ⇒ no stale progress/attempt state: a leftover answer-attempt epoch
-# would suppress a legitimate idle reap in the next window; a leftover re-answer counter
-# (#203) would strand a spoke at a ceiling reached in a prior window; a leftover gate-voided /
+# would suppress a legitimate idle reap in the next window; a leftover gate-voided /
 # terminal-logged marker (#237) would keep a since-resolved gate terminal across windows; a
 # leftover warned-retry backoff (#241) would inherit a prior window's grown cadence and skip
 # the clean first-exhaustion re-service; a leftover served record (#294) would skip the first
 # serve of a park whose approve was delivered in a window that is already over.
+#
+# The re-answer counter (#203) is NOT cleared here any more — it lives in the append-only
+# transition log now (#318). Dropping park-onset-*/park-sig- below is what gives it the same
+# fresh start: the ceiling's episode key carries the onset, so the next park mints a new key
+# and counts from zero, without the log having to forget anything.
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/done-*.epoch "$dir"/tip-* \
     "$dir"/park-onset-*.epoch "$dir"/park-sig-* "$dir"/parked-total-*.seconds \
-    "$dir"/reanswer-* "$dir"/answer-drop-* "$dir"/served-* "$dir"/gate-voided-* \
+    "$dir"/answer-drop-* "$dir"/served-* "$dir"/gate-voided-* \
     "$dir"/terminal-logged-* \
     "$dir"/wd-fire-dedup-* \
     "$dir"/offline-since.epoch 2>/dev/null || true   # #249: drop a stale outage marker too
@@ -368,47 +372,111 @@ _broker_park_signature() {
   printf '%s' "$basis" | wt_sha256_stdin
 }
 
-# _reanswer_state_file <issue> -> the per-issue counter file: "<tip>\t<sig>\t<count>".
-_reanswer_state_file() { printf '%s\n' "$(_afk_state_dir)/reanswer-$1"; }
+# --- the ceiling reads the transition log (#318, #300 step 6) -----------------
+# The attempt count lives in the transition log, not a `reanswer-<issue>` side-channel: the
+# choke point RECORDS the attempt it admits, and counts them back (AFK Principle 1). It uses
+# its OWN lane, `ceiling`, with exactly one writer (_broker_reanswer_exhausted) and one meaning
+# — "the ceiling admitted one service attempt for this episode".
+#
+# WHY ITS OWN LANE and not the answer/permission lanes' events. The ceiling bumps exactly ONCE
+# per tick, upstream of both paths; those lanes' events are not 1:1 with it. The fast-path gate
+# waive bumps but records `waived` on lane `gate`, and hub-inject's delivery events carry no
+# episode at all -> an episode-keyed answer-lane count would sit at 0 forever and NEVER engage
+# (#203's doom-loop). Conversely answer_computed + answer_dropped both fire on lane `answer` in
+# a single tick -> double-count. And afk_lane_event_count has no ACTOR filter, so hub-inject's
+# writes would count too. Reading another lane's events to mean "an attempt happened" is the
+# cross-lane reinterpretation AFK Principle 5 forbids (the answer-attempt-<n>.epoch mistake).
 
-# _broker_reanswer_exhausted <wt> <issue> <sig> -> rc 0 (EXHAUSTED — be terminal, skip the
-# reasoner) when the SAME (tip, sig) has already been attempted AFK_REANSWER_CEILING (default
-# 2) times; otherwise rc 1 AND this attempt is RECORDED (the counter bumped). A changed tip
-# or signature resets the counter. An empty signature never suppresses (fail-open).
+# _reanswer_episode_key <wt> <issue> <sig> -> the ceiling lane's episode "<tip>:<sig>:<onset>",
+# or empty when no signature is substantiable.
+#
+# The TIP IS FOLDED IN DELIBERATELY, and read LIVE here rather than inherited from the park
+# episode the other lanes key on ("<sig>:<onset>", _gb_episode_key). That onset only rolls when
+# note_park_episode runs — driven by slot_state/the watchdog's park probe, a DIFFERENT actor on
+# a DIFFERENT schedule. Keying the ceiling on it would leave a spoke that just COMMITTED
+# throttled at an already-earned-out ceiling until some detector happened to re-stamp: a
+# reset riding another actor is exactly the inferred-state trap #300 exists to close. The tip is
+# the ceiling's own business, so the ceiling reads it (#318 amendment 2).
+#
+# The onset rides along so a fresh window starts clean: _clear_progress_state drops
+# park-onset-*/park-sig-* at every arm, so the next park mints a new onset -> a new key -> a
+# fresh count, which is what the retired file got from its own `rm`. It also means an
+# unpark->repark cycle re-keys (clear_park_onset_epoch drops the epoch on a not-parked tick);
+# that is a genuine state change slot_state OBSERVED, and re-serving a truly re-parked spoke
+# once more is the "act when unattended" posture (Principle 3) — bounded by the ceiling either
+# way.
+_reanswer_episode_key() {
+  local wt="$1" issue="$2" sig="$3" tip onset
+  [ -n "$sig" ] || return 0
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+  onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
+  printf '%s:%s:%s\n' "$tip" "$sig" "$onset"
+}
+
+# _broker_reanswer_exhausted <wt> <issue> <sig> -> rc 0 (EXHAUSTED — warn + back off, the
+# caller's #241 §5 curve) when the SAME (tip, sig) episode has already been admitted
+# AFK_REANSWER_CEILING (default 2) times; otherwise rc 1 AND this attempt is RECORDED (one
+# `service_attempt` event on lane `ceiling`). A changed tip or signature is a new episode and
+# starts a fresh count. An empty signature never suppresses (fail-open) — unchanged.
+#
+# LIB-ABSENT FAILS CLOSED, AND LOUDLY (#318 amendment 1). The log write API is a best-effort
+# no-op when transition-log.sh is missing (worktree-lib.sh), and the retired file-backed ceiling
+# had no dependency on it — so counting from the log makes lib-absence a NEW failure mode, and
+# it is decided here rather than left to silently read 0. Reading 0 forever would un-engage the
+# ceiling and re-run the 900s reasoner every tick — the PRICIEST possible default, which
+# Principle 2 forbids as a silent fallback. Closed is safe and is NOT a stall: post-#241 the
+# caller treats exhaustion as warn + back off + one supervised retry per window, so the spoke is
+# still answered, just paced from the first tick. The warn names the REAL cause; leaving the
+# caller's generic "re-answer ceiling reached" to speak for it would misreport a broken
+# deployment as a stuck spoke.
+#
+# An UNWRITABLE state dir still fail-OPENS exactly as before: _tlog_append is best-effort, so
+# the event is dropped, the count stays 0, and the ceiling never engages — the same outcome the
+# retired `> "$f" 2>/dev/null || true` had. That path is unchanged by this conversion.
 _broker_reanswer_exhausted() {
-  local wt="$1" issue="$2" sig="$3" ceiling tip f prev_tip="" prev_sig="" prev_n=0
+  local wt="$1" issue="$2" sig="$3" ceiling episode n
   [ -n "$sig" ] || return 1
   ceiling="${AFK_REANSWER_CEILING:-2}"
   case "$ceiling" in '' | *[!0-9]*) ceiling=2 ;; esac
   [ "$ceiling" -lt 1 ] && ceiling=1   # floor at 1: a 0 ceiling would strand every gate unanswered
-  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
-  f="$(_reanswer_state_file "$issue")"
-  if [ -f "$f" ]; then
-    IFS=$'\t' read -r prev_tip prev_sig prev_n < "$f" 2>/dev/null || true
-    case "$prev_n" in '' | *[!0-9]*) prev_n=0 ;; esac
+  if ! command -v afk_lane_event_count >/dev/null 2>&1; then
+    command -v broker_warn >/dev/null 2>&1 && broker_warn "$issue" \
+      "the transition log is unavailable (transition-log.sh absent) — the re-answer ceiling cannot count attempts and is failing CLOSED onto the retry backoff; the reasoner is paced, not free-running (#318)"
+    return 0
   fi
-  if [ "$prev_tip" != "$tip" ] || [ "$prev_sig" != "$sig" ]; then prev_n=0; fi   # new context
-  [ "$prev_n" -ge "$ceiling" ] && return 0                                       # exhausted
-  mkdir -p "$(dirname "$f")" 2>/dev/null || true
-  printf '%s\t%s\t%s\n' "$tip" "$sig" "$(( prev_n + 1 ))" > "$f" 2>/dev/null || true
+  episode="$(_reanswer_episode_key "$wt" "$issue" "$sig")"
+  [ -n "$episode" ] || return 1                                   # unsubstantiable → fail-open
+  n="$(afk_lane_event_count "$issue" ceiling "$episode" 2>/dev/null)"
+  case "$n" in '' | *[!0-9]*) n=0 ;; esac
+  [ "$n" -ge "$ceiling" ] && return 0                             # exhausted
+  _broker_tlog_ceiling_attempt "$issue" "$episode" "$(( n + 1 ))"
   return 1
 }
 
-# read_reanswer_count <wt> <issue> -> the re-answer attempt COUNT recorded for the CURRENT
-# (tip, sig), or empty when none/stale. The single reader of reanswer-<issue>'s record layout —
-# so a caller outside this module (the watchdog's servicing-evidence probe, #288 AC2) never
-# hand-parses the file and risks drifting from _broker_reanswer_exhausted's own writer if the
-# layout ever changes.
+# _broker_tlog_ceiling_attempt <issue> <episode> <n> -> record ONE admitted attempt on the
+# ceiling lane. Best-effort by the #300 contract: never fails the caller.
+_broker_tlog_ceiling_attempt() {
+  command -v wt_tlog_event >/dev/null 2>&1 || return 0
+  wt_tlog_event "$1" service_attempt gate-broker.sh ceiling "$2" "{\"attempt\":$3}" || true
+}
+
+# read_reanswer_count <wt> <issue> -> the re-answer attempt COUNT admitted for the CURRENT
+# (tip, sig) episode, or empty when none. The PROJECTION of the ceiling-lane query for a caller
+# outside this module (the watchdog's servicing-evidence probe, #288 AC2): it re-derives the
+# signature itself, exactly as it did when the count lived in the file, so that call site never
+# learns the record moved into the log (#318). Empty (not 0) when nothing is on record, so
+# "never serviced" stays distinguishable from "serviced zero times" for the caller's
+# never-attempted branch.
 read_reanswer_count() {
-  local wt="$1" issue="$2" f tip sig rec_tip rec_sig rec_n
-  f="$(_reanswer_state_file "$issue")"
-  [ -f "$f" ] || return 0
-  IFS=$'\t' read -r rec_tip rec_sig rec_n < "$f" 2>/dev/null || return 0
-  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+  local wt="$1" issue="$2" sig episode n
+  command -v afk_lane_event_count >/dev/null 2>&1 || return 0
   sig="$(_broker_park_signature "$wt" "$issue" 2>/dev/null)"
-  [ "$rec_tip" = "$tip" ] && [ "$rec_sig" = "$sig" ] || return 0
-  case "$rec_n" in '' | *[!0-9]*) return 0 ;; esac
-  printf '%s\n' "$rec_n"
+  episode="$(_reanswer_episode_key "$wt" "$issue" "$sig")"
+  [ -n "$episode" ] || return 0
+  n="$(afk_lane_event_count "$issue" ceiling "$episode" 2>/dev/null)"
+  case "$n" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$n" -gt 0 ] || return 0
+  printf '%s\n' "$n"
 }
 
 # --- computed-then-dropped answers (issue #288 AC3) ---------------------------

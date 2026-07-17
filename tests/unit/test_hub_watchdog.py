@@ -885,9 +885,30 @@ def _head(wt: Path) -> str:
 
 # ── issue #288 AC2: never-attempted suppression when the drain HAS attempted + is paced ────────
 # answer-attempt-<issue>.epoch (stamped only at DELIVERY) is blind to every pre-inject drop path.
-# Two records the re-answer-ceiling code ALREADY writes prove otherwise: reanswer-<issue> (an
-# attempt genuinely ran on the CURRENT (tip, sig)) and an armed, not-yet-due warned-retry backoff
+# Two records the re-answer-ceiling code ALREADY writes prove otherwise: an admitted ceiling
+# attempt on the CURRENT (tip, sig) episode, and an armed, not-yet-due warned-retry backoff
 # (the drain is paced to retry, not abandoned). Together, firing "never-attempted" would be a lie.
+#
+# #318 (#300 step 6): the attempt record moved out of the reanswer-<issue> file and into the
+# transition log's `ceiling` lane. read_reanswer_count still projects it, so the detector under
+# test is unchanged — only the fixture's storage moved (see _seed_ceiling_attempt).
+
+
+def _seed_ceiling_attempt(sd: Path, wt: Path, issue: int, sig: str, onset: str) -> None:
+    """Record one ADMITTED re-answer attempt exactly as the ceiling now does (#318).
+
+    A `service_attempt` event on lane `ceiling`, keyed by the ceiling's own
+    "<tip>:<sig>:<onset>" episode. Replaces the retired `reanswer-<issue>` file these fixtures
+    used to write; seeding that file instead would leave the pin passing vacuously, since
+    nothing reads it any more.
+    """
+    log = sd / "transitions" / f"{issue}.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(
+        f'{{"v":1,"ts":{int(NOW) - 60},"issue":{issue},"kind":"event",'
+        f'"event":"service_attempt","actor":"gate-broker.sh","lane":"ceiling",'
+        f'"episode":"{_head(wt)}:{sig}:{onset}"}}\n'
+    )
 
 
 def test_park_unanswered_never_attempted_suppressed_when_attempted_and_backing_off(
@@ -896,9 +917,9 @@ def test_park_unanswered_never_attempted_suppressed_when_attempted_and_backing_o
     wt = _git_repo(tmp_path)
     sd = tmp_path / "sd"
     sd.mkdir()
-    (sd / "reanswer-5").write_text(f"{_head(wt)}\tsigA\t1\n")
-    (sd / "warned-state-5").write_text(f"1\t{int(NOW) + 300}\n")  # armed, not due for 300s
     old = str(int(NOW) - 700)  # past the 600s ceiling
+    _seed_ceiling_attempt(sd, wt, 5, "sigA", old)
+    (sd / "warned-state-5").write_text(f"1\t{int(NOW) + 300}\n")  # armed, not due for 300s
     prelude = (
         f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
         "_broker_park_signature() { printf '%s' 'sigA'; }; "
@@ -929,9 +950,9 @@ def test_park_unanswered_fires_when_attempted_but_backoff_already_due(tmp_path: 
     wt = _git_repo(tmp_path)
     sd = tmp_path / "sd"
     sd.mkdir()
-    (sd / "reanswer-5").write_text(f"{_head(wt)}\tsigA\t1\n")
-    (sd / "warned-state-5").write_text(f"1\t{int(NOW) - 10}\n")  # already due
     old = str(int(NOW) - 700)
+    _seed_ceiling_attempt(sd, wt, 5, "sigA", old)
+    (sd / "warned-state-5").write_text(f"1\t{int(NOW) - 10}\n")  # already due
     prelude = (
         f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
         "_broker_park_signature() { printf '%s' 'sigA'; }; "
