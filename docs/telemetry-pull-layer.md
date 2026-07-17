@@ -15,13 +15,61 @@ against #21's frozen span schema (`docs/telemetry-span-schema.md`) verbatim.
 > the transcript backfill (`langfuse_backfill.py` + `causal_tree.py`, #92) —
 > live capture is complete by construction, so no after-the-fact healing path
 > exists. The transcript parsers documented here survive solely as the view
-> builder's input layer.
+> builder's input layer. Read that narrowly: what #140 retired is the *transcript*
+> backfill. The view builder itself sources from Langfuse, so a single lost land is
+> still re-runnable from its id alone (`--spoke-run-id`) — see the #319 note below
+> for why that is not a fleet backfill.
 
 > [!NOTE]
 > Issue #91 retired `ccusage` and the pull-cost layer (`telemetry/cost.py`). The
 > otelcol remaps tokens to `gen_ai.usage.*`, so **Langfuse computes cost itself**
 > from token usage × its model-pricing config. The pull layer now attributes only
 > tokens; cost is no longer derived on-machine.
+
+## The 2026-07-13..17 score gap: no backfill (Issue #319)
+
+**Decision: the gap is not backfilled. It stays empty, and empty is honest.**
+
+For ~4 days and 51 drain lands, no `step_tokens_written` / `step_total_cost_usd` /
+`step_duration_ms` scores were produced. The sync never shipped the `telemetry/`
+package into `.ai-toolkit/scripts/`, so the drain's self-copy (built from that dir,
+and not a git checkout) failed `telemetry-ingest-spoke.sh`'s package probe and skipped
+the ingest on every land. #319 fixed the cause; this records what was decided about
+the data already lost.
+
+A backfill is **technically possible**, and the honest reason not to do it is not
+that no path exists:
+
+- #140 retired the **transcript** backfill (`langfuse_backfill.py`), but the view
+  builder does not need it — it **sources from Langfuse**, fetching the session's
+  traces and copying their observations into the two views.
+- Those 51 spokes passed the OTel and auth gates (they reached the package probe,
+  which is downstream of both), so their live-pushed generations should still exist
+  server-side.
+- `build_step_windows` derives the cycle windows from the **trace observations** (the
+  `TaskCreate`/`TaskUpdate` ledger ops), not from anything on disk. The dead score
+  families are therefore rebuildable in principle.
+- `telemetry-ingest-spoke.sh --spoke-run-id <id>` exists precisely as the degraded
+  re-run, and the ids are recoverable from `.git/ai-toolkit-afk/land-*.log`.
+
+It is not done because **the re-run would attribute the hub's context to 51 spokes**.
+The worktrees are long torn down, so a re-run has no `--root` and no `--request-bodies`,
+and `--root` defaults to the cwd — the hub. `read_mode_lane`, `read_outcome` and the
+raw-bodies convention would then all read from the **hub checkout**, and the #87
+loaded-context itemization would itemize the *hub's* rules/skills/memory as though they
+were each spoke's. The commit (#162), lifecycle (#280) and repo-tag (#231) legs have no
+source at all.
+
+That trade is bad in the one direction that matters: a gap is visibly empty and asks a
+question, whereas a wrong value silently answers it — and poisons the very cost/latency
+dashboards (#128, spoke-cost) this data feeds. It is the view builder's own rule (skip a
+metric rather than emit a wrong one) and #319's own lesson: the silent-but-plausible
+failure is the one that costs days.
+
+> [!TIP]
+> The degraded `--spoke-run-id` re-run remains correct for its designed case: **one**
+> land whose ingest was lost to a transient Langfuse outage, re-run while the worktree
+> still exists. It is not a fleet backfill tool, and nothing here should be read as one.
 
 Everything here is **read-only and 100% local**. Session logs contain prompt
 content, so they are parsed on-machine and only metadata / metrics are surfaced —
