@@ -9249,7 +9249,8 @@ def _seed_land_lane_event(statedir: Path, next_due: int, issue: int = 5) -> None
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text(
         f'{{"v":1,"ts":1000,"issue":{issue},"kind":"event","event":"land_failed",'
-        f'"actor":"hub-afk.sh","lane":"land","evidence":{{"attempt":1,"next":{next_due}}}}}\n'
+        f'"actor":"hub-afk.sh","lane":"land-backoff",'
+        f'"evidence":{{"attempt":1,"next":{next_due}}}}}\n'
     )
 
 
@@ -9360,7 +9361,9 @@ def test_auto_land_logs_every_ready_at_tip_skip_with_next_due(
     wt_land, land_log = _land_recorder(tmp_path)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
-    (statedir / "warned-state-5-land").write_text("2\t2000\n")  # land lane pending, next-due 2000
+    # #318: the pending land backoff is the RECORDED arm now, not warned-state-5-land — that file
+    # no longer paces (test_land_lane_due_reads_the_log_not_the_warned_state_file pins it).
+    _seed_land_lane_event(statedir, next_due=2000)
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
 
     r = _call(
