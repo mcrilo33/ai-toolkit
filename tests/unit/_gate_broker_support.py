@@ -438,6 +438,42 @@ def _spoke_activity_turn() -> dict:
     }
 
 
+def _spoke_await_review_turn() -> dict:
+    """A COMPLIANT parked spoke's trailing turn: the agent loop's text-only reply to the gate
+    Bash's tool_result — 'plan posted, awaiting review' — then it idles. No mutation past the gate,
+    so this must NOT read as coded-past (the #312 review's false-positive case)."""
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "I've posted my plan and am waiting for review before I proceed.",
+                }
+            ]
+        },
+    }
+
+
+def _spoke_coded_past_turn() -> dict:
+    """The #117 keeps-coding shape: the spoke WROTE to the worktree past the gate (an Edit) — the
+    operation the PLAN gate exists to block. This is what proves it coded past, not a text turn."""
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "Starting the implementation."},
+                {
+                    "type": "tool_use",
+                    "name": "Edit",
+                    "id": "tu_e",
+                    "input": {"file_path": "hub-afk.sh", "old_string": "a", "new_string": "b"},
+                },
+            ]
+        },
+    }
+
+
 def _write_transcript(projects: Path, wt: Path, records: list[dict]) -> None:
     pd = _project_dir_for(projects, wt)
     (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))

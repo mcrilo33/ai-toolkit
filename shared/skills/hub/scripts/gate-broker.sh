@@ -510,6 +510,37 @@ _broker_try_fastpath_gate() {
   return 0
 }
 
+# _retire_abandoned_gate_park <wt> <issue> -> retire a PLAN-gate episode the spoke coded past
+# without a reply (#117/#312). The same teardown the #204 self-heal runs (top of
+# broker_service_gate), plus a journal line: consume the stale gate/<issue> tag (so the next tick
+# reads the spoke as busy, not a re-serviceable gate park — this is what stops the reasoner-run-
+# per-tick loop), credit + clear the park onset, drop the answer-lane warned-retry backoff, and
+# clear the answer-drop ledger for the now-resolved episode. Journaled under park kind
+# `gate-abandoned` (NOT `gate`) so it is auditable (#241) yet never mistaken for the #277
+# fast-path waive, which the `gate` kind emits as a `waived` lane event. Best-effort throughout.
+_retire_abandoned_gate_park() {
+  local wt="$1" issue="$2"
+  _consume_gate_tag "$wt" "$issue"
+  clear_park_onset_epoch "$issue"
+  _afk_clear_warned "$issue"
+  clear_answer_drop "$issue"
+  broker_journal_decision "$issue" gate-abandoned \
+    "spoke coded past its PLAN gate without a reply (#117) — retired the abandoned gate episode" reversible
+}
+
+# _broker_retire_if_coded_past_gate <wt> <issue> <was_gate> -> rc 0 (retired — the caller must
+# then return) when this is a PLAN-gate park the spoke coded PAST without a reply (#117/#312); rc 1
+# otherwise (the caller falls through to its plain moved-on drop, unchanged). Shared by BOTH
+# moved-on drop sites — the ANSWER pre-inject drop and the ESCALATE/no-decision drop — so an
+# abandoned gate is retired whatever the reasoner returned, not only on an ANSWER.
+_broker_retire_if_coded_past_gate() {
+  local wt="$1" issue="$2" was_gate="$3"
+  [ "$was_gate" -eq 1 ] || return 1
+  _gate_spoke_coded_past "$wt" || return 1
+  log "  #$issue coded past its PLAN gate without a reply (#117) — retiring the abandoned gate episode"
+  _retire_abandoned_gate_park "$wt" "$issue"
+}
+
 # decide_and_act <wt_path> <issue> -> reason about a parked spoke and act: inject the
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
@@ -744,6 +775,13 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
         broker_service_gate "$wt" "$issue" "$mode" "$(( depth + 1 ))"
         return $?
       fi
+      # #312: a PLAN-gate park the spoke coded PAST (#117 keeps-coding shape) is ABANDONED, not
+      # merely stale — this moved-on drop has just PROVEN the episode is over. Retire it here, by
+      # the actor that proved it (principle #1), so the gate/<n> tag + park onset do not linger and
+      # age into a watchdog park-undeliverable fire (and a reasoner run) every tick. Extends the
+      # #204 self-heal (top of this function) to the shape its typed-reply detector can't see; an
+      # ambiguous / non-coded-past read falls through to the plain drop below, unchanged.
+      if _broker_retire_if_coded_past_gate "$wt" "$issue" "$was_gate"; then return 0; fi
       log "  #$issue is no longer parked on that prompt — dropping the stale answer (spoke moved on)"
       note_answer_drop "$wt" "$issue" "$park_sig" "no longer parked on that prompt (spoke moved on)"
       return 0
@@ -832,6 +870,9 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   # it as "moved on" would drop every #201 escalation and re-paste onto the wedged composer
   # forever, with no blocked/<issue> ever stamped (#201 review, CONFIRMED).
   if [ "$inject_diagnosed" -eq 0 ] && _spoke_moved_on "$wt" "$parked_mtime"; then
+    # #312: same as the ANSWER-branch drop — a gate the spoke coded past is retired here too, so an
+    # ESCALATE/no-decision outcome on an abandoned gate stops re-running the reasoner every tick.
+    if _broker_retire_if_coded_past_gate "$wt" "$issue" "$was_gate"; then return 0; fi
     log "  #$issue transcript advanced while reasoning — dropping the escalation (spoke moved on)"
     return 0
   fi

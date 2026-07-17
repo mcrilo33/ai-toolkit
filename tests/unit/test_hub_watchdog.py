@@ -996,6 +996,54 @@ def test_park_undeliverable_quiet_when_a_delivery_already_landed_in_episode(tmp_
     assert rc == 1
 
 
+# ── issue #312: condition 1b inherits condition 1's drain-touched suppression ─────────────────
+# The #307 false-fire: park-undeliverable fired on a spoke the drain was ACTIVELY servicing
+# (permission-lane decisions journaled seconds around the fire) because 1b — unlike condition 1
+# (line 280) — never consulted _wd_drain_touched_recently. A drop on record off a stale onset is
+# not a shortfall when the drain is visibly handling the spoke. This suppression is distinct from
+# the deliberately-omitted warned-backoff one (#288): the backoff stays dropped so an
+# exhausted-backoff drop still surfaces; THIS suppresses only active, in-window servicing.
+
+
+def test_park_undeliverable_quiet_when_the_drain_decided_recently(tmp_path: Path) -> None:
+    # A broker decision for this issue inside the ceiling window is proof the drain is servicing
+    # the spoke (the #307 shape) — the drop on record must NOT read as an undeliverable shortfall.
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    _journal(sd, "5", int(NOW) - 12)  # the broker serviced a permission dialog 12s ago
+    (sd / "answer-drop-5").write_text(
+        f"{_head(wt)}\tsigA\t3\tno longer parked on that prompt (spoke moved on)\n"
+    )
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        "_broker_park_signature() { printf '%s' 'sigA'; }; "
+        f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_undeliverable '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 1
+
+
+def test_park_undeliverable_fires_when_a_stale_decision_is_the_only_touch(tmp_path: Path) -> None:
+    # #288 AC3 regression: a genuinely undeliverable park — drop on record, and the drain's last
+    # touch is OLDER than the ceiling (it decided long ago, then went idle) — must STILL fire. The
+    # suppression is bounded by RECENCY, not the mere existence of a past decision.
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    _journal(sd, "5", int(NOW) - 700)  # a decision, but older than the 600s ceiling
+    (sd / "answer-drop-5").write_text(
+        f"{_head(wt)}\tsigA\t3\tno longer parked on that prompt (spoke moved on)\n"
+    )
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        "_broker_park_signature() { printf '%s' 'sigA'; }; "
+        f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_undeliverable '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 0
+
+
 def test_park_undeliverable_reason_names_the_count_and_last_verdict(tmp_path: Path) -> None:
     wt = _git_repo(tmp_path)
     sd = tmp_path / "sd"
