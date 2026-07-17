@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -311,9 +312,11 @@ def test_skips_when_telemetry_package_missing(worktree: Path, tmp_path: Path) ->
         worktree, bindir, script=repo / ".ai-toolkit" / "scripts" / "telemetry-ingest-spoke.sh"
     )
 
-    # Assert: never a python call on a path that can't exist, and never a failed land
+    # Assert: never a python call on a path that can't exist, never a failed land, and the
+    # land log reads as a breakage rather than the benign "skipping" that hid this 4 days.
     assert result.returncode == 0, result.stderr
     assert not runlog.exists()
+    assert "BROKEN" in result.stderr
 
 
 # ── retry + backoff: a transient Langfuse outage is recoverable (issue #151) ──
@@ -467,42 +470,90 @@ def test_auth_unset_does_not_alarm(worktree: Path, tmp_path: Path) -> None:
     assert not alarmlog.exists(), "an auth-less host is a benign gate, not a broken install"
 
 
-def test_alarm_survives_a_broken_notifier(worktree: Path, tmp_path: Path) -> None:
-    # Principle 6: a best-effort signal must never fail the operation it observes. A notifier
-    # that does not exist, or exits non-zero, must not take the land down with it — the script
-    # runs under `set -uo pipefail` and this is the last thing standing between a broken
-    # install and a completed land.
+def test_alarm_notifies_via_osascript_when_no_notify_cmd_is_set(
+    worktree: Path, tmp_path: Path
+) -> None:
+    # AI_TOOLKIT_NOTIFY_CMD is a TEST seam — it is set nowhere in production, so osascript is
+    # the branch every real land takes, and it was the one branch the suite never executed.
+    # An empty value reads as unset to alarm()'s [ -n ] check, so this falls through to the
+    # real notifier path, with osascript stubbed on PATH (bindir is already prepended).
     repo = _make_repo(tmp_path, script_dir=".ai-toolkit/scripts")
     shutil.rmtree(repo / "scripts" / "telemetry")
     bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
     _make_python_stub(bindir, runlog)
+    osalog = tmp_path / "osascript-argv"
+    osa = bindir / "osascript"
+    osa.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{osalog}"\nexit 0\n')
+    osa.chmod(0o755)
 
     result = _run(
         worktree,
         bindir,
         script=repo / ".ai-toolkit" / "scripts" / "telemetry-ingest-spoke.sh",
-        extra_env={"AI_TOOLKIT_NOTIFY_CMD": "/nonexistent/notifier-that-is-not-there"},
-    )
-
-    assert result.returncode == 0, "a broken notifier must never fail the land"
-
-
-def test_broken_install_says_so_on_stderr(worktree: Path, tmp_path: Path) -> None:
-    # The land log is still the forensic record even though it is not the alarm: it must read
-    # as a breakage, not as the benign "skipping" that hid this for 4 days.
-    repo = _make_repo(tmp_path, script_dir=".ai-toolkit/scripts")
-    shutil.rmtree(repo / "scripts" / "telemetry")
-    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
-    _make_python_stub(bindir, runlog)
-
-    result = _run(
-        worktree, bindir, script=repo / ".ai-toolkit" / "scripts" / "telemetry-ingest-spoke.sh"
+        extra_env={"AI_TOOLKIT_NOTIFY_CMD": ""},
     )
 
     assert result.returncode == 0, result.stderr
-    assert "BROKEN" in result.stderr, (
-        "a broken install must read as a breakage in the land log, not as a benign skip"
+    assert osalog.exists(), "with no notify seam set, the alarm must reach osascript"
+    argv = osalog.read_text()
+    assert "display notification" in argv
+    assert SPOKE_RUN_ID in argv, "the notification must name the spoke whose scores were lost"
+
+
+def test_alarm_escapes_quotes_for_the_applescript_literal(worktree: Path, tmp_path: Path) -> None:
+    # The escaping is the reason this branch exists (hub-notify.sh learned it the hard way):
+    # an unescaped quote or backslash in the interpolated path/id makes osascript fail to
+    # COMPILE, and the trailing `|| true` then silently drops the very ping that matters most.
+    # The spoke-run-id comes off disk, so it is the untrusted-ish value that reaches the literal.
+    (worktree / ".ai-toolkit" / "spoke-run-id").write_text('a"quote\\and-backslash\n')
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_flaky_python_stub(bindir, runlog, fail_times=99)
+    osalog = tmp_path / "osascript-argv"
+    osa = bindir / "osascript"
+    osa.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{osalog}"\nexit 0\n')
+    osa.chmod(0o755)
+
+    result = _run(
+        worktree,
+        bindir,
+        extra_env={"AI_TOOLKIT_INGEST_RETRIES": "1", "AI_TOOLKIT_NOTIFY_CMD": ""},
     )
+
+    assert result.returncode == 0, result.stderr
+    argv = osalog.read_text()
+    assert '\\"' in argv, "a quote must reach the AppleScript literal escaped, or it won't compile"
+    assert "\\\\" in argv, "a backslash must be escaped FIRST, or the escaping doubles up"
+
+
+def test_alarm_cannot_fail_its_caller_even_under_set_e(tmp_path: Path) -> None:
+    # Principle 6, pinned where it can actually break. End-to-end the script cannot fail here
+    # (no `set -e`, and an explicit exit 0 follows every call site), so an end-to-end test
+    # passes even with the `|| true` deleted — it proves nothing. Lift the REAL alarm() out
+    # and run it under `set -e` with a notifier that exits non-zero: that is the guard the
+    # `|| true` provides, and the trap a future `set -e` on this script would spring.
+    alarm_fn = re.search(r"^alarm\(\) \{$.*?^\}$", INGEST.read_text(), re.MULTILINE | re.DOTALL)
+    assert alarm_fn, "alarm() not found in telemetry-ingest-spoke.sh"
+    failing_notifier = tmp_path / "notifier"
+    failing_notifier.write_text("#!/bin/sh\nexit 42\n")
+    failing_notifier.chmod(0o755)
+    harness = "\n".join(
+        [
+            "set -euo pipefail",
+            'PROG="telemetry-ingest-spoke"',
+            'warn() { printf \'%s: %s\\n\' "$PROG" "$*" >&2; }',
+            f'AI_TOOLKIT_NOTIFY_CMD="{failing_notifier}"',
+            alarm_fn.group(0),
+            'alarm "the ingest is broken"',
+            'echo "SURVIVED"',
+        ]
+    )
+
+    result = subprocess.run(["bash", "-c", harness], capture_output=True, text=True)
+
+    assert "SURVIVED" in result.stdout, (
+        f"alarm() must not abort its caller under set -e: {result.stdout + result.stderr}"
+    )
+    assert result.returncode == 0
 
 
 # ── degraded re-run from the spoke_run_id alone (issue #151) ──────────────────
@@ -622,6 +673,42 @@ def test_skips_when_spoke_run_id_missing(worktree: Path, tmp_path: Path) -> None
     # Assert
     assert result.returncode == 0, result.stderr
     assert not runlog.exists()
+
+
+def test_missing_spoke_run_id_past_the_otel_gate_fires_the_alarm(
+    worktree: Path, tmp_path: Path
+) -> None:
+    # Past the OTel gate this is BROKEN, not benign: worktree-new.sh writes spoke-run-id
+    # unconditionally when it mints .ai-toolkit/, and only creates raw-bodies later under
+    # AI_TOOLKIT_OTEL=1 — so raw-bodies existing implies the id was written. Its absence means
+    # something removed it, and the spoke's scores are lost exactly as with a missing package.
+    (worktree / ".ai-toolkit" / "spoke-run-id").unlink()
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+    alarmlog = tmp_path / "alarms"
+    notify = _make_notify_stub(bindir, alarmlog)
+
+    result = _run(worktree, bindir, extra_env={"AI_TOOLKIT_NOTIFY_CMD": str(notify)})
+
+    assert result.returncode == 0, "the alarm must never fail the land"
+    assert alarmlog.exists(), (
+        "a missing spoke-run-id on an OTel spoke is a broken install, not a benign skip"
+    )
+
+
+def test_empty_spoke_run_id_past_the_otel_gate_fires_the_alarm(
+    worktree: Path, tmp_path: Path
+) -> None:
+    (worktree / ".ai-toolkit" / "spoke-run-id").write_text("\n")
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+    alarmlog = tmp_path / "alarms"
+    notify = _make_notify_stub(bindir, alarmlog)
+
+    result = _run(worktree, bindir, extra_env={"AI_TOOLKIT_NOTIFY_CMD": str(notify)})
+
+    assert result.returncode == 0, "the alarm must never fail the land"
+    assert alarmlog.exists(), "an empty spoke-run-id is a broken install, not a benign skip"
 
 
 def _git(repo: Path, *args: str) -> None:

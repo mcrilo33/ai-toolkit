@@ -205,12 +205,19 @@ else
   [ -d "$BODY_DIR" ] || exit 0
 
   # The id every ingester keys on; without it there is nothing to assemble.
+  #
+  # LOUD (#319): past the OTel gate this is BROKEN, not benign. worktree-new.sh writes
+  # spoke-run-id unconditionally when it mints .ai-toolkit/, and creates raw-bodies only
+  # under AI_TOOLKIT_OTEL=1 — strictly later. So a raw-bodies dir implies the id was
+  # written, and its absence here means something removed or truncated it. The scores are
+  # lost exactly as they are for a missing package, and warning into the same unread land
+  # log is the #319 shape all over again.
   if [ ! -r "$ID_FILE" ]; then
-    warn "no spoke-run-id under $AIT_DIR — skipping Langfuse ingestion"
+    alarm "no spoke-run-id under $AIT_DIR though raw-bodies exists (an OTel spoke is minted with one) — NO Langfuse ingestion for $WT_DIR"
     exit 0
   fi
   SPOKE_RUN_ID="$(head -n1 "$ID_FILE" | tr -d '[:space:]')"
-  [ -n "$SPOKE_RUN_ID" ] || { warn "spoke-run-id file is empty — skipping Langfuse ingestion"; exit 0; }
+  [ -n "$SPOKE_RUN_ID" ] || { alarm "spoke-run-id file at $ID_FILE is empty — NO Langfuse ingestion for $WT_DIR"; exit 0; }
 fi
 
 # Auth gate: warn-and-continue, never fail the land. A manual re-run has no
