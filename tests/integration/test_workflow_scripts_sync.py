@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -160,3 +161,170 @@ class TestWorkflowScriptSync:
         assert not (target_repo / ".ai-toolkit" / "scripts").exists()
         for rel in INSTALLED.values():
             assert f"[dry-run] would write {rel}" in result.stdout
+
+
+# ── the telemetry python PACKAGE (issue #319) ─────────────────────────────────
+# telemetry-ingest-spoke.sh resolves the view builder at $SCRIPT_DIR/telemetry when it is
+# not running from a git checkout — which is exactly the drain's temp self-copy. The sync
+# shipped the .sh files but never the PACKAGE, so that probe missed on every drain land and
+# the post-run ingestion was silently skipped: 51 lands over 4 days produced no cycle-step
+# scores. These pin the package into a synced target as a COMPLETE, IMPORTABLE unit.
+TELEMETRY_SRC = REPO_ROOT / "scripts" / "telemetry"
+TELEMETRY_DST = ".ai-toolkit/scripts/telemetry"
+
+
+def _package_sources() -> set[str]:
+    """Every source file of the telemetry package, as paths relative to the package root.
+
+    Enumerated from the source tree — never a hand-listed manifest (#316's lesson: a list
+    is a thing to forget). ``__pycache__`` is excluded: it is a build artifact, not part of
+    the package, and the hub EXECUTES this package in place so it is always present there.
+    """
+    return {
+        str(f.relative_to(TELEMETRY_SRC))
+        for f in TELEMETRY_SRC.rglob("*")
+        if f.is_file() and "__pycache__" not in f.parts
+    }
+
+
+def _import_from_target(target: Path, module: str) -> subprocess.CompletedProcess[str]:
+    """Import `module` in a subprocess whose only telemetry source is the synced target.
+
+    Uses ``sys.executable`` (the interpreter running the suite) rather than a hardcoded
+    python3.12: the ingest script pins 3.12 for the real run, but this asserts the SYNCED
+    TREE is importable, which is interpreter-independent — and this host's python3 is 3.14.
+    Runs with cwd inside the target and PYTHONPATH pinned to the synced scripts dir, and
+    prints the resolved ``__file__`` so the caller can prove it loaded from the target and
+    not from some other checkout on the path.
+    """
+    return subprocess.run(
+        [sys.executable, "-c", f"import {module} as m; print(m.__file__)"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(target / ".ai-toolkit" / "scripts")},
+        cwd=str(target),
+    )
+
+
+@pytest.fixture()
+def source_pycache() -> Path:
+    """A ``__pycache__`` in the source package — the hub's steady state.
+
+    The hub runs the view builder straight out of ``scripts/telemetry``, so CPython writes
+    bytecode caches there. A copy that does not prune them ships stale .pyc into every
+    target and churns the manifest. Creates a uniquely-named sentinel and removes only
+    that, so a real cache (and a parallel run) is left untouched.
+    """
+    sentinel = TELEMETRY_SRC / "__pycache__" / "sync_pin_319.cpython-39.pyc"
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_bytes(b"stale bytecode that must never reach a target\n")
+    yield sentinel
+    sentinel.unlink(missing_ok=True)
+
+
+class TestTelemetryPackageSync:
+    """Sync installs the telemetry package COMPLETE and IMPORTABLE at .ai-toolkit/scripts/."""
+
+    MANIFEST_NAME = ".ai-toolkit-manifest.json"
+
+    def test_package_is_installed_complete(self, target_repo: Path) -> None:
+        # Complete BY CONSTRUCTION: every source file, whatever its extension. A package
+        # copied partially is a package that imports until it doesn't.
+        _run_sync(target_repo, "claude")
+
+        installed = {
+            str(f.relative_to(target_repo / TELEMETRY_DST))
+            for f in (target_repo / TELEMETRY_DST).rglob("*")
+            if f.is_file()
+        }
+        assert _package_sources() <= installed, (
+            f"missing from the synced package: {sorted(_package_sources() - installed)}"
+        )
+
+    def test_installed_package_matches_source(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "claude")
+
+        for rel in _package_sources():
+            assert (target_repo / TELEMETRY_DST / rel).read_bytes() == (
+                TELEMETRY_SRC / rel
+            ).read_bytes(), f"{rel} differs from source"
+
+    def test_package_is_importable_in_target(self, target_repo: Path) -> None:
+        # The acceptance criterion, asserted literally: present AND importable. Uses a
+        # dependency-free leaf so the pin holds even where PyYAML is absent, and proves the
+        # module resolved from the TARGET rather than from another checkout on the path.
+        _run_sync(target_repo, "claude")
+
+        result = _import_from_target(target_repo, "telemetry.spoke_tree.scores")
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.startswith(str(target_repo)), (
+            f"resolved outside the target: {result.stdout!r}"
+        )
+
+    def test_view_builder_entrypoint_is_importable_in_target(self, target_repo: Path) -> None:
+        # The module telemetry-ingest-spoke.sh actually runs. It reaches PyYAML through
+        # spoke_tree.context_deltas' unguarded top-level `import yaml`, so gate the pin on
+        # the dependency being present rather than assert a stdlib-only package it is not.
+        # (A synced target WITHOUT PyYAML genuinely cannot ingest — that is a broken install,
+        # and the #319 alarm in telemetry-ingest-spoke.sh is what surfaces it.)
+        pytest.importorskip("yaml")
+        _run_sync(target_repo, "claude")
+
+        result = _import_from_target(target_repo, "telemetry.langfuse_spoke_tree")
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.startswith(str(target_repo)), (
+            f"resolved outside the target: {result.stdout!r}"
+        )
+
+    def test_package_recorded_in_manifest_for_every_tool(self, target_repo: Path) -> None:
+        # Recorded per-file so the GC reclaims a module that is later deleted upstream —
+        # an unrecorded copy would silently strand removed modules in every target.
+        _run_sync(target_repo, "all")
+
+        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
+        for tool in ("copilot", "cursor", "claude"):
+            for rel in _package_sources():
+                assert f"{TELEMETRY_DST}/{rel}" in manifest["tools"][tool], (
+                    f"{tool}: {TELEMETRY_DST}/{rel} missing from manifest"
+                )
+
+    def test_pycache_is_not_synced(self, target_repo: Path, source_pycache: Path) -> None:
+        assert source_pycache.exists(), "fixture failed to stage the source __pycache__"
+
+        _run_sync(target_repo, "claude")
+
+        # Guard against a vacuous pass: with no package installed the stray-scan below finds
+        # nothing and the test would "pass" while proving nothing at all.
+        assert (target_repo / TELEMETRY_DST).is_dir(), "no package installed — nothing to prune"
+        strays = [
+            str(f.relative_to(target_repo))
+            for f in (target_repo / TELEMETRY_DST).rglob("*")
+            if "__pycache__" in f.parts or f.suffix == ".pyc"
+        ]
+        assert strays == [], f"build artifacts leaked into the target: {strays}"
+
+    def test_resync_is_byte_identical(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "all")
+        first = {
+            rel: (target_repo / TELEMETRY_DST / rel).read_bytes() for rel in _package_sources()
+        }
+
+        _run_sync(target_repo, "all")
+
+        second = {
+            rel: (target_repo / TELEMETRY_DST / rel).read_bytes() for rel in _package_sources()
+        }
+        assert first == second
+
+    def test_dry_run_does_not_install_the_package(self, target_repo: Path) -> None:
+        result = subprocess.run(
+            ["bash", str(SYNC_SCRIPT), str(target_repo), "claude", "--dry-run"],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert not (target_repo / TELEMETRY_DST).exists()
+        assert f"[dry-run] would write {TELEMETRY_DST}/langfuse_spoke_tree.py" in result.stdout

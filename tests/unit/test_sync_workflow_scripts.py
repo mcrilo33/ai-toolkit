@@ -47,6 +47,14 @@ def _for_name_list() -> list[str]:
     return match.group(1).split()
 
 
+def _copy_telemetry_package_body() -> str:
+    """The body of the ``copy_telemetry_package()`` helper in sync-to-repo.sh (issue #319)."""
+    text = SYNC_SCRIPT.read_text()
+    match = re.search(r"^copy_telemetry_package\(\) \{$(.*?)^\}$", text, re.MULTILINE | re.DOTALL)
+    assert match, "copy_telemetry_package() function not found in sync-to-repo.sh"
+    return match.group(1)
+
+
 def test_travel_local_registered_in_sync_loop() -> None:
     assert "travel-local.sh" in _for_name_list(), (
         "travel-local.sh is not registered in sync_workflow_scripts() — it will not sync "
@@ -253,3 +261,53 @@ def test_hub_watchdog_module_source_exists_and_is_executable(module: str) -> Non
     src = HUB_SCRIPTS_DIR / f"hub-watchdog-{module}.sh"
     assert src.is_file(), f"shared/skills/hub/scripts/hub-watchdog-{module}.sh missing"
     assert os.access(src, os.X_OK), f"hub-watchdog-{module}.sh is not executable"
+
+
+# ── telemetry package registration (issue #319) ───────────────────────────────
+# The `for name in …` loop copies .sh FILES; the telemetry python PACKAGE needs its own
+# recursive step. Without it .ai-toolkit/scripts/telemetry never exists, so the drain's
+# self-copy (built from the synced scripts) has no package either and every drain land
+# silently skipped the post-run ingestion — 51 lands, 4 days, no cycle-step scores. These
+# are the source-level guards; the end-to-end outcome (complete + importable in a target)
+# is covered by tests/integration/test_workflow_scripts_sync.py.
+TELEMETRY_PKG = REPO_ROOT / "scripts" / "telemetry"
+
+
+def test_telemetry_package_copy_invoked_in_sync_workflow_scripts() -> None:
+    assert "copy_telemetry_package" in _sync_workflow_scripts_body(), (
+        "sync_workflow_scripts() never copies the telemetry package — a synced target and "
+        "the drain's self-copy would both lack it, and every land skips Langfuse ingestion"
+    )
+
+
+def test_telemetry_package_copy_enumerates_the_source_tree() -> None:
+    # Complete BY CONSTRUCTION (#316's lesson, applied to a package): the copy must walk the
+    # source tree, never a hand-listed set of module names. A manifest is a thing to forget,
+    # and a forgotten module is an ImportError on a land nobody is watching.
+    body = _copy_telemetry_package_body()
+    assert "find " in body, (
+        "copy_telemetry_package must enumerate the package with find, not a hand-listed manifest"
+    )
+    hardcoded = [m.name for m in TELEMETRY_PKG.glob("*.py") if m.name in body]
+    assert hardcoded == [], (
+        f"copy_telemetry_package hard-codes module names {hardcoded} — enumerate the tree instead"
+    )
+
+
+def test_telemetry_package_copy_prunes_pycache() -> None:
+    # The hub EXECUTES the package in place, so __pycache__ is always present at the source;
+    # copying it ships stale bytecode into every target and churns the sync manifest.
+    assert "__pycache__" in _copy_telemetry_package_body(), (
+        "copy_telemetry_package must prune __pycache__ — the hub's source tree always has one"
+    )
+
+
+def test_telemetry_package_source_exists() -> None:
+    # The view builder telemetry-ingest-spoke.sh runs, and the package marker that makes the
+    # tree importable once PYTHONPATH points at the synced scripts dir.
+    assert (TELEMETRY_PKG / "langfuse_spoke_tree.py").is_file(), (
+        "scripts/telemetry/langfuse_spoke_tree.py missing — the sync would copy no view builder"
+    )
+    assert (TELEMETRY_PKG / "__init__.py").is_file(), (
+        "scripts/telemetry/__init__.py missing — the synced tree would not be importable"
+    )
