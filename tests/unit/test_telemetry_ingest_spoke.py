@@ -305,10 +305,9 @@ def test_skips_when_telemetry_package_missing(worktree: Path, tmp_path: Path) ->
         worktree, bindir, script=repo / ".ai-toolkit" / "scripts" / "telemetry-ingest-spoke.sh"
     )
 
-    # Assert: warn-and-skip — never a python call on a path that can't exist
+    # Assert: never a python call on a path that can't exist, and never a failed land
     assert result.returncode == 0, result.stderr
     assert not runlog.exists()
-    assert "skipping" in result.stderr
 
 
 # ── retry + backoff: a transient Langfuse outage is recoverable (issue #151) ──
@@ -355,6 +354,149 @@ def test_view_builder_not_retried_when_first_attempt_succeeds(
 
     assert result.returncode == 0, result.stderr
     assert len(runlog.read_text().splitlines()) == 1, "a green first attempt is never retried"
+
+
+# ── a BROKEN ingest is loud, a benign skip stays quiet (issue #319) ───────────
+# The #319 outage was not that the failure went unrecorded — the warn DID print in
+# land-317.log, 51 times. It was that nobody reads land logs, so 4 days of lost cost/token/
+# duration scores surfaced only when a human noticed an empty dashboard widget. A louder
+# stderr line would have fixed nothing; the signal has to leave the log.
+#
+# The line drawn here: by the time the package probe runs we KNOW this is an OTel spoke
+# (raw-bodies exists) and auth is set — ingestion was EXPECTED and is now impossible. That is
+# a broken install, not a skip, and it alarms. The genuinely benign gates (not an OTel spoke,
+# no auth) are expected states and stay silent. Nothing here may ever fail the land
+# (AFK Design Principle 6) — a telemetry write must not break the operation it observes.
+
+
+def _make_notify_stub(bindir: Path, alarmlog: Path, *, exit_code: int = 0) -> Path:
+    """A notifier stub for AI_TOOLKIT_NOTIFY_CMD that records the message it is handed."""
+    bindir.mkdir(parents=True, exist_ok=True)
+    stub = bindir / "notify-stub"
+    stub.write_text(f'#!/bin/sh\nprintf "ALARM %s\\n" "$1" >> "{alarmlog}"\nexit {exit_code}\n')
+    stub.chmod(0o755)
+    return stub
+
+
+def test_missing_package_fires_the_alarm(worktree: Path, tmp_path: Path) -> None:
+    # The #319 land itself: an OTel spoke, auth set, package absent — a broken install that
+    # silently produced no scores for 51 lands.
+    repo = _make_repo(tmp_path, script_dir=".ai-toolkit/scripts")
+    shutil.rmtree(repo / "scripts" / "telemetry")
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+    alarmlog = tmp_path / "alarms"
+    notify = _make_notify_stub(bindir, alarmlog)
+
+    result = _run(
+        worktree,
+        bindir,
+        script=repo / ".ai-toolkit" / "scripts" / "telemetry-ingest-spoke.sh",
+        extra_env={"AI_TOOLKIT_NOTIFY_CMD": str(notify)},
+    )
+
+    assert result.returncode == 0, "the alarm must never fail the land"
+    assert alarmlog.exists(), "a missing telemetry package must fire the alarm, not warn quietly"
+    assert SPOKE_RUN_ID in alarmlog.read_text(), "the alarm must name the spoke it lost"
+
+
+def test_retry_exhausted_fires_the_alarm(worktree: Path, tmp_path: Path) -> None:
+    # The other half of "missing/broken": the package resolves but the builder fails every
+    # attempt (Langfuse down, a missing PyYAML in the target, a bad interpreter). The scores
+    # are just as lost, so it is just as loud.
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_flaky_python_stub(bindir, runlog, fail_times=99)
+    alarmlog = tmp_path / "alarms"
+    notify = _make_notify_stub(bindir, alarmlog)
+
+    result = _run(
+        worktree,
+        bindir,
+        extra_env={"AI_TOOLKIT_INGEST_RETRIES": "2", "AI_TOOLKIT_NOTIFY_CMD": str(notify)},
+    )
+
+    assert result.returncode == 0, "the alarm must never fail the land"
+    assert alarmlog.exists(), "an ingest that exhausted its retries must fire the alarm"
+
+
+def test_successful_ingest_does_not_alarm(worktree: Path, tmp_path: Path) -> None:
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+    alarmlog = tmp_path / "alarms"
+    notify = _make_notify_stub(bindir, alarmlog)
+
+    result = _run(worktree, bindir, extra_env={"AI_TOOLKIT_NOTIFY_CMD": str(notify)})
+
+    assert result.returncode == 0, result.stderr
+    assert not alarmlog.exists(), "a green ingest must be silent"
+
+
+def test_non_otel_spoke_does_not_alarm(tmp_path: Path) -> None:
+    # An ordinary (non-OTel) spoke has nothing to ingest. Expected state, not a breakage —
+    # alarming here would cry wolf on every non-OTel land and train the human to ignore it.
+    wt = tmp_path / "wt"
+    (wt / ".ai-toolkit").mkdir(parents=True)  # no raw-bodies dir
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+    alarmlog = tmp_path / "alarms"
+    notify = _make_notify_stub(bindir, alarmlog)
+
+    result = _run(wt, bindir, extra_env={"AI_TOOLKIT_NOTIFY_CMD": str(notify)})
+
+    assert result.returncode == 0, result.stderr
+    assert not alarmlog.exists(), "a non-OTel spoke is a benign skip, not a broken install"
+
+
+def test_auth_unset_does_not_alarm(worktree: Path, tmp_path: Path) -> None:
+    # No Langfuse credentials is a documented benign gate (a manual land on a host with no
+    # auth), not a broken install.
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+    alarmlog = tmp_path / "alarms"
+    notify = _make_notify_stub(bindir, alarmlog)
+
+    result = _run(worktree, bindir, auth=None, extra_env={"AI_TOOLKIT_NOTIFY_CMD": str(notify)})
+
+    assert result.returncode == 0, result.stderr
+    assert not alarmlog.exists(), "an auth-less host is a benign gate, not a broken install"
+
+
+def test_alarm_survives_a_broken_notifier(worktree: Path, tmp_path: Path) -> None:
+    # Principle 6: a best-effort signal must never fail the operation it observes. A notifier
+    # that does not exist, or exits non-zero, must not take the land down with it — the script
+    # runs under `set -uo pipefail` and this is the last thing standing between a broken
+    # install and a completed land.
+    repo = _make_repo(tmp_path, script_dir=".ai-toolkit/scripts")
+    shutil.rmtree(repo / "scripts" / "telemetry")
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    result = _run(
+        worktree,
+        bindir,
+        script=repo / ".ai-toolkit" / "scripts" / "telemetry-ingest-spoke.sh",
+        extra_env={"AI_TOOLKIT_NOTIFY_CMD": "/nonexistent/notifier-that-is-not-there"},
+    )
+
+    assert result.returncode == 0, "a broken notifier must never fail the land"
+
+
+def test_broken_install_says_so_on_stderr(worktree: Path, tmp_path: Path) -> None:
+    # The land log is still the forensic record even though it is not the alarm: it must read
+    # as a breakage, not as the benign "skipping" that hid this for 4 days.
+    repo = _make_repo(tmp_path, script_dir=".ai-toolkit/scripts")
+    shutil.rmtree(repo / "scripts" / "telemetry")
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    result = _run(
+        worktree, bindir, script=repo / ".ai-toolkit" / "scripts" / "telemetry-ingest-spoke.sh"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "BROKEN" in result.stderr, (
+        "a broken install must read as a breakage in the land log, not as a benign skip"
+    )
 
 
 # ── degraded re-run from the spoke_run_id alone (issue #151) ──────────────────
