@@ -603,10 +603,17 @@ def _v_park(world: World, issue: int, now: int, step: dict, mutation: dict | Non
 
 def _v_answer(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
     """The drain services the park — SCRIPTED as the drain-authored records a real
-    answer_pass writes: a decision-journal entry (the watchdog's recency signal) and
-    an episode-keyed `answer_delivered` event. A mutation `drop`s these to reintroduce
-    the pre-#300 unrecorded-service that false-fired the watchdog (#263/#288)."""
-    world.write_journal(issue, now)
+    answer_pass writes. `via` selects which recency signal the watchdog reads:
+    `journal` (a decision-journal entry, default) or `progress` (a progress-epoch
+    advance). Both are paired with an episode-keyed `answer_delivered` event. A
+    mutation `drop`s these to reintroduce the pre-#300 unrecorded-service that
+    false-fired the watchdog (#263/#265/#283/#288)."""
+    via = step.get("via", "journal")
+    if via == "progress":
+        if "progress" not in world.dropped:
+            world.write_epoch("progress", issue, now)
+    else:
+        world.write_journal(issue, now)
     world.event(
         issue,
         "answer_delivered",
@@ -661,6 +668,13 @@ def _v_epoch(world: World, issue: int, now: int, step: dict, mutation: dict | No
     world.write_epoch(step["name"], issue, now)
 
 
+def _v_journal(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
+    """A bare decision-journal entry with NO real service behind it — a stale record
+    that the watchdog reads as recent servicing. Used by a mutation to falsely suppress
+    the #310 backstop (the drain looked busy, so nothing escalated the jam)."""
+    world.write_journal(issue, now)
+
+
 _VERBS = {
     "park": _v_park,
     "push": _v_push,
@@ -672,6 +686,7 @@ _VERBS = {
     "block": _v_block,
     "answer": _v_answer,
     "epoch": _v_epoch,
+    "journal": _v_journal,
 }
 
 
@@ -754,29 +769,29 @@ _SERVICE_EVENTS = {"answer_delivered", "approval_injected", "waived"}
 _ESCALATE = {"escalated", "answer_dropped"}
 
 
-def inv_park_ceiling_escalates(world: World, scenario: dict) -> list[Violation]:
-    """I3 (#310): a spoke that parked and whose scenario declares the park outlived
-    the answer ceiling is never left silently parked — the drain records a service
-    (`answer_delivered`), an escalation (`escalated`/`blocked`), or a forward
-    transition (principle 3: act when unattended; escalate only the irreversible)."""
+def inv_unserviced_park_backstopped(world: World, scenario: dict) -> list[Violation]:
+    """I3 (#310): the watchdog is the BACKSTOP. A park declared past the ceiling AND
+    unserviced MUST be fired by the watchdog (which then intervenes) — never left to
+    rot. A stale record that falsely reads as "serviced" suppresses the backstop and
+    reproduces the #310 silent 10-hour jam (principle 3: act when unattended; a stall
+    jams every dependent)."""
     out: list[Violation] = []
     for issue in _scenario_issues(scenario):
-        if not _spoke_truth(scenario, issue).get("parked_past_ceiling"):
+        truth = _spoke_truth(scenario, issue)
+        if not (truth.get("parked_past_ceiling") and not truth.get("serviced")):
             continue
-        states = {t["to"] for t in world.transitions(issue)}
-        events = {e.get("event") for e in world.events(issue)}
-        serviced = bool(events & _SERVICE_EVENTS) or bool(events & _ESCALATE)
-        escalated = "blocked" in states
-        advanced = bool(states & _FORWARD_STATES)
-        if not (serviced or escalated or advanced):
+        fired = any(
+            f.get("condition") in {"park-unanswered", "park-undeliverable"}
+            for f in world.fires(issue)
+        )
+        if not fired:
             out.append(
                 Violation(
                     "I3",
                     issue,
-                    f"#{issue} parked past the ceiling but the drain recorded no "
-                    f"answer, escalation, or advance (states={sorted(states)}, "
-                    f"events={sorted(e for e in events if e)}) — a stall jams every "
-                    f"dependent (principle 3).",
+                    f"#{issue} parked past the ceiling and was NEVER serviced, yet the "
+                    f"watchdog never fired — nothing escalated it (the #310 silent jam: "
+                    f"a stall jams every scope-dependent issue behind it, principle 3).",
                 )
             )
     return out
@@ -827,20 +842,17 @@ def inv_answered_park_advances(world: World, scenario: dict) -> list[Violation]:
 
 def inv_serviced_park_never_fired(world: World, scenario: dict) -> list[Violation]:
     """I6 (#263/#265/#283/#288): a park the scenario declares the drain SERVICED is
-    never fired park-unanswered/undeliverable by the watchdog. The drain records its
-    service (a decision-journal entry / an episode-keyed answer_delivered); the
-    watchdog reads that record and suppresses. Reintroducing the pre-#300 unrecorded
-    service (dropping the record) is what false-fired four times (principles 1, 6:
-    recorded state over inference; absence is not evidence)."""
+    never fired park-UNANSWERED ("no answer delivered") by the watchdog. The drain
+    records its service (a decision-journal entry / a progress epoch / an episode-keyed
+    answer_delivered); the watchdog reads that record and suppresses. Reintroducing the
+    pre-#300 unrecorded service (dropping the record) is what false-fired four times
+    (principles 1, 6). NB park-UNDELIVERABLE is the HONEST reason for a serviced park
+    whose delivery dropped (#288) — not a false silence — so it is not flagged here."""
     out: list[Violation] = []
     for issue in _scenario_issues(scenario):
         if not _spoke_truth(scenario, issue).get("serviced"):
             continue
-        bad = [
-            f
-            for f in world.fires(issue)
-            if f.get("condition") in {"park-unanswered", "park-undeliverable"}
-        ]
+        bad = [f for f in world.fires(issue) if f.get("condition") == "park-unanswered"]
         if bad:
             out.append(
                 Violation(
@@ -897,7 +909,7 @@ def inv_dead_agent_never_injected(world: World, scenario: dict) -> list[Violatio
 INVARIANTS = [
     inv_pushed_ready_lands,
     inv_landing_never_dead_pane,
-    inv_park_ceiling_escalates,
+    inv_unserviced_park_backstopped,
     inv_answered_park_advances,
     inv_dead_agent_never_injected,
     inv_serviced_park_never_fired,
@@ -951,7 +963,12 @@ def _apply_mutation_env(world: World, mutation: dict) -> None:
 
 
 def _run_timeline(world: World, scenario: dict, *, mutation: dict | None) -> None:
-    for step in sorted(scenario["timeline"], key=lambda s: int(s["t"])):
+    # A mutation may INJECT extra timeline steps (e.g. a stale false-service record that
+    # suppresses the watchdog backstop) — merged in and re-sorted by fake-clock time.
+    steps = list(scenario["timeline"])
+    if mutation:
+        steps += mutation.get("inject", [])
+    for step in sorted(steps, key=lambda s: int(s["t"])):
         apply_step(world, step, mutation=mutation)
 
 

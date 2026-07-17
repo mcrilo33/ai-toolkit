@@ -1,0 +1,23 @@
+id: 288-serviced-park-not-unanswered
+stresses:
+  incident: 288
+  invariant: I6
+  principle: "1,6"
+spokes:
+  - issue: 288
+    slug: gate
+    truth:
+      serviced: true
+timeline:
+  - { t: 0, spoke: 288, do: park }
+  - { t: 10, run: [watchdog] }
+  # The drain DID reason about this park and record its service. Even if a delivery
+  # later drops, the honest reason is park-undeliverable — never the misleading
+  # park-UNANSWERED ("no answer delivered"), which is what #288 forbids.
+  - { t: 500, spoke: 288, do: answer }
+  - { t: 700, run: [watchdog] }
+expect:
+  violations: []
+mutation:
+  drop: [journal, answer_delivered]
+  expect_violation: I6

@@ -1,0 +1,22 @@
+id: 283-park-progress-suppressed
+stresses:
+  incident: 283
+  invariant: I6
+  principle: "1,6"
+spokes:
+  - issue: 283
+    slug: gate
+    truth:
+      serviced: true
+timeline:
+  - { t: 0, spoke: 283, do: park }
+  - { t: 10, run: [watchdog] }
+  # The drain touched the spoke via a PROGRESS-epoch advance (dropped/recomputed/backed
+  # off mid-service, the #283 shape) — a distinct recency signal from the journal.
+  - { t: 500, spoke: 283, do: answer, via: progress }
+  - { t: 700, run: [watchdog] }
+expect:
+  violations: []
+mutation:
+  drop: [progress, answer_delivered]
+  expect_violation: I6

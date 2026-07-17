@@ -1,0 +1,28 @@
+id: 312-answered-park-advances
+stresses:
+  incident: 312
+  invariant: I4
+  principle: "5,6"
+spokes:
+  - issue: 312
+    slug: gate
+    truth:
+      serviced: true
+      advances: true
+timeline:
+  - { t: 0, spoke: 312, do: park }
+  - { t: 10, run: [watchdog] }
+  # The drain answers the park (records the service)...
+  - { t: 100, spoke: 312, do: answer }
+  # ...and the spoke ADVANCES — it resumes working and pushes (a forward transition),
+  # never silently re-parking on the same episode (#312).
+  - { t: 200, spoke: 312, do: push }
+  # Past the ceiling, but serviced + advanced: the watchdog must NOT re-fire.
+  - { t: 700, run: [watchdog] }
+expect:
+  violations: []
+mutation:
+  # Withhold the forward transition: the answered park never advances (it re-parked) —
+  # the #312 shape where a serviced episode is re-interpreted as still-stuck.
+  drop: [pushing, pushed]
+  expect_violation: I4
