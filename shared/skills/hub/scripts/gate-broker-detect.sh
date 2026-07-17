@@ -474,6 +474,57 @@ sys.exit(0 if approved else 1)
 PYEOF
 }
 
+# _gate_spoke_coded_past <wt> -> rc 0 when the spoke emitted its PLAN gate and then KEPT CODING
+# without a reply (the #117 shape): an assistant turn AFTER the last `spoke-ready.sh --gate`
+# emission proves the spoke generated new work past the gate. This is the keeps-coding twin of
+# _gate_answer_landed (#204): that proves a TYPED reply landed; this proves the spoke moved on
+# under its own steam, which the typed-reply detector can never see. The moved-on drop uses it to
+# RETIRE the abandoned gate episode (#312) instead of leaving gate/<n> at the tip to age. The
+# gate emission's OWN tool_result (a user turn) does not count — only a later ASSISTANT turn does,
+# so a spoke genuinely parked right after the emission stays "not coded past". A re-park (another
+# gate emission) resets the evidence, so a spoke sitting at a fresh gate is not read as coded past.
+# Fail-CLOSED (rc 1): no transcript, no python3, or no post-gate assistant turn means "cannot
+# prove the spoke coded past" -> the caller does NOT retire (an ambiguous read never retires a
+# real park).
+_gate_spoke_coded_past() {
+  local wt="$1" jsonl
+  jsonl="$(_spoke_jsonl "$wt")"
+  [ -n "$jsonl" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
+import json, os, sys
+
+parked = False
+advanced = False
+try:
+    with open(os.environ["_AFK_JSONL"], encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                continue
+            content = (obj.get("message") or {}).get("content")
+            blocks = content if isinstance(content, list) else []
+            is_gate = any(
+                isinstance(b, dict)
+                and b.get("type") == "tool_use"
+                and b.get("name") == "Bash"
+                and "spoke-ready.sh --gate" in ((b.get("input") or {}).get("command") or "")
+                for b in blocks
+            )
+            if is_gate:
+                parked = True        # a (re-)park resets the "advanced past it" evidence
+                advanced = False
+            elif parked:
+                advanced = True      # an assistant turn AFTER the emission = the spoke kept coding
+except Exception:
+    sys.exit(1)
+sys.exit(0 if advanced else 1)
+PYEOF
+}
+
 # _gate_artifact_path <wt> <issue> -> the gate plan artifact path (<wt>/.ai-toolkit/
 # gate-<issue>.md). The single owner of that layout, shared by _read_gate_artifact and
 # _consume_gate_tag (spoke-ready.sh writes the same path from the spoke side, #175). Falls

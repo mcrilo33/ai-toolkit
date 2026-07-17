@@ -510,6 +510,24 @@ _broker_try_fastpath_gate() {
   return 0
 }
 
+# _retire_abandoned_gate_park <wt> <issue> -> retire a PLAN-gate episode the spoke coded past
+# without a reply (#117/#312). The same teardown the #204 self-heal runs (top of
+# broker_service_gate), plus a journal line: consume the stale gate/<issue> tag (so the next tick
+# reads the spoke as busy, not a re-serviceable gate park — this is what stops the reasoner-run-
+# per-tick loop), credit + clear the park onset, drop the answer-lane warned-retry backoff, and
+# clear the answer-drop ledger for the now-resolved episode. Journaled under park kind
+# `gate-abandoned` (NOT `gate`) so it is auditable (#241) yet never mistaken for the #277
+# fast-path waive, which the `gate` kind emits as a `waived` lane event. Best-effort throughout.
+_retire_abandoned_gate_park() {
+  local wt="$1" issue="$2"
+  _consume_gate_tag "$wt" "$issue"
+  clear_park_onset_epoch "$issue"
+  _afk_clear_warned "$issue"
+  clear_answer_drop "$issue"
+  broker_journal_decision "$issue" gate-abandoned \
+    "spoke coded past its PLAN gate without a reply (#117) — retired the abandoned gate episode" reversible
+}
+
 # decide_and_act <wt_path> <issue> -> reason about a parked spoke and act: inject the
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
@@ -743,6 +761,17 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
         log "  #$issue still parked on a refreshed prompt (no reply landed) — recomputing against the current park (#241)"
         broker_service_gate "$wt" "$issue" "$mode" "$(( depth + 1 ))"
         return $?
+      fi
+      # #312: a PLAN-gate park the spoke coded PAST (#117 keeps-coding shape) is ABANDONED, not
+      # merely stale — this moved-on drop has just PROVEN the episode is over. Retire it here, by
+      # the actor that proved it (principle #1), so the gate/<n> tag + park onset do not linger and
+      # age into a watchdog park-undeliverable fire (and a reasoner run) every tick. Extends the
+      # #204 self-heal (top of this function) to the shape its typed-reply detector can't see; an
+      # ambiguous / non-coded-past read falls through to the plain drop below, unchanged.
+      if [ "$was_gate" -eq 1 ] && _gate_spoke_coded_past "$wt"; then
+        log "  #$issue coded past its PLAN gate without a reply (#117) — retiring the abandoned gate episode"
+        _retire_abandoned_gate_park "$wt" "$issue"
+        return 0
       fi
       log "  #$issue is no longer parked on that prompt — dropping the stale answer (spoke moved on)"
       note_answer_drop "$wt" "$issue" "$park_sig" "no longer parked on that prompt (spoke moved on)"
