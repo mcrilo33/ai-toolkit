@@ -345,6 +345,34 @@ tmux send-keys -t '<sess>:<window>' Enter          # separate Enter, not a trail
 - **Removal needs `--force` only when dirty.** Because `.claude/` is gitignored, a copied
   config does not make the worktree dirty, so a clean task removes without `--force`.
 
+## The `/afk` drain runs from a frozen, complete copy
+
+An armed `/afk` drain re-execs itself from a private temp copy of its scripts dir
+(`/T/hub-afk-self.XXXXXX`) so a land rewriting `hub-afk.sh` mid-tick cannot corrupt the
+running interpreter — bash lazily re-reads the script past `main()` on the exit path (#133).
+The copy must be a *complete* snapshot: the drain resolves its sibling modules and the
+rendered `spoke-model.env` from that dir, so a missing file silently degrades it (a
+config-less copy fell to the priciest model tier and cost real money — #291/#305/#306).
+
+Two invariants keep an incomplete runtime from ever running (issue #316):
+
+- **Complete by construction.** The copy is the *whole* scripts dir (`cp -R`), not a
+  filtered `*.sh` glob plus a hand-listed config seed. Every co-located sibling — `.sh`
+  modules, `spoke-model.env` / `ai_toolkit_config.py`, and any future file of any extension
+  — rides along automatically. There is no per-file manifest to forget.
+- **Loud, never a silent worse-default.** `cp -R` is not atomic, so before the drain execs
+  into the copy it asserts the copy carries every top-level file of the source
+  (`_afk_self_copy_complete`, dotfiles included). An incomplete copy is recorded in the
+  decision journal (durable — the nohup'd respawn/resume launches send stderr to `/dev/null`,
+  so a bare `wt_warn` alone would vanish), warned, and reclaimed; the drain then runs from the
+  *original* checkout (complete by definition) — it never execs a partial runtime and never
+  refuses to arm (AFK Design Principle 2).
+
+Self-update (#250) and watchdog respawn rebuild the copy through the same path
+(`env -u AFK_RUNNING_COPY`), so a recycled runtime is as complete as the armed one. This is
+orthogonal to the watchdog's stale-daemon guard (#296): that path proves a daemon out of
+date by hashing the *origin* source bundle, never the self-copy's contents.
+
 ## Task triage — three lanes
 
 Every task is classified on the hub (~10 seconds) before any worktree or issue is created:
