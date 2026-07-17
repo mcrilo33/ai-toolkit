@@ -119,6 +119,12 @@ def _run(
         # Pin the auth-resolver conf: a developer's real ~/.afk-telemetry must
         # never leak credentials into the auth-unset tests.
         "AFK_TELEMETRY_CONF": str(conf) if conf else "/nonexistent/afk-telemetry",
+        # Pin the #319 alarm's notifier to a no-op by default, for the same reason: left
+        # unset, alarm() falls through to the real osascript and every broken-install test
+        # fires an actual OS notification at whoever is running the suite — and the suite
+        # runs constantly under an /afk drain. A test that wants to OBSERVE the alarm
+        # overrides this with its own recording stub.
+        "AI_TOOLKIT_NOTIFY_CMD": "/nonexistent/notifier",
     }
     # A caller PYTHONPATH would suffix the exported one — drop it so the layout
     # tests can assert the resolved import path exactly.

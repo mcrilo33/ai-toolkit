@@ -21,11 +21,19 @@
 # Contract: this NEVER fails the land. It gates, warns, and returns 0 on every
 # path — a missing id, a not-an-OTel spoke, no Langfuse auth, or a failing step.
 #
+# But never failing the land is not the same as being quiet about it (issue #319). A skip
+# that is EXPECTED stays silent; a skip that means the pipeline is BROKEN fires an alarm —
+# a warn plus one OS notification, so the signal leaves a land log nobody reads. See alarm().
+#
 #   OTel gate     the raw-bodies dir exists only under AI_TOOLKIT_OTEL=1, so its
 #                 presence is the durable "this was an OTel spoke" signal at land
 #                 time. Absent → quiet skip (an ordinary spoke has nothing to push).
 #   auth gate     LANGFUSE_BASIC_AUTH unset → one-line skip notice, return 0. The
 #                 view builder needs it to reach Langfuse; its absence is not an error.
+#   package gate  BROKEN → alarm. Past the two gates above, ingestion was expected, so a
+#                 missing package is a broken install (the #319 outage: 51 drain lands).
+#   retry spend   BROKEN → alarm. Spending the whole budget means the outage is not
+#                 transient, and the spoke's scores die with the raw bodies at teardown.
 #   flush wait    a brief settle so the live native-trace push lands before we read
 #                 it — the teardown SIGKILL would otherwise drop in-flight spans.
 #                 Override with AI_TOOLKIT_INGEST_FLUSH_WAIT (seconds; 0 in tests).
@@ -34,10 +42,11 @@
 #                 so a transient Langfuse hiccup mid-land is survived, not fatal (#151).
 #
 # Env for the step: LANGFUSE_HOST defaults to http://localhost:3000; the view builder
-# runs under PYTHONPATH=<repo>/scripts with python3.12 (matching the telemetry
-# package). The package is resolved relative to the repo checkout holding this
-# script — NOT relative to the script itself: the synced copy lives at
-# <target>/.ai-toolkit/scripts/ with no telemetry/ subpackage (issue #136).
+# runs under PYTHONPATH=<dirname of the resolved package> with python3.12 (matching the
+# telemetry package). The package resolves to the repo checkout's scripts/telemetry when
+# this script runs from one, else to the CO-LOCATED sibling the sync now ships beside it
+# (issue #319) — which is the live path for a synced target and for the /afk drain's
+# self-copy. See the resolution block below.
 set -uo pipefail
 
 PROG="telemetry-ingest-spoke"
@@ -45,6 +54,39 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 info() { printf '%s: %s\n' "$PROG" "$*"; }
+
+# alarm <message> — the LOUD path for a BROKEN ingest (issue #319; AFK Design Principle 2).
+#
+# Not every skip is a breakage. The OTel and auth gates below are expected states and stay
+# quiet. But an ingest that was expected and is now impossible — the package gone, or the
+# builder dead after every retry — silently costs cycle-step scores on a land nobody is
+# watching. That is what happened: the warn DID print, in 51 land logs over 4 days, and the
+# only signal that ever reached a human was an empty dashboard widget. So the stderr line is
+# kept as the forensic record, and the alarm ALSO leaves the log via one OS notification.
+#
+# AI_TOOLKIT_NOTIFY_CMD (an executable handed the message as $1) overrides the default
+# osascript for tests and non-macOS hosts — the same seam hub-notify.sh uses for HUB_NOTIFY_CMD.
+# Best-effort throughout: a notifier that is missing, broken, or non-macOS must never fail the
+# land it is only observing (Principle 6), hence the `|| true` on every path.
+# UPGRADE: this duplicates hub-notify.sh's notify(); if a third caller appears, lift a shared
+# wt_notify into worktree-lib.sh (already sourced here) rather than copy it again.
+alarm() {
+  local msg="$1"
+  warn "BROKEN — $msg"
+  if [ -n "${AI_TOOLKIT_NOTIFY_CMD:-}" ]; then
+    "$AI_TOOLKIT_NOTIFY_CMD" "$PROG: $msg" >/dev/null 2>&1 || true
+    return 0
+  fi
+  # Escape for the AppleScript string literal: backslashes FIRST (else the next step's
+  # inserted backslashes get doubled), then double-quotes — a raw backslash or quote in a
+  # path would otherwise fail to compile and, because of the trailing `|| true`, silently
+  # drop the very ping that matters most (the bug hub-notify.sh already learned).
+  local esc="${msg//\\/\\\\}"
+  esc="${esc//\"/\\\"}"
+  osascript -e "display notification \"$esc\" with title \"ai-toolkit: telemetry ingest BROKEN\"" \
+    >/dev/null 2>&1 || true
+  return 0
+}
 
 # --- per-issue cycle-time sources (#280) --------------------------------------
 # Gather the lifecycle-timeline instants + drain-window snapshot the view builder cannot derive
@@ -186,10 +228,16 @@ if [ -z "${LANGFUSE_BASIC_AUTH:-}" ]; then
   exit 0
 fi
 
-# Resolve the telemetry python package: sync_workflow_scripts ships this script
-# to <target>/.ai-toolkit/scripts/ but never the package (issue #136), so the
-# repo checkout's scripts/telemetry is the canonical home; the SCRIPT_DIR
-# sibling stays as a fallback for a non-git install that co-locates it.
+# Resolve the telemetry python package. Two candidates, in order:
+#   1. <repo>/scripts/telemetry — a toolkit checkout (the hub), where the package is the
+#      canonical source and always wins.
+#   2. $SCRIPT_DIR/telemetry — the CO-LOCATED sibling. sync_workflow_scripts ships the
+#      package next to this script (issue #319), so this is the live resolution for a synced
+#      target AND for the /afk drain's temp self-copy — which is not a git checkout, so
+#      candidate 1 resolves to nothing there and this is the only one left. It is NOT a
+#      vestigial non-git fallback: deleting it re-opens #319 and every drain land silently
+#      stops ingesting. (Before #319 the sync shipped only the .sh files, which is why the
+#      old comment here claimed the synced copy had no telemetry/ subpackage — issue #136.)
 # env -u: an inherited git-hook GIT_DIR/GIT_WORK_TREE would override -C
 # discovery and resolve a different checkout's package (this repo's documented
 # hook-env leak class) — strip both so the answer is always THIS script's repo.
@@ -199,7 +247,10 @@ for _cand in ${REPO_ROOT:+"$REPO_ROOT/scripts/telemetry"} "$SCRIPT_DIR/telemetry
   if [ -f "$_cand/langfuse_spoke_tree.py" ]; then TELEMETRY_DIR="$_cand"; break; fi
 done
 if [ -z "$TELEMETRY_DIR" ]; then
-  warn "telemetry python package not found (probed ${REPO_ROOT:+$REPO_ROOT/scripts/telemetry and }$SCRIPT_DIR/telemetry) — skipping post-run Langfuse ingestion for $SPOKE_RUN_ID"
+  # LOUD (#319): this is an OTel spoke and auth resolved, so ingestion was EXPECTED — the
+  # package's absence is a broken install, not a benign skip, and it costs this spoke's
+  # cycle-step scores for good once teardown removes the raw bodies.
+  alarm "telemetry python package not found (probed ${REPO_ROOT:+$REPO_ROOT/scripts/telemetry and }$SCRIPT_DIR/telemetry) — NO Langfuse ingestion for $SPOKE_RUN_ID; re-sync the target (scripts/sync-to-repo.sh) to restore it"
   exit 0
 fi
 
@@ -231,7 +282,10 @@ run_step() {
   while :; do
     python3.12 "$@" && return 0
     if [ "$attempt" -ge "$INGEST_RETRIES" ]; then
-      warn "$label failed after ${attempt} attempt(s) (continuing) — re-run from the id alone: telemetry-ingest-spoke.sh --spoke-run-id $SPOKE_RUN_ID"
+      # LOUD (#319): the retry budget existed to survive a TRANSIENT hiccup. Spending it
+      # whole means the outage is not transient (Langfuse down, no PyYAML in the target, a
+      # bad interpreter) and this spoke's scores are lost — as silently as a missing package.
+      alarm "$label failed after ${attempt} attempt(s) — NO Langfuse ingestion for $SPOKE_RUN_ID; re-run from the id alone: telemetry-ingest-spoke.sh --spoke-run-id $SPOKE_RUN_ID"
       return 0
     fi
     # 10# forces base-10: the digits-only guard still admits a leading-zero value
