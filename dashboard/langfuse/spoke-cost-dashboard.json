@@ -1,0 +1,187 @@
+{
+  "name": "spoke cost",
+  "description": "What does a spoke COST, and where does the money go? Cost per cycle step, tokens written per step, and the context-carry cost of every rule and tool definition (paid on EVERY call). The carry-cost widgets are the actionable ones: a rule or tool-def that costs real money per spoke and never changes an outcome is deletable. Companion to the 'spoke latency' dashboard. Saved once via the Langfuse UI (v3.192.x has no public dashboards API); each widget's metricsQuery is the exact /api/public/metrics query that backs it — add fromTimestamp/toTimestamp when running one. See docs/telemetry-pull-layer.md.",
+  "widgets": [
+    {
+      "title": "Cost per cycle step (RED/GREEN/PUSH/pre) — daily total",
+      "chart": "stacked-bar-time-series",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [
+          {
+            "field": "name"
+          }
+        ],
+        "metrics": [
+          {
+            "measure": "value",
+            "aggregation": "sum"
+          }
+        ],
+        "filters": [
+          {
+            "column": "name",
+            "operator": "starts with",
+            "value": "step_total_cost_usd:",
+            "type": "string"
+          }
+        ],
+        "timeDimension": {
+          "granularity": "day"
+        }
+      }
+    },
+    {
+      "title": "Cost per spoke by cycle step (p50/p95/max) — outlier hunt",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [
+          {
+            "field": "name"
+          }
+        ],
+        "metrics": [
+          {
+            "measure": "value",
+            "aggregation": "p50"
+          },
+          {
+            "measure": "value",
+            "aggregation": "p95"
+          },
+          {
+            "measure": "value",
+            "aggregation": "max"
+          }
+        ],
+        "filters": [
+          {
+            "column": "name",
+            "operator": "starts with",
+            "value": "step_total_cost_usd:",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Rule carry cost per spoke (paid on EVERY call)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [
+          {
+            "field": "name"
+          }
+        ],
+        "metrics": [
+          {
+            "measure": "value",
+            "aggregation": "sum"
+          },
+          {
+            "measure": "value",
+            "aggregation": "p95"
+          }
+        ],
+        "filters": [
+          {
+            "column": "name",
+            "operator": "starts with",
+            "value": "rule_carry_cost_usd:",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Tool-definition carry cost by tool (paid on EVERY call)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [
+          {
+            "field": "name"
+          }
+        ],
+        "metrics": [
+          {
+            "measure": "value",
+            "aggregation": "sum"
+          },
+          {
+            "measure": "value",
+            "aggregation": "p95"
+          }
+        ],
+        "filters": [
+          {
+            "column": "name",
+            "operator": "starts with",
+            "value": "tooldef_carry_cost_usd:",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "title": "Tokens written per cycle step (daily total)",
+      "chart": "stacked-bar-time-series",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [
+          {
+            "field": "name"
+          }
+        ],
+        "metrics": [
+          {
+            "measure": "value",
+            "aggregation": "sum"
+          }
+        ],
+        "filters": [
+          {
+            "column": "name",
+            "operator": "starts with",
+            "value": "step_tokens_written:",
+            "type": "string"
+          }
+        ],
+        "timeDimension": {
+          "granularity": "day"
+        }
+      }
+    },
+    {
+      "title": "Cache-write cost per cycle step (daily total)",
+      "chart": "stacked-bar-time-series",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [
+          {
+            "field": "name"
+          }
+        ],
+        "metrics": [
+          {
+            "measure": "value",
+            "aggregation": "sum"
+          }
+        ],
+        "filters": [
+          {
+            "column": "name",
+            "operator": "starts with",
+            "value": "step_cache_write_usd:",
+            "type": "string"
+          }
+        ],
+        "timeDimension": {
+          "granularity": "day"
+        }
+      }
+    }
+  ]
+}
