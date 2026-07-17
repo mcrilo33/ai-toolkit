@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -299,6 +300,100 @@ def test_telemetry_package_copy_prunes_pycache() -> None:
     # copying it ships stale bytecode into every target and churns the sync manifest.
     assert "__pycache__" in _copy_telemetry_package_body(), (
         "copy_telemetry_package must prune __pycache__ — the hub's source tree always has one"
+    )
+
+
+def _extract_fn(name: str) -> str:
+    """The verbatim source of a top-level function in sync-to-repo.sh.
+
+    sync-to-repo.sh parses argv and runs at top level, so it cannot simply be sourced. The
+    copy helpers are pure functions of their args + a few globals, so lift them into a
+    harness and exercise the REAL code (not a paraphrase of it).
+    """
+    text = SYNC_SCRIPT.read_text()
+    match = re.search(rf"^{name}\(\) \{{$.*?^\}}$", text, re.MULTILINE | re.DOTALL)
+    assert match, f"{name}() not found in sync-to-repo.sh"
+    return match.group(0)
+
+
+def _run_copy_telemetry_package(
+    tmp_path: Path, script_dir: Path, *, dry_run: int = 0
+) -> subprocess.CompletedProcess[str]:
+    """Run the real copy_telemetry_package against a fake SCRIPT_DIR, under `set -euo pipefail`."""
+    target = tmp_path / "target"
+    target.mkdir(exist_ok=True)
+    harness = "\n".join(
+        [
+            "set -euo pipefail",
+            f'TARGET="{target}"',
+            f'SCRIPT_DIR="{script_dir}"',
+            f"DRY_RUN={dry_run}",
+            f'RECORD_FILE="{tmp_path / "record"}"',
+            ': > "$RECORD_FILE"',
+            "warn() { printf 'WARN: %s\\n' \"$*\" >&2; }",
+            _extract_fn("record_file"),
+            _extract_fn("make_dir"),
+            _extract_fn("copy_file"),
+            _extract_fn("copy_telemetry_package"),
+            'copy_telemetry_package "$TARGET/.ai-toolkit/scripts/telemetry" && echo "RC=0" || echo "RC=$?"',
+        ]
+    )
+    return subprocess.run(["bash", "-c", harness], capture_output=True, text=True)
+
+
+def test_telemetry_package_copy_reports_a_missing_source(tmp_path: Path) -> None:
+    # A silent skip dressed as success is the #319 bug itself: the caller prints a green
+    # "scripts/telemetry/" on a 0 return, so a no-op MUST report non-zero.
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()  # no telemetry/ at all
+
+    result = _run_copy_telemetry_package(tmp_path, script_dir)
+
+    assert "RC=1" in result.stdout, f"missing package source must report failure: {result.stdout}"
+
+
+def test_telemetry_package_copy_reports_an_empty_source(tmp_path: Path) -> None:
+    # `[ -d ]` passes for an empty dir, so a presence check alone would no-op and still
+    # report success — a target that cannot ingest, announced as a clean sync.
+    pkg = tmp_path / "scripts" / "telemetry"
+    pkg.mkdir(parents=True)
+
+    result = _run_copy_telemetry_package(tmp_path, tmp_path / "scripts")
+
+    assert "RC=1" in result.stdout, f"empty package source must report failure: {result.stdout}"
+
+
+def test_telemetry_package_copy_recurses_and_prunes(tmp_path: Path) -> None:
+    # The happy path, end to end through the real helpers: nested modules land, __pycache__
+    # does not, and every copied file is recorded for the manifest GC.
+    pkg = tmp_path / "scripts" / "telemetry"
+    (pkg / "spoke_tree").mkdir(parents=True)
+    (pkg / "__pycache__").mkdir()
+    (pkg / "__init__.py").write_text("# root\n")
+    (pkg / "spoke_tree" / "steps.py").write_text("# nested\n")
+    (pkg / "__pycache__" / "stale.pyc").write_bytes(b"stale\n")
+
+    result = _run_copy_telemetry_package(tmp_path, tmp_path / "scripts")
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+    installed = tmp_path / "target" / ".ai-toolkit" / "scripts" / "telemetry"
+    assert (installed / "spoke_tree" / "steps.py").is_file(), "a nested module must be copied"
+    assert not (installed / "__pycache__").exists(), "__pycache__ must be pruned"
+    recorded = (tmp_path / "record").read_text().splitlines()
+    assert ".ai-toolkit/scripts/telemetry/spoke_tree/steps.py" in recorded, (
+        "every copied module must be manifest-recorded or the GC cannot reclaim it"
+    )
+
+
+def test_sync_warns_when_the_telemetry_package_is_missing() -> None:
+    # The caller must branch on the helper's status: calling it bare prints the success line
+    # even when nothing was copied.
+    body = _sync_workflow_scripts_body()
+    assert re.search(r"if copy_telemetry_package .*; then", body), (
+        "sync_workflow_scripts must branch on copy_telemetry_package's status (#319)"
+    )
+    assert re.search(r"else\s*\n\s*warn ", body), (
+        "sync_workflow_scripts must warn LOUD when the telemetry package is missing (#319)"
     )
 
 

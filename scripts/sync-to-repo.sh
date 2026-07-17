@@ -161,6 +161,49 @@ copy_skill_subdirs() {
     done
 }
 
+# ─── Helper: copy the telemetry python package (issue #319) ───
+# sync_workflow_scripts ships .sh FILES; the view builder is a PACKAGE and needs its own
+# recursive step. Without it, telemetry-ingest-spoke.sh's $SCRIPT_DIR/telemetry probe misses
+# in every layout that is not a toolkit checkout — above all the drain's temp self-copy, which
+# is built from the synced scripts dir — and the post-run Langfuse ingestion is skipped on
+# every drain land (51 lands / 4 days with no cycle-step scores before anyone noticed an empty
+# dashboard).
+#
+# Enumerated from the SOURCE TREE, never a hand-listed set of module names: a manifest is a
+# thing to forget, and a forgotten module is an ImportError on an unattended land (#316's
+# lesson, applied to a package). Any new module rides along by construction. Each file goes
+# through copy_file so it is manifest-recorded (the GC reclaims a module deleted upstream) and
+# dry-run aware; copy_file is a bare cp, so the parent dir is made first or the nested
+# spoke_tree/ modules would fail into a non-existent dir and, under set -e, abort the whole
+# sync. __pycache__ is pruned: the hub EXECUTES this package in place, so stale bytecode is
+# always present at the source and must never reach a target.
+#
+# Returns non-zero when the package source is missing or empty, so the caller reports the
+# truth instead of a green line over an empty target — a silent skip dressed as success is
+# exactly the #319 failure this helper exists to end (AFK Design Principle 2).
+# UPGRADE: -type f skips a symlinked module (none today); enumerate -type l too if the
+# package ever ships one, since here it would vanish rather than be copied as a link.
+copy_telemetry_package() {
+    local src_dir="$SCRIPT_DIR/telemetry" dst_dir="$1"
+    [ -d "$src_dir" ] || return 1
+    local files
+    files="$(find "$src_dir" -name '__pycache__' -prune -o -type f -print)"
+    [ -n "$files" ] || return 1
+    local f rel
+    # Fed by heredoc, NOT `find | while` — a pipeline would run the loop in a subshell and the
+    # copy's exit status could not reach the caller (record_file survives either way, but the
+    # return value would not).
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        rel="${f#"$src_dir/"}"
+        make_dir "$(dirname "$dst_dir/$rel")"
+        copy_file "$f" "$dst_dir/$rel"
+    done <<EOF
+$files
+EOF
+    return 0
+}
+
 # ─── Field sets per tool per category ───
 COPILOT_RULE_FIELDS="name,description,applyTo,excludeAgent"
 CURSOR_RULE_FIELDS="description,globs,alwaysApply"
@@ -501,33 +544,9 @@ sync_mcp_servers() {
 # telemetry-ingest-spoke.sh at the toolkit root scripts/, hub-status.sh,
 # hub-ready-watch.sh, hub-otel-watch.sh, hub-afk.sh and batch-plan.sh under
 # the hub skill (shared/skills/hub/scripts/).
-
-# ─── Helper: copy the telemetry python package (issue #319) ───
-# The loop above ships .sh FILES; the view builder is a PACKAGE and needs its own recursive
-# step. Without it, telemetry-ingest-spoke.sh's $SCRIPT_DIR/telemetry probe misses in every
-# layout that is not a toolkit checkout — above all the drain's temp self-copy, which is built
-# from this very dir — and the post-run Langfuse ingestion is skipped on every drain land (51
-# lands / 4 days with no cycle-step scores before anyone noticed an empty dashboard).
-#
-# Enumerated from the SOURCE TREE, never a hand-listed set of module names: a manifest is a
-# thing to forget, and a forgotten module is an ImportError on an unattended land (#316's
-# lesson, applied to a package). Any new module — of any extension — rides along by
-# construction. Each file goes through copy_file so it is manifest-recorded (the GC reclaims a
-# module deleted upstream) and dry-run aware; copy_file is a bare cp, so the parent dir is
-# made first or the nested spoke_tree/ modules would fail into a non-existent dir and, under
-# set -e, abort the whole sync. __pycache__ is pruned: the hub EXECUTES this package in place,
-# so stale bytecode is always present at the source and must never reach a target.
-copy_telemetry_package() {
-    local src_dir="$SCRIPT_DIR/telemetry" dst_dir="$1"
-    [ -d "$src_dir" ] || return 0
-    local f rel
-    find "$src_dir" -name '__pycache__' -prune -o -type f -print | while read -r f; do
-        rel="${f#"$src_dir/"}"
-        make_dir "$(dirname "$dst_dir/$rel")"
-        copy_file "$f" "$dst_dir/$rel"
-    done
-}
-
+# The telemetry python PACKAGE the land-time ingest imports rides along too, via
+# copy_telemetry_package (issue #319) — a package, not a flat file, so it takes its
+# own recursive step rather than the name loop.
 sync_workflow_scripts() {
     section "Workflow scripts (hub/spoke/land)"
     local dst_dir="$TARGET/.ai-toolkit/scripts"
@@ -551,11 +570,15 @@ sync_workflow_scripts() {
         fi
     done
 
-    # The telemetry python package the land-time ingest imports (issue #319). Not executable
-    # and not a flat file, so it takes its own recursive step rather than the loop above.
-    copy_telemetry_package "$dst_dir/telemetry"
-    if [ "$DRY_RUN" -eq 0 ]; then
-        info "scripts/telemetry/"
+    # The telemetry python package the land-time ingest imports (issue #319). Warn LOUD rather
+    # than print a green line over an empty target: without the package every land silently
+    # skips Langfuse ingestion, which is the whole bug (AFK Design Principle 2).
+    if copy_telemetry_package "$dst_dir/telemetry"; then
+        if [ "$DRY_RUN" -eq 0 ]; then
+            info "scripts/telemetry/"
+        fi
+    else
+        warn "telemetry package not found at $SCRIPT_DIR/telemetry — the target and any /afk drain built from it CANNOT ingest (issue #319)"
     fi
 
     # Spoke-default model env (issue #142), derived from the config's
