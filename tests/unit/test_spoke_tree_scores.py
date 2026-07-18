@@ -22,6 +22,7 @@ from telemetry.spoke_tree.scores import (
     build_mcp_def_load_scores,
     build_score_events,
     build_script_success_scores,
+    build_skill_cost_scores,
     build_skill_success_scores,
     build_step_cost_scores,
     build_step_duration_scores,
@@ -186,6 +187,94 @@ class TestBuildSkillSuccessScores:
         batch = [{"body": {"id": "t1", "name": "tool:Skill", "metadata": {}}}]
 
         assert build_skill_success_scores(SPOKE, batch, base_ts="t") == []
+
+
+class TestBuildSkillCostScores:
+    """#322: sum a skill span's generation-descendant cost into a skill_cost_usd:<name> score.
+
+    A ``skill:<name>`` span is a relabeled ``tool:Skill`` span whose own ``costDetails`` is $0 — the
+    real spend lives in its generation descendants — so Langfuse's own-cost-summing metrics API
+    returns $0 for a ``skill:`` filter. Each skill node therefore emits ``skill_cost_usd:<name>``, the
+    summed ``costDetails`` of every generation in its subtree, observation-scoped to the skill node.
+    A skill with no generation descendants is SKIPPED (never scored 0) — absence of spend is not a
+    cost, mirroring the ready-but-latent ``skill_success`` idiom.
+    """
+
+    def _skill(self, obs_id: str, name: str, parent: str | None = None) -> dict:
+        return {
+            "type": "span-create",
+            "body": {"id": obs_id, "name": name, "parentObservationId": parent},
+        }
+
+    def _gen(self, obs_id: str, parent: str, cost: dict[str, float]) -> dict:
+        return {
+            "type": "generation-create",
+            "body": {"id": obs_id, "parentObservationId": parent, "costDetails": cost},
+        }
+
+    def test_two_skill_nodes_sum_generation_descendants(self) -> None:
+        # skill:code-review has a generation nested one level down under a sub-agent container
+        # (subtree depth > 1) plus a direct generation; skill:brainstorming has one generation.
+        batch = [
+            self._skill("sc", "skill:code-review"),
+            {"type": "span-create", "body": {"id": "sac", "parentObservationId": "sc"}},
+            self._gen("g_rev", "sac", {"total": 2.0}),
+            self._gen("g_rev2", "sc", {"input": 0.3, "output": 0.7}),
+            self._skill("sb", "skill:brainstorming"),
+            self._gen("g_bs", "sb", {"total": 5.0}),
+        ]
+
+        events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
+
+        by_name = {e["body"]["name"]: e["body"] for e in events}
+        assert set(by_name) == {"skill_cost_usd:code-review", "skill_cost_usd:brainstorming"}
+        assert all(e["type"] == "score-create" for e in events)
+        assert by_name["skill_cost_usd:code-review"]["value"] == pytest.approx(3.0)
+        assert by_name["skill_cost_usd:code-review"]["observationId"] == "sc"
+        assert by_name["skill_cost_usd:brainstorming"]["value"] == pytest.approx(5.0)
+        assert by_name["skill_cost_usd:brainstorming"]["observationId"] == "sb"
+
+    def test_zero_descendant_skill_is_skipped(self) -> None:
+        batch = [
+            self._skill("sc", "skill:code-review"),
+            self._gen("g_rev", "sc", {"total": 2.0}),
+            self._skill("sl", "skill:land"),  # no generation descendants
+        ]
+
+        events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
+
+        assert {e["body"]["name"] for e in events} == {"skill_cost_usd:code-review"}
+
+    def test_explicit_total_wins_over_component_sum(self) -> None:
+        batch = [
+            self._skill("sc", "skill:code-review"),
+            self._gen("g", "sc", {"input": 0.3, "output": 0.7, "total": 1.0}),
+        ]
+
+        events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
+
+        assert events[0]["body"]["value"] == pytest.approx(1.0)
+
+    def test_nested_skills_each_report_their_subtree(self) -> None:
+        # skill:brainstorming nested under skill:code-review: the inner generation rolls into BOTH
+        # (the subtree-rollup boundary), while code-review's own direct generation is only its own.
+        batch = [
+            self._skill("sc", "skill:code-review"),
+            self._gen("g_outer", "sc", {"total": 1.0}),
+            self._skill("sb", "skill:brainstorming", parent="sc"),
+            self._gen("g_inner", "sb", {"total": 4.0}),
+        ]
+
+        events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
+
+        by_name = {e["body"]["name"]: e["body"]["value"] for e in events}
+        assert by_name["skill_cost_usd:code-review"] == pytest.approx(5.0)
+        assert by_name["skill_cost_usd:brainstorming"] == pytest.approx(4.0)
+
+    def test_generation_under_no_skill_is_ignored(self) -> None:
+        batch = [self._gen("g", "i1", {"total": 9.0})]
+
+        assert build_skill_cost_scores(SPOKE, batch, base_ts="t") == []
 
 
 class TestBuildMcpCallScores:

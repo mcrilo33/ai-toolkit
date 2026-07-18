@@ -1291,6 +1291,13 @@ def build_step_total_cost_scores(
     return events
 
 
+def build_skill_cost_scores(
+    spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
+) -> list[IngestEvent]:
+    """Stub (RED): the real subtree-cost sum lands in GREEN (#322)."""
+    return []
+
+
 def _step_duration_ms(body: dict[str, Any]) -> int | None:
     """Return a cycle-step node's window length in ms from its start/end, or None when unparseable."""
     start = _parse_utc(body.get("startTime"))
