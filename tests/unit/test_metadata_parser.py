@@ -1026,3 +1026,154 @@ class TestApplyOverrides:
         fm = dict(query(items, "claude", ["name", "model", "effort"]))["architect"]
         assert "model: claude-fable-5" in fm
         assert "effort: max" in fm
+
+
+# ── Claude rule model: always-on vs conditional vs on-demand (issue #320) ──
+
+# The four always-on rules and the six on-demand rules, mirrored from
+# tests/unit/test_rules_governance.py::EXPECTED_ALWAYS_ON and the issue.
+_ALWAYS_ON = {"guidelines", "security", "agent-orchestration", "scientific-integrity"}
+_CONDITIONAL = {
+    "code-quality",
+    "python-style",
+    "gitignore-template",
+    "markdown-style",
+    "mermaid-conventions",
+    "pytest-conventions",
+    "operational-gotchas",
+    "afk-design-principles",
+    "github-actions",
+}
+_ON_DEMAND = {
+    "workflow",
+    "planning-hub",
+    "issue-hygiene",
+    "bug-triage",
+    "afk-answering",
+    "library-research",
+}
+
+
+class TestClaudeAlwaysOnRules:
+    """Claude's three-way rule mapping.
+
+    Claude Code honors only ``paths:`` — a rule with no ``paths`` loads at session
+    start (always-on). The sync must therefore emit a rule when it is conditional
+    (has ``paths``) OR always-on (``alwaysApply: true``, no ``paths``), and skip the
+    on-demand rules (neither). Only ``paths`` is ever emitted for Claude — never
+    ``alwaysApply``/``globs``/``applyTo``.
+    """
+
+    PARSER = Path(__file__).resolve().parents[2] / "scripts" / "metadata_parser.py"
+    REPO_ROOT = Path(__file__).resolve().parents[2]
+
+    @pytest.fixture()
+    def rule_meta(self, tmp_path: Path) -> Path:
+        """One rule of each kind: always-on, conditional, on-demand."""
+        content = textwrap.dedent("""\
+            guidelines:
+              name: "Guidelines"
+              applyTo: "**"
+              alwaysApply: true
+
+            code-quality:
+              name: "Code Quality"
+              applyTo: "**/*.py"
+              globs: "**/*.py"
+              paths: "**/*.py"
+              alwaysApply: false
+
+            workflow:
+              name: "Development Workflow"
+              applyTo: "**"
+              alwaysApply: false
+        """)
+        p = tmp_path / "metadata.yml"
+        p.write_text(content)
+        return p
+
+    # ── query() mapping ──
+
+    def test_always_on_rule_emits_empty_frontmatter(self, rule_meta: Path) -> None:
+        items = parse(str(rule_meta))
+
+        results = dict(query(items, "claude", ["paths"], always_on="alwaysApply"))
+
+        assert "guidelines" in results
+        assert results["guidelines"] == ""
+
+    def test_conditional_rule_keeps_its_glob(self, rule_meta: Path) -> None:
+        items = parse(str(rule_meta))
+
+        results = dict(query(items, "claude", ["paths"], always_on="alwaysApply"))
+
+        assert 'paths: "**/*.py"' in results["code-quality"]
+
+    def test_on_demand_rule_absent(self, rule_meta: Path) -> None:
+        items = parse(str(rule_meta))
+
+        results = dict(query(items, "claude", ["paths"], always_on="alwaysApply"))
+
+        assert "workflow" not in results
+
+    def test_default_query_skips_always_on_when_flag_absent(self, rule_meta: Path) -> None:
+        """Without always_on, every other caller's behavior stays byte-identical."""
+        items = parse(str(rule_meta))
+
+        results = dict(query(items, "claude", ["paths"]))
+
+        assert "guidelines" not in results
+        assert "code-quality" in results
+
+    # ── real shared/rules/metadata.yml pin ──
+
+    def test_real_metadata_three_way_mapping(self) -> None:
+        meta = self.REPO_ROOT / "shared" / "rules" / "metadata.yml"
+        items = parse(str(meta))
+
+        results = dict(query(items, "claude", ["paths"], always_on="alwaysApply"))
+
+        assert set(results) == _ALWAYS_ON | _CONDITIONAL
+        assert _ON_DEMAND.isdisjoint(results)
+        for name in _ALWAYS_ON:
+            assert results[name] == "", f"{name} must emit empty frontmatter"
+        for name in _CONDITIONAL:
+            assert results[name].startswith("paths:"), f"{name} must emit its glob"
+
+    def test_no_disallowed_fields_leak_for_claude(self) -> None:
+        meta = self.REPO_ROOT / "shared" / "rules" / "metadata.yml"
+        items = parse(str(meta))
+
+        results = dict(query(items, "claude", ["paths"], always_on="alwaysApply"))
+
+        for name, fm in results.items():
+            assert "alwaysApply" not in fm, f"alwaysApply leaked into {name}"
+            assert "globs" not in fm, f"globs leaked into {name}"
+            assert "applyTo" not in fm, f"applyTo leaked into {name}"
+
+    # ── CLI (cited RED node: fails by assertion pre-impl) ──
+
+    def test_cli_always_on_flag_emits_three_way_mapping(self, rule_meta: Path) -> None:
+        out = subprocess.run(
+            [
+                sys.executable,
+                str(self.PARSER),
+                str(rule_meta),
+                "claude",
+                "paths",
+                "--always-on",
+                "alwaysApply",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        rows = {
+            line.split("\t", 1)[0]: (line.split("\t", 1)[1] if "\t" in line else "")
+            for line in out.stdout.splitlines()
+        }
+
+        assert "guidelines" in rows  # always-on emitted...
+        assert rows["guidelines"] == ""  # ...with empty frontmatter (no paths)
+        assert 'paths: "**/*.py"' in rows["code-quality"]  # conditional keeps its glob
+        assert "workflow" not in rows  # on-demand excluded
