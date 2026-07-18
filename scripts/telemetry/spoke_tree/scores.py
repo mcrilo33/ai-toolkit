@@ -94,6 +94,13 @@ _STATUS_SUCCESS = "success"
 # contract stamps a status. Read from the skill span attributes, in priority order.
 _SKILL_SUCCESS_SCORE = "skill_success"
 _SKILL_STATUS_KEYS = ("skill.status", "skill_exit_status")
+# Per-skill cost (#322): a ``skill:<name>`` span is a relabeled ``tool:Skill`` span whose OWN
+# ``costDetails`` is $0 — the real LLM spend lives in its generation DESCENDANTS. Langfuse's
+# metrics/dashboard API sums each observation's own cost, so a ``skill:`` filter returns $0; mirror
+# the rule/step carry-cost builders and emit the summed descendant-generation cost as a numeric
+# ``skill_cost_usd:<name>`` score. A skill with no generation descendants is SKIPPED (never scored 0)
+# — absence of spend is not a cost (AFK Design Principle 1; the ready-but-latent skill_success idiom).
+_SKILL_COST_SCORE = "skill_cost_usd"
 # MCP call scores (#234): per ``mcp:<server>`` group, mirror its call count and success into
 # chartable numeric scores — ``mcp_success:<server>`` is 1.0 when the server's group had zero
 # error-shaped calls else 0.0 (so a Scores-view average reads as its success rate), and
@@ -1291,11 +1298,76 @@ def build_step_total_cost_scores(
     return events
 
 
+def _skill_span_ancestors(
+    node_id: str, parent_of: dict[str, str | None], skill_ids: set[str]
+) -> set[str]:
+    """Walk ``parentObservationId`` up from ``node_id``, collecting EVERY skill-span ancestor (#322).
+
+    A generation is a descendant of every skill span on its ancestor chain, so for nested skill spans
+    (a ``skill:brainstorming`` under a ``skill:code-review``) an inner generation credits BOTH — the
+    subtree-rollup boundary. The visited set guards against a malformed parent cycle.
+    """
+    ancestors: set[str] = set()
+    seen: set[str] = set()
+    current = parent_of.get(node_id)
+    while current is not None and current not in seen:
+        if current in skill_ids:
+            ancestors.add(current)
+        seen.add(current)
+        current = parent_of.get(current)
+    return ancestors
+
+
 def build_skill_cost_scores(
     spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
 ) -> list[IngestEvent]:
-    """Stub (RED): the real subtree-cost sum lands in GREEN (#322)."""
-    return []
+    """Build per-skill ``skill_cost_usd:<name>`` scores summing each skill's descendant cost (#322).
+
+    A first-class ``skill:<name>`` span (relabeled from ``tool:Skill``, :func:`_skill_relabel`) is a
+    span whose OWN ``costDetails`` is $0 — the real LLM spend lives in its generation descendants — so
+    Langfuse's own-cost-summing metrics API returns $0 for a ``skill:`` filter. Mirroring
+    :func:`build_step_total_cost_scores`, every ``generation-create`` in the assembled batch is walked
+    up ``parentObservationId`` (:func:`_skill_span_ancestors`) and its full Langfuse
+    ``costDetails`` (:func:`_generation_total_cost`) is summed into each skill span on its chain, so a
+    skill node's score is the total cost of its SUBTREE. Only actual generation leaves are summed —
+    never a nested skill span's own field — so there is no double counting within one skill's score.
+    Observation-scoped to the skill node with a deterministic id (a skill run twice keeps both scores).
+
+    A skill span with no generation descendants never enters the accumulator, so it is SKIPPED rather
+    than scored 0 — absence of spend is not a cost (mirrors the ready-but-latent ``skill_success``
+    idiom; AFK Design Principle 1). Read off View A (the same batch :func:`build_skill_success_scores`
+    reads), so it is trace-level like the other skill scores.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        batch: The assembled View A events (its ``skill:`` spans and generation copies are read).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events, one per skill node with generation descendants (empty when none).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    by_id = {event["body"]["id"]: event["body"] for event in batch}
+    parent_of = {node_id: body.get("parentObservationId") for node_id, body in by_id.items()}
+    skill_ids = {node_id for node_id, body in by_id.items() if _is_skill_span(body)}
+    cost_by_skill: dict[str, float] = {}
+    for event in batch:
+        if event["type"] != "generation-create":
+            continue
+        cost = _generation_total_cost(event["body"])
+        for skill_id in _skill_span_ancestors(event["body"]["id"], parent_of, skill_ids):
+            cost_by_skill[skill_id] = cost_by_skill.get(skill_id, 0.0) + cost
+    return [
+        _score_event(
+            spoke_run_id,
+            name=f"{_SKILL_COST_SCORE}:{_skill_span_name(by_id[skill_id])}",
+            value=cost,
+            trace_id=trace_id,
+            base_ts=base_ts,
+            observation_id=skill_id,
+        )
+        for skill_id, cost in cost_by_skill.items()
+    ]
 
 
 def _step_duration_ms(body: dict[str, Any]) -> int | None:

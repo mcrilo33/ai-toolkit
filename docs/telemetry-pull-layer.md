@@ -321,6 +321,35 @@ PLAN-gate park emission.
 > to the filters — or read `rollup.duration.components.wait` off the spoke's
 > assembled root span, which carries the same answer per spoke.
 
+### Widget 5 — per-skill cost (Issue #322)
+
+The dashboard twin of the rule carry-cost chart. A `skill:<name>` node is a relabeled
+`tool:Skill` **span** (#234) whose own `costDetails` is $0 — the real LLM spend lives in
+its generation descendants — so an Observations → Total Cost widget filtered to `skill:`
+returns $0. The builder therefore emits a per-skill `skill_cost_usd:<name>` numeric score
+(:func:`build_skill_cost_scores`) summing the full `costDetails` of every generation in the
+skill's subtree, so the $ is a queryable Scores value rather than a UI-only trace-view
+rollup.
+
+| Field | Value |
+|-------|-------|
+| View | Scores (numeric) |
+| Filters | `name` *starts with* `skill_cost_usd:` |
+| Metrics | `value` — `sum` |
+| Breakdown dimension | `name` |
+| Chart | Horizontal bar |
+
+> [!NOTE]
+> **Coverage caveat — only `Skill`-tool invocations mint a `skill:` span.** A `skill:<name>`
+> node is minted from every `tool:Skill` span, named from the Skill tool call's input. Skills
+> invoked as **slash commands / prompt expansions** (`/source-task`, `/land`, most
+> drain-driven skills) do **not** create a `tool:Skill` span, so they never score. Only skills
+> the model invokes through the **Skill tool** (e.g. `code-review` during a cycle) appear — so
+> read the chart as "cost of Skill-tool-invoked skills", not "every skill that ran." Capturing
+> slash-invoked skills is a separate, larger change. A skill node with no generation
+> descendants is skipped (not charted as $0), matching the ready-but-latent `skill_success`
+> idiom.
+
 ## Outcome, normalization + cross-project stamping (Issue #231)
 
 A blocked/reaped disaster spoke and a clean landed spoke used to carry identical trace

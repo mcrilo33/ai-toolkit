@@ -253,6 +253,7 @@ from telemetry.spoke_tree.scores import (
     build_rule_invocation_scores,
     build_score_events,
     build_script_success_scores,
+    build_skill_cost_scores,
     build_skill_success_scores,
     build_step_cost_scores,
     build_step_duration_scores,
@@ -1014,6 +1015,7 @@ class EnrichmentContext:
     enforcement_scores: list[IngestEvent] = field(default_factory=list)
     script_success_scores: list[IngestEvent] = field(default_factory=list)
     skill_success_scores: list[IngestEvent] = field(default_factory=list)
+    skill_cost_scores: list[IngestEvent] = field(default_factory=list)
     mcp_call_scores: list[IngestEvent] = field(default_factory=list)
     mcp_def_load_scores: list[IngestEvent] = field(default_factory=list)
     agent_verdict_scores: list[IngestEvent] = field(default_factory=list)
@@ -1154,8 +1156,17 @@ def _enrich_script_success(ctx: EnrichmentContext) -> None:
 
 
 def _enrich_skill_success(ctx: EnrichmentContext) -> None:
-    """Emit per-skill ``skill_success:<name>`` 0/1 scores from each skill span's scripted status (#234)."""
+    """Emit per-skill ``skill_success:<name>`` (#234) + ``skill_cost_usd:<name>`` (#322) scores.
+
+    Both read the same assembled View A batch. The #322 per-skill cost score is FOLDED into this
+    existing pass — not a new ``_ENRICHMENTS`` entry — so the registry order stays the documented
+    sequence and the out-of-scope registry equality assertion is untouched (mirroring how the #280
+    lifecycle scores fold into the ``scores`` pass).
+    """
     ctx.skill_success_scores = build_skill_success_scores(
+        ctx.spoke_run_id, ctx.batch, base_ts=ctx.base_ts
+    )
+    ctx.skill_cost_scores = build_skill_cost_scores(
         ctx.spoke_run_id, ctx.batch, base_ts=ctx.base_ts
     )
 
@@ -1320,6 +1331,7 @@ def main(argv: list[str] | None = None) -> int:
         + ctx.enforcement_scores
         + ctx.script_success_scores
         + ctx.skill_success_scores
+        + ctx.skill_cost_scores
         + ctx.mcp_call_scores
         + ctx.mcp_def_load_scores
         + ctx.agent_verdict_scores
@@ -1346,6 +1358,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.enforcement_scores)} enforcement-fire scores emitted, "
         f"{len(ctx.script_success_scores)} script-success scores emitted, "
         f"{len(ctx.skill_success_scores)} skill-success scores emitted, "
+        f"{len(ctx.skill_cost_scores)} skill-cost scores emitted, "
         f"{len(ctx.mcp_call_scores)} mcp-call scores emitted, "
         f"{len(ctx.mcp_def_load_scores)} mcp-def-load scores emitted, "
         f"{len(ctx.agent_verdict_scores)} agent-verdict scores emitted, "
