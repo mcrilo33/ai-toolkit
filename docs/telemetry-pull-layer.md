@@ -350,6 +350,36 @@ rollup.
 > descendants is skipped (not charted as $0), matching the ready-but-latent `skill_success`
 > idiom.
 
+### Widget 6 — per-sub-agent cost (Issue #323)
+
+The exact analog of Widget 5 for sub-agents — the most expensive spawned unit in a run,
+and previously a cost blind spot. A `sub-agent:<type>` node is the otelcol-renamed
+`tool:Agent` **container** (#161) whose own `costDetails` is $0 — the real LLM spend lives
+in its `sub-agent:llm` generation descendants — so an Observations → Total Cost widget
+filtered to `sub-agent:` returns $0. The builder therefore emits a per-agent
+`agent_cost_usd:<type>` numeric score (:func:`build_agent_cost_scores`) summing the full
+`costDetails` of every generation in the agent's subtree, reusing the same
+`_cost_subtree_ancestors` rollup helper as `skill_cost_usd`. A fan-out of N same-type agents
+emits N observation-scoped scores under one name, so the *Sum / breakdown Name* below folds
+them into one volume-aware bar.
+
+| Field | Value |
+|-------|-------|
+| View | Scores (numeric) |
+| Filters | `name` *starts with* `agent_cost_usd:` |
+| Metrics | `value` — `sum` (add `count` to separate "expensive per run" from "expensive because many") |
+| Breakdown dimension | `name` |
+| Chart | Horizontal bar |
+
+> [!NOTE]
+> **Reconciliation — `agent_cost_usd:<type>` is a *subset* of `step_total_cost_usd`, not
+> additive.** The `sub-agent:llm` generations a sub-agent runs are already folded into the
+> `step_total_cost_usd:<PHASE>` of the cycle-step the agent sits in (that per-step total
+> windows *every* generation, main-loop and sub-agent). So the agent-cost bar re-cuts a slice
+> of the step total by agent type — never read it *on top of* the step cost. A container with
+> no generation descendants is skipped (not charted as $0), matching the `skill_cost_usd` /
+> ready-but-latent `skill_success` discipline.
+
 ## Outcome, normalization + cross-project stamping (Issue #231)
 
 A blocked/reaped disaster spoke and a clean landed spoke used to carry identical trace

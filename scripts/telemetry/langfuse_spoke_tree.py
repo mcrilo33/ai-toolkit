@@ -241,6 +241,7 @@ from telemetry.spoke_tree.rollups import (
     _strip_container_usage,
 )
 from telemetry.spoke_tree.scores import (
+    build_agent_cost_scores,
     build_agent_verdict_scores,
     build_enforcement_fire_scores,
     build_lifecycle_stage_scores,
@@ -1019,6 +1020,7 @@ class EnrichmentContext:
     mcp_call_scores: list[IngestEvent] = field(default_factory=list)
     mcp_def_load_scores: list[IngestEvent] = field(default_factory=list)
     agent_verdict_scores: list[IngestEvent] = field(default_factory=list)
+    agent_cost_scores: list[IngestEvent] = field(default_factory=list)
     outcome_count_scores: list[IngestEvent] = field(default_factory=list)
     normalization_scores: list[IngestEvent] = field(default_factory=list)
 
@@ -1206,13 +1208,19 @@ def _enrich_normalization(ctx: EnrichmentContext) -> None:
 
 
 def _enrich_agent_verdict(ctx: EnrichmentContext) -> None:
-    """Emit per-agent ``agent_verdict:<type>`` scores from reviews + sub-agent outcomes (#233).
+    """Emit per-agent ``agent_verdict:<type>`` (#233) + ``agent_cost_usd:<type>`` (#323) scores.
 
-    Reads the worktree's ``.review`` artifacts (code-review verdicts) and the assembled batch's
-    ``sub-agent:`` containers (schema status / reaper-killed died class).
+    Both read the assembled View A batch's ``sub-agent:`` containers (the verdict pass also reads the
+    worktree's ``.review`` artifacts for code-review verdicts). The #323 per-agent cost score is
+    FOLDED into this existing pass — not a new ``_ENRICHMENTS`` entry — so the registry order stays
+    the documented sequence and the out-of-scope registry equality assertion is untouched (mirroring
+    how the #322 skill-cost score folds into the ``skill-success`` pass).
     """
     ctx.agent_verdict_scores = build_agent_verdict_scores(
         ctx.spoke_run_id, ctx.batch, ctx.root / ".review", base_ts=ctx.base_ts
+    )
+    ctx.agent_cost_scores = build_agent_cost_scores(
+        ctx.spoke_run_id, ctx.batch, base_ts=ctx.base_ts
     )
 
 
@@ -1335,6 +1343,7 @@ def main(argv: list[str] | None = None) -> int:
         + ctx.mcp_call_scores
         + ctx.mcp_def_load_scores
         + ctx.agent_verdict_scores
+        + ctx.agent_cost_scores
         + ctx.outcome_count_scores
         + ctx.normalization_scores,
         post,
@@ -1362,6 +1371,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.mcp_call_scores)} mcp-call scores emitted, "
         f"{len(ctx.mcp_def_load_scores)} mcp-def-load scores emitted, "
         f"{len(ctx.agent_verdict_scores)} agent-verdict scores emitted, "
+        f"{len(ctx.agent_cost_scores)} agent-cost scores emitted, "
         f"{len(ctx.outcome_count_scores)} outcome-count scores emitted, "
         f"{len(ctx.normalization_scores)} normalization scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
