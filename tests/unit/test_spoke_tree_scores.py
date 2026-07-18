@@ -15,6 +15,7 @@ from telemetry.spoke_tree.observations import Lifecycle
 from telemetry.spoke_tree.scores import (
     _step_phase,
     _step_phase_of,
+    build_agent_cost_scores,
     build_agent_verdict_scores,
     build_lifecycle_stage_scores,
     build_mcp_call_scores,
@@ -290,6 +291,131 @@ class TestBuildSkillCostScores:
 
         assert all(e["body"]["name"] == "skill_cost_usd:code-review" for e in events)
         assert {e["body"]["observationId"] for e in events} == {"sc1", "sc2"}
+        assert len({e["body"]["id"] for e in events}) == 2
+
+
+class TestBuildAgentCostScores:
+    """#323: sum a sub-agent container's generation-descendant cost into an agent_cost_usd:<type>.
+
+    A ``sub-agent:<type>`` span is the otelcol-renamed ``tool:Agent`` container whose own
+    ``costDetails`` is $0 — the real spend lives in its ``sub-agent:llm`` generation descendants —
+    so Langfuse's own-cost-summing metrics API returns $0 for a ``sub-agent:`` filter. Each
+    container therefore emits ``agent_cost_usd:<type>``, the summed ``costDetails`` of every
+    generation in its subtree, observation-scoped to the container. A container with no generation
+    descendants is SKIPPED (never scored 0), mirroring the #322 skill-cost discipline. This reuses
+    the same subtree-rollup helper as :func:`build_skill_cost_scores`.
+    """
+
+    def _agent(self, obs_id: str, name: str, parent: str | None = None) -> dict:
+        return {
+            "type": "span-create",
+            "body": {"id": obs_id, "name": name, "parentObservationId": parent},
+        }
+
+    def _gen(self, obs_id: str, parent: str, cost: dict[str, float]) -> dict:
+        return {
+            "type": "generation-create",
+            "body": {
+                "id": obs_id,
+                "name": "sub-agent:llm",
+                "parentObservationId": parent,
+                "costDetails": cost,
+            },
+        }
+
+    def test_two_agent_types_sum_generation_descendants(self) -> None:
+        # sub-agent:code-review has a generation nested one level down under an inner span (subtree
+        # depth > 1) plus a direct generation; sub-agent:general-purpose has one generation.
+        batch = [
+            self._agent("acr", "sub-agent:code-review"),
+            {"type": "span-create", "body": {"id": "inner", "parentObservationId": "acr"}},
+            self._gen("g_rev", "inner", {"total": 2.0}),
+            self._gen("g_rev2", "acr", {"input": 0.3, "output": 0.7}),
+            self._agent("agp", "sub-agent:general-purpose"),
+            self._gen("g_gp", "agp", {"total": 5.0}),
+        ]
+
+        events = build_agent_cost_scores(SPOKE, batch, base_ts="t")
+
+        by_name = {e["body"]["name"]: e["body"] for e in events}
+        assert set(by_name) == {
+            "agent_cost_usd:code-review",
+            "agent_cost_usd:general-purpose",
+        }
+        assert all(e["type"] == "score-create" for e in events)
+        assert by_name["agent_cost_usd:code-review"]["value"] == pytest.approx(3.0)
+        assert by_name["agent_cost_usd:code-review"]["observationId"] == "acr"
+        assert by_name["agent_cost_usd:general-purpose"]["value"] == pytest.approx(5.0)
+        assert by_name["agent_cost_usd:general-purpose"]["observationId"] == "agp"
+
+    def test_zero_descendant_agent_is_skipped(self) -> None:
+        batch = [
+            self._agent("acr", "sub-agent:code-review"),
+            self._gen("g_rev", "acr", {"total": 2.0}),
+            self._agent("aex", "sub-agent:Explore"),  # no generation descendants
+        ]
+
+        events = build_agent_cost_scores(SPOKE, batch, base_ts="t")
+
+        assert {e["body"]["name"] for e in events} == {"agent_cost_usd:code-review"}
+
+    def test_sub_agent_llm_generation_is_not_a_boundary(self) -> None:
+        # The generation leaves are named sub-agent:llm; they are summed, never scored themselves.
+        batch = [
+            self._agent("agp", "sub-agent:general-purpose"),
+            self._gen("g", "agp", {"total": 4.0}),
+        ]
+
+        events = build_agent_cost_scores(SPOKE, batch, base_ts="t")
+
+        assert {e["body"]["name"] for e in events} == {"agent_cost_usd:general-purpose"}
+
+    def test_explicit_total_wins_over_component_sum(self) -> None:
+        batch = [
+            self._agent("acr", "sub-agent:code-review"),
+            self._gen("g", "acr", {"input": 0.3, "output": 0.7, "total": 1.0}),
+        ]
+
+        events = build_agent_cost_scores(SPOKE, batch, base_ts="t")
+
+        assert events[0]["body"]["value"] == pytest.approx(1.0)
+
+    def test_nested_agents_each_report_their_subtree(self) -> None:
+        # A general-purpose agent spawns a nested planner: the inner generation rolls into BOTH
+        # (the subtree-rollup boundary), while general-purpose's own generation is only its own.
+        batch = [
+            self._agent("agp", "sub-agent:general-purpose"),
+            self._gen("g_outer", "agp", {"total": 1.0}),
+            self._agent("apl", "sub-agent:planner", parent="agp"),
+            self._gen("g_inner", "apl", {"total": 4.0}),
+        ]
+
+        events = build_agent_cost_scores(SPOKE, batch, base_ts="t")
+
+        by_name = {e["body"]["name"]: e["body"]["value"] for e in events}
+        assert by_name["agent_cost_usd:general-purpose"] == pytest.approx(5.0)
+        assert by_name["agent_cost_usd:planner"] == pytest.approx(4.0)
+
+    def test_generation_under_no_agent_is_ignored(self) -> None:
+        batch = [self._gen("g", "i1", {"total": 9.0})]
+
+        assert build_agent_cost_scores(SPOKE, batch, base_ts="t") == []
+
+    def test_same_agent_type_run_twice_keeps_both_scores(self) -> None:
+        # A fan-out of two same-type agents: each gets its own observation-scoped score with a
+        # distinct id (keyed off the container id), so both survive ingest and the dashboard's
+        # Sum-by-Name folds them into one volume-aware bar.
+        batch = [
+            self._agent("a1", "sub-agent:general-purpose"),
+            self._gen("g1", "a1", {"total": 2.0}),
+            self._agent("a2", "sub-agent:general-purpose"),
+            self._gen("g2", "a2", {"total": 5.0}),
+        ]
+
+        events = build_agent_cost_scores(SPOKE, batch, base_ts="t")
+
+        assert all(e["body"]["name"] == "agent_cost_usd:general-purpose" for e in events)
+        assert {e["body"]["observationId"] for e in events} == {"a1", "a2"}
         assert len({e["body"]["id"] for e in events}) == 2
 
 

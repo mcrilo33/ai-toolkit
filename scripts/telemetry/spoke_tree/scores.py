@@ -1370,6 +1370,13 @@ def build_skill_cost_scores(
     ]
 
 
+def build_agent_cost_scores(
+    spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
+) -> list[IngestEvent]:
+    """Build per-sub-agent ``agent_cost_usd:<type>`` scores (#323). RED stub — GREEN implements."""
+    return []
+
+
 def _step_duration_ms(body: dict[str, Any]) -> int | None:
     """Return a cycle-step node's window length in ms from its start/end, or None when unparseable."""
     start = _parse_utc(body.get("startTime"))
