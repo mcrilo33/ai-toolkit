@@ -380,6 +380,52 @@ them into one volume-aware bar.
 > no generation descendants is skipped (not charted as $0), matching the `skill_cost_usd` /
 > ready-but-latent `skill_success` discipline.
 
+### Widget 7 — per-agent verdict + the status contract (Issues #233, #325)
+
+Whether spawning a sub-agent *succeeded* is a per-agent `agent_verdict:<type>` score
+(`1.0` success / `0.0` reject), from two sources (:func:`build_agent_verdict_scores`):
+
+- **code-review** — the signed `.review/*.json` artifacts (APPROVE → 1.0,
+  REQUEST_CHANGES → 0.0). Trace-level, authoritative; the `sub-agent:code-review`
+  container is *not* also scored from its output, to avoid double-counting.
+- **every other `sub-agent:<type>`** — the generic path (:func:`_sub_agent_verdict`):
+  it reads a `status` off the agent's grafted `output` (:func:`_output_status`) and maps
+  it through `_AGENT_SUCCESS_STATUSES` — `success, completed, approved, pass, passed, ok,
+  done` score 1.0, any other status scores 0.0.
+
+**The status contract (agent side).** `_output_status` runs `json.loads()` on the
+**entire** `output` and requires a dict with a `status` key, so an agent scores a verdict
+only when its **final message is a single JSON object** (no prose around it, under the
+20k graft cap) carrying that key. This is a return-contract obligation on the agent brief,
+not a builder feature — the builder has been generic since #233; #325 is what makes real
+agents emit the status. The briefs that carry it today:
+
+| Agent | Success status | When |
+|-------|----------------|------|
+| `bug-scoper` | `completed` | issue filed / drafted / deduped (a `blocked` status marks an investigation it could not complete) |
+| `planner` | `completed` | a plan was produced (`blocked` when the goal was too ill-defined to decompose) |
+| `code-review` | — | scored from the `.review` artifact, not a returned status |
+
+A reaper-killed (`ERROR`-level) container instead scores a separate
+`agent_verdict:<type>:died` **count** (kept off the 0/1 rate name so it never collides).
+
+> [!NOTE]
+> **Research / read-only agents carry no status — and that absence is not a failure.**
+> `Explore`, `general-purpose`, `claude-code-guide`, `documentation`, and `architect`
+> return prose findings/designs with no discrete pass/fail, so `_output_status` reads
+> `None` and they score **nothing**. A missing `agent_verdict:<type>` for these agents
+> means "not a scoreable outcome", never "the agent failed" — absence is not a firing
+> basis (AFK Design Principle 6). Do not read their empty verdict bar as a 0% success
+> rate; filter the widget to the status-carrying types above.
+
+| Field | Value |
+|-------|-------|
+| View | Scores (numeric) |
+| Filters | `name` *starts with* `agent_verdict:` (exclude `:died` for the pass rate) |
+| Metrics | `value` — `avg` for the success rate; add `count` for volume |
+| Breakdown dimension | `name` |
+| Chart | Horizontal bar |
+
 ## Outcome, normalization + cross-project stamping (Issue #231)
 
 A blocked/reaped disaster spoke and a clean landed spoke used to carry identical trace
