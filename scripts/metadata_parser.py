@@ -229,16 +229,31 @@ def _encode(fm_lines: list[str]) -> str:
     return "\\n".join(line.replace("\\", "\\\\") for line in fm_lines)
 
 
-def query(items: dict[str, dict], tool: str, fields: list[str]) -> list[tuple[str, str]]:
+def query(
+    items: dict[str, dict],
+    tool: str,
+    fields: list[str],
+    *,
+    always_on: str | None = None,
+) -> list[tuple[str, str]]:
     """Return ``[(name, frontmatter_string), …]`` for the given tool and fields.
 
     Args:
         items: Output of :func:`parse`.
         tool: Tool name whose overrides take precedence over defaults.
         fields: Frontmatter field names to emit, in order.
+        always_on: Name of a boolean field (e.g. ``"alwaysApply"``) that marks a
+            rule as always-on. When set, an item with none of the requested
+            ``fields`` is still emitted — with *empty* frontmatter — if its merged
+            ``always_on`` field is truthy (``"true"``). This maps the Claude rule
+            model: a rule with ``paths`` emits its glob (conditional), an always-on
+            rule with no ``paths`` emits nothing but its file (session-start), and a
+            rule that is neither is skipped (on-demand). Defaults to ``None``, which
+            preserves the historic "emit only if a requested field is present".
 
     Returns:
-        One entry per item that has at least one requested field. The
+        One entry per item that has at least one requested field, plus — when
+        ``always_on`` is set — each always-on item as ``(name, "")``. The
         frontmatter string is a single line with newlines encoded for the
         ``echo -e`` transport (see :func:`_encode`).
     """
@@ -251,6 +266,8 @@ def query(items: dict[str, dict], tool: str, fields: list[str]) -> list[tuple[st
                 fm_lines.extend(_to_yaml_lines(f, merged[f], 0))
         if fm_lines:
             results.append((name, _encode(fm_lines)))
+        elif always_on and str(merged.get(always_on, "")).lower() == "true":
+            results.append((name, ""))
     return results
 
 
@@ -281,22 +298,31 @@ def apply_overrides(
 def main() -> None:
     """CLI entry point — drop-in replacement for the heredoc in sync-to-repo.sh.
 
-    Usage: ``metadata_parser.py <meta_file> <tool> <fields> [config_file]``.
-    When ``config_file`` is given, each agent's ``model``/``effort`` from the
-    ai-toolkit config is overlaid onto ``tool``'s block before querying, so the
-    config — not the metadata.yml — is the source of truth for model routing.
+    Usage: ``metadata_parser.py <meta_file> <tool> <fields> [config_file]
+    [--always-on <field>]``. When ``config_file`` is given, each agent's
+    ``model``/``effort`` from the ai-toolkit config is overlaid onto ``tool``'s
+    block before querying, so the config — not the metadata.yml — is the source of
+    truth for model routing. ``--always-on <field>`` emits items whose ``<field>``
+    is truthy but which carry none of the requested fields as empty-frontmatter
+    rows (the Claude always-on rule model; see :func:`query`).
     """
-    meta_file, tool, fields_str = sys.argv[1], sys.argv[2], sys.argv[3]
+    argv = sys.argv[1:]
+    always_on: str | None = None
+    if "--always-on" in argv:
+        i = argv.index("--always-on")
+        always_on = argv[i + 1]
+        del argv[i : i + 2]
+    meta_file, tool, fields_str = argv[0], argv[1], argv[2]
     wanted = [f.strip() for f in fields_str.split(",")]
     items = parse(meta_file)
-    if len(sys.argv) > 4:
+    if len(argv) > 3:
         # Lazy on purpose: ai_toolkit_config imports metadata_parser at module
         # load, so a top-level import here would be circular. Keep it local.
         import ai_toolkit_config as cfg
 
-        config = cfg.load_config(sys.argv[4])
+        config = cfg.load_config(argv[3])
         apply_overrides(items, tool, cfg.agent_model_overrides(config))
-    for name, fm in query(items, tool, wanted):
+    for name, fm in query(items, tool, wanted, always_on=always_on):
         print(f"{name}\t{fm}")
 
 

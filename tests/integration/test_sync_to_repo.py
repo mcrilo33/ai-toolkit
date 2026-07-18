@@ -76,7 +76,9 @@ _CLAUDE_EVENT_MAP = {
 # Rules that have the tool-relevant field in metadata.yml:
 # Copilot: emits all rules that have at least one of (name, description, applyTo)
 # Cursor:  emits all rules that have at least one of (description, globs, alwaysApply)
-# Claude:  emits only rules that have the 'paths' field
+# Claude:  emits rules that have 'paths' (conditional) OR alwaysApply: true with no
+#          'paths' (always-on, empty frontmatter); on-demand rules (neither) are not
+#          emitted (issue #320)
 
 # All rules in metadata — guidelines is ALSO generated as an instruction file
 ALL_RULE_NAMES = {
@@ -110,7 +112,7 @@ RULES_WITHOUT_GLOB = {
     "bug-triage",
 }
 
-# Rules that define 'paths' in metadata → generated as Claude rules
+# Rules that define 'paths' in metadata → generated as conditional Claude rules
 CLAUDE_RULES_WITH_PATHS = {
     "afk-design-principles",
     "code-quality",
@@ -121,6 +123,30 @@ CLAUDE_RULES_WITH_PATHS = {
     "pytest-conventions",
     "operational-gotchas",
     "github-actions",
+}
+
+# Rules with alwaysApply: true and no 'paths' → generated as always-on Claude rules
+# (empty frontmatter, loaded at session start). Mirrors
+# tests/unit/test_rules_governance.py::EXPECTED_ALWAYS_ON (issue #320).
+CLAUDE_ALWAYS_ON_RULES = {
+    "guidelines",
+    "security",
+    "agent-orchestration",
+    "scientific-integrity",
+}
+
+# The full Claude rule set: conditional + always-on. On-demand rules (no 'paths',
+# alwaysApply falsy) are surfaced via their skills, never emitted here.
+CLAUDE_RULES_GENERATED = CLAUDE_RULES_WITH_PATHS | CLAUDE_ALWAYS_ON_RULES
+
+# On-demand rules: neither 'paths' nor alwaysApply: true → not generated for Claude.
+CLAUDE_RULES_ON_DEMAND = {
+    "workflow",
+    "planning-hub",
+    "issue-hygiene",
+    "bug-triage",
+    "afk-answering",
+    "library-research",
 }
 
 # All skill directories in shared/skills/ that contain SKILL.md
@@ -458,21 +484,41 @@ class TestClaudeRules:
     """Verify Claude rules: exact set, fields, and body."""
 
     def test_exact_rule_set_generated(self, target_repo: Path) -> None:
-        """Only rules with 'paths' in metadata are generated."""
+        """Conditional (paths) plus always-on (alwaysApply, no paths) rules generate."""
         _run_sync(target_repo, "claude")
 
         rules_dir = target_repo / ".claude" / "rules"
         generated = {f.stem for f in rules_dir.glob("*.md")}
-        assert generated == CLAUDE_RULES_WITH_PATHS
+        assert generated == CLAUDE_RULES_GENERATED
 
-    def test_frontmatter_has_paths_field(self, target_repo: Path) -> None:
+    def test_conditional_frontmatter_has_paths_field(self, target_repo: Path) -> None:
+        """Every conditional (paths) rule carries a non-empty 'paths' field."""
+        _run_sync(target_repo, "claude")
+
+        rules_dir = target_repo / ".claude" / "rules"
+        for name in CLAUDE_RULES_WITH_PATHS:
+            fm = _parse_frontmatter((rules_dir / f"{name}.md").read_text())
+            assert "paths" in fm, f"{name}.md missing 'paths' field"
+            assert fm["paths"], f"{name}.md has empty paths"
+
+    def test_always_on_frontmatter_has_no_paths(self, target_repo: Path) -> None:
+        """Always-on rules emit empty frontmatter (no 'paths') so CC loads them always."""
+        _run_sync(target_repo, "claude")
+
+        rules_dir = target_repo / ".claude" / "rules"
+        for name in CLAUDE_ALWAYS_ON_RULES:
+            fm = _parse_frontmatter((rules_dir / f"{name}.md").read_text())
+            assert "paths" not in fm, f"{name}.md must not carry 'paths' (always-on)"
+
+    def test_no_disallowed_fields_in_frontmatter(self, target_repo: Path) -> None:
+        """Claude frontmatter emits only 'paths' — never alwaysApply/globs/applyTo."""
         _run_sync(target_repo, "claude")
 
         rules_dir = target_repo / ".claude" / "rules"
         for f in rules_dir.glob("*.md"):
             fm = _parse_frontmatter(f.read_text())
-            assert "paths" in fm, f"{f.name} missing 'paths' field"
-            assert fm["paths"], f"{f.name} has empty paths"
+            for disallowed in ("alwaysApply", "globs", "applyTo"):
+                assert disallowed not in fm, f"{f.name}: '{disallowed}' leaked into frontmatter"
 
     def test_paths_value_matches_metadata(self, target_repo: Path) -> None:
         _run_sync(target_repo, "claude")
@@ -485,14 +531,15 @@ class TestClaudeRules:
             fm = _parse_frontmatter(f.read_text())
             assert fm.get("paths", "") == expected, f"{f.name}: paths mismatch"
 
-    def test_rules_without_paths_excluded(self, target_repo: Path) -> None:
-        """guidelines, security, workflow, library-research have no paths → not generated."""
+    def test_on_demand_rules_excluded(self, target_repo: Path) -> None:
+        """On-demand rules (no paths, alwaysApply falsy) are surfaced via skills, not here."""
         _run_sync(target_repo, "claude")
 
         rules_dir = target_repo / ".claude" / "rules"
         generated = {f.stem for f in rules_dir.glob("*.md")}
-        excluded = {"guidelines", "security", "workflow", "library-research"}
-        assert generated.isdisjoint(excluded), f"Unexpected rules in Claude: {generated & excluded}"
+        assert generated.isdisjoint(CLAUDE_RULES_ON_DEMAND), (
+            f"Unexpected on-demand rules in Claude: {generated & CLAUDE_RULES_ON_DEMAND}"
+        )
 
     def test_body_matches_source_for_every_rule(self, target_repo: Path) -> None:
         _run_sync(target_repo, "claude")

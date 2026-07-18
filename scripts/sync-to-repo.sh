@@ -81,14 +81,22 @@ fi
 # Args: $1=metadata.yml  $2=tool  $3=comma-separated fields
 # Output: "name<TAB>field1: val\nfield2: val" per item
 query_metadata() {
-    local meta_file="$1" tool="$2" fields="$3" config="${4:-}"
+    local meta_file="$1" tool="$2" fields="$3" config="${4:-}" always_on="${5:-}"
     [ -f "$meta_file" ] || return 0
+    # A 5th arg names the always-on boolean field (issue #320): items whose field
+    # is truthy but which carry none of the requested fields emit as empty rows.
+    # ao_args is a fixed internal token pair (never user input), so leaving it
+    # unquoted to word-split into two argv elements is correct — and array-free,
+    # so it stays safe under bash 3.2 + `set -u` (an empty "${arr[@]}" would trip
+    # unbound-variable there).
+    local ao_args=""
+    [ -n "$always_on" ] && ao_args="--always-on $always_on"
     # A 4th arg passes the ai-toolkit config so the parser overlays each agent's
     # model/effort from it (issue #142) — the config, not metadata.yml, routes.
     if [ -n "$config" ] && [ -f "$config" ]; then
-        python3 "$SCRIPT_DIR/metadata_parser.py" "$meta_file" "$tool" "$fields" "$config"
+        python3 "$SCRIPT_DIR/metadata_parser.py" "$meta_file" "$tool" "$fields" "$config" $ao_args
     else
-        python3 "$SCRIPT_DIR/metadata_parser.py" "$meta_file" "$tool" "$fields"
+        python3 "$SCRIPT_DIR/metadata_parser.py" "$meta_file" "$tool" "$fields" $ao_args
     fi
 }
 
@@ -338,8 +346,10 @@ sync_claude() {
     section "Claude → $cl/"
     make_dir "$cl/rules" "$cl/skills" "$cl/agents"
 
-    # rules/*.md (with paths)
-    query_metadata "$SHARED_DIR/rules/metadata.yml" claude "$CLAUDE_RULE_FIELDS" | while IFS=$'\t' read -r name fm; do
+    # rules/*.md — conditional rules emit their `paths:` glob; always-on rules
+    # (alwaysApply: true, no paths) emit empty frontmatter so Claude Code loads
+    # them at session start; on-demand rules (neither) are not emitted (issue #320).
+    query_metadata "$SHARED_DIR/rules/metadata.yml" claude "$CLAUDE_RULE_FIELDS" "" alwaysApply | while IFS=$'\t' read -r name fm; do
         [ -f "$SHARED_DIR/rules/${name}.md" ] || continue
         add_frontmatter "$SHARED_DIR/rules/${name}.md" "$cl/rules/${name}.md" "$fm"
         info "rules/${name}.md"
