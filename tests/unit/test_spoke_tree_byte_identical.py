@@ -5,7 +5,8 @@ a single byte of the assembled ingest batches. This test rebuilds a reference sp
 whole pure-function pipeline the orchestrator's ``main`` drives — View A (:func:`build_batch`),
 View B (:func:`build_cycle_batch`), the numeric scores (:func:`build_score_events`), and the
 per-phase step-cost scores (:func:`build_step_cost_scores`), the #230 true per-step total-cost
-(:func:`build_step_total_cost_scores`) and duration (:func:`build_step_duration_scores`) scores,
+(:func:`build_step_total_cost_scores`) and duration (:func:`build_step_duration_scores`) scores, the
+#322 per-skill cost (:func:`build_skill_cost_scores`) scores,
 including the #162 commit timeline nodes — and asserts the result equals a golden captured from
 pre-refactor code. Any drift in the core assembly, re-parenting, rollups, view lenses, or score
 emission fails here immediately.
@@ -24,6 +25,7 @@ from telemetry.langfuse_spoke_tree import (
     build_batch,
     build_cycle_batch,
     build_score_events,
+    build_skill_cost_scores,
     build_step_cost_scores,
     build_step_duration_scores,
     build_step_total_cost_scores,
@@ -66,6 +68,7 @@ def _reference_batches() -> dict[str, list]:
     step_scores = build_step_cost_scores(SPOKE, view_b, base_ts=_BASE_TS, price=_PRICE)
     step_total_cost_scores = build_step_total_cost_scores(SPOKE, view_b, base_ts=_BASE_TS)
     step_duration_scores = build_step_duration_scores(SPOKE, view_b, base_ts=_BASE_TS)
+    skill_cost_scores = build_skill_cost_scores(SPOKE, view_a, base_ts=_BASE_TS)
     return {
         "view_a": view_a,
         "view_b": view_b,
@@ -73,6 +76,7 @@ def _reference_batches() -> dict[str, list]:
         "step_scores": step_scores,
         "step_total_cost_scores": step_total_cost_scores,
         "step_duration_scores": step_duration_scores,
+        "skill_cost_scores": skill_cost_scores,
     }
 
 

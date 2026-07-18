@@ -682,5 +682,6 @@
   "scores": [],
   "step_scores": [],
   "step_total_cost_scores": [],
-  "step_duration_scores": []
+  "step_duration_scores": [],
+  "skill_cost_scores": []
 }
