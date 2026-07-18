@@ -1420,8 +1420,8 @@ def build_agent_cost_scores(
 
     A container with no generation descendants never enters the accumulator, so it is SKIPPED rather
     than scored 0 — absence of spend is not a cost (mirrors the #322 skill-cost / ``skill_success``
-    idiom; AFK Design Principle 1). Read off View A (the same batch :func:`build_agent_verdict_scores`
-    reads), so it is trace-level like the other agent scores.
+    idiom; AFK Design Principle 1). Read off the View A batch (the same one
+    :func:`build_agent_verdict_scores` reads), observation-scoped to the container.
 
     ``agent_cost_usd:<type>`` is a SUBSET of the ``step_total_cost_usd`` of the step the agent sits in
     (that step already folds ``sub-agent:llm`` spend), so the two must not be read as additive.
