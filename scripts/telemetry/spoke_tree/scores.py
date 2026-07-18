@@ -101,6 +101,16 @@ _SKILL_STATUS_KEYS = ("skill.status", "skill_exit_status")
 # ``skill_cost_usd:<name>`` score. A skill with no generation descendants is SKIPPED (never scored 0)
 # — absence of spend is not a cost (AFK Design Principle 1; the ready-but-latent skill_success idiom).
 _SKILL_COST_SCORE = "skill_cost_usd"
+# Per-sub-agent cost (#323): the exact analog for a ``sub-agent:<type>`` container — the otelcol-
+# renamed ``tool:Agent`` span whose OWN ``costDetails`` is $0 while the real LLM spend lives in its
+# ``sub-agent:llm`` generation DESCENDANTS. Langfuse's own-cost-summing metrics API returns $0 for a
+# ``sub-agent:`` filter, so the summed descendant-generation cost is emitted as a numeric
+# ``agent_cost_usd:<type>`` score, reusing the #322 subtree-rollup helper (:func:`_cost_subtree_ancestors`).
+# A container with no generation descendants is SKIPPED (never scored 0). ``agent_cost_usd:<type>`` is
+# a SUBSET of the ``step_total_cost_usd`` of the step the agent sits in (that step already folds
+# ``sub-agent:llm``), so the two must not be read as additive.
+_AGENT_COST_SCORE = "agent_cost_usd"
+_SUB_AGENT_LLM_TYPE = "llm"  # the sub-agent's own generation leaves, never a rollup boundary
 # MCP call scores (#234): per ``mcp:<server>`` group, mirror its call count and success into
 # chartable numeric scores — ``mcp_success:<server>`` is 1.0 when the server's group had zero
 # error-shaped calls else 0.0 (so a Scores-view average reads as its success rate), and
@@ -1298,20 +1308,22 @@ def build_step_total_cost_scores(
     return events
 
 
-def _skill_span_ancestors(
-    node_id: str, parent_of: dict[str, str | None], skill_ids: set[str]
+def _cost_subtree_ancestors(
+    node_id: str, parent_of: dict[str, str | None], boundary_ids: set[str]
 ) -> set[str]:
-    """Walk ``parentObservationId`` up from ``node_id``, collecting EVERY skill-span ancestor (#322).
+    """Walk ``parentObservationId`` up from ``node_id``, collecting EVERY boundary-span ancestor.
 
-    A generation is a descendant of every skill span on its ancestor chain, so for nested skill spans
-    (a ``skill:brainstorming`` under a ``skill:code-review``) an inner generation credits BOTH — the
-    subtree-rollup boundary. The visited set guards against a malformed parent cycle.
+    The shared subtree-cost rollup helper (#322 skill cost, #323 agent cost): a generation is a
+    descendant of every boundary span on its ancestor chain, so for nested boundaries (a
+    ``skill:brainstorming`` under a ``skill:code-review``, or a ``sub-agent:planner`` under a
+    ``sub-agent:general-purpose``) an inner generation credits BOTH — the subtree-rollup boundary.
+    The visited set guards against a malformed parent cycle.
     """
     ancestors: set[str] = set()
     seen: set[str] = set()
     current = parent_of.get(node_id)
     while current is not None and current not in seen:
-        if current in skill_ids:
+        if current in boundary_ids:
             ancestors.add(current)
         seen.add(current)
         current = parent_of.get(current)
@@ -1327,7 +1339,7 @@ def build_skill_cost_scores(
     span whose OWN ``costDetails`` is $0 — the real LLM spend lives in its generation descendants — so
     Langfuse's own-cost-summing metrics API returns $0 for a ``skill:`` filter. Mirroring
     :func:`build_step_total_cost_scores`, every ``generation-create`` in the assembled batch is walked
-    up ``parentObservationId`` (:func:`_skill_span_ancestors`) and its full Langfuse
+    up ``parentObservationId`` (:func:`_cost_subtree_ancestors`) and its full Langfuse
     ``costDetails`` (:func:`_generation_total_cost`) is summed into each skill span on its chain, so a
     skill node's score is the total cost of its SUBTREE. Only actual generation leaves are summed —
     never a nested skill span's own field — so there is no double counting within one skill's score.
@@ -1355,7 +1367,7 @@ def build_skill_cost_scores(
         if event["type"] != "generation-create":
             continue
         cost = _generation_total_cost(event["body"])
-        for skill_id in _skill_span_ancestors(event["body"]["id"], parent_of, skill_ids):
+        for skill_id in _cost_subtree_ancestors(event["body"]["id"], parent_of, skill_ids):
             cost_by_skill[skill_id] = cost_by_skill.get(skill_id, 0.0) + cost
     return [
         _score_event(
@@ -1370,11 +1382,81 @@ def build_skill_cost_scores(
     ]
 
 
+def _is_sub_agent_container(body: dict[str, Any]) -> bool:
+    """Whether a node is a ``sub-agent:<type>`` container, not the ``sub-agent:llm`` leaves (#323).
+
+    The ``sub-agent:llm`` generations are the sub-agent's own LLM turns (the cost leaves), never a
+    rollup boundary — the same split :func:`build_agent_verdict_scores` / :func:`main_loop_request_count`
+    already use.
+    """
+    name = body.get("name") or ""
+    return (
+        name.startswith(_SUB_AGENT_PREFIX) and name[len(_SUB_AGENT_PREFIX) :] != _SUB_AGENT_LLM_TYPE
+    )
+
+
+def _sub_agent_type(body: dict[str, Any]) -> str:
+    """Return a ``sub-agent:<type>`` container's agent type for the score-name suffix (#323)."""
+    return (body.get("name") or "")[len(_SUB_AGENT_PREFIX) :]
+
+
 def build_agent_cost_scores(
     spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
 ) -> list[IngestEvent]:
-    """Build per-sub-agent ``agent_cost_usd:<type>`` scores (#323). RED stub — GREEN implements."""
-    return []
+    """Build per-sub-agent ``agent_cost_usd:<type>`` scores summing each agent's descendant cost (#323).
+
+    A ``sub-agent:<type>`` span is the otelcol-renamed ``tool:Agent`` container (:data:`_SUB_AGENT_PREFIX`)
+    whose OWN ``costDetails`` is $0 — the real LLM spend lives in its ``sub-agent:llm`` generation
+    descendants — so Langfuse's own-cost-summing metrics API returns $0 for a ``sub-agent:`` filter.
+    Mirroring :func:`build_skill_cost_scores`, every ``generation-create`` in the assembled batch is
+    walked up ``parentObservationId`` (:func:`_cost_subtree_ancestors`, the shared #322 rollup helper)
+    and its full Langfuse ``costDetails`` (:func:`_generation_total_cost`) is summed into each sub-agent
+    container on its chain, so a container's score is the total cost of its SUBTREE. Only actual
+    generation leaves are summed — never a nested container's own field — so there is no double counting
+    within one agent's score; a nested ``sub-agent:planner`` under a ``sub-agent:general-purpose``
+    credits BOTH (the subtree boundary). Observation-scoped to the container with a deterministic id, so
+    a fan-out of N same-type agents keeps N distinct scores that the dashboard's Sum-by-Name folds into
+    one volume-aware ``agent_cost_usd:<type>`` bar.
+
+    A container with no generation descendants never enters the accumulator, so it is SKIPPED rather
+    than scored 0 — absence of spend is not a cost (mirrors the #322 skill-cost / ``skill_success``
+    idiom; AFK Design Principle 1). Read off View A (the same batch :func:`build_agent_verdict_scores`
+    reads), so it is trace-level like the other agent scores.
+
+    ``agent_cost_usd:<type>`` is a SUBSET of the ``step_total_cost_usd`` of the step the agent sits in
+    (that step already folds ``sub-agent:llm`` spend), so the two must not be read as additive.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        batch: The assembled View A events (its ``sub-agent:`` containers and generation copies read).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events, one per sub-agent container with generation descendants (empty
+        when no sub-agent ran or none carried spend).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    by_id = {event["body"]["id"]: event["body"] for event in batch}
+    parent_of = {node_id: body.get("parentObservationId") for node_id, body in by_id.items()}
+    agent_ids = {node_id for node_id, body in by_id.items() if _is_sub_agent_container(body)}
+    cost_by_agent: dict[str, float] = {}
+    for event in batch:
+        if event["type"] != "generation-create":
+            continue
+        cost = _generation_total_cost(event["body"])
+        for agent_id in _cost_subtree_ancestors(event["body"]["id"], parent_of, agent_ids):
+            cost_by_agent[agent_id] = cost_by_agent.get(agent_id, 0.0) + cost
+    return [
+        _score_event(
+            spoke_run_id,
+            name=f"{_AGENT_COST_SCORE}:{_sub_agent_type(by_id[agent_id])}",
+            value=cost,
+            trace_id=trace_id,
+            base_ts=base_ts,
+            observation_id=agent_id,
+        )
+        for agent_id, cost in cost_by_agent.items()
+    ]
 
 
 def _step_duration_ms(body: dict[str, Any]) -> int | None:
