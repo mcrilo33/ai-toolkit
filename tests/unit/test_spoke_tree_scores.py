@@ -623,6 +623,44 @@ class TestBuildAgentVerdictScores:
 
         assert build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t") == []
 
+    @pytest.mark.parametrize("agent_type", ["bug-scoper", "planner"])
+    def test_shipped_brief_completed_status_scores_a_verdict(
+        self, agent_type: str, tmp_path: Path
+    ) -> None:
+        # #325: guards the REAL return contract of shipped briefs. bug-scoper and planner end
+        # with a single JSON object carrying status:"completed" (an _AGENT_SUCCESS_STATUSES
+        # member), so the generic _sub_agent_verdict path mints agent_verdict:<type> = 1.0 for
+        # every non-code-review type — not only code-review. A refactor that drops the generic
+        # branch fails here.
+        batch = [
+            {
+                "body": {
+                    "id": "sa",
+                    "name": f"sub-agent:{agent_type}",
+                    "output": json.dumps({"status": "completed", "summary": "..."}),
+                }
+            }
+        ]
+
+        events = build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t")
+
+        assert len(events) == 1
+        body = events[0]["body"]
+        assert body["name"] == f"agent_verdict:{agent_type}"
+        assert body["value"] == 1.0
+        assert body["observationId"] == "sa"
+
+    @pytest.mark.parametrize("agent_type", ["Explore", "general-purpose", "claude-code-guide"])
+    def test_research_agent_prose_return_scores_nothing(
+        self, agent_type: str, tmp_path: Path
+    ) -> None:
+        # #325: pure research / read-only agents carry NO terminal status by design, so a prose
+        # return scores nothing. That absence is expected (AFK Design Principle 6) and must never
+        # be read as a failure — pins that the documented out-of-scope agents stay unscored.
+        batch = [{"body": {"id": "sa", "name": f"sub-agent:{agent_type}", "output": "prose"}}]
+
+        assert build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t") == []
+
 
 class TestStepPhase:
     def test_parses_leftmost_known_phase(self) -> None:
