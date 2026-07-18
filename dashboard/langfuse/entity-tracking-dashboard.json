@@ -34,7 +34,8 @@
         "dimensions": [{ "field": "name" }],
         "metrics": [{ "measure": "value", "aggregation": "avg" }],
         "filters": [
-          { "column": "name", "operator": "starts with", "value": "agent_verdict:", "type": "string" }
+          { "column": "name", "operator": "starts with", "value": "agent_verdict:", "type": "string" },
+          { "column": "name", "operator": "does not contain", "value": ":died", "type": "string" }
         ]
       }
     },

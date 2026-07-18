@@ -243,6 +243,22 @@ class TestReadsTheScoresWeEmit:
                 fields = {d["field"] for d in widget["metricsQuery"].get("dimensions", [])}
                 assert "name" in fields, f"{widget['title']!r} must group by score name"
 
+    def test_agent_verdict_rate_excludes_the_died_count_subfamily(
+        self, widgets: list[dict]
+    ) -> None:
+        # `agent_verdict:` is not flat: a reaper-killed sub-agent also emits
+        # `agent_verdict:<type>:died` at a constant 1.0 — a COUNT the emitter keeps off
+        # the 0/1 rate name on purpose (scores.py `_DIED_FLAG`). Under an `avg`
+        # success-rate widget a `starts with "agent_verdict:"` filter would chart each
+        # `:died` bar at 100% success; a `does not contain ":died"` filter keeps the rate
+        # honest. Losing this filter re-scales a death count onto the approval rate.
+        widget = next(w for w in widgets if _family_of(w) == "agent_verdict:")
+        filters = widget["metricsQuery"]["filters"]
+
+        assert any(
+            f.get("operator") == "does not contain" and f.get("value") == ":died" for f in filters
+        ), "agent_verdict success-rate widget must exclude the :died count sub-family"
+
 
 class TestEachWidgetMatchesItsSpec:
     def test_one_widget_per_expected_family(self, widgets: list[dict]) -> None:
