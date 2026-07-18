@@ -1,0 +1,79 @@
+{
+  "name": "entity tracking",
+  "description": "Track the entities you most want to 'well track' — skills, sub-agents, and MCP servers — that had scores but no widget. One-stop view: per-skill cost (skill_cost_usd, #322), per-sub-agent cost and success (agent_cost_usd #323 + agent_verdict #233), and per-MCP-server carry cost, call volume, and success (mcp_carry_cost_usd / mcp_calls / mcp_success, #234). Cost and volume families roll up with sum; the 0/1 success families average to a rate. Rule and tool-definition carry costs are NOT re-charted here — they live in spoke-cost-dashboard.json. Saved once via the Langfuse UI (v3.192.x has no public dashboards API); each widget's metricsQuery is the exact /api/public/metrics query that backs it — add fromTimestamp/toTimestamp when running one. See docs/telemetry-pull-layer.md.",
+  "widgets": [
+    {
+      "title": "Skill cost per spoke (skill_cost_usd)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [{ "measure": "value", "aggregation": "sum" }],
+        "filters": [
+          { "column": "name", "operator": "starts with", "value": "skill_cost_usd:", "type": "string" }
+        ]
+      }
+    },
+    {
+      "title": "Sub-agent cost per spoke (agent_cost_usd)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [{ "measure": "value", "aggregation": "sum" }],
+        "filters": [
+          { "column": "name", "operator": "starts with", "value": "agent_cost_usd:", "type": "string" }
+        ]
+      }
+    },
+    {
+      "title": "Sub-agent success rate (agent_verdict)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [{ "measure": "value", "aggregation": "avg" }],
+        "filters": [
+          { "column": "name", "operator": "starts with", "value": "agent_verdict:", "type": "string" },
+          { "column": "name", "operator": "does not contain", "value": ":died", "type": "string" }
+        ]
+      }
+    },
+    {
+      "title": "MCP carry cost per spoke (mcp_carry_cost_usd)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [{ "measure": "value", "aggregation": "sum" }],
+        "filters": [
+          { "column": "name", "operator": "starts with", "value": "mcp_carry_cost_usd:", "type": "string" }
+        ]
+      }
+    },
+    {
+      "title": "MCP calls per spoke (mcp_calls)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [{ "measure": "value", "aggregation": "sum" }],
+        "filters": [
+          { "column": "name", "operator": "starts with", "value": "mcp_calls:", "type": "string" }
+        ]
+      }
+    },
+    {
+      "title": "MCP success rate (mcp_success)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [{ "measure": "value", "aggregation": "avg" }],
+        "filters": [
+          { "column": "name", "operator": "starts with", "value": "mcp_success:", "type": "string" }
+        ]
+      }
+    }
+  ]
+}
