@@ -79,7 +79,11 @@ field as markdown text:
 Use `"status": "completed"` — a recognized success status — whenever you produced a
 plan. Only if you genuinely could not (the goal was too ill-defined to decompose even
 after asking) return `"status": "blocked"` (a non-success status) and say why in
-`summary`. Keep the whole object under ~20k characters.
+`summary`. Keep the whole object under ~20k characters: a return past that cap is
+truncated before it is read, which invalidates the JSON and **drops the verdict
+silently**. The "keep it short — 3–10 steps" guidance below keeps you well inside the
+cap; if a plan genuinely cannot fit, it is over-planned — split it rather than letting
+the envelope truncate.
 
 The `summary` markdown keeps the plan shape:
 
