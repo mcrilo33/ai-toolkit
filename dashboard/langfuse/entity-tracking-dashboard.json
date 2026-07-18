@@ -10,7 +10,7 @@
         "dimensions": [{ "field": "name" }],
         "metrics": [{ "measure": "value", "aggregation": "sum" }],
         "filters": [
-          { "column": "name", "operator": "starts with", "value": "skill_cost_usd_RENAMED:", "type": "string" }
+          { "column": "name", "operator": "starts with", "value": "skill_cost_usd:", "type": "string" }
         ]
       }
     },
@@ -20,7 +20,7 @@
       "metricsQuery": {
         "view": "scores-numeric",
         "dimensions": [{ "field": "name" }],
-        "metrics": [{ "measure": "latency", "aggregation": "sum" }],
+        "metrics": [{ "measure": "value", "aggregation": "sum" }],
         "filters": [
           { "column": "name", "operator": "starts with", "value": "agent_cost_usd:", "type": "string" }
         ]
