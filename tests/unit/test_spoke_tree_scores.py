@@ -276,6 +276,22 @@ class TestBuildSkillCostScores:
 
         assert build_skill_cost_scores(SPOKE, batch, base_ts="t") == []
 
+    def test_same_skill_run_twice_keeps_both_scores(self) -> None:
+        # Two distinct spans share the skill name; each gets its own observation-scoped score with a
+        # distinct id (keyed off the span id), so both survive ingest rather than upserting onto one.
+        batch = [
+            self._skill("sc1", "skill:code-review"),
+            self._gen("g1", "sc1", {"total": 2.0}),
+            self._skill("sc2", "skill:code-review"),
+            self._gen("g2", "sc2", {"total": 5.0}),
+        ]
+
+        events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
+
+        assert all(e["body"]["name"] == "skill_cost_usd:code-review" for e in events)
+        assert {e["body"]["observationId"] for e in events} == {"sc1", "sc2"}
+        assert len({e["body"]["id"] for e in events}) == 2
+
 
 class TestBuildMcpCallScores:
     """#234: per-server mcp_success:<server> 0/1 + mcp_calls:<server> count from the mcp groups."""
