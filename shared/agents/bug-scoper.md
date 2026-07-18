@@ -101,14 +101,35 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
 
 State which path you took, and which repo you filed to and why.
 
-## Report
+## Report — a structured terminal status
 
-Close with a compact summary:
+Your **final message must be a single JSON object** (nothing before or after it — no
+prose, no code fence), so the telemetry builder can read a terminal outcome off your
+return and score `agent_verdict:bug-scoper` (the generic `_sub_agent_verdict` path; free
+prose parses to no status and scores nothing). Put the human-readable summary in the
+`summary` field:
 
-- **Action:** filed (with URL) / drafted (awaiting approval) / deduped (into #N).
-- **Scope:** the paths you derived, and one line on how you derived them.
-- **Gate:** `none` or `plan`, with the reason if `plan`.
-- **Labels:** the set you applied, and which heuristic triggered each non-`bug` one.
+```json
+{
+  "status": "completed",
+  "action": "filed | drafted | deduped",
+  "issue": "<URL, or #N when deduped, else null>",
+  "scope": "<the Scope: paths you derived>",
+  "gate": "none | plan",
+  "summary": "Action + how you derived the scope + Gate reason + labels applied and why."
+}
+```
+
+- **`status`** is the one machine-read field. Use `"completed"` — a recognized success
+  status — whenever you terminated normally: an issue **filed**, **drafted** for
+  approval, or **deduped** into an existing one are all "the agent did its job". Only if
+  you genuinely could not investigate (the defect was unreproducible or you could not
+  reach the code to derive a scope) return `"status": "blocked"` (a non-success status)
+  and say why in `summary`. Keep the whole object under ~20k characters.
+- **`summary`** carries what the prose report used to: **Action** (filed with URL /
+  drafted / deduped into #N), **Scope** (paths + one line on how you derived them),
+  **Gate** (`none`/`plan` + reason if `plan`), and **Labels** (the set applied and which
+  heuristic triggered each non-`bug` one).
 
 ## Checklist
 
@@ -119,4 +140,5 @@ Close with a compact summary:
 - [ ] Body has Why / What (numbered) / Acceptance in house style
 - [ ] Labels applied (`bug` always; `priority`/`hold` per heuristic)
 - [ ] Filed when unattended, drafted when attended — path stated
+- [ ] Final message is the single JSON status object (`status` + `summary`), nothing else
 - [ ] No source code modified

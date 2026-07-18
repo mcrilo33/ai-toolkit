@@ -61,7 +61,27 @@ Produce a step-by-step plan with verification checkpoints. Hand off each step to
 4. **Integration fourth** — wire things together (routes, handlers, adapters)
 5. **Edge cases last** — error handling, validation, edge cases after the happy path works
 
-## Output: Implementation Plan
+## Output: a structured terminal status
+
+Your **final message must be a single JSON object** (nothing before or after it — no
+prose, no code fence), so the telemetry builder can read a terminal outcome off your
+return and score `agent_verdict:planner` (the generic `_sub_agent_verdict` path; free
+prose parses to no status and scores nothing). The plan itself goes in the `summary`
+field as markdown text:
+
+```json
+{
+  "status": "completed",
+  "summary": "<the full implementation plan, in the markdown shape shown below>"
+}
+```
+
+Use `"status": "completed"` — a recognized success status — whenever you produced a
+plan. Only if you genuinely could not (the goal was too ill-defined to decompose even
+after asking) return `"status": "blocked"` (a non-success status) and say why in
+`summary`. Keep the whole object under ~20k characters.
+
+The `summary` markdown keeps the plan shape:
 
 ```text
 ## Plan: <feature/task name>
@@ -125,3 +145,4 @@ Steps [X, Y] can run in parallel (no shared dependencies).
 - [ ] Risks and rollback documented
 - [ ] Out-of-scope items listed
 - [ ] Plan ready for execution (no ambiguous steps)
+- [ ] Final message is the single JSON status object (`status` + `summary`), nothing else
