@@ -51,6 +51,7 @@ EXPECTED_ROUTING = {
     "tdd-red": (OPUS, "high"),
     "devops": (OPUS, "max"),
     "bug-scoper": (OPUS, "high"),
+    "followup-scoper": (OPUS, "high"),
     "tdd-green": (SONNET, "high"),
     "tdd-refactor": (SONNET, "high"),
     "refactor": (SONNET, "high"),

@@ -55,16 +55,39 @@ code is broken**, not on which repo you happen to be sitting in:
 The `bug-scoper` agent targets the upstream repo **explicitly** for tooling defects
 rather than defaulting to the current project's git remote — see its Phase 5.
 
+## Deferred follow-ups: file them, don't lose them
+
+A **grounded, deliberately-deferred follow-up** — an optimization, cleanup, or hardening
+you consciously chose to leave out of the current issue, backed by evidence (a `file:line`,
+a profile number, a measured cost) and a concrete fix direction — is filed via the
+**`followup-scoper` agent immediately, without asking**, exactly as a confirmed bug is
+routed to `bug-scoper`. This imperative **binds spokes too**: a drain-spoke that defers a
+follow-up files it the moment it is made, then keeps going — rather than writing it into a
+transcript that is torn down with the worktree and read by no one.
+
+`followup-scoper` is self-protecting the same way `bug-scoper` is: it verifies the
+follow-up is grounded (a vague "would be nice" is **dropped, not filed**), dedups against
+open issues, derives the real `Scope:`/`Gate:` footer, applies the `enhancement` label,
+and routes tooling follow-ups upstream. A follow-up that is really the parent issue's own
+deferred scope is surfaced as a comment / `UPGRADE` marker, **not** a new issue.
+
+**Best-effort, fail loud (AFK principles #2, #6):** dispatching `followup-scoper` must
+**never fail the caller's cycle** — it rides alongside the work. But a follow-up it cannot
+file is reported **loudly**, with the follow-up text preserved, never silently dropped: a
+lost follow-up is a visible failure, not a no-op.
+
 ## What this does not cover
 
-- **Enhancements and design ideas** are not bugs; raise them conversationally or file
-  them yourself with the standard footer.
+- **Speculative ideas and design musings** — a preference with no measured cost, an
+  unfounded "would be nice", a "we might one day want" with no evidence — are not grounded
+  follow-ups; raise them conversationally rather than filing. (A *grounded, deliberately-
+  deferred* follow-up instead routes to `followup-scoper` above.)
 - A bug in the user's **uncommitted work-in-progress** they are actively editing —
   mention it in the moment instead of filing; it may vanish on their next save.
 
 ## Related
 
-- `github-issues` skill — the `bug-scoper` agent reuses its filing mechanics
+- `github-issues` skill — the `bug-scoper` and `followup-scoper` agents reuse its filing mechanics
 - `issue-hygiene` rule — the `Scope:`/`Gate:` footer the agent emits on every issue
 - `planning-hub` rule — the hub authors and dispatches; this keeps discovered defects
   from being lost between those steps

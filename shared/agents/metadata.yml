@@ -174,6 +174,19 @@ bug-scoper:
       agent: debug
       prompt: "Fix the bug scoped in the issue above (whether it was filed, drafted for approval, or deduped into an existing one)."
 
+followup-scoper:
+  name: "followup-scoper"
+  description: "Investigate a grounded, deliberately-deferred follow-up, derive its real Scope:/Gate: footer, and file (or draft) a correctly-scoped GitHub enhancement issue — never implements it."
+  argument-hint: "Describe the deferred follow-up — the evidence, the fix direction, and any scope hint"
+  disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
+  claude:
+    skills:
+      - github-issues
+  handoffs:
+    - label: "Plan the enhancement"
+      agent: planner
+      prompt: "Decompose the enhancement scoped in the issue above into an ordered implementation plan (whether it was filed, drafted for approval, or deduped into an existing one)."
+
 architect:
   name: "architect"
   description: "System design and architecture decisions — boundaries, trade-offs, ADRs, and diagrams. Designs structure; never writes implementation."

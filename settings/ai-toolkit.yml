@@ -163,6 +163,11 @@ model:
     bug-scoper:
       model: claude-opus-4-8
       effort: high
+    # followup-scoper is bug-scoper's sibling (#331): same Scope:-derivation
+    # reasoning is the value, so route it identically (opus / high).
+    followup-scoper:
+      model: claude-opus-4-8
+      effort: high
     tdd-green:
       model: claude-sonnet-5
       effort: high
