@@ -86,6 +86,12 @@ afk:
   allowed-tools: "run_in_terminal read_file grep_search"
   argument-hint: "[<duration> | until HH:MM | drain | off | status]"
 
+afk-travel:
+  name: "afk-travel"
+  description: "Toggle travel mode so an unattended /afk drain keeps running with the MacBook lid CLOSED and reachable over a phone hotspot — no second machine, no Tailscale. Wraps scripts/afk-travel.sh: 'on' disables clamshell sleep (pmset disablesleep) and joins a Keychain-configured hotspot, 'off' restores normal sleep, 'status' reports state. Use when the user says 'travel mode', 'heading out', or 'arrived at my desk'. Toggles sleep only — it does not start the drain."
+  allowed-tools: "run_in_terminal read_file grep_search"
+  argument-hint: "[on | off | status]"
+
 tdd-workflow:
   name: "tdd-workflow"
   description: "Guide through TDD red-green-refactor cycle."
