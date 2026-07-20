@@ -1270,6 +1270,103 @@ class TestManifestAndGC:
         assert manifest["tools"]["claude"], "claude list is empty"
 
 
+# ── Config files: copy (tier a) + reconcile (tier b) ──────
+
+
+class TestConfigFileSync:
+    """Config files: tier-(a) copy-if-absent + tier-(b) .gitignore reconcile.
+
+    Issue #333: an existing host config is never deleted (GC-protected) nor
+    clobbered; ``.gitignore`` is reconciled in place (host lines preserved, the
+    ai-toolkit managed block refreshed), converging to a fixed point.
+    """
+
+    MANIFEST_NAME = ".ai-toolkit-manifest.json"
+    BEGIN_MARKER = "# >>> ai-toolkit managed (do not edit) >>>"
+    END_MARKER = "# <<< ai-toolkit managed <<<"
+
+    # ── Tier (b): .gitignore reconcile ────────────────────
+
+    def test_fresh_gitignore_gets_managed_block(self, target_repo: Path) -> None:
+        """No host .gitignore → sync writes one managed block (copy path)."""
+        assert not (target_repo / ".gitignore").exists()
+
+        _run_sync(target_repo, "claude")
+
+        content = (target_repo / ".gitignore").read_text()
+        assert self.BEGIN_MARKER in content
+        assert self.END_MARKER in content
+        assert ".ai-toolkit-manifest.json" in content  # a shared managed pattern
+
+    def test_existing_gitignore_host_lines_preserved(self, target_repo: Path) -> None:
+        """An existing host .gitignore is reconciled, not clobbered (reconcile path)."""
+        gitignore = target_repo / ".gitignore"
+        gitignore.write_text("# host owned\n/my-secret-dir/\ncoverage.host.xml\n")
+
+        _run_sync(target_repo, "claude")
+
+        content = gitignore.read_text()
+        assert "/my-secret-dir/" in content
+        assert "coverage.host.xml" in content
+        assert self.BEGIN_MARKER in content  # managed block added alongside
+
+    def test_gitignore_byte_identical_across_runs(self, target_repo: Path) -> None:
+        """Reconcile is idempotent: a second sync is a byte-for-byte no-op."""
+        gitignore = target_repo / ".gitignore"
+        gitignore.write_text("/host-only/\n")
+
+        _run_sync(target_repo, "claude")
+        first = gitignore.read_text()
+        _run_sync(target_repo, "claude")
+        second = gitignore.read_text()
+
+        assert first == second
+        assert "/host-only/" in second
+
+    def test_gitignore_not_recorded_in_manifest(self, target_repo: Path) -> None:
+        """The reconciled .gitignore is reconciler-owned — never manifest-listed."""
+        _run_sync(target_repo, "claude")
+
+        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
+        for paths in manifest["tools"].values():
+            assert ".gitignore" not in paths
+
+    # ── Tier (a): copy-if-absent + GC protection ──────────
+
+    def test_existing_pyproject_never_clobbered(self, target_repo: Path) -> None:
+        """A host pyproject.toml survives sync untouched (copy-if-absent skips)."""
+        pyproject = target_repo / "pyproject.toml"
+        host_content = '[project]\nname = "host-app"\nversion = "9.9.9"\n'
+        pyproject.write_text(host_content)
+
+        _run_sync(target_repo, "claude")
+
+        assert pyproject.read_text() == host_content
+
+    def test_existing_host_config_survives_resync_gc(self, target_repo: Path) -> None:
+        """A pre-existing host config is never GC-deleted across a re-sync.
+
+        Asserted end-to-end even when the manifest is doctored to list the config
+        as a stale toolkit output — the protection is explicit, not merely the
+        path's absence from the manifest.
+        """
+        editorconfig = target_repo / ".editorconfig"
+        editorconfig.write_text("root = true\n[*]\nindent_size = 2\n")
+
+        _run_sync(target_repo, "claude")
+
+        # Doctor the manifest so a naive GC would reclaim the host config.
+        manifest_file = target_repo / self.MANIFEST_NAME
+        manifest = json.loads(manifest_file.read_text())
+        manifest["tools"]["claude"].append(".editorconfig")
+        manifest_file.write_text(json.dumps(manifest))
+
+        _run_sync(target_repo, "claude")
+
+        assert editorconfig.exists()
+        assert editorconfig.read_text() == "root = true\n[*]\nindent_size = 2\n"
+
+
 # ── MCP servers (review-stamp) ────────────────────────────
 
 

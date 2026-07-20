@@ -619,9 +619,12 @@ sync_workflow_scripts() {
 sync_config_files() {
     section "Config files"
 
-    # Generic helper: copy a shared config file if target doesn't have one.
-    # NOT recorded in the manifest: copy-if-absent semantics mean the user
-    # owns the file after creation, so GC must never reclaim it.
+    # Tier (a) — copy a shared config file if the target doesn't have one.
+    # NOT recorded in the manifest, and explicitly GC-protected in
+    # sync_manifest.py (issue #333): an already-existing host config is never
+    # clobbered nor reclaimed. These formats (TOML/INI/version) need a
+    # comment/ordering-preserving writer that stdlib can't provide safely, so
+    # they stay copy-if-absent pending a per-format tier-(b) follow-up.
     _sync_config() {
         local filename="$1"
         [ -f "$SHARED_DIR/$filename" ] || return 0
@@ -635,9 +638,29 @@ sync_config_files() {
         fi
     }
 
+    # Tier (b) — reconcile the ai-toolkit managed block into a line-based config
+    # (issue #333). config_reconciler.py replaces the sentinel-marked owned block
+    # with the fresh shared set while preserving every host-authored line, and
+    # converges to a fixed point. NOT recorded in the manifest: reconciler-owned
+    # and GC-protected, exactly like the hooks reconcile.
+    _reconcile_config() {
+        local filename="$1" kind="$2"
+        [ -f "$SHARED_DIR/$filename" ] || return 0
+        local target_file="$TARGET/$filename"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "[dry-run] would reconcile $filename"
+            return 0
+        fi
+        [ -f "$target_file" ] && cp "$target_file" "$target_file.bak"
+        python3 "$SCRIPT_DIR/config_reconciler.py" "$kind" \
+            "$target_file" < "$SHARED_DIR/$filename" > "$target_file.tmp"
+        mv "$target_file.tmp" "$target_file"
+        info "$filename (reconciled)"
+    }
+
     _sync_config "pyproject.toml"
     _sync_config "ruff.toml"
-    _sync_config ".gitignore"
+    _reconcile_config ".gitignore" "gitignore"
     _sync_config ".editorconfig"
     _sync_config ".python-version"
 }
