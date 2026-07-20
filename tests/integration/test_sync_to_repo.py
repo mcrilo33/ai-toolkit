@@ -240,8 +240,30 @@ def target_repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+# Session-tree paths synced exactly once (issue #330). A repeated `_run_sync` against one
+# of these is a no-op — see `_run_sync`. Only the shared read-only trees built by
+# `build_synced_tree` register here; every per-test `target_repo` is a fresh dir that never
+# does, so mutating / idempotency tests always run a real (and repeatable) sync.
+_SHARED_SYNCED: set[str] = set()
+
+# A cheap stand-in for a suppressed re-sync's result. The read-only classes that share a
+# tree ignore the returned CompletedProcess (they assert on the generated files); the
+# tests that inspect stdout/returncode all use a fresh, unregistered target_repo.
+_NOOP_SYNC_RESULT = subprocess.CompletedProcess(["sync-to-repo.sh"], 0, "", "")
+
+
 def _run_sync(target: Path, tool: str = "all") -> subprocess.CompletedProcess[str]:
-    """Run sync-to-repo.sh and return the result."""
+    """Run sync-to-repo.sh and return the result.
+
+    #330: the sync output is a pure function of the constant shared/ source, so a target
+    already synced once as a shared read-only tree (registered in `_SHARED_SYNCED`) is not
+    re-synced — the read-only assertion tests below share one `synced_<tool>` tree instead
+    of each re-running a full sync (a #328-flagged wall-clock hotspot). A per-test
+    target_repo is a fresh dir absent from that set, so it always runs a real sync, even
+    when a mutating/idempotency test syncs the same dir twice.
+    """
+    if str(target) in _SHARED_SYNCED:
+        return _NOOP_SYNC_RESULT
     return subprocess.run(
         ["bash", str(SYNC_SCRIPT), str(target), tool],
         capture_output=True,
@@ -250,11 +272,53 @@ def _run_sync(target: Path, tool: str = "all") -> subprocess.CompletedProcess[st
     )
 
 
+# ── Shared once-synced trees (issue #330) ─────────────────
+# Sync each tool ONCE per session into its own git repo; the pure read-only classes below
+# consume the matching tree via a class-scoped `target_repo` override. Tests that MUTATE
+# the tree, sync twice (reconciliation / idempotency), write a pre-sync config, or inspect
+# the sync's own stdout keep the per-test `target_repo` — its fresh dir never registers in
+# `_SHARED_SYNCED`, so it always runs a real sync.
+
+
+def build_synced_tree(tmp_path_factory: pytest.TempPathFactory, tool: str) -> Path:
+    """Sync `tool` once into a fresh session-lived git repo and return its path."""
+    target = tmp_path_factory.mktemp(f"synced-{tool}")
+    subprocess.run(["git", "init"], cwd=target, check=True, capture_output=True)
+    _run_sync(target, tool)
+    _SHARED_SYNCED.add(str(target))  # subsequent _run_sync on this tree is a no-op
+    return target
+
+
+@pytest.fixture(scope="session")
+def synced_copilot(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return build_synced_tree(tmp_path_factory, "copilot")
+
+
+@pytest.fixture(scope="session")
+def synced_cursor(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return build_synced_tree(tmp_path_factory, "cursor")
+
+
+@pytest.fixture(scope="session")
+def synced_claude(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return build_synced_tree(tmp_path_factory, "claude")
+
+
+@pytest.fixture(scope="session")
+def synced_all(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return build_synced_tree(tmp_path_factory, "all")
+
+
 # ── Copilot ───────────────────────────────────────────────
 
 
 class TestSyncCopilot:
     """Verify Copilot file generation."""
+
+    @pytest.fixture
+    def target_repo(self, synced_copilot: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_copilot
 
     def test_copilot_instruction_files_have_frontmatter(self, target_repo: Path) -> None:
         _run_sync(target_repo, "copilot")
@@ -305,6 +369,11 @@ class TestSyncCopilot:
 
 class TestCopilotRules:
     """Verify Copilot instruction rules: exact set, fields, and body."""
+
+    @pytest.fixture
+    def target_repo(self, synced_copilot: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_copilot
 
     def test_exact_rule_set_generated(self, target_repo: Path) -> None:
         """Every metadata rule appears as an instruction file."""
@@ -369,6 +438,11 @@ class TestCopilotRules:
 class TestSyncCursor:
     """Verify Cursor file generation."""
 
+    @pytest.fixture
+    def target_repo(self, synced_cursor: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_cursor
+
     def test_cursor_rules_created(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
 
@@ -398,6 +472,11 @@ class TestSyncCursor:
 
 class TestCursorRules:
     """Verify Cursor rules: exact set, fields, and body."""
+
+    @pytest.fixture
+    def target_repo(self, synced_cursor: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_cursor
 
     def test_exact_rule_set_generated(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
@@ -458,6 +537,11 @@ class TestCursorRules:
 class TestSyncClaude:
     """Verify Claude file generation."""
 
+    @pytest.fixture
+    def target_repo(self, synced_claude: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_claude
+
     def test_claude_rules_have_frontmatter(self, target_repo: Path) -> None:
         _run_sync(target_repo, "claude")
 
@@ -482,6 +566,11 @@ class TestSyncClaude:
 
 class TestClaudeRules:
     """Verify Claude rules: exact set, fields, and body."""
+
+    @pytest.fixture
+    def target_repo(self, synced_claude: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_claude
 
     def test_exact_rule_set_generated(self, target_repo: Path) -> None:
         """Conditional (paths) plus always-on (alwaysApply, no paths) rules generate."""
@@ -559,12 +648,10 @@ class TestClaudeRules:
 class TestSyncAll:
     """Verify syncing all tools at once."""
 
-    def test_sync_all_creates_all_tool_dirs(self, target_repo: Path) -> None:
-        _run_sync(target_repo, "all")
-
-        assert (target_repo / ".github").is_dir()
-        assert (target_repo / ".cursor").is_dir()
-        assert (target_repo / ".claude").is_dir()
+    def test_sync_all_creates_all_tool_dirs(self, synced_all: Path) -> None:
+        assert (synced_all / ".github").is_dir()
+        assert (synced_all / ".cursor").is_dir()
+        assert (synced_all / ".claude").is_dir()
 
     def test_idempotent_second_run(self, target_repo: Path) -> None:
         _run_sync(target_repo, "all")
@@ -583,12 +670,10 @@ class TestSyncAll:
 
         assert first == second
 
-    def test_content_preserved_after_frontmatter(self, target_repo: Path) -> None:
+    def test_content_preserved_after_frontmatter(self, synced_copilot: Path) -> None:
         """Original rule body is intact after frontmatter injection."""
-        _run_sync(target_repo, "copilot")
-
         src = SHARED_DIR / "rules" / "security.md"
-        dst = target_repo / ".github" / "instructions" / "security.instructions.md"
+        dst = synced_copilot / ".github" / "instructions" / "security.instructions.md"
         if not dst.exists():
             pytest.skip("security rule not generated")
 
@@ -607,6 +692,11 @@ class TestSyncAll:
 
 class TestCopilotSkills:
     """Verify Copilot skill generation: set, frontmatter, body, and subdirs."""
+
+    @pytest.fixture
+    def target_repo(self, synced_copilot: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_copilot
 
     def test_exact_skill_set_generated(self, target_repo: Path) -> None:
         """Every skill directory appears under .github/skills/."""
@@ -692,6 +782,11 @@ class TestCopilotSkills:
 class TestCursorSkills:
     """Verify Cursor skill generation: set, frontmatter, body, and subdirs."""
 
+    @pytest.fixture
+    def target_repo(self, synced_cursor: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_cursor
+
     def test_exact_skill_set_generated(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
 
@@ -755,6 +850,11 @@ class TestCursorSkills:
 
 class TestClaudeSkills:
     """Verify Claude skill generation: set, frontmatter, body, and subdirs."""
+
+    @pytest.fixture
+    def target_repo(self, synced_claude: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_claude
 
     def test_exact_skill_set_generated(self, target_repo: Path) -> None:
         _run_sync(target_repo, "claude")
@@ -820,6 +920,11 @@ class TestClaudeSkills:
 class TestCopilotAgents:
     """Verify Copilot agent generation: exact set, frontmatter, body."""
 
+    @pytest.fixture
+    def target_repo(self, synced_copilot: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_copilot
+
     def test_exact_agent_set_generated(self, target_repo: Path) -> None:
         """Every agent .md appears as a .agent.md under .github/agents/."""
         _run_sync(target_repo, "copilot")
@@ -883,6 +988,11 @@ class TestCopilotAgents:
 class TestCursorAgents:
     """Verify Cursor agent generation: exact set, frontmatter, body."""
 
+    @pytest.fixture
+    def target_repo(self, synced_cursor: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_cursor
+
     def test_exact_agent_set_generated(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
 
@@ -929,6 +1039,11 @@ class TestCursorAgents:
 
 class TestClaudeAgents:
     """Verify Claude agent generation: exact set, frontmatter, body."""
+
+    @pytest.fixture
+    def target_repo(self, synced_claude: Path) -> Path:
+        """#330: read-only assertions share one session-synced tree."""
+        return synced_claude
 
     def test_exact_agent_set_generated(self, target_repo: Path) -> None:
         _run_sync(target_repo, "claude")
@@ -1093,10 +1208,8 @@ class TestManifestAndGC:
 
     MANIFEST_NAME = ".ai-toolkit-manifest.json"
 
-    def test_sync_cursor_writes_manifest_with_cursor_list(self, target_repo: Path) -> None:
-        _run_sync(target_repo, "cursor")
-
-        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
+    def test_sync_cursor_writes_manifest_with_cursor_list(self, synced_cursor: Path) -> None:
+        manifest = json.loads((synced_cursor / self.MANIFEST_NAME).read_text())
         assert manifest["tools"]["cursor"], "cursor list is empty"
         assert ".cursor/rules/guidelines.mdc" in manifest["tools"]["cursor"]
 
@@ -1150,10 +1263,8 @@ class TestManifestAndGC:
         second = (target_repo / self.MANIFEST_NAME).read_bytes()
         assert first == second
 
-    def test_sync_all_writes_all_three_tool_lists(self, target_repo: Path) -> None:
-        _run_sync(target_repo, "all")
-
-        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
+    def test_sync_all_writes_all_three_tool_lists(self, synced_all: Path) -> None:
+        manifest = json.loads((synced_all / self.MANIFEST_NAME).read_text())
         assert manifest["tools"]["copilot"], "copilot list is empty"
         assert manifest["tools"]["cursor"], "cursor list is empty"
         assert manifest["tools"]["claude"], "claude list is empty"
@@ -1174,29 +1285,21 @@ class TestMcpServerSync:
     RUN_SH = ".ai-toolkit/mcp/review-stamp/run.sh"
     SERVER_PY = ".ai-toolkit/mcp/review-stamp/server.py"
 
-    def test_run_sh_installed_and_executable(self, target_repo: Path) -> None:
-        _run_sync(target_repo, "claude")
-
-        run_sh = target_repo / self.RUN_SH
+    def test_run_sh_installed_and_executable(self, synced_claude: Path) -> None:
+        run_sh = synced_claude / self.RUN_SH
         assert run_sh.is_file(), f"{self.RUN_SH} not installed"
         assert os.access(run_sh, os.X_OK), f"{self.RUN_SH} not executable"
 
-    def test_server_py_installed(self, target_repo: Path) -> None:
-        _run_sync(target_repo, "claude")
+    def test_server_py_installed(self, synced_claude: Path) -> None:
+        assert (synced_claude / self.SERVER_PY).is_file()
 
-        assert (target_repo / self.SERVER_PY).is_file()
-
-    def test_installed_files_match_source(self, target_repo: Path) -> None:
-        _run_sync(target_repo, "claude")
-
+    def test_installed_files_match_source(self, synced_claude: Path) -> None:
         src_dir = REPO_ROOT / "mcp" / "review-stamp"
-        assert (target_repo / self.RUN_SH).read_bytes() == (src_dir / "run.sh").read_bytes()
-        assert (target_repo / self.SERVER_PY).read_bytes() == (src_dir / "server.py").read_bytes()
+        assert (synced_claude / self.RUN_SH).read_bytes() == (src_dir / "run.sh").read_bytes()
+        assert (synced_claude / self.SERVER_PY).read_bytes() == (src_dir / "server.py").read_bytes()
 
-    def test_both_files_recorded_in_manifest_for_every_tool(self, target_repo: Path) -> None:
-        _run_sync(target_repo, "all")
-
-        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
+    def test_both_files_recorded_in_manifest_for_every_tool(self, synced_all: Path) -> None:
+        manifest = json.loads((synced_all / self.MANIFEST_NAME).read_text())
         for tool in ("copilot", "cursor", "claude"):
             assert self.RUN_SH in manifest["tools"][tool], f"{tool}: run.sh missing"
             assert self.SERVER_PY in manifest["tools"][tool], f"{tool}: server.py missing"
