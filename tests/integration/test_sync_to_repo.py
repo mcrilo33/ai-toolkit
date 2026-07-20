@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -270,6 +271,23 @@ def _run_sync(target: Path, tool: str = "all") -> subprocess.CompletedProcess[st
         text=True,
         check=True,
     )
+
+
+def _build_isolated_source(dest: Path) -> Path:
+    """Copy the ai-toolkit source into `dest` and git-init it (#338).
+
+    Produces a self-contained checkout whose own scripts/sync-to-repo.sh can run
+    against itself — a genuine self-sync (source == target) isolated from the real
+    REPO_ROOT, which a tmp target can never reproduce (it is never `-ef` REPO_DIR).
+    """
+    for name in ("scripts", "shared", "settings", "mcp"):
+        shutil.copytree(REPO_ROOT / name, dest / name)
+    shutil.copy2(REPO_ROOT / ".gitignore", dest / ".gitignore")
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "init"], cwd=dest, check=True, capture_output=True)
+    subprocess.run([*git, "add", "-A"], cwd=dest, check=True, capture_output=True)
+    subprocess.run([*git, "commit", "-m", "seed"], cwd=dest, check=True, capture_output=True)
+    return dest
 
 
 # ── Shared once-synced trees (issue #330) ─────────────────
@@ -1330,6 +1348,43 @@ class TestConfigFileSync:
         manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
         for paths in manifest["tools"].values():
             assert ".gitignore" not in paths
+
+    def test_host_sync_leaves_no_gitignore_bak(self, target_repo: Path) -> None:
+        """A host reconcile refreshes the block but leaves no .gitignore.bak (#338).
+
+        #333's reconcile cp'd a .bak beside the target; the repo-root .gitignore.bak
+        is not itself gitignored, so it littered the tree. The atomic tmp-write + mv
+        already covers graceful-degrade, so no backup should remain.
+        """
+        gitignore = target_repo / ".gitignore"
+        gitignore.write_text("# host owned\n/my-secret-dir/\n")
+
+        _run_sync(target_repo, "claude")
+
+        assert self.BEGIN_MARKER in gitignore.read_text()  # reconcile still ran
+        assert not (target_repo / ".gitignore.bak").exists()
+
+    def test_self_sync_leaves_tree_clean(self, tmp_path: Path) -> None:
+        """A self-sync (target == the ai-toolkit source repo) stays clean (#338).
+
+        The source repo maintains its own .gitignore by hand; injecting the host
+        managed block into its tracked .gitignore left it dirty-but-uncommitted,
+        silently blocking worktree-land.sh. A self-sync must skip the reconcile and
+        leave neither a .gitignore modification nor a .gitignore.bak.
+        """
+        source = _build_isolated_source(tmp_path / "toolkit")
+        gitignore = source / ".gitignore"
+        before = gitignore.read_bytes()
+
+        subprocess.run(
+            ["bash", str(source / "scripts" / "sync-to-repo.sh"), str(source), "claude"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert gitignore.read_bytes() == before  # tracked .gitignore untouched
+        assert not (source / ".gitignore.bak").exists()  # no stray backup
 
     # ── Tier (a): copy-if-absent + GC protection ──────────
 
