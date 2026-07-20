@@ -1741,5 +1741,5 @@ def test_unmapped_lib_change_still_escalates_to_full(repo: Path, tmp_path: Path)
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "RUN -n auto\n" in log  # FULL
+    assert "RUN -n auto -m not serial\n" in log  # FULL, two-phase serial split
     assert "tests/unit/" not in log  # no phantom selection
