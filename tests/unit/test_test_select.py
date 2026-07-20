@@ -1617,3 +1617,48 @@ def test_full_suite_degrades_to_single_process_without_xdist(repo: Path, tmp_pat
     log = _runlog(runlog)
     assert "RUN \n" in log  # bare full suite, no -n auto
     assert "-n auto" not in log
+
+
+# ── Issue #326: the shell source-dependency graph prunes lib changes ─────────────
+# A changed sourced-lib .sh with no test of its own maps — through the graph — to
+# the mirror tests of the scripts that source it, so the gate runs SELECTED instead
+# of escalating to FULL. An unmapped lib (no test, no tested dependent) still goes
+# FULL (safe direction preserved).
+
+
+def test_lib_only_diff_maps_via_source_graph_to_selected(repo: Path, tmp_path: Path) -> None:
+    _write_ref_test(repo, "tests/unit/test_consumer.py", "consumer.sh")
+    base = _commit(
+        repo,
+        {
+            "shared/hooks/consumer.sh": '#!/bin/sh\nsource "$D/lib/base.sh"\n',
+            "shared/hooks/lib/base.sh": "#!/bin/sh\n",
+        },
+        "feat: consumer sources base",
+    )
+    tip = _commit(repo, {"shared/hooks/lib/base.sh": "#!/bin/sh\n# edit\n"})  # lib-only diff
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN -n auto tests/unit/test_consumer.py\n" in log  # SELECTED via the graph
+    assert "RUN -n auto\n" not in log  # NOT the full suite
+
+
+def test_unmapped_lib_change_still_escalates_to_full(repo: Path, tmp_path: Path) -> None:
+    # AC3: a lib with no test and no tested dependent has no mapping — the push
+    # escalates to the full suite, exactly as before the graph.
+    base = _rev(repo)
+    tip = _commit(repo, {"shared/hooks/lib/orphan.sh": "#!/bin/sh\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN -n auto\n" in log  # FULL
+    assert "tests/unit/" not in log  # no phantom selection

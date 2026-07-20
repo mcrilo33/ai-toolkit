@@ -363,3 +363,95 @@ class TestControlPlaneCoverage:
 def test_straggler_script_parses(script: str) -> None:
     proc = subprocess.run(["bash", "-n", str(REPO_ROOT / script)], capture_output=True, text=True)
     assert proc.returncode == 0, f"{script} does not parse: {proc.stderr}"
+
+
+# --- issue #326: the shell source-dependency graph -------------------------------
+# A changed sourced library maps not only to tests naming it verbatim but to the
+# mirror tests of every script that (transitively) `source`s it. testmon is blind
+# to shell, so this is the only thing that can prune a lib change to a SELECTED run
+# instead of the full suite. Over-map, never under-map: an unresolvable `$var`
+# source drops an edge (backstopped by the #124 post-land sweep), never a wrong
+# mapping.
+
+
+def _cache_keys(repo: Path) -> list[str]:
+    """The cache-key filenames present under <git-dir>/.test-reverse-index."""
+    d = repo / ".git" / ".test-reverse-index"
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def test_changed_lib_maps_to_sourcing_scripts_test(repo: Path) -> None:
+    # base.sh has no test of its own; it is sourced by consumer.sh, which does.
+    # Via the graph the lib maps to the consumer's mirror test.
+    _write(repo, "tests/unit/test_consumer.py", 'HOOK = HOOKS / "consumer.sh"\n')
+    _write(repo, "shared/hooks/consumer.sh", '#!/bin/sh\nsource "$D/lib/base.sh"\n')
+    _write(repo, "shared/hooks/lib/base.sh", "#!/bin/sh\n")
+    _commit_all(repo)
+
+    assert _lookup(repo, "shared/hooks/lib/base.sh") == ["tests/unit/test_consumer.py"]
+
+
+def test_changed_lib_maps_transitively_through_the_graph(repo: Path) -> None:
+    # base.sh <- mid.sh <- top.sh; only top.sh has a test. A base.sh change must
+    # reach top.sh's mirror test through two source hops.
+    _write(repo, "tests/unit/test_top.py", 'HOOK = "top.sh"\n')
+    _write(repo, "shared/hooks/top.sh", '#!/bin/sh\nsource "$D/mid.sh"\n')
+    _write(repo, "shared/hooks/mid.sh", '#!/bin/sh\nsource "$D/lib/base.sh"\n')
+    _write(repo, "shared/hooks/lib/base.sh", "#!/bin/sh\n")
+    _commit_all(repo)
+
+    assert _lookup(repo, "shared/hooks/lib/base.sh") == ["tests/unit/test_top.py"]
+
+
+def test_changed_lib_unions_direct_and_graph_tests(repo: Path) -> None:
+    # base.sh has its OWN test AND is sourced by a separately-tested consumer;
+    # the lookup returns both, sorted-unique.
+    _write(repo, "tests/unit/test_base.py", 'HOOK = "base.sh"\n')
+    _write(repo, "tests/unit/test_consumer.py", 'HOOK = "consumer.sh"\n')
+    _write(repo, "shared/hooks/consumer.sh", '#!/bin/sh\nsource "$D/lib/base.sh"\n')
+    _write(repo, "shared/hooks/lib/base.sh", "#!/bin/sh\n")
+    _commit_all(repo)
+
+    assert _lookup(repo, "shared/hooks/lib/base.sh") == [
+        "tests/unit/test_base.py",
+        "tests/unit/test_consumer.py",
+    ]
+
+
+def test_leaf_script_change_still_maps_to_own_test(repo: Path) -> None:
+    # AC2 regression: a leaf that sources nothing and is sourced by nothing still
+    # maps to its own mirror test — the graph adds nothing, removes nothing.
+    _write(repo, "tests/unit/test_leaf.py", 'HOOK = "leaf.sh"\n')
+    _write(repo, "scripts/leaf.sh", "#!/bin/sh\necho hi\n")
+    _commit_all(repo)
+
+    assert _lookup(repo, "scripts/leaf.sh") == ["tests/unit/test_leaf.py"]
+
+
+def test_var_source_without_sh_token_adds_no_edge(repo: Path) -> None:
+    # A `source "$VAR"` with no resolvable .sh basename yields no graph edge:
+    # under-map (safe, backstopped by the sweep), never a fabricated mapping.
+    _write(repo, "tests/unit/test_consumer.py", 'HOOK = "consumer.sh"\n')
+    _write(repo, "shared/hooks/consumer.sh", '#!/bin/sh\nsource "$DYNAMIC"\n')
+    _write(repo, "shared/hooks/lib/base.sh", "#!/bin/sh\n")
+    _commit_all(repo)
+
+    assert _lookup(repo, "shared/hooks/lib/base.sh") == []
+
+
+def test_committed_sh_change_mints_new_cache_key(repo: Path) -> None:
+    # AC4: the cache invalidates on a committed .sh change — the graph depends on
+    # shell state, so a new key is minted. Observed via the cache dir, without
+    # hard-coding the key formula.
+    _write(repo, "tests/unit/test_consumer.py", 'HOOK = "consumer.sh"\n')
+    _write(repo, "shared/hooks/consumer.sh", '#!/bin/sh\nsource "$D/lib/base.sh"\n')
+    _write(repo, "shared/hooks/lib/base.sh", "#!/bin/sh\n")
+    _commit_all(repo)
+    _lookup(repo, "shared/hooks/lib/base.sh")
+    before = _cache_keys(repo)
+
+    _write(repo, "shared/hooks/lib/base.sh", "#!/bin/sh\n# edit a sourced lib\n")
+    _commit_all(repo, "chore: edit a sourced lib")
+    _lookup(repo, "shared/hooks/lib/base.sh")
+
+    assert set(_cache_keys(repo)) - set(before)  # a new cache key appeared
