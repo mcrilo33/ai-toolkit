@@ -84,10 +84,36 @@ def _lookup(repo: Path, changed_file: str) -> list[str]:
     return [line for line in proc.stdout.splitlines() if line]
 
 
+def _cache_key(repo: Path) -> str:
+    """The combined cache key: a hash over the tree objects the map depends on —
+    tests/ (token map) and the shipped shell dirs (source graph, #326). Mirrors
+    ``_reverse_index_key`` in the lib, so the tests pin the key derivation."""
+    parts = ""
+    for d in ("tests", "scripts", "shared", "dashboard"):
+        proc = subprocess.run(
+            ["git", "rev-parse", "-q", "--verify", f"HEAD:{d}"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=_GIT_ENV,
+        )
+        sha = proc.stdout.strip()
+        if proc.returncode == 0 and sha:
+            parts += f"{d}:{sha};"
+    return subprocess.run(
+        ["git", "hash-object", "--stdin"],
+        cwd=str(repo),
+        input=parts,
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+        check=True,
+    ).stdout.strip()
+
+
 def _cache_path(repo: Path) -> Path:
-    """Where the lib must cache the map for the repo's committed tests/ tree."""
-    key = _git(repo, "rev-parse", "HEAD:tests").strip()
-    return repo / ".git" / ".test-reverse-index" / key
+    """Where the lib must cache the map for the repo's committed inputs."""
+    return repo / ".git" / ".test-reverse-index" / _cache_key(repo)
 
 
 # --- token matching: the reference conventions the repo already uses -------------

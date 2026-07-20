@@ -10,13 +10,25 @@
 # scope-guard.sh. Only collectible test_*.py files are map targets — a fixture
 # or conftest mentioning a script is not a runnable selection.
 #
-# CACHE: <git-common-dir>/.test-reverse-index/<tree-hash-of-tests-at-HEAD> —
-# structural invalidation exactly like the gate stamps (#122): any committed
-# tests/ change yields a new key; shared by the hub and every spoke worktree,
-# never in-tree. A dirty tests/ (tracked modifications or untracked files)
-# bypasses the cache with a fresh scan of the WORKING TREE, so a just-written
-# test is visible to the commit-time nudge before it is committed; the cache is
-# neither consulted nor overwritten then.
+# SOURCE GRAPH (issue #326): a changed *.sh is often a sourced *library* that no
+# test names directly, only its callers do. testmon is blind to shell, so such a
+# lib would otherwise escalate the whole push to the full suite. So the map is
+# augmented with a shell source-dependency graph: for every shipped *.sh we scan
+# its `source`/`.` includes to learn "script -> libs it sources", invert to
+# "lib -> scripts that (transitively) source it", and map a changed lib to the
+# UNION of the tests naming it directly and the mirror tests of all its
+# transitive dependents. A leaf script still maps to its own test; a bare-$var
+# source with no resolvable .sh basename simply drops that edge — under-mapping
+# (backstopped by the #124 post-land sweep), never a wrong mapping.
+#
+# CACHE: <git-common-dir>/.test-reverse-index/<key>, where <key> is a content
+# hash over the tree objects the map depends on — tests/ (the token map) and the
+# shipped shell dirs (the source graph). Structural invalidation like the gate
+# stamps (#122): any committed tests/ OR .sh change yields a new key; shared by
+# the hub and every spoke worktree, never in-tree. A dirty tests/ or shell dir
+# (tracked modifications or untracked files) bypasses the cache with a fresh scan
+# of the WORKING TREE, so a just-edited lib is visible to the commit-time nudge
+# before it is committed; the cache is neither consulted nor overwritten then.
 #
 # Known assumption: the scan reads the WORKING TREE while the key names the
 # HEAD:tests tree, and a gitignored test_*.py is invisible to the clean check —
@@ -49,6 +61,75 @@ _reverse_index_scan() {
   done < <(find tests -type f -name 'test_*.py' 2>/dev/null | sort)
 }
 
+# The shipped shell surface scanned for source-dependency edges (issue #326).
+REVERSE_INDEX_SHELL_DIRS=("scripts" "shared/hooks" "shared/skills" "dashboard/langfuse")
+
+# Emit "sourced-lib-basename<TAB>sourcing-script-basename" for every `source X` /
+# `. X` include in every shipped *.sh whose argument resolves to a .sh basename.
+# A bare-$var argument (no .sh token) drops its edge — under-mapping, backstopped
+# by the #124 sweep, never a wrong mapping. `|| true` keeps a source-less file
+# from aborting the scan under a caller's `set -euo pipefail`, exactly as the
+# token scan above does. A self-source (a file sourcing its own basename) is
+# skipped so it can't seed a spurious cycle.
+_reverse_index_source_edges() {
+  local dirs=() d f base
+  for d in "${REVERSE_INDEX_SHELL_DIRS[@]}"; do
+    [ -d "$d" ] && dirs+=("$d")
+  done
+  [ "${#dirs[@]}" -gt 0 ] || return 0
+  while IFS= read -r f; do
+    base="${f##*/}"
+    { grep -hE '^[[:space:]]*(source|\.)[[:space:]]' "$f" 2>/dev/null || true; } \
+      | { grep -oE '[A-Za-z0-9_.-]+\.sh' || true; } \
+      | while IFS= read -r lib; do
+          [ -n "$lib" ] && [ "$lib" != "$base" ] && printf '%s\t%s\n' "$lib" "$base"
+        done
+  done < <(find "${dirs[@]}" -type f -name '*.sh' 2>/dev/null | sort)
+}
+
+# The full map: the direct token map (_reverse_index_scan) PLUS graph edges — for
+# each sourced lib, one "lib<TAB>test" line per mirror test of every script that
+# transitively sources it. One awk pass: load the source edges (from a process-
+# substitution fd so an empty edge set is handled cleanly) into an adjacency list
+# "lib -> scripts that source it", pass the direct lines through while indexing
+# "token -> tests", then BFS each lib's transitive dependents and emit their
+# tests. Duplicates are harmless — callers sort -u at lookup. `_reverse_index_scan`
+# stays a PURE direct scan (the coverage meta-test reads its tokens verbatim).
+_reverse_index_scan_expanded() {
+  _reverse_index_scan \
+    | awk -F'\t' -v edgesfile=<(_reverse_index_source_edges) '
+      function collect(start,   wl, seen, head, tail, cur, i, k, arr, m, tarr, n) {
+        head = 0; tail = 0; wl[tail++] = start
+        while (head < tail) {
+          cur = wl[head++]
+          m = split(adj[cur], arr, SUBSEP)
+          for (i = 1; i <= m; i++) {
+            k = arr[i]
+            if (k != "" && !(k in seen)) { seen[k] = 1; wl[tail++] = k }
+          }
+        }
+        for (k in seen) {
+          if (k in tests) {
+            n = split(tests[k], tarr, SUBSEP)
+            for (i = 1; i <= n; i++) if (tarr[i] != "") print start "\t" tarr[i]
+          }
+        }
+      }
+      BEGIN {
+        while ((getline line < edgesfile) > 0) {
+          p = index(line, "\t")
+          if (p == 0) continue
+          lib = substr(line, 1, p - 1)
+          scr = substr(line, p + 1)
+          adj[lib] = adj[lib] SUBSEP scr
+        }
+        close(edgesfile)
+      }
+      { print; tests[$1] = tests[$1] SUBSEP $2 }
+      END { for (lib in adj) collect(lib) }
+    '
+}
+
 # Print the absolute cache directory <git-common-dir>/.test-reverse-index,
 # absolutizing a relative --git-common-dir the way gate-stamp.sh does.
 _reverse_index_dir() {
@@ -62,27 +143,46 @@ _reverse_index_dir() {
   printf '%s/.test-reverse-index' "$common"
 }
 
-# Print the cache file path for the current state — ONLY when tests/ is clean
-# (no tracked modifications, no untracked files) so the cached map provably
-# matches the working tree the suite would run against. Dirty or keyless
-# (no tests/ at HEAD) states return 1: scan fresh instead.
+# The cache key (issue #123 + #326): a content hash over the tree objects the map
+# depends on — tests/ (the token map) and the shipped shell dirs (the source
+# graph). Any committed change under these mints a new key; unrelated commits keep
+# it. Dirs absent at HEAD are skipped; an all-absent set returns 1 (scan fresh).
+# `-q --verify` keeps a missing dir quiet (no stray "HEAD:dir" echoed to stdout).
+_reverse_index_key() {
+  local d sha parts=""
+  for d in tests scripts shared dashboard; do
+    sha="$(git rev-parse -q --verify "HEAD:$d" 2>/dev/null)" || sha=""
+    [ -n "$sha" ] || continue
+    parts="${parts}${d}:${sha};"
+  done
+  [ -n "$parts" ] || return 1
+  printf '%s' "$parts" | git hash-object --stdin 2>/dev/null
+}
+
+# Print the cache file path for the current state — ONLY when the map's inputs
+# are clean (no tracked modifications, no untracked files under tests/ or the
+# shipped shell dirs) so the cached map provably matches the working tree the
+# suite would run against. `git status` tolerates a pathspec that is absent at
+# HEAD, so all four are passed unconditionally. Dirty or keyless states return 1:
+# scan fresh instead.
 _reverse_index_cache_path() {
-  [ -z "$(git status --porcelain -- tests 2>/dev/null)" ] || return 1
+  [ -z "$(git status --porcelain -- tests scripts shared dashboard 2>/dev/null)" ] || return 1
   local key dir
-  key="$(git rev-parse 'HEAD:tests' 2>/dev/null)" || return 1
+  key="$(_reverse_index_key)" || return 1
+  [ -n "$key" ] || return 1
   dir="$(_reverse_index_dir)" || return 1
   printf '%s/%s' "$dir" "$key"
 }
 
 # Build the map into <cache>. Temp-file + mv keeps concurrent builders atomic
-# (two builders on the same tests/ tree write identical content). GC of stale
-# keys rides along, like the gate-stamp mint.
+# (two builders on the same inputs write identical content). GC of stale keys
+# rides along, like the gate-stamp mint.
 _reverse_index_build_cache() {
   local cache="$1" dir tmp
   dir="${cache%/*}"
   mkdir -p "$dir"
   tmp="$(mktemp "$dir/.build.XXXXXX")" || return 1
-  _reverse_index_scan > "$tmp"
+  _reverse_index_scan_expanded > "$tmp"
   mv -f "$tmp" "$cache"
   find "$dir" -type f -mtime +14 -delete 2>/dev/null || true
 }
@@ -120,7 +220,7 @@ reverse_index_tests_for() {
     [ -f "$cache" ] || _reverse_index_build_cache "$cache" || return 0
     awk -F'\t' -v b="$base" '$1 == b { print $2 }' "$cache" | sort -u
   else
-    _reverse_index_scan | awk -F'\t' -v b="$base" '$1 == b { print $2 }' | sort -u
+    _reverse_index_scan_expanded | awk -F'\t' -v b="$base" '$1 == b { print $2 }' | sort -u
   fi
   return 0
 }

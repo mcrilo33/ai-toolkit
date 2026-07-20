@@ -211,6 +211,33 @@ def _runlog(path: Path) -> str:
     return path.read_text() if path.exists() else ""
 
 
+def _reverse_index_key(repo: Path) -> str:
+    """The reverse-index cache key: a hash over the tree objects the map depends
+    on — tests/ (token map) and the shipped shell dirs (source graph, #326).
+    Mirrors ``_reverse_index_key`` in lib/test-reverse-index.sh."""
+    parts = ""
+    for d in ("tests", "scripts", "shared", "dashboard"):
+        proc = subprocess.run(
+            ["git", "rev-parse", "-q", "--verify", f"HEAD:{d}"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=_GIT_ENV,
+        )
+        sha = proc.stdout.strip()
+        if proc.returncode == 0 and sha:
+            parts += f"{d}:{sha};"
+    return subprocess.run(
+        ["git", "hash-object", "--stdin"],
+        cwd=str(repo),
+        input=parts,
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+        check=True,
+    ).stdout.strip()
+
+
 # --- the docs-only tier: run nothing --------------------------------------------
 
 
@@ -1451,8 +1478,7 @@ def test_mapping_to_vanished_test_escalates_full(repo: Path, tmp_path: Path) -> 
     runlog = tmp_path / "run.log"
     _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
     _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # builds the cache
-    key = _git(repo, "rev-parse", "HEAD:tests").strip()
-    cache = repo / ".git" / ".test-reverse-index" / key
+    cache = repo / ".git" / ".test-reverse-index" / _reverse_index_key(repo)
     cache.write_text("do.sh\ttests/unit/test_gone.py\n")
     _stamp_path(repo).unlink(missing_ok=True)  # drop any stamp so the tier re-decides
 
