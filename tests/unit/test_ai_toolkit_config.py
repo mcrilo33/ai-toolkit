@@ -795,3 +795,144 @@ def test_secrets_scan_allows_public_key_in_ai_toolkit_yml() -> None:
     result = _scan_write(content)
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# ─── issue_routing: config-driven upstream target (issue #332) ───
+
+# The hardcoded fail-safe default (AFK principle #2): the resolver never returns empty,
+# falling back to this documented literal when neither an override nor the config supplies
+# a value. A fork changes `issue_routing.upstream_repo` (or `git config
+# ai-toolkit.upstream-repo`) — not this literal, and not agent prose.
+UPSTREAM_DEFAULT = "mcrilo33/ai-toolkit"
+
+_ROUTING_SEED = (
+    "issue_routing:\n"
+    "  upstream_repo: owner/tool\n"
+    "  tooling_paths:\n"
+    "    - .claude/**\n"
+    "    - scripts/telemetry/**\n"
+)
+
+
+def test_upstream_repo_returns_configured_value(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, _ROUTING_SEED).as_posix())
+
+    assert cfg.upstream_repo(config) == "owner/tool"
+
+
+def test_upstream_repo_falls_back_to_default_when_absent(tmp_path: Path) -> None:
+    # A config with no issue_routing block ⇒ the resolver returns the hardcoded default,
+    # never empty (the never-empty fail-safe: an un-migrated config keeps routing upstream).
+    config = cfg.load_config(_write(tmp_path, "base_branch: main\n").as_posix())
+
+    assert cfg.upstream_repo(config) == UPSTREAM_DEFAULT
+
+
+def test_upstream_repo_falls_back_to_default_when_blank(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "issue_routing:\n  upstream_repo:\n").as_posix())
+
+    assert cfg.upstream_repo(config) == UPSTREAM_DEFAULT
+
+
+def test_upstream_repo_override_wins_over_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The `git config ai-toolkit.upstream-repo` override is the first resolution layer,
+    # so a fork reroutes without touching config or prose (override → config → default).
+    monkeypatch.setattr(cfg, "_git_config_upstream_override", lambda: "fork/repo", raising=False)
+    config = cfg.load_config(_write(tmp_path, _ROUTING_SEED).as_posix())
+
+    assert cfg.upstream_repo(config) == "fork/repo"
+
+
+def test_upstream_repo_override_absent_uses_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No git override ⇒ the config value is used (not the default), proving the middle layer.
+    monkeypatch.setattr(cfg, "_git_config_upstream_override", lambda: None, raising=False)
+    config = cfg.load_config(_write(tmp_path, _ROUTING_SEED).as_posix())
+
+    assert cfg.upstream_repo(config) == "owner/tool"
+
+
+def test_upstream_repo_fallback_warning_flags_missing_key(tmp_path: Path) -> None:
+    # The LOUD part (AFK #2): a synced-but-un-migrated config missing the key gets a
+    # visible warning naming the key, rather than silently falling back to the default.
+    config = cfg.load_config(_write(tmp_path, "base_branch: main\n").as_posix())
+
+    warning = cfg.upstream_repo_fallback_warning(config)
+
+    assert warning is not None
+    assert "issue_routing.upstream_repo" in warning
+
+
+def test_upstream_repo_fallback_warning_none_when_configured(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, _ROUTING_SEED).as_posix())
+
+    assert cfg.upstream_repo_fallback_warning(config) is None
+
+
+def test_tooling_paths_returns_configured_globs(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, _ROUTING_SEED).as_posix())
+
+    assert cfg.tooling_paths(config) == [".claude/**", "scripts/telemetry/**"]
+
+
+def test_tooling_paths_falls_back_to_default_when_absent(tmp_path: Path) -> None:
+    # A config with no issue_routing block ⇒ the resolver returns a non-empty default
+    # manifest, so host-vs-tooling classification always has a boundary to match against.
+    config = cfg.load_config(_write(tmp_path, "base_branch: main\n").as_posix())
+
+    paths = cfg.tooling_paths(config)
+
+    assert ".claude/**" in paths
+    assert paths == cfg.TOOLING_PATHS_DEFAULT
+
+
+def test_upstream_repo_cli_emits_resolved_value(tmp_path: Path) -> None:
+    path = _write(tmp_path, _ROUTING_SEED)
+
+    out = cfg._cli(["ai_toolkit_config.py", "upstream-repo", str(path)])
+
+    assert out == "owner/tool"
+
+
+def test_upstream_repo_cli_warns_on_missing_key_via_stderr(tmp_path: Path) -> None:
+    # stdout carries ONLY the resolved value (the default); the missing-key warning goes to
+    # stderr so a bash consumer's captured value stays clean — mirrors the base-branch CLI.
+    path = _write(tmp_path, "base_branch: main\n")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "ai_toolkit_config.py"),
+            "upstream-repo",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == UPSTREAM_DEFAULT
+    assert "issue_routing.upstream_repo" in result.stderr
+
+
+# ─── real config: issue_routing seed ───
+
+
+def test_real_config_upstream_repo_seed(real_config: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The canonical repo ships the documented default; a fork changes only this value.
+    # Pin the override layer off so a stray local `git config ai-toolkit.upstream-repo`
+    # on the dev host cannot mask the seed value under test.
+    monkeypatch.setattr(cfg, "_git_config_upstream_override", lambda: None, raising=False)
+
+    assert cfg.upstream_repo(real_config) == UPSTREAM_DEFAULT
+
+
+def test_real_config_tooling_paths_seed(real_config: dict) -> None:
+    # The seed manifest matches the tooling-owned path list bug-triage.md names.
+    paths = cfg.tooling_paths(real_config)
+
+    for glob in (".claude/**", ".ai-toolkit/**", "scripts/telemetry/**", "shared/**"):
+        assert glob in paths
