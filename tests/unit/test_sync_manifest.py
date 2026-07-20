@@ -84,9 +84,7 @@ class TestFinalizeFirstRun:
         assert set(manifest.keys()) == {"toolkit_rev", "tools"}
 
     def test_finalize_returns_no_deletions_on_first_run(self, target: Path) -> None:
-        deleted = finalize(
-            str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="abc123"
-        )
+        deleted = finalize(str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="abc123")
 
         assert deleted == []
 
@@ -95,9 +93,7 @@ class TestFinalizeFirstRun:
         (target / MANIFEST_NAME).write_text("{not valid json!!!")
         _plant(target, ".cursor/rules/existing.mdc")
 
-        deleted = finalize(
-            str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="abc123"
-        )
+        deleted = finalize(str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="abc123")
 
         assert deleted == []
         assert (target / ".cursor/rules/existing.mdc").exists()
@@ -122,9 +118,7 @@ class TestFinalizePerToolScoping:
         finalize(str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="new")
 
         manifest = _read_manifest(target)
-        assert manifest["tools"]["copilot"] == [
-            ".github/instructions/x.instructions.md"
-        ]
+        assert manifest["tools"]["copilot"] == [".github/instructions/x.instructions.md"]
 
     def test_finalize_replaces_target_tool_list(self, target: Path) -> None:
         _write_manifest(
@@ -151,9 +145,7 @@ class TestFinalizeGC:
             target,
             {
                 "toolkit_rev": "old",
-                "tools": {
-                    "cursor": [".cursor/rules/keep.mdc", ".cursor/rules/stale.mdc"]
-                },
+                "tools": {"cursor": [".cursor/rules/keep.mdc", ".cursor/rules/stale.mdc"]},
             },
         )
 
@@ -168,15 +160,11 @@ class TestFinalizeGC:
             target,
             {
                 "toolkit_rev": "old",
-                "tools": {
-                    "cursor": [".cursor/rules/keep.mdc", ".cursor/rules/stale.mdc"]
-                },
+                "tools": {"cursor": [".cursor/rules/keep.mdc", ".cursor/rules/stale.mdc"]},
             },
         )
 
-        deleted = finalize(
-            str(target), "cursor", [".cursor/rules/keep.mdc"], toolkit_rev="new"
-        )
+        deleted = finalize(str(target), "cursor", [".cursor/rules/keep.mdc"], toolkit_rev="new")
 
         assert deleted == [".cursor/rules/stale.mdc"]
 
@@ -186,9 +174,7 @@ class TestFinalizeGC:
             target,
             {
                 "toolkit_rev": "old",
-                "tools": {
-                    "cursor": [".cursor/rules/keep.mdc", ".cursor/rules/stale.mdc"]
-                },
+                "tools": {"cursor": [".cursor/rules/keep.mdc", ".cursor/rules/stale.mdc"]},
             },
         )
 
@@ -197,9 +183,7 @@ class TestFinalizeGC:
         manifest = _read_manifest(target)
         assert ".cursor/rules/stale.mdc" not in manifest["tools"]["cursor"]
 
-    def test_finalize_tolerates_stale_path_missing_from_disk(
-        self, target: Path
-    ) -> None:
+    def test_finalize_tolerates_stale_path_missing_from_disk(self, target: Path) -> None:
         """A stale manifest entry with no file on disk is dropped without error."""
         _write_manifest(
             target,
@@ -211,9 +195,7 @@ class TestFinalizeGC:
         manifest = _read_manifest(target)
         assert ".cursor/rules/ghost.mdc" not in manifest["tools"]["cursor"]
 
-    def test_finalize_never_deletes_path_not_in_old_manifest(
-        self, target: Path
-    ) -> None:
+    def test_finalize_never_deletes_path_not_in_old_manifest(self, target: Path) -> None:
         """User files unknown to the manifest are never touched."""
         _plant(target, ".cursor/rules/my-own-rule.mdc")
         _write_manifest(
@@ -221,9 +203,7 @@ class TestFinalizeGC:
             {"toolkit_rev": "old", "tools": {"cursor": [".cursor/rules/keep.mdc"]}},
         )
 
-        deleted = finalize(
-            str(target), "cursor", [".cursor/rules/keep.mdc"], toolkit_rev="new"
-        )
+        deleted = finalize(str(target), "cursor", [".cursor/rules/keep.mdc"], toolkit_rev="new")
 
         assert (target / ".cursor/rules/my-own-rule.mdc").exists()
         assert ".cursor/rules/my-own-rule.mdc" not in deleted
@@ -243,9 +223,7 @@ class TestFinalizeSafety:
             ".cursor/../../escape.md",
         ],
     )
-    def test_finalize_raises_on_unsafe_input_path(
-        self, target: Path, bad_path: str
-    ) -> None:
+    def test_finalize_raises_on_unsafe_input_path(self, target: Path, bad_path: str) -> None:
         with pytest.raises(ValueError):
             finalize(str(target), "cursor", [bad_path], toolkit_rev="abc123")
 
@@ -261,9 +239,7 @@ class TestFinalizeSafety:
         )
 
         with pytest.raises(ValueError):
-            finalize(
-                str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="new"
-            )
+            finalize(str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="new")
 
         assert outside.exists()
 
@@ -281,9 +257,7 @@ class TestFinalizeSafety:
             {"toolkit_rev": "old", "tools": {"cursor": ["link/evil.txt"]}},
         )
 
-        deleted = finalize(
-            str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="new"
-        )
+        deleted = finalize(str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="new")
 
         assert outside_file.exists()
         assert "link/evil.txt" not in deleted
@@ -303,21 +277,56 @@ class TestFinalizeExclusions:
             ".cursor/hooks.json.bak",
         ],
     )
-    def test_finalize_never_deletes_protected_path(
-        self, target: Path, protected: str
-    ) -> None:
+    def test_finalize_never_deletes_protected_path(self, target: Path, protected: str) -> None:
         _plant(target, protected)
         _write_manifest(
             target,
             {"toolkit_rev": "old", "tools": {"cursor": [protected]}},
         )
 
-        deleted = finalize(
-            str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="new"
-        )
+        deleted = finalize(str(target), "cursor", [".cursor/rules/a.mdc"], toolkit_rev="new")
 
         assert (target / protected).exists()
         assert protected not in deleted
+
+
+# ── Host config protection (issue #333) ───────────────────
+
+
+class TestFinalizeConfigProtection:
+    """Existing host config files are never GC-deleted, made explicit.
+
+    Copy-if-absent config files (pyproject.toml, ruff.toml, .gitignore,
+    .editorconfig, .python-version) are host-owned. Even if a stale manifest
+    lists one (e.g. a future toolkit revision recorded it, then a re-sync at a
+    different revision no longer does), GC must never remove it — the guarantee
+    is explicit in the protection set, not a side-effect of keeping the path out
+    of the manifest.
+    """
+
+    @pytest.mark.parametrize(
+        "config_path",
+        [
+            "pyproject.toml",
+            "ruff.toml",
+            ".gitignore",
+            ".editorconfig",
+            ".python-version",
+        ],
+    )
+    def test_finalize_never_deletes_existing_host_config(
+        self, target: Path, config_path: str
+    ) -> None:
+        _plant(target, config_path)
+        _write_manifest(
+            target,
+            {"toolkit_rev": "old", "tools": {"claude": [config_path]}},
+        )
+
+        deleted = finalize(str(target), "claude", [".claude/settings.json"], toolkit_rev="new")
+
+        assert (target / config_path).exists()
+        assert config_path not in deleted
 
 
 # ── Dry run ───────────────────────────────────────────────
@@ -377,9 +386,7 @@ class TestFinalizeDryRun:
 
         assert (target / MANIFEST_NAME).read_bytes() == before
 
-    def test_finalize_dry_run_writes_no_manifest_on_fresh_target(
-        self, target: Path
-    ) -> None:
+    def test_finalize_dry_run_writes_no_manifest_on_fresh_target(self, target: Path) -> None:
         finalize(
             str(target),
             "cursor",
@@ -403,9 +410,7 @@ class TestCLI:
             target,
             {
                 "toolkit_rev": "old",
-                "tools": {
-                    "cursor": [".cursor/rules/keep.mdc", ".cursor/rules/stale.mdc"]
-                },
+                "tools": {"cursor": [".cursor/rules/keep.mdc", ".cursor/rules/stale.mdc"]},
             },
         )
 
