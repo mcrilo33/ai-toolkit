@@ -651,11 +651,19 @@ sync_config_files() {
             echo "[dry-run] would reconcile $filename"
             return 0
         fi
-        [ -f "$target_file" ] && cp "$target_file" "$target_file.bak"
-        python3 "$SCRIPT_DIR/config_reconciler.py" "$kind" \
-            "$target_file" < "$SHARED_DIR/$filename" > "$target_file.tmp"
-        mv "$target_file.tmp" "$target_file"
-        info "$filename (reconciled)"
+        # Write to a temp file first: a reconcile failure leaves the target
+        # untouched and warns (graceful degradation, matching spoke-model.env
+        # and apply_base_branch_config above) instead of aborting the sync or
+        # truncating the file. The mv is an atomic swap on success.
+        if python3 "$SCRIPT_DIR/config_reconciler.py" "$kind" \
+            "$target_file" < "$SHARED_DIR/$filename" > "$target_file.tmp"; then
+            [ -f "$target_file" ] && cp "$target_file" "$target_file.bak"
+            mv "$target_file.tmp" "$target_file"
+            info "$filename (reconciled)"
+        else
+            rm -f "$target_file.tmp"
+            warn "could not reconcile $filename — left unchanged"
+        fi
     }
 
     _sync_config "pyproject.toml"

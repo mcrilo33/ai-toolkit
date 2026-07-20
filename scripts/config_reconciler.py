@@ -59,6 +59,9 @@ from __future__ import annotations
 
 import sys
 
+# Sentinel markers bounding the ai-toolkit-owned region. Invariant: the managed
+# content (shared/.gitignore) must never itself contain a marker line, or the
+# wrapped block would be mis-parsed on the next reconcile.
 BEGIN_MARKER = "# >>> ai-toolkit managed (do not edit) >>>"
 END_MARKER = "# <<< ai-toolkit managed <<<"
 
