@@ -542,6 +542,41 @@ def test_run_suite_parallelizes_the_full_sweep(repo: Path, tmp_path: Path) -> No
     assert "-n auto" in argv_log.read_text()  # the full sweep, parallelized
 
 
+def test_run_suite_runs_two_phase_serial_split(repo: Path, tmp_path: Path) -> None:
+    # Issue #328: the post-land sweep runs two-phase like the push gate — the
+    # parallel bulk under `-n auto -m "not serial"`, then the ref-mutating tail
+    # single-process under `-m serial`. Assert both invocations reached pytest.
+    _mint(repo, "testmon")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    pytest_stub = bindir / "pytest"
+    pytest_stub.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in --help|-h) echo "usage: pytest"; echo "  -n numprocesses"; exit 0 ;; '
+        '--version|-V) echo "pytest 9.9"; exit 0 ;; esac\n'
+        f'printf "%s\\n" "$*" >> "{argv_log}"\n'
+        "exit 0\n"
+    )
+    pytest_stub.chmod(0o755)
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+
+    subprocess.run(
+        ["bash", str(GATE_SWEEP), "--run", _head(repo)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+
+    log = argv_log.read_text() if argv_log.exists() else ""
+    assert "-n auto -m not serial" in log  # parallel bulk, serial deselected
+    assert any(line.strip() == "-m serial" for line in log.splitlines()), (
+        f"no single-process serial leg in:\n{log}"
+    )
+
+
 # --- --run: one sweep at a time per checkout (lock + newest-wins queue) ------------
 
 

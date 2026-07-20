@@ -306,6 +306,57 @@ def test_python_under_docs_runs_testmon(repo: Path, tmp_path: Path) -> None:
 # --- the full-suite tier: default-to-full safety ---------------------------------
 
 
+def test_full_tier_runs_two_phase_serial_split(repo: Path, tmp_path: Path) -> None:
+    # Issue #328: the FULL suite runs two-phase — the parallel-safe bulk under
+    # `-n auto -m "not serial"`, then the ref-mutating tail single-process under
+    # `-m serial` (never under xdist workers). A shell change forces the FULL tier.
+    base = _rev(repo)
+    tip = _commit(repo, {"scripts/thing.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN -n auto -m not serial\n" in log  # parallel bulk, serial deselected
+    assert "RUN -m serial\n" in log  # serial tail, single-process (no -n)
+    assert "RUN -n auto\n" not in log  # never the old bare full run under xdist
+
+
+def test_full_tier_serial_leg_no_tests_is_green(repo: Path, tmp_path: Path) -> None:
+    # The serial leg exits 5 ("no tests collected") when nothing is marked serial —
+    # a GREEN outcome the two-phase runner normalizes so it never blocks a clean push.
+    base = _rev(repo)
+    tip = _commit(repo, {"scripts/thing.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    # The serial leg (its argv contains `serial` but not `not`) exits 5; every other
+    # invocation exits 0.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "pytest").write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        '  --help|-h) echo "usage: pytest"; echo "  --testmon"; '
+        'echo "  -n numprocesses"; exit 0 ;;\n'
+        f'  --version) echo "{STUB_ENV_FINGERPRINT}"; exit 0 ;;\n'
+        "esac\n"
+        f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
+        "is_serial=0; is_not=0\n"
+        'for a in "$@"; do\n'
+        '  [ "$a" = "serial" ] && is_serial=1\n'
+        '  [ "$a" = "not serial" ] && is_not=1\n'
+        "done\n"
+        '[ "$is_serial" = "1" ] && [ "$is_not" = "0" ] && exit 5\n'
+        "exit 0\n"
+    )
+    (bindir / "pytest").chmod(0o755)
+
+    proc = _run_select(repo, _stdin(tip, base), bindir)
+
+    assert proc.returncode == 0, proc.stderr + "\n" + _runlog(runlog)
+
+
 def test_shell_change_runs_full_suite(repo: Path, tmp_path: Path) -> None:
     base = _rev(repo)
     tip = _commit(repo, {"scripts/do.sh": "#!/bin/sh\necho hi\n"})
