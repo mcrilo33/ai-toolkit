@@ -332,6 +332,79 @@ def test_run_never_sweeps_a_full_stamped_tree(repo: Path, tmp_path: Path) -> Non
     assert not runner_log.exists()  # dedupe holds at run time too, not just spawn
 
 
+# --- full-tier land: refresh the baseline off the already-proven tree (issue #327) ---
+# A FULL-tier land already proved the tree green at push time, so it needs no safety-net
+# sweep — but it must still refresh the pre-warmed baseline, which previously only pruned
+# tiers did. gate-sweep grows a --refresh-only mode: rebuild the baseline, no suite, no
+# stamp change.
+
+
+def test_spawn_full_tier_refreshes_baseline_without_sweeping(repo: Path, tmp_path: Path) -> None:
+    # RED (#327): before the change the `full` spawn is a no-op, so the baseline is never
+    # rebuilt. After it, a full-tier land launches a detached refresh that rebuilds the
+    # baseline while never re-running the suite.
+    _mint(repo, "full")
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--spawn",
+        _head(repo),
+        cmd=_runner_cmd(runner_log),
+        testmon_cmd='printf "DB" > "$TESTMON_DATAFILE"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _wait_for(_baseline(repo)), "a full-tier land must refresh the baseline"
+    assert _baseline(repo).read_text() == "DB"
+    time.sleep(0.5)  # grace: a wrongly-spawned suite worker would have written by now
+    assert not runner_log.exists(), "a full-tier land must NOT re-run the gate suite"
+
+
+def test_run_refresh_only_rebuilds_baseline_without_suite(repo: Path, tmp_path: Path) -> None:
+    # The detached worker: --refresh-only rebuilds the baseline directly, never touching
+    # the suite runner (the full tier already proved green at push time).
+    _mint(repo, "full")
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        "--refresh-only",
+        _head(repo),
+        cmd=_runner_cmd(runner_log),
+        testmon_cmd='printf "DB" > "$TESTMON_DATAFILE"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _wait_for(_baseline(repo))
+    assert _baseline(repo).read_text() == "DB"
+    assert not runner_log.exists()  # no suite re-run in refresh-only mode
+
+
+def test_refresh_only_leaves_the_stamp_untouched(repo: Path, tmp_path: Path) -> None:
+    # A refresh is a baseline rebuild, not a gate re-check: the tree's `full` stamp must
+    # stay exactly as it was (no re-mint, no downgrade).
+    _mint(repo, "full")
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        "--refresh-only",
+        _head(repo),
+        cmd=_runner_cmd(runner_log),
+        testmon_cmd='printf "DB" > "$TESTMON_DATAFILE"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _wait_for(_baseline(repo))
+    assert _stamp_text(repo) == "tier=full\nenv=py3.12/pytest-9\n"
+
+
 def test_run_dirty_tree_skips_and_logs(repo: Path, tmp_path: Path) -> None:
     # The sweep keys its proof on HEAD^{tree}; a dirty checkout would prove the
     # wrong tree, so the worker logs the skip instead of running.
