@@ -123,6 +123,28 @@ while read -r _lref lsha _rref _rsha; do
   esac
 done <<< "$STDIN"
 
+# ── Persistent per-project config (issue #334) ──────────────────────────────────
+# The durable equivalent of the one-shot TEST_SELECT_SKIP / TEST_SELECT_CMD env vars,
+# read from git config (ai-toolkit.hook.test-select.*) so a host is not limited to a
+# per-invocation env var no re-sync preserves. A LIVE env var still WINS (only an
+# UNSET one is filled); an unconfigured repo keeps today's tiered behavior. Guarded on
+# the resolver's presence so a stale install predating #334 is unaffected.
+if command -v ai_toolkit_hook_enabled >/dev/null 2>&1; then
+  # Per-hook kill switch: a disabled test-select gate runs nothing (like the skip
+  # hatch) rather than blocking the push.
+  if ! ai_toolkit_hook_enabled test-select .; then
+    note "test-select disabled by per-project config (ai-toolkit.hook.test-select.enabled) — skipping tests"
+    exit 0
+  fi
+  if [ -z "${TEST_SELECT_SKIP:-}" ] && ai_toolkit_hook_test_select_skip .; then
+    TEST_SELECT_SKIP=1
+  fi
+  if [ -z "${TEST_SELECT_CMD:-}" ]; then
+    _persist_cmd="$(ai_toolkit_hook_test_select_command .)"
+    [ -n "$_persist_cmd" ] && TEST_SELECT_CMD="$_persist_cmd"
+  fi
+fi
+
 # ── Env escape hatches (worktree-land's --skip-tests / --test-cmd) ──────────────
 if [ -n "${TEST_SELECT_SKIP:-}" ]; then
   note "TEST_SELECT_SKIP set — skipping tests"

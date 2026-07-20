@@ -86,6 +86,9 @@ config-protection:
     event: beforeShellExecution
     matcher: "git( +-[^ ]+| +-C +[^ ]+)* +(add|commit)( |$)"
 
+# Per-hook configurable (issue #334): a host disables hub-guard alone via
+# `git config ai-toolkit.hook.hub-guard.enabled false` or the sync-safe
+# `ai-toolkit hook-off hub-guard` marker — every other gate stays enforced.
 hub-guard:
   event: preToolUse
   matcher: "Edit|Write|NotebookEdit|Bash"
@@ -130,6 +133,9 @@ console-log-warn:
     event: afterFileEdit
     matcher: "Write|TabWrite"
 
+# Per-hook configurable (issue #334): `git config ai-toolkit.hook.commit-quality.*`
+# sets `enabled`, the allowed `types` list, and `require-anchor` — so a host with a
+# different commit convention opts in without disabling the whole toolkit.
 commit-quality:
   event: preToolUse
   matcher: Bash

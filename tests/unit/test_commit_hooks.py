@@ -1985,3 +1985,61 @@ class TestLedgerSchemaGuard:
             env=env,
         ).returncode
         assert rc == ALLOW
+
+
+# ── #334: per-project commit-quality configuration ──────────────────
+# commit-quality reads its enable flag, allowed `types`, and issue-anchor
+# requirement from the sync-materialized git config (ai-toolkit.hook.commit-
+# quality.*). An unconfigured repo keeps today's exact behavior (the tests above
+# are the regression pins); these cover the configured overrides.
+
+
+def _cq_config(repo: Path, key: str, value: str) -> None:
+    subprocess.run(
+        ["git", "config", f"ai-toolkit.hook.commit-quality.{key}", value],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_commit_quality_disabled_allows_nonconventional(
+    on_branch: Callable[[str], Path],
+) -> None:
+    repo = on_branch("feature/1-x")
+    _cq_config(repo, "enabled", "false")
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "totally not conventional"', cwd=repo) == ALLOW
+
+
+def test_commit_quality_custom_types_accept_host_convention(
+    on_branch: Callable[[str], Path],
+) -> None:
+    repo = on_branch("feature/1-x")
+    _cq_config(repo, "types", "wip hotfix")
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "wip: iterate"', cwd=repo) == ALLOW
+
+
+def test_commit_quality_custom_types_block_unlisted(
+    on_branch: Callable[[str], Path],
+) -> None:
+    repo = on_branch("feature/1-x")
+    _cq_config(repo, "types", "wip hotfix")
+    # `feat` is no longer in the host's list, so it is now rejected.
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: add"', cwd=repo) == BLOCK
+
+
+def test_commit_quality_default_types_block_unknown(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Baseline (no config): `wip` is not a default conventional type → blocked.
+    repo = on_branch("feature/1-x")
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "wip: iterate"', cwd=repo) == BLOCK
+
+
+def test_commit_quality_require_anchor_false_allows_unanchored(
+    on_branch: Callable[[str], Path],
+) -> None:
+    repo = on_branch("no-issue-here")
+    _cq_config(repo, "require-anchor", "false")
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: y"', cwd=repo) == ALLOW

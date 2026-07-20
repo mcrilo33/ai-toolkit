@@ -74,6 +74,15 @@ hub_default_branch() {
 INPUT=$(read_stdin)
 ROOT=$(project_root_from_payload "$INPUT")
 
+# Per-hook kill switch (issue #334): a host project where developers legitimately
+# commit on main/master disables hub-guard alone — every other gate stays enforced.
+# Guarded on the resolver's presence: a stale install predating #334 lacks it, and
+# a missing switch must degrade to ENABLED (the guard stays active, the safe
+# direction), never silently no-op the hub protection.
+if command -v ai_toolkit_hook_enabled >/dev/null 2>&1; then
+  ai_toolkit_hook_enabled hub-guard "$ROOT" || exit 0
+fi
+
 # Not in a git repo → nothing to guard.
 GIT_DIR=$(git -C "$ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)
 [ -z "$GIT_DIR" ] && exit 0

@@ -30,6 +30,15 @@ COMMAND=$(get_shell_command "$INPUT")
 # so it works regardless of where the commit appears.
 is_git_commit "$COMMAND" || exit 0
 
+# Per-hook config (issue #334): resolve the project root once (for git-config reads
+# and the branch lookup below), then honor the per-hook enable switch — a host that
+# opts out of commit-quality commits freely. Guarded on the resolver's presence so a
+# stale install predating #334 keeps today's unconditional behavior.
+PROJECT_ROOT=$(project_root_from_payload "$INPUT")
+if command -v ai_toolkit_hook_enabled >/dev/null 2>&1; then
+  ai_toolkit_hook_enabled commit-quality "$PROJECT_ROOT" || exit 0
+fi
+
 # Extract the SUBJECT from the FIRST message flag. With multiple -m flags the
 # first is the subject and the rest are body/footer paragraphs (git's own
 # semantics), so the conventional-commit check must target the first one.
@@ -88,14 +97,23 @@ esac
 # ── Conventional commits validation ─────────────────────────────────
 # Pattern: type(optional-scope): description
 #   OR: type!: description (breaking change)
-VALID_TYPES="feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert"
+# The allowed types are the configurable per-project list (issue #334); unconfigured
+# or on a stale install this is exactly today's fixed conventional set.
+if command -v ai_toolkit_hook_commit_types >/dev/null 2>&1; then
+  VALID_TYPES="$(ai_toolkit_hook_commit_types "$PROJECT_ROOT")"
+else
+  VALID_TYPES="feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert"
+fi
 PATTERN="^($VALID_TYPES)(\([a-zA-Z0-9._-]+\))?(!)?: .+"
 
 if ! echo "$MSG" | grep -qE "$PATTERN"; then
+  # Show the ACTUALLY allowed types (issue #334): the deny message must reflect a
+  # host's configured `types` list, not the hardcoded default, or it misleads.
+  TYPES_DISPLAY="$(printf '%s' "$VALID_TYPES" | sed 's/|/, /g')"
   deny "Commit message doesn't follow conventional commits format.
 Expected: type(scope): description
-Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
-Example: feat(auth): add OAuth2 login flow
+Types: $TYPES_DISPLAY
+Example: ${VALID_TYPES%%|*}(scope): short description
 Got: $MSG"
 fi
 
@@ -113,9 +131,16 @@ fi
 # Deliberately permissive on UNPARSEABLE messages: this gate only runs on
 # the -m text we can read. Editor/-F/-c/heredoc messages already exited
 # above, so they are never denied here.
-# Resolve the repo from the payload (workspace_roots / $CURSOR_PROJECT_DIR) so
-# the branch lookup does not depend on cwd (empty on Cursor beforeShellExecution).
-PROJECT_ROOT=$(project_root_from_payload "$INPUT")
+#
+# Per-hook toggle (issue #334): a host may drop the issue-anchor requirement
+# (require_issue_anchor=false) while keeping the format check above. Guarded so a
+# stale install predating #334 keeps requiring an anchor (today's behavior).
+if command -v ai_toolkit_hook_require_anchor >/dev/null 2>&1 \
+   && ! ai_toolkit_hook_require_anchor "$PROJECT_ROOT"; then
+  exit 0
+fi
+# PROJECT_ROOT was resolved from the payload above (workspace_roots /
+# $CURSOR_PROJECT_DIR) so the branch lookup does not depend on cwd.
 BRANCH=$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 
 # An issue ID in the branch is a tracker key (PROJ-12) anywhere, OR a bare

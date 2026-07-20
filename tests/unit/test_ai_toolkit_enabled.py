@@ -619,3 +619,199 @@ def test_sync_defaults_on_when_config_unreadable(sync_target: Path, tmp_path: Pa
         env=_GIT_ENV,
     )
     assert result.returncode != 0  # unset → resolver defaults to ENABLED
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Per-hook granular config (issue #334)
+# ═══════════════════════════════════════════════════════════════════════════
+# The per-project layer atop the global switch: each hook resolves via the same
+# marker > git config > default-ON precedence, and the three security guards
+# (secrets-scan, secrets-scan-revert, block-no-verify) stay ON unless explicitly
+# disabled — which must be LOUD (AFK principle #2).
+
+
+def _hook_check(repo: Path, name: str) -> int:
+    """Run ``enabled.sh hook-check <name>`` — 0 ENABLED, non-zero DISABLED."""
+    return subprocess.run(
+        [str(ENABLED_SH), "hook-check", name],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=_env(repo),
+    ).returncode
+
+
+def _probe(repo: Path, snippet: str) -> subprocess.CompletedProcess[str]:
+    """Source enabled.sh then run a snippet, in the sandboxed repo."""
+    script = f'source "{ENABLED_SH}"\n{snippet}\n'
+    return subprocess.run(
+        ["bash", "-c", script], cwd=str(repo), capture_output=True, text=True, env=_env(repo)
+    )
+
+
+def _hook_marker(repo: Path, name: str) -> Path:
+    return _common_dir(repo) / f"ai-toolkit-hook-{name}-off"
+
+
+# ── resolver precedence ──
+
+
+def test_hook_enabled_by_default(repo: Path) -> None:
+    assert _hook_check(repo, "hub-guard") == 0
+
+
+def test_hook_git_config_false_disables(repo: Path) -> None:
+    _git(repo, "config", "--local", "ai-toolkit.hook.hub-guard.enabled", "false")
+    assert _hook_check(repo, "hub-guard") != 0
+
+
+def test_hook_off_marker_disables_and_survives_git_config_true(repo: Path) -> None:
+    _git(repo, "config", "--local", "ai-toolkit.hook.hub-guard.enabled", "true")
+    assert _cli(repo, "hook-off", "hub-guard").returncode == 0
+    assert _hook_marker(repo, "hub-guard").exists()
+    assert _hook_check(repo, "hub-guard") != 0  # marker decisive over git config true
+
+
+def test_hook_on_removes_marker(repo: Path) -> None:
+    _cli(repo, "hook-off", "hub-guard")
+    _cli(repo, "hook-on", "hub-guard")
+    assert not _hook_marker(repo, "hub-guard").exists()
+    assert _hook_check(repo, "hub-guard") == 0
+
+
+# ── security guards ──
+
+
+@pytest.mark.parametrize("guard", ["secrets-scan", "secrets-scan-revert", "block-no-verify"])
+def test_security_guard_on_by_default(repo: Path, guard: str) -> None:
+    assert _hook_check(repo, guard) == 0
+
+
+def test_security_guard_explicit_disable_honored(repo: Path) -> None:
+    _git(repo, "config", "--local", "ai-toolkit.hook.secrets-scan.enabled", "false")
+    assert _hook_check(repo, "secrets-scan") != 0
+
+
+def test_security_banner_fires_when_guard_disabled(repo: Path) -> None:
+    _git(repo, "config", "--local", "ai-toolkit.hook.secrets-scan.enabled", "false")
+    result = _probe(repo, 'ai_toolkit_warn_disabled_security_guards "$PWD"')
+    assert "secrets-scan" in result.stderr
+    assert "SECURITY" in result.stderr
+
+
+def test_security_banner_silent_when_all_on(repo: Path) -> None:
+    result = _probe(repo, 'ai_toolkit_warn_disabled_security_guards "$PWD"')
+    assert result.returncode == 0
+    assert result.stderr.strip() == ""
+
+
+def test_security_banner_never_fails_caller(repo: Path) -> None:
+    # Best-effort (AFK #6): the scan must return 0 even when a guard is disabled,
+    # so it can never abort a hook that runs it under set -e.
+    _git(repo, "config", "--local", "ai-toolkit.hook.secrets-scan.enabled", "false")
+    result = _probe(repo, 'set -e; ai_toolkit_warn_disabled_security_guards "$PWD"; echo AFTER')
+    assert "AFTER" in result.stdout
+
+
+# ── rule-config getters ──
+
+
+def test_commit_types_default_is_conventional(repo: Path) -> None:
+    result = _probe(repo, 'ai_toolkit_hook_commit_types "$PWD"')
+    assert result.stdout.strip() == "feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert"
+
+
+def test_commit_types_configured_becomes_alternation(repo: Path) -> None:
+    _git(repo, "config", "--local", "ai-toolkit.hook.commit-quality.types", "wip hotfix")
+    result = _probe(repo, 'ai_toolkit_hook_commit_types "$PWD"')
+    assert result.stdout.strip() == "wip|hotfix"
+
+
+def test_require_anchor_required_by_default(repo: Path) -> None:
+    result = _probe(repo, 'ai_toolkit_hook_require_anchor "$PWD" && echo REQ || echo NOREQ')
+    assert "REQ" in result.stdout and "NOREQ" not in result.stdout
+
+
+def test_require_anchor_disabled(repo: Path) -> None:
+    _git(repo, "config", "--local", "ai-toolkit.hook.commit-quality.require-anchor", "false")
+    result = _probe(repo, 'ai_toolkit_hook_require_anchor "$PWD" && echo REQ || echo NOREQ')
+    assert "NOREQ" in result.stdout
+
+
+def test_test_select_skip_off_by_default(repo: Path) -> None:
+    result = _probe(repo, 'ai_toolkit_hook_test_select_skip "$PWD" && echo SKIP || echo NOSKIP')
+    assert "NOSKIP" in result.stdout
+
+
+def test_test_select_skip_configured(repo: Path) -> None:
+    _git(repo, "config", "--local", "ai-toolkit.hook.test-select.skip", "true")
+    result = _probe(repo, 'ai_toolkit_hook_test_select_skip "$PWD" && echo SKIP || echo NOSKIP')
+    assert "SKIP" in result.stdout and "NOSKIP" not in result.stdout
+
+
+def test_test_select_command_configured(repo: Path) -> None:
+    _git(repo, "config", "--local", "ai-toolkit.hook.test-select.command", "make test")
+    result = _probe(repo, 'ai_toolkit_hook_test_select_command "$PWD"')
+    assert result.stdout.strip() == "make test"
+
+
+# ── utils.sh source-time banner ──
+
+
+def test_utils_source_time_security_banner(repo: Path) -> None:
+    """utils.sh fires the security banner at source time when a guard is disabled,
+    yet still sources through to the hook body (best-effort, never blocks)."""
+    _git(repo, "config", "--local", "ai-toolkit.hook.secrets-scan.enabled", "false")
+    result = _run_utils_probe(repo)
+    assert "REACHED_BODY" in result.stdout
+    assert "secrets-scan" in result.stderr
+
+
+# ── sync materialization ──
+
+
+def test_sync_materializes_hook_disabled(sync_target: Path, tmp_path: Path) -> None:
+    _sync(sync_target, "hooks:\n  hub-guard:\n    enabled: false\n", tmp_path)
+    assert (
+        _git(sync_target, "config", "--local", "--get", "ai-toolkit.hook.hub-guard.enabled").strip()
+        == "false"
+    )
+
+
+def test_sync_materializes_rule_config(sync_target: Path, tmp_path: Path) -> None:
+    _sync(
+        sync_target,
+        "hooks:\n  commit-quality:\n    require_issue_anchor: false\n",
+        tmp_path,
+    )
+    assert (
+        _git(
+            sync_target,
+            "config",
+            "--local",
+            "--get",
+            "ai-toolkit.hook.commit-quality.require-anchor",
+        ).strip()
+        == "false"
+    )
+
+
+def test_sync_does_not_clobber_host_override(sync_target: Path, tmp_path: Path) -> None:
+    """A host's own git-config rule override survives a re-sync when the shipped
+    config leaves that key unset (Acceptance: overrides survive re-sync)."""
+    _git(sync_target, "config", "--local", "ai-toolkit.hook.commit-quality.types", "wip hotfix")
+    _sync(sync_target, "hooks:\n  hub-guard:\n    enabled: true\n", tmp_path)
+    assert (
+        _git(
+            sync_target, "config", "--local", "--get", "ai-toolkit.hook.commit-quality.types"
+        ).strip()
+        == "wip hotfix"
+    )
+
+
+def test_sync_does_not_touch_hook_marker(sync_target: Path, tmp_path: Path) -> None:
+    """A per-hook off marker survives a re-sync (sync owns git config, not markers)."""
+    marker = _common_dir(sync_target) / "ai-toolkit-hook-hub-guard-off"
+    marker.write_text("")
+    _sync(sync_target, "hooks:\n  hub-guard:\n    enabled: true\n", tmp_path)
+    assert marker.exists()
