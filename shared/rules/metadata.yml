@@ -111,7 +111,7 @@ issue-hygiene:
 
 bug-triage:
   name: "Bug Triage"
-  description: "When you discover a confirmed defect during any work, file it via the bug-scoper agent immediately without asking — the agent verifies evidence against the code and dedups, so filing-by-default is safe. Auto-file confirmed bugs; only surface genuine is-this-intended-design uncertainty. ai-toolkit tooling defects go to the ai-toolkit upstream repo even from a downstream project, never the host repo. Surfaced on demand, not auto-applied to every session."
+  description: "When you discover a confirmed defect during any work, file it via the bug-scoper agent immediately without asking — the agent verifies evidence against the code and dedups, so filing-by-default is safe. Auto-file confirmed bugs; only surface genuine is-this-intended-design uncertainty. ai-toolkit tooling defects go to the configured upstream (issue_routing.upstream_repo, default mcrilo33/ai-toolkit) even from a downstream project, never the host repo. Surfaced on demand, not auto-applied to every session."
   alwaysApply: false
 
 afk-answering:

@@ -45,15 +45,20 @@ ai-toolkit is synced *into* other projects, so where a bug is filed depends on *
 code is broken**, not on which repo you happen to be sitting in:
 
 - A defect in the **ai-toolkit tooling** — a synced rule, skill, hook, script, agent,
-  or the telemetry code (files under `shared/`, `.claude/`, `.ai-toolkit/`,
-  `scripts/telemetry/`, …) — is filed to the **ai-toolkit upstream repo**
-  (`mcrilo33/ai-toolkit`), even when discovered inside a host project. Otherwise the
-  toolkit's own bugs scatter across downstream trackers and never reach its maintainer.
+  or the telemetry code (files matching the configured `issue_routing.tooling_paths`
+  manifest: `shared/`, `.claude/`, `.ai-toolkit/`, `scripts/telemetry/`, …) — is filed to
+  the **configured ai-toolkit upstream** (`issue_routing.upstream_repo` in
+  `settings/ai-toolkit.yml`, default `mcrilo33/ai-toolkit`), even when discovered inside a
+  host project. Otherwise the toolkit's own bugs scatter across downstream trackers and
+  never reach its maintainer.
 - A defect in the **host project's own code** is filed to the **host project's** repo,
   as normal.
 
-The `bug-scoper` agent targets the upstream repo **explicitly** for tooling defects
-rather than defaulting to the current project's git remote — see its Phase 5.
+The `bug-scoper` agent resolves the upstream repo from the configured
+`issue_routing.upstream_repo` and classifies host-vs-tooling against `tooling_paths`,
+rather than defaulting to the current project's git remote or naming a bare literal — see
+its Phase 5. A fork/rename reroutes tooling defects by changing that config
+(`issue_routing.upstream_repo` or `git config ai-toolkit.upstream-repo`), not agent prose.
 
 ## Deferred follow-ups: file them, don't lose them
 

@@ -195,3 +195,27 @@ model:
       lane:reasoning:
         model: claude-opus-4-8
         effort: max
+
+# Where tooling defects are filed when ai-toolkit is synced into a host project
+# (issue #332). bug-scoper / followup-scoper file HERE (not the host git remote) for a
+# defect in ai-toolkit-owned files, so the toolkit's own bugs reach its maintainer
+# instead of scattering across downstream trackers. The config accessor
+# (ai_toolkit_config.py) resolves the upstream as: `git config ai-toolkit.upstream-repo`
+# override -> `upstream_repo` below -> a hardcoded `mcrilo33/ai-toolkit` fail-safe (never
+# empty — AFK principle #2). A fork/rename changes `upstream_repo` here (survives re-sync,
+# since this is the committed SOURCE config) or sets the git-config override; NO agent
+# prose edit is needed. Keep each value on its own line — an inline `# comment` is NOT
+# stripped by the sync parser and would be read as part of the value.
+issue_routing:
+  upstream_repo: mcrilo33/ai-toolkit
+  # ai-toolkit-owned path globs in a host project. A tooling defect touching these routes
+  # to `upstream_repo`; anything else routes to the host repo. Machine-readable so the
+  # host-vs-tooling split is a crisp rule, not judgment-only.
+  tooling_paths:
+    - .claude/**
+    - .ai-toolkit/**
+    - .cursor/**
+    - .github/agents/**
+    - .github/instructions/**
+    - scripts/telemetry/**
+    - shared/**
