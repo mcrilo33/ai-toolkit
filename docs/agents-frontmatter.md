@@ -113,6 +113,7 @@ transition to the next agent with relevant context.
 | **security-reviewer** | debug | `false` | Vulnerabilities to fix |
 | **devops** | code-review | `false` | Pipeline changes to review |
 | **bug-scoper** | debug | `false` | Issue filed → fix the bug |
+| **followup-scoper** | planner | `false` | Enhancement filed → plan it |
 
 ### Common workflow paths
 
@@ -150,6 +151,7 @@ carry fell back to `claude-opus-4-8`.)
 | `tdd-red` | `claude-opus-4-8` | `max` | Behaviour specification gates the implementation |
 | `devops` | `claude-opus-4-8` | `max` | Careful but bounded |
 | `bug-scoper` | `claude-opus-4-8` | `max` | Accurate `Scope:` derivation from investigation is the whole value |
+| `followup-scoper` | `claude-opus-4-8` | `high` | Sibling of `bug-scoper`; the same `Scope:` derivation is the whole value |
 | `refactor` | `claude-sonnet-5` | `max` | Wide but mechanical; needs care, not genius |
 | `tdd-green` | `claude-sonnet-5` | `max` | Deliberately minimal — over-thinking is a bug |
 | `tdd-refactor` | `claude-sonnet-5` | `max` | Quality pass with tests already green |
@@ -179,6 +181,7 @@ override block** — neither Copilot nor Cursor supports the field.
 | `tdd-refactor` | `tdd-workflow` | Refactor-phase rules with tests green |
 | `devops` | `ci-cd-review`, `docker-patterns`, `deployment-patterns` | Pipeline, container, and deployment references |
 | `bug-scoper` | `github-issues` | Issue-filing mechanics (create/search/dedup, labels) |
+| `followup-scoper` | `github-issues` | Same issue-filing mechanics (create/search/dedup, labels) |
 
 Preloading controls startup context only — agents can still discover other
 skills at runtime through the Skill tool.
@@ -210,8 +213,9 @@ Requires `chat.useCustomAgentHooks: true`.
 Read-only agents (`code-review`, `security-reviewer`, `architect`, `planner`)
 have `disallowedTools` blocking file edits, so PostToolUse edit hooks would
 never fire. `tdd-red` writes tests only. `documentation` writes prose, not
-code — code linters don't apply. `bug-scoper` files issues and, like the read-only
-agents, blocks the file-edit and terminal tools, so no edit hooks apply.
+code — code linters don't apply. `bug-scoper` and `followup-scoper` file issues and,
+like the read-only agents, block the file-edit and terminal tools, so no edit hooks
+apply.
 
 ## Emitted frontmatter per platform
 
