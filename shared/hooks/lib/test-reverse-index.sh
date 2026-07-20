@@ -24,11 +24,13 @@
 # CACHE: <git-common-dir>/.test-reverse-index/<key>, where <key> is a content
 # hash over the tree objects the map depends on — tests/ (the token map) and the
 # shipped shell dirs (the source graph). Structural invalidation like the gate
-# stamps (#122): any committed tests/ OR .sh change yields a new key; shared by
-# the hub and every spoke worktree, never in-tree. A dirty tests/ or shell dir
-# (tracked modifications or untracked files) bypasses the cache with a fresh scan
-# of the WORKING TREE, so a just-edited lib is visible to the commit-time nudge
-# before it is committed; the cache is neither consulted nor overwritten then.
+# stamps (#122): any committed change under tests/ or those dirs yields a new key
+# — a superset of .sh changes (a doc commit under shared/ also rebuilds), which
+# is safe over-invalidation, never a stale map. Shared by the hub and every spoke
+# worktree, never in-tree. A dirty tests/ or shell dir (tracked modifications or
+# untracked files) bypasses the cache with a fresh scan of the WORKING TREE, so a
+# just-edited lib is visible to the commit-time nudge before it is committed; the
+# cache is neither consulted nor overwritten then.
 #
 # Known assumption: the scan reads the WORKING TREE while the key names the
 # HEAD:tests tree, and a gitignored test_*.py is invisible to the clean check —
@@ -145,7 +147,8 @@ _reverse_index_dir() {
 
 # The cache key (issue #123 + #326): a content hash over the tree objects the map
 # depends on — tests/ (the token map) and the shipped shell dirs (the source
-# graph). Any committed change under these mints a new key; unrelated commits keep
+# graph). Coarse by dir, not by .sh blob: any committed change under these mints a
+# new key (safe over-invalidation, ~sub-second rebuild); commits elsewhere keep
 # it. Dirs absent at HEAD are skipped; an all-absent set returns 1 (scan fresh).
 # `-q --verify` keeps a missing dir quiet (no stray "HEAD:dir" echoed to stdout).
 _reverse_index_key() {

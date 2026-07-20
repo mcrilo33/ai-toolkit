@@ -27,16 +27,21 @@ LIB = REPO_ROOT / "shared" / "hooks" / "lib" / "test-reverse-index.sh"
 # Pin git config to nothing so a host's global config can't reach these repos.
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
 
-# The shipped shell surface: the same dirs the selector's reverse index scans.
-SHELL_DIRS = ("scripts", "shared/hooks")
-SHELL_GLOB_DIRS = ("shared/skills/*/scripts",)
+# The shipped shell surface: the SAME dirs the selector's reverse index scans
+# (REVERSE_INDEX_SHELL_DIRS in lib/test-reverse-index.sh), kept in lock-step so
+# the guard can never under-cover relative to the gate — a future orphan .sh under
+# dashboard/langfuse or a skills root must still be caught, not silently skipped.
+SHELL_DIRS = ("scripts", "shared/hooks", "shared/skills", "dashboard/langfuse")
 
 
 def _shipped_sh(root: Path) -> list[Path]:
-    dirs = [root / d for d in SHELL_DIRS]
-    for pattern in SHELL_GLOB_DIRS:
-        dirs.extend(root.glob(pattern))
-    return sorted(f for d in dirs if d.is_dir() for f in d.rglob("*.sh") if f.is_file())
+    return sorted(
+        f
+        for d in (root / p for p in SHELL_DIRS)
+        if d.is_dir()
+        for f in d.rglob("*.sh")
+        if f.is_file()
+    )
 
 
 def _lookup(root: Path, rel: str) -> list[str]:
