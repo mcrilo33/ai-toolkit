@@ -22,7 +22,9 @@ Effort defaults to ``max`` wherever it is omitted.
 
 from __future__ import annotations
 
+import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -264,6 +266,133 @@ def base_branch_camelcase_warning(config: dict) -> str | None:
     return None
 
 
+# --- issue_routing: config-driven upstream target for tooling bugs (issue #332) ---
+# ai-toolkit is synced INTO host projects, so a tooling defect must be filed to the
+# ai-toolkit upstream repo, not the host git remote. The upstream target is config-driven
+# (not hardcoded in agent prose a re-sync would clobber): the resolver layers a fork's
+# `git config ai-toolkit.upstream-repo` override over `issue_routing.upstream_repo`, and
+# never returns empty — it falls back LOUDLY to the documented hardcoded default so a
+# missing/blank config can never silently misroute (AFK principle #2).
+
+# The fail-safe upstream target: returned when neither a git-config override nor the config
+# supplies a value. The canonical repo; a fork changes the CONFIG, never this literal.
+UPSTREAM_REPO_DEFAULT = "mcrilo33/ai-toolkit"
+
+# The fail-safe host-vs-tooling manifest: ai-toolkit-owned path globs in a host project.
+# Used when `issue_routing.tooling_paths` is absent, so classification always has a
+# boundary to match against. Kept in step with the list bug-triage.md names as tooling.
+TOOLING_PATHS_DEFAULT: list[str] = [
+    ".claude/**",
+    ".ai-toolkit/**",
+    ".cursor/**",
+    ".github/agents/**",
+    ".github/instructions/**",
+    "scripts/telemetry/**",
+    "shared/**",
+]
+
+# The git-config key a fork sets to reroute tooling defects without editing the config
+# file or agent prose (survives until the next re-sync, unlike the file default).
+_UPSTREAM_REPO_GIT_KEY = "ai-toolkit.upstream-repo"
+
+
+def _issue_routing_section(config: dict) -> dict:
+    section = config.get("issue_routing")
+    return section if isinstance(section, dict) else {}
+
+
+def _config_upstream_repo(config: dict) -> str | None:
+    """The `issue_routing.upstream_repo` value, stripped, or None when absent/blank."""
+    value = _issue_routing_section(config).get("upstream_repo")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _git_config_upstream_override() -> str | None:
+    """A fork's `git config ai-toolkit.upstream-repo`, stripped, or None.
+
+    Best-effort (AFK principle #6): a missing key, a non-git cwd, or a missing git binary
+    degrades to None (no override), never raising into the caller — so a broken probe can
+    never fail the routing it merely observes. ``LC_ALL=C`` guards the non-C dev-host locale
+    (the ``git`` invocation itself is ASCII, but keep it deterministic).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", _UPSTREAM_REPO_GIT_KEY],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except Exception:
+        # A read-only probe must NEVER propagate (AFK #6): beyond OSError (missing git),
+        # a non-UTF-8 decode under text=True would raise ValueError — all degrade to None.
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def upstream_repo(config: dict) -> str:
+    """The upstream repo tooling defects are filed to (issue #332).
+
+    Resolves in priority order, NEVER returning empty (AFK principle #2 — a fail-safe
+    default over a silent misroute):
+
+    1. ``git config ai-toolkit.upstream-repo`` — a fork's override;
+    2. ``issue_routing.upstream_repo`` in ``settings/ai-toolkit.yml``;
+    3. the hardcoded :data:`UPSTREAM_REPO_DEFAULT`.
+
+    When it falls through to the hardcoded default because the config lacks the key,
+    :func:`upstream_repo_fallback_warning` surfaces that loudly.
+
+    Args:
+        config: The parsed config mapping (from :func:`load_config`).
+
+    Returns:
+        An ``owner/repo`` slug; always non-empty.
+    """
+    override = _git_config_upstream_override()
+    if override:
+        return override
+    return _config_upstream_repo(config) or UPSTREAM_REPO_DEFAULT
+
+
+def upstream_repo_fallback_warning(config: dict) -> str | None:
+    """Warn text when the config lacks ``issue_routing.upstream_repo`` (issue #332).
+
+    The LOUD half of the never-empty fail-safe: a synced-but-un-migrated (or malformed)
+    config missing the key means the routing target is not pinned in the committed source,
+    so it is made visible here rather than masked. Returns None when the config supplies the
+    key (no fallback in play). A live ``git config`` override is a deliberate reroute, not a
+    misconfig, so it does not suppress the warning about the file key being absent — but the
+    text names only the missing FILE key (not a resolved target), so it stays accurate
+    whether the effective value comes from an override or the hardcoded default.
+    """
+    if _config_upstream_repo(config) is not None:
+        return None
+    return (
+        f"config key 'issue_routing.upstream_repo' is unset in settings/ai-toolkit.yml; the "
+        f"resolver uses a `git config {_UPSTREAM_REPO_GIT_KEY}` override if set, else the "
+        f"hardcoded default {UPSTREAM_REPO_DEFAULT!r}. Set the key to pin the tooling-defect "
+        f"target in the committed source."
+    )
+
+
+def tooling_paths(config: dict) -> list[str]:
+    """The ai-toolkit-owned path globs classifying host-vs-tooling defects (issue #332).
+
+    Returns ``issue_routing.tooling_paths`` when configured, else the non-empty
+    :data:`TOOLING_PATHS_DEFAULT` — so the classification always has a manifest to match
+    against, never an empty boundary that would route every defect to the host repo.
+    """
+    value = _issue_routing_section(config).get("tooling_paths")
+    if isinstance(value, list) and value:
+        return [str(p) for p in value]
+    return list(TOOLING_PATHS_DEFAULT)
+
+
 # --- telemetry: client-side Langfuse settings (issue #228) --------------------
 # The config carries only the NON-SECRET, client-facing "where/whether to send"
 # telemetry settings; the Langfuse secret (LANGFUSE_BASIC_AUTH / secret key) stays
@@ -361,6 +490,12 @@ def _cli(argv: list[str]) -> str:
         return base_branch(config)
     if command == "enabled":
         return "true" if enabled(config) else "false"
+    if command == "upstream-repo":
+        warning = upstream_repo_fallback_warning(config)
+        if warning:
+            # stderr only — stdout carries just the resolved value the bash consumer evals.
+            print(f"ai-toolkit: WARNING: {warning}", file=sys.stderr)
+        return upstream_repo(config)
     if command == "spoke-env":
         spec = spoke_model(config) or ("claude-opus-4-8[1m]", DEFAULT_EFFORT)
         # shell-quote the values: worktree-new.sh sources / evals this output, so
@@ -407,15 +542,16 @@ def _cli(argv: list[str]) -> str:
         return "\n".join(lines)
     raise SystemExit(
         "ai_toolkit_config: unknown command "
-        f"{command!r} (base-branch|enabled|spoke-env|batch-env|telemetry-env)"
+        f"{command!r} (base-branch|enabled|upstream-repo|spoke-env|batch-env|telemetry-env)"
     )
 
 
 def main() -> None:
-    """CLI: ``ai_toolkit_config.py <base-branch|enabled|spoke-env|batch-env|telemetry-env> [config-path]``.
+    """CLI: ``ai_toolkit_config.py <base-branch|enabled|upstream-repo|spoke-env|batch-env|telemetry-env> [config-path]``.
 
     A thin bash-facing seam so sync-to-repo.sh can set ``ai-toolkit.base-branch``
-    and ``ai-toolkit.enabled``, emit the spoke-default env file, the hub dispatch
+    and ``ai-toolkit.enabled``, resolve the tooling-defect ``upstream-repo``, emit the
+    spoke-default env file, the hub dispatch
     path can read the batch concurrency cap / stagger, and the telemetry consumers
     can read the client-side Langfuse defaults — without a YAML parser of their own.
     """

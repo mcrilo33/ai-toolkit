@@ -16,6 +16,7 @@ model.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -814,13 +815,25 @@ _ROUTING_SEED = (
 )
 
 
-def test_upstream_repo_returns_configured_value(tmp_path: Path) -> None:
+@pytest.fixture
+def no_git_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the git-config override layer off so config/default resolution is deterministic.
+
+    `upstream_repo` reads a real `git config ai-toolkit.upstream-repo`; a stray value on
+    the dev host (or CI) would otherwise mask the config/default value under test.
+    """
+    monkeypatch.setattr(cfg, "_git_config_upstream_override", lambda: None)
+
+
+def test_upstream_repo_returns_configured_value(tmp_path: Path, no_git_override: None) -> None:
     config = cfg.load_config(_write(tmp_path, _ROUTING_SEED).as_posix())
 
     assert cfg.upstream_repo(config) == "owner/tool"
 
 
-def test_upstream_repo_falls_back_to_default_when_absent(tmp_path: Path) -> None:
+def test_upstream_repo_falls_back_to_default_when_absent(
+    tmp_path: Path, no_git_override: None
+) -> None:
     # A config with no issue_routing block ⇒ the resolver returns the hardcoded default,
     # never empty (the never-empty fail-safe: an un-migrated config keeps routing upstream).
     config = cfg.load_config(_write(tmp_path, "base_branch: main\n").as_posix())
@@ -828,7 +841,9 @@ def test_upstream_repo_falls_back_to_default_when_absent(tmp_path: Path) -> None
     assert cfg.upstream_repo(config) == UPSTREAM_DEFAULT
 
 
-def test_upstream_repo_falls_back_to_default_when_blank(tmp_path: Path) -> None:
+def test_upstream_repo_falls_back_to_default_when_blank(
+    tmp_path: Path, no_git_override: None
+) -> None:
     config = cfg.load_config(_write(tmp_path, "issue_routing:\n  upstream_repo:\n").as_posix())
 
     assert cfg.upstream_repo(config) == UPSTREAM_DEFAULT
@@ -889,7 +904,7 @@ def test_tooling_paths_falls_back_to_default_when_absent(tmp_path: Path) -> None
     assert paths == cfg.TOOLING_PATHS_DEFAULT
 
 
-def test_upstream_repo_cli_emits_resolved_value(tmp_path: Path) -> None:
+def test_upstream_repo_cli_emits_resolved_value(tmp_path: Path, no_git_override: None) -> None:
     path = _write(tmp_path, _ROUTING_SEED)
 
     out = cfg._cli(["ai_toolkit_config.py", "upstream-repo", str(path)])
@@ -897,9 +912,18 @@ def test_upstream_repo_cli_emits_resolved_value(tmp_path: Path) -> None:
     assert out == "owner/tool"
 
 
+def _hermetic_git_env() -> dict[str, str]:
+    """An env that neutralizes any real git config, so a subprocessed resolver sees no
+    override. Global/system point at the null device; local is avoided by running from a
+    non-git cwd (see the callers' ``cwd=``)."""
+    return {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+
+
 def test_upstream_repo_cli_warns_on_missing_key_via_stderr(tmp_path: Path) -> None:
     # stdout carries ONLY the resolved value (the default); the missing-key warning goes to
     # stderr so a bash consumer's captured value stays clean — mirrors the base-branch CLI.
+    # Run hermetically (neutralized git config + non-git cwd) so a stray `git config
+    # ai-toolkit.upstream-repo` on the host cannot surface an override on stdout.
     path = _write(tmp_path, "base_branch: main\n")
 
     result = subprocess.run(
@@ -912,10 +936,42 @@ def test_upstream_repo_cli_warns_on_missing_key_via_stderr(tmp_path: Path) -> No
         capture_output=True,
         text=True,
         check=True,
+        cwd=tmp_path,
+        env=_hermetic_git_env(),
     )
 
     assert result.stdout.strip() == UPSTREAM_DEFAULT
     assert "issue_routing.upstream_repo" in result.stderr
+
+
+# ─── the git-config override probe: best-effort, never raises (AFK #6) ───
+
+
+def test_git_config_upstream_override_none_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The REAL subprocess probe (not a stub): with git config neutralized and a non-git
+    # cwd, no key is set anywhere, so the rc!=0 branch degrades to None.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+
+    assert cfg._git_config_upstream_override() is None
+
+
+def test_git_config_upstream_override_none_when_probe_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A broken probe must degrade to None, never propagate — a read-only observation can't
+    # be allowed to fail the routing it observes (AFK #6). Raise a NON-OSError (as a
+    # non-UTF-8 decode under text=True would) to pin the wider `except Exception` guard: a
+    # narrow `except OSError` would let this propagate.
+    def _boom(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        raise ValueError("bad decode")
+
+    monkeypatch.setattr(cfg.subprocess, "run", _boom)
+
+    assert cfg._git_config_upstream_override() is None
 
 
 # ─── real config: issue_routing seed ───
