@@ -653,8 +653,13 @@ def test_run_suite_runs_two_phase_serial_split(repo: Path, tmp_path: Path) -> No
     )
 
     log = argv_log.read_text() if argv_log.exists() else ""
-    assert "-n auto -m not serial" in log  # parallel bulk, serial deselected
-    assert any(line.strip() == "-m serial" for line in log.splitlines()), (
+    # Parallel bulk under -n auto with serial deselected; both legs report every test's
+    # durations (--durations=0, issue #336) for the budget watcher.
+    assert any(
+        "-n auto" in line and "-m not serial" in line and "--durations=0" in line
+        for line in log.splitlines()
+    ), f"no parallel bulk leg in:\n{log}"
+    assert any(line.strip() == "--durations=0 -m serial" for line in log.splitlines()), (
         f"no single-process serial leg in:\n{log}"
     )
 
@@ -888,9 +893,7 @@ def test_sweep_hands_capture_to_budget_watch(repo: Path, tmp_path: Path) -> None
     runner_log = tmp_path / "runner.log"
     cap_seen = tmp_path / "cap-seen.txt"
     watch = tmp_path / "watch.sh"
-    watch.write_text(
-        f'#!/usr/bin/env bash\ncat "$1" >> "{cap_seen}" 2>/dev/null || true\n'
-    )
+    watch.write_text(f'#!/usr/bin/env bash\ncat "$1" >> "{cap_seen}" 2>/dev/null || true\n')
     watch.chmod(0o755)
 
     proc, _ = _run_sweep(

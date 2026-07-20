@@ -275,14 +275,17 @@ run_suite() {
   # temp file; both are concatenated into $cap so file_red_issue reads failing ids from
   # either. The green/red verdict is the suite's own (the observe tripwire never returns a
   # breach code here).
+  # --durations=0 (issue #336): report EVERY test's phase durations into the capture so
+  # the duration-budget watcher can read the per-test + suite timings this run already
+  # produces — no separate profiling run. Reporting-only, so it cannot change the verdict.
   local rc=0 rc2=0
   if command -v run_under_tripwire_observe >/dev/null 2>&1; then
     run_under_tripwire_observe "${cap}.par" "${RUNNER_ARR[@]}" ${xdist[@]+"${xdist[@]}"} \
-      -m "not serial" 2>>"$LOG" || rc=$?
-    run_under_tripwire_observe "${cap}.ser" "${RUNNER_ARR[@]}" -m serial 2>>"$LOG" || rc2=$?
+      --durations=0 -m "not serial" 2>>"$LOG" || rc=$?
+    run_under_tripwire_observe "${cap}.ser" "${RUNNER_ARR[@]}" --durations=0 -m serial 2>>"$LOG" || rc2=$?
   else
-    "${RUNNER_ARR[@]}" ${xdist[@]+"${xdist[@]}"} -m "not serial" > "${cap}.par" 2>&1 || rc=$?
-    "${RUNNER_ARR[@]}" -m serial > "${cap}.ser" 2>&1 || rc2=$?
+    "${RUNNER_ARR[@]}" ${xdist[@]+"${xdist[@]}"} --durations=0 -m "not serial" > "${cap}.par" 2>&1 || rc=$?
+    "${RUNNER_ARR[@]}" --durations=0 -m serial > "${cap}.ser" 2>&1 || rc2=$?
   fi
   # Exit 5 ("no tests collected") is green on EITHER leg: the serial leg when nothing is
   # marked serial, the parallel leg for a serial-only suite. Normalize both.
@@ -430,6 +433,16 @@ process_request() {
   # file a spurious red issue. Only a genuine pytest red reaches file_red_issue below.
   rc=0
   run_suite "$cap" || rc=$?
+  # Duration-budget watch (issue #336): hand the sweep's OWN --durations=0 capture to the
+  # watcher — no new suite run, just the timings this sweep already produced. Runs for both
+  # a green and a red sweep (durations exist either way). Best-effort: guarded on the
+  # watcher's presence (a downstream target that hasn't synced it is a no-op), and a failure
+  # only logs — it never fails the sweep (the EXIT trap keeps this exit 0 regardless).
+  local watch="${GATE_SWEEP_BUDGET_WATCH:-$SCRIPT_DIR/test-budget-watch.sh}"
+  if [ -f "$watch" ]; then
+    bash "$watch" "$cap" ${BRANCH:+--branch} ${BRANCH:+"$BRANCH"} ${ISSUE:+--issue} ${ISSUE:+"$ISSUE"} \
+      || log "budget watch failed (non-fatal) for tree $tree"
+  fi
   if [ "$rc" -eq 0 ]; then
     gate_stamp_mint "$tree" full "$(sweep_fingerprint)" \
       || log "stamp upgrade failed (non-fatal — a later gate re-proves the tree)"
