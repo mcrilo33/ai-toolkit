@@ -107,10 +107,13 @@ fi
 PATTERN="^($VALID_TYPES)(\([a-zA-Z0-9._-]+\))?(!)?: .+"
 
 if ! echo "$MSG" | grep -qE "$PATTERN"; then
+  # Show the ACTUALLY allowed types (issue #334): the deny message must reflect a
+  # host's configured `types` list, not the hardcoded default, or it misleads.
+  TYPES_DISPLAY="$(printf '%s' "$VALID_TYPES" | sed 's/|/, /g')"
   deny "Commit message doesn't follow conventional commits format.
 Expected: type(scope): description
-Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
-Example: feat(auth): add OAuth2 login flow
+Types: $TYPES_DISPLAY
+Example: ${VALID_TYPES%%|*}(scope): short description
 Got: $MSG"
 fi
 

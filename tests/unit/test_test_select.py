@@ -1805,3 +1805,26 @@ def test_hook_disabled_skips_gate(repo: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "RUN" not in _runlog(runlog)
+
+
+def test_live_env_cmd_wins_over_persistent(repo: Path, tmp_path: Path) -> None:
+    # The contract point: a LIVE TEST_SELECT_CMD wins over a conflicting persistent
+    # git-config command — only the env one runs, the persistent one never fires.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    envlog = tmp_path / "env.log"
+    persist = tmp_path / "persist.log"
+    _git(repo, "config", "ai-toolkit.hook.test-select.command", f"echo persist >> {persist}")
+
+    proc = _run_select(
+        repo,
+        _stdin(tip, base),
+        tmp_path / "bin",
+        env_extra={"TEST_SELECT_CMD": f"echo env >> {envlog}"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert envlog.exists() and "env" in envlog.read_text()  # live env command ran
+    assert not persist.exists()  # persistent config command did NOT run
