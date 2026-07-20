@@ -992,3 +992,168 @@ def test_real_config_tooling_paths_seed(real_config: dict) -> None:
 
     for glob in (".claude/**", ".ai-toolkit/**", "scripts/telemetry/**", "shared/**"):
         assert glob in paths
+
+
+# ─── per-hook granular config (issue #334) ───
+# The per-project layer atop the global `enabled` switch: each hook can be
+# enabled/disabled and (for commit-quality/test-select) rule-configured
+# independently. Every accessor defaults to today's behavior so an un-migrated
+# config (no `hooks:` section) is a byte-for-byte no-op.
+
+
+def test_hook_enabled_defaults_true_when_unmigrated(tmp_path: Path) -> None:
+    # No `hooks:` section at all ⇒ every hook is ENABLED (today's behavior).
+    config = cfg.load_config(_write(tmp_path, "base_branch:\n").as_posix())
+
+    assert cfg.hook_enabled(config, "hub-guard") is True
+    assert cfg.hook_enabled(config, "commit-quality") is True
+    assert cfg.hook_enabled(config, "test-select") is True
+
+
+def test_hook_enabled_false_disables(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(tmp_path, "hooks:\n  hub-guard:\n    enabled: false\n").as_posix()
+    )
+
+    assert cfg.hook_enabled(config, "hub-guard") is False
+
+
+def test_hook_enabled_true_keeps_enabled(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(tmp_path, "hooks:\n  hub-guard:\n    enabled: true\n").as_posix()
+    )
+
+    assert cfg.hook_enabled(config, "hub-guard") is True
+
+
+@pytest.mark.parametrize("guard", ["secrets-scan", "secrets-scan-revert", "block-no-verify"])
+def test_security_guard_defaults_on(tmp_path: Path, guard: str) -> None:
+    # A security guard is ON by default under any blanket/absent config (AFK #2).
+    config = cfg.load_config(_write(tmp_path, "hooks:\n").as_posix())
+
+    assert cfg.hook_enabled(config, guard) is True
+    assert guard in cfg.SECURITY_GUARDS
+
+
+def test_security_guard_explicit_disable_is_honored(tmp_path: Path) -> None:
+    # Explicit disable turns it off — but that path must be loud (see warning test).
+    config = cfg.load_config(
+        _write(tmp_path, "hooks:\n  secrets-scan:\n    enabled: false\n").as_posix()
+    )
+
+    assert cfg.hook_enabled(config, "secrets-scan") is False
+
+
+def test_security_guard_disable_warning_names_disabled_guard(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(tmp_path, "hooks:\n  secrets-scan:\n    enabled: false\n").as_posix()
+    )
+
+    warning = cfg.security_guard_disable_warning(config)
+
+    assert warning is not None
+    assert "secrets-scan" in warning
+
+
+def test_security_guard_disable_warning_none_when_all_on(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(tmp_path, "hooks:\n  hub-guard:\n    enabled: false\n").as_posix()
+    )
+
+    # hub-guard is not a security guard, so disabling it raises no security warning.
+    assert cfg.security_guard_disable_warning(config) is None
+
+
+def test_commit_quality_types_defaults_to_conventional_list(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "base_branch:\n").as_posix())
+
+    types = cfg.commit_quality_types(config)
+
+    assert "feat" in types and "fix" in types and "chore" in types
+
+
+def test_commit_quality_types_honors_host_list(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(
+            tmp_path,
+            "hooks:\n  commit-quality:\n    types:\n      - wip\n      - hotfix\n",
+        ).as_posix()
+    )
+
+    assert cfg.commit_quality_types(config) == ["wip", "hotfix"]
+
+
+def test_commit_quality_require_anchor_defaults_true(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "base_branch:\n").as_posix())
+
+    assert cfg.commit_quality_require_anchor(config) is True
+
+
+def test_commit_quality_require_anchor_can_be_disabled(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(tmp_path, "hooks:\n  commit-quality:\n    require_issue_anchor: false\n").as_posix()
+    )
+
+    assert cfg.commit_quality_require_anchor(config) is False
+
+
+def test_test_select_command_none_by_default(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "base_branch:\n").as_posix())
+
+    assert cfg.test_select_command(config) is None
+
+
+def test_test_select_command_returns_configured(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(tmp_path, "hooks:\n  test-select:\n    command: make test\n").as_posix()
+    )
+
+    assert cfg.test_select_command(config) == "make test"
+
+
+def test_test_select_skip_defaults_false(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "base_branch:\n").as_posix())
+
+    assert cfg.test_select_skip(config) is False
+
+
+def test_test_select_skip_can_be_enabled(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(tmp_path, "hooks:\n  test-select:\n    skip: true\n").as_posix()
+    )
+
+    assert cfg.test_select_skip(config) is True
+
+
+def test_hooks_config_cli_emits_only_explicit_values(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "hooks:\n"
+        "  hub-guard:\n    enabled: false\n"
+        "  commit-quality:\n    require_issue_anchor: false\n"
+        "  test-select:\n    skip: true\n",
+    )
+
+    out = cfg._cli(["ai_toolkit_config.py", "hooks-config", str(path)])
+
+    assert "enabled\thub-guard\tfalse" in out
+    assert "config\tai-toolkit.hook.commit-quality.require-anchor\tfalse" in out
+    assert "config\tai-toolkit.hook.test-select.skip\ttrue" in out
+
+
+def test_hooks_config_cli_empty_when_unmigrated(tmp_path: Path) -> None:
+    path = _write(tmp_path, "base_branch:\n")
+
+    assert cfg._cli(["ai_toolkit_config.py", "hooks-config", str(path)]) == ""
+
+
+def test_real_config_preserves_default_hook_behavior(real_config: dict) -> None:
+    # The shipped config must keep today's exact behavior for all three gates so a
+    # re-sync never changes an unconfigured host (Acceptance #1).
+    assert cfg.hook_enabled(real_config, "hub-guard") is True
+    assert cfg.hook_enabled(real_config, "commit-quality") is True
+    assert cfg.hook_enabled(real_config, "test-select") is True
+    assert cfg.commit_quality_require_anchor(real_config) is True
+    assert cfg.test_select_skip(real_config) is False
+    # No security guard is disabled in the shipped config.
+    assert cfg.security_guard_disable_warning(real_config) is None
