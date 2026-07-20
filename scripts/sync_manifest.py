@@ -24,6 +24,20 @@ MANIFEST_NAME = ".ai-toolkit-manifest.json"
 # Hook-reconciler-owned configs and backups are never deleted by GC.
 _PROTECTED_PATHS = frozenset({".cursor/hooks.json", ".claude/settings.json"})
 
+# Host-owned config files (issue #333). These are copy-if-absent or
+# reconciled-in-place, never regenerated wholesale, so an already-existing one
+# is host-owned and must never be GC-removed — made explicit here rather than
+# relying on the paths merely being absent from the manifest.
+_PROTECTED_CONFIG_PATHS = frozenset(
+    {
+        "pyproject.toml",
+        "ruff.toml",
+        ".gitignore",
+        ".editorconfig",
+        ".python-version",
+    }
+)
+
 
 def _validate_relpath(path: str) -> None:
     """Raise ValueError if ``path`` is absolute or escapes the target root."""
@@ -35,7 +49,7 @@ def _validate_relpath(path: str) -> None:
 
 
 def _is_protected(path: str) -> bool:
-    return path in _PROTECTED_PATHS or path.endswith(".bak")
+    return path in _PROTECTED_PATHS or path in _PROTECTED_CONFIG_PATHS or path.endswith(".bak")
 
 
 def _is_contained(target_dir: Path, path: str) -> bool:
@@ -82,7 +96,7 @@ def finalize(
     Paths listed under ``tool`` in the old manifest but absent from ``files``
     are deleted from disk (stale outputs of a previous sync). Paths never
     listed in the manifest are never touched. Protected paths (reconciler-owned
-    configs, ``*.bak`` backups) are never deleted.
+    configs, host-owned config files, ``*.bak`` backups) are never deleted.
 
     Args:
         target: Path to the target repo root.
@@ -110,9 +124,7 @@ def finalize(
         _validate_relpath(path)
 
     stale = sorted(set(old_files) - set(new_files))
-    deleted = [
-        p for p in stale if not _is_protected(p) and _is_contained(target_dir, p)
-    ]
+    deleted = [p for p in stale if not _is_protected(p) and _is_contained(target_dir, p)]
     if dry_run:
         return deleted
 
@@ -136,9 +148,7 @@ def main() -> None:
     args = parser.parse_args()
 
     files = [line.strip() for line in sys.stdin if line.strip()]
-    deleted = finalize(
-        args.target, args.tool, files, toolkit_rev=args.rev, dry_run=args.dry_run
-    )
+    deleted = finalize(args.target, args.tool, files, toolkit_rev=args.rev, dry_run=args.dry_run)
     for path in deleted:
         print(path)
 
