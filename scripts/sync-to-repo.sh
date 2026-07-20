@@ -646,6 +646,17 @@ sync_config_files() {
     _reconcile_config() {
         local filename="$1" kind="$2"
         [ -f "$SHARED_DIR/$filename" ] || return 0
+        # Self-sync guard (issue #338): when the target IS the ai-toolkit source
+        # repo (same dir on disk — `-ef` compares device+inode, so it matches
+        # regardless of path spelling whenever the sync runs from within the
+        # checkout it targets), skip the host-managed reconcile. The source
+        # maintains its own tracked $filename by hand; injecting the managed block
+        # would leave it modified-but-uncommitted, silently blocking worktree-land.
+        # A separate host project / fork has a different inode and still reconciles.
+        if [ "$TARGET" -ef "$REPO_DIR" ]; then
+            info "$filename (self-sync — source maintains its own; skipped)"
+            return 0
+        fi
         local target_file="$TARGET/$filename"
         if [ "$DRY_RUN" -eq 1 ]; then
             echo "[dry-run] would reconcile $filename"
@@ -654,10 +665,11 @@ sync_config_files() {
         # Write to a temp file first: a reconcile failure leaves the target
         # untouched and warns (graceful degradation, matching spoke-model.env
         # and apply_base_branch_config above) instead of aborting the sync or
-        # truncating the file. The mv is an atomic swap on success.
+        # truncating the file. The mv is an atomic swap on success — the original
+        # is intact until it lands, so no separate backup is needed (issue #338:
+        # a .gitignore.bak beside a tracked .gitignore littered the tree).
         if python3 "$SCRIPT_DIR/config_reconciler.py" "$kind" \
             "$target_file" < "$SHARED_DIR/$filename" > "$target_file.tmp"; then
-            [ -f "$target_file" ] && cp "$target_file" "$target_file.bak"
             mv "$target_file.tmp" "$target_file"
             info "$filename (reconciled)"
         else
