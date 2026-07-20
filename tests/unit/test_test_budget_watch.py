@@ -106,7 +106,10 @@ def _run(
         **_GIT_ENV,
         "TEST_BUDGET_SLOW_SECONDS": str(slow),
         "TEST_BUDGET_SUITE_SECONDS": str(suite),
-        "TEST_BUDGET_SCOPER_CMD": f'bash "{scoper}"',
+        # The seam is invoked `bash -c "$CMD" test-budget-watch <kind> <node> <secs>`
+        # (mirrors HUB_WATCHDOG_SCOPER_CMD), so the CMD must forward the positional
+        # args with "$@" to reach the stub.
+        "TEST_BUDGET_SCOPER_CMD": f'bash "{scoper}" "$@"',
         "AFK_STATE_DIR": str(state_dir),
     }
     proc = subprocess.run(
@@ -226,7 +229,7 @@ def test_budgets_read_from_config_file(repo: Path, tmp_path: Path) -> None:
     env = {
         **_GIT_ENV,
         "TEST_BUDGET_CONFIG": str(config),
-        "TEST_BUDGET_SCOPER_CMD": f'bash "{scoper}"',
+        "TEST_BUDGET_SCOPER_CMD": f'bash "{scoper}" "$@"',
         "AFK_STATE_DIR": str(tmp_path / "state"),
     }
 

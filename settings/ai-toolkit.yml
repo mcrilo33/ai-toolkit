@@ -100,6 +100,21 @@ batch:
   # suites don't all hit at once. Empty ⇒ 45; 0 disables the stagger.
   stagger_seconds: 20
 
+# Test duration budgets (issue #336) — the single source of truth for the
+# duration-budget watcher (scripts/test-budget-watch.sh). The pre-push gate's
+# wall-clock silently rots when a slow test creeps in (#328 found a 122.6s test by
+# luck); the watcher reads the per-test durations gate-sweep's off-critical-path
+# `-n auto` full run already produces and surfaces a deduped enhancement when a
+# single test or the whole suite crosses its budget. These are a GENERAL bound
+# (a per-test ceiling + a suite target), NOT thresholds tuned to today's known-slow
+# tests (scientific-integrity rule). A blank/absent/non-integer value degrades to
+# the watcher's fail-safe default (30 / 480). Keep each value on its own line — an
+# inline `# comment` is NOT stripped by the sync parser and would be read as part of
+# the value.
+test_budget:
+  slow_test_seconds: 30     # a single test slower than X seconds is flagged
+  suite_seconds: 480        # the whole suite slower than Y seconds is flagged
+
 model:
   # The interactive spoke driver launched by worktree-new.sh. Routine spokes run
   # Sonnet at high effort (2026-07-15 budget routing): no `[1m]` tier, so context
