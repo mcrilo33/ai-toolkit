@@ -295,6 +295,43 @@ if [ -d "$warn_state_dir" ]; then
   fi
 fi
 
+# --- test-budget breach pings (issue #336) ------------------------------------
+# The duration-budget watcher (scripts/test-budget-watch.sh) writes one
+# test-budget-breach-<slug>.txt per CURRENT breach under the AFK state dir (the same dir
+# the warned-* records above live in). Fire exactly ONE OS notification per NEW breach —
+# keyed on the record's basename + a content hash, so a CHANGED breach (a worse regression)
+# re-fires while a steady one stays quiet — with its OWN seen-set. Mode-aware like the
+# gate/ready pings: suppressed under a LIVE drain (the watcher already filed a followup —
+# the durable unattended record — so the desktop ping is for the ATTENDED operator), fired
+# when attended. Skipping the whole pass under a drain leaves the seen-set untouched, so a
+# withheld breach still fires once the drain ends. Quiet when nothing breaches.
+budget_state_dir="${AFK_STATE_DIR:-$common_dir/ai-toolkit-afk}"
+budget_seen_file="${HUB_NOTIFY_BUDGET_SEEN_FILE:-$common_dir/hub-notify-budget-seen}"
+if [ "$afk_active" -eq 0 ] && [ -d "$budget_state_dir" ]; then
+  budget_seen=""
+  [ -f "$budget_seen_file" ] && budget_seen="$(cat "$budget_seen_file" 2>/dev/null)"
+  budget_persist=""
+  for bf in "$budget_state_dir"/test-budget-breach-*.txt; do
+    [ -f "$bf" ] || continue                       # unmatched glob → literal, guarded here
+    bbase="${bf##*/}"
+    bhash="$(cksum < "$bf" 2>/dev/null | awk '{print $1}')"
+    bmsg="$(head -n1 "$bf" 2>/dev/null)"
+    [ -n "$bmsg" ] || bmsg="test-budget breach detected"
+    if printf '%s\n' "$budget_seen" | grep -qxF "$bbase $bhash"; then
+      budget_persist+="$bbase $bhash"$'\n'         # already pinged at this content → steady
+      continue
+    fi
+    notify "$bmsg"
+    budget_persist+="$bbase $bhash"$'\n'
+  done
+  mkdir -p "$(dirname "$budget_seen_file")" 2>/dev/null || true
+  if [ -n "$budget_persist" ]; then
+    printf '%s' "$budget_persist" >"$budget_seen_file" 2>/dev/null || true
+  else
+    : >"$budget_seen_file" 2>/dev/null || true
+  fi
+fi
+
 # /afk drain-complete (issue #150): hub-afk writes <git-common-dir>/.afk-drain-complete
 # with the landed count when a drain finishes (see hub-afk.sh _afk_emit_drain_complete).
 # Fire ONE "/afk drain complete — <k> landed" ping and consume the file, so a completed

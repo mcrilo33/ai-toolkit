@@ -699,3 +699,82 @@ def test_warned_record_refires_after_interval(hub: Path, tmp_path: Path) -> None
     assert n1 == 1, m1
     assert n2 == 1, "within the repeat window a warning must not re-fire"
     assert n3 == 2, "after the repeat window a standing warning re-fires"
+
+
+# ── issue #336: test-budget breach pings (the duration-budget watcher surfaces a breach) ──
+# The watcher (scripts/test-budget-watch.sh) writes one test-budget-breach-<slug>.txt per
+# current breach under the AFK state dir; hub-notify fires exactly ONE OS notification per
+# NEW breach (own seen-set), mode-aware — suppressed under a live drain (the scoper filing
+# is the durable unattended record), fired when attended. Quiet when nothing breaches.
+
+
+def _budget_env(statedir: Path, seen: Path, **extra: str) -> dict[str, str]:
+    return {"AFK_STATE_DIR": str(statedir), "HUB_NOTIFY_BUDGET_SEEN_FILE": str(seen), **extra}
+
+
+def test_budget_breach_record_fires_notification(hub: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "test-budget-breach-suite.txt").write_text(
+        "#336 test-budget breach — suite total 500.00s > 480s budget\n"
+    )
+
+    _proc, messages = _run(hub, tmp_path, env_extra=_budget_env(statedir, tmp_path / "bseen"))
+
+    assert any("test-budget breach" in m and "500.00s" in m for m in messages), messages
+
+
+def test_budget_breach_deduped_on_second_run(hub: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "test-budget-breach-suite.txt").write_text(
+        "#336 test-budget breach — suite total 500.00s > 480s budget\n"
+    )
+    seen = tmp_path / "bseen"
+
+    _p1, m1 = _run(hub, tmp_path, env_extra=_budget_env(statedir, seen))
+    _p2, m2 = _run(hub, tmp_path, env_extra=_budget_env(statedir, seen))
+
+    assert sum("test-budget breach" in m for m in m1) == 1
+    assert sum("test-budget breach" in m for m in m2) == 1, (
+        "a persistent breach record must not re-fire the ping"
+    )
+
+
+def test_no_budget_breach_record_fires_nothing(hub: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+
+    _proc, messages = _run(hub, tmp_path, env_extra=_budget_env(statedir, tmp_path / "bseen"))
+
+    assert not any("test-budget breach" in m for m in messages), messages
+
+
+def test_budget_breach_suppressed_under_live_drain(hub: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "test-budget-breach-suite.txt").write_text(
+        "#336 test-budget breach — suite total 500.00s > 480s budget\n"
+    )
+
+    _proc, messages = _run(
+        hub, tmp_path, afk=True, env_extra=_budget_env(statedir, tmp_path / "bseen")
+    )
+
+    assert not any("test-budget breach" in m for m in messages), (
+        "a budget breach ping is suppressed under a live drain (attended-only)"
+    )
+
+
+def test_budget_breach_fires_when_attended(hub: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "test-budget-breach-suite.txt").write_text(
+        "#336 test-budget breach — suite total 500.00s > 480s budget\n"
+    )
+
+    _proc, messages = _run(
+        hub, tmp_path, afk=False, env_extra=_budget_env(statedir, tmp_path / "bseen")
+    )
+
+    assert any("test-budget breach" in m for m in messages), "attended: the breach must ping"
