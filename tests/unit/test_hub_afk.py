@@ -4977,6 +4977,18 @@ def _reaper_env(
         # #241: the revive/warn-park paths journal a decision — keep the gh issue comment OFF so
         # the reaper tests never fire a real `gh issue comment` at the live repo.
         "AFK_JOURNAL_GH_COMMENT": "0",
+        # #330: zero the injector verify poll for the whole reaper cluster. A reap that reaches
+        # the finished-turn-idle nudge (or any inject_and_verify path) otherwise polls
+        # _transcript_advanced up to AFK_INJECT_VERIFY_SECONDS (60s) plus a bounded retry
+        # (~122s) against the stub tmux, which NEVER advances the transcript — so the poll can
+        # only ever time out. Both vars are read at call time, so zeroing them here is a pure
+        # clock injection: _transcript_advanced returns on its first check without sleeping and
+        # no reap-path outcome changes. A test that needs a real budget overrides BOTH on its
+        # returned env AFTER this call — raise VERIFY_SECONDS *and* POLL_SECONDS together, since
+        # _transcript_advanced only escapes its loop via `waited += poll`; a nonzero budget with
+        # POLL still 0 would spin forever.
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
     }
     return expr, env, ready_log, statedir
 
@@ -7815,7 +7827,8 @@ def test_reap_pass_clears_offline_marker_when_network_recovers(tmp_path: Path) -
     # that reintroduces that dead wait fails loudly instead of silently capping the full-suite
     # wall-clock. The fix zeroes the inject-verify budget in _reaper_env's returned env.
     assert elapsed < 10, (
-        f"reap_pass blocked on the injector poll ({elapsed:.1f}s); expected sub-second"
+        f"reap_pass blocked on the injector poll ({elapsed:.1f}s); the fixed path is ~2s, so "
+        "anything near the 122s pre-fix wait is a regression"
     )
 
 
