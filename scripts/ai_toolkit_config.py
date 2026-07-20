@@ -553,6 +553,10 @@ def hook_enabled(config: dict, name: str) -> bool:
     """
     explicit = _hook_enabled_explicit(config, name)
     if name in SECURITY_GUARDS:
+        # A security guard is ON unless it carries its OWN explicit `enabled: false`.
+        # The dedicated branch keeps that invariant independent of the default-ON path
+        # so a future blanket/default-off can never silently strip it (AFK #2); today
+        # the two paths coincide because no blanket disable exists yet.
         return explicit is not False
     return True if explicit is None else explicit
 

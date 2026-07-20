@@ -27,7 +27,7 @@ if [ -f "$_UTILS_LIB_DIR/enabled.sh" ]; then
   # never silently strip security). Best-effort: guarded so a probe error can
   # never abort the hook under set -e (the always-exit-0 discipline, AFK #6).
   if command -v ai_toolkit_warn_disabled_security_guards >/dev/null 2>&1; then
-    ai_toolkit_warn_disabled_security_guards "$(pwd)" || true
+    ai_toolkit_warn_disabled_security_guards || true   # default root "." (cwd), as ai_toolkit_enabled above
   fi
 fi
 # shellcheck source=telemetry.sh
