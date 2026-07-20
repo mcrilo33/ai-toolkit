@@ -1743,3 +1743,65 @@ def test_unmapped_lib_change_still_escalates_to_full(repo: Path, tmp_path: Path)
     log = _runlog(runlog)
     assert "RUN -n auto -m not serial\n" in log  # FULL, two-phase serial split
     assert "tests/unit/" not in log  # no phantom selection
+
+
+# --- #334: persistent per-project config (durable TEST_SELECT_SKIP/CMD) ----------
+# The gate reads a persistent per-project runner/behavior config from git config
+# (ai-toolkit.hook.test-select.*) so a host is not limited to the one-shot env
+# vars. A LIVE env var still wins; absent config keeps today's tiered behavior.
+
+
+def test_persistent_skip_config_skips(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})  # would otherwise run
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _git(repo, "config", "ai-toolkit.hook.test-select.skip", "true")
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN" not in _runlog(runlog)
+
+
+def test_persistent_command_config_runs(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    custom = tmp_path / "custom.log"
+    _git(repo, "config", "ai-toolkit.hook.test-select.command", f"echo ran >> {custom}")
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert custom.exists() and "ran" in custom.read_text()  # persistent cmd beats tiered
+    assert "RUN" not in _runlog(runlog)
+
+
+def test_live_env_skip_still_wins(repo: Path, tmp_path: Path) -> None:
+    # No persistent config: the one-shot env var must still work (unchanged).
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(
+        repo, _stdin(tip, base), tmp_path / "bin", env_extra={"TEST_SELECT_SKIP": "1"}
+    )
+
+    assert proc.returncode == 0
+    assert "RUN" not in _runlog(runlog)
+
+
+def test_hook_disabled_skips_gate(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _git(repo, "config", "ai-toolkit.hook.test-select.enabled", "false")
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN" not in _runlog(runlog)

@@ -222,3 +222,28 @@ class TestSecretsScanJqAbsent:
         result = _run(SECRETS_SCAN, claude_write("/x/c.py", f'k = "{FAKE_SECRET}"\n'), env=env)
         assert result.returncode == BLOCK
         assert "jq is unavailable" in result.stderr
+
+
+# ── #334: per-project hub-guard kill switch ──────────────────────────
+
+
+def _bash_commit_payload() -> str:
+    return json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git commit -m x"},
+        }
+    )
+
+
+class TestHubGuardPerHookDisable:
+    def test_enabled_denies_commit_on_hub(self, git_repo: Path) -> None:
+        # Baseline: with hub-guard enabled (default), a commit on the hub's default
+        # branch is denied.
+        assert _run(HUB_GUARD, _bash_commit_payload(), cwd=git_repo).returncode == BLOCK
+
+    def test_disabled_allows_commit_on_hub(self, git_repo: Path) -> None:
+        # A host that disables hub-guard alone may commit on main freely.
+        _git(git_repo, "config", "ai-toolkit.hook.hub-guard.enabled", "false")
+        assert _run(HUB_GUARD, _bash_commit_payload(), cwd=git_repo).returncode == ALLOW
