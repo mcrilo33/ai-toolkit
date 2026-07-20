@@ -7801,10 +7801,21 @@ def test_reap_pass_clears_offline_marker_when_network_recovers(tmp_path: Path) -
     _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1"})
     env["AFK_NET_PROBE_CMD"] = "true"  # network back up (auth stub in _reaper_env is healthy)
 
+    start = time.monotonic()
     _call(expr, env=env)
+    elapsed = time.monotonic() - start
 
     assert not (statedir / "offline-since.epoch").exists(), (
         "network recovery must clear the outage marker so --status stops reporting OFFLINE"
+    )
+    # #330: the marker clear happens at the TOP of reap_pass (clear_offline_since), before
+    # _reap_or_resume's nudge path enters inject_and_verify -> _transcript_advanced, which
+    # polls up to AFK_INJECT_VERIFY_SECONDS (60s) plus a bounded retry (~122s total against
+    # the stub tmux that never advances the transcript). Bound the whole pass so a regression
+    # that reintroduces that dead wait fails loudly instead of silently capping the full-suite
+    # wall-clock. The fix zeroes the inject-verify budget in _reaper_env's returned env.
+    assert elapsed < 10, (
+        f"reap_pass blocked on the injector poll ({elapsed:.1f}s); expected sub-second"
     )
 
 
