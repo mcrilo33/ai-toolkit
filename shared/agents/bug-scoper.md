@@ -89,15 +89,20 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
   create, with `labels` — you have no shell, so filing is MCP-only). Report the URL.
 - **Attended (a human is present to approve):** return the full drafted issue —
   title, body, footer, labels — for a one-look approval instead of filing blind.
-- **Target repo — set `owner`/`repo` EXPLICITLY, never rely on the ambient default.**
-  A defect in the **ai-toolkit tooling** (a synced rule/skill/hook/script/agent, or the
-  `scripts/telemetry/` code — anything originating from ai-toolkit) is filed to the
-  **ai-toolkit upstream repo**: `owner: mcrilo33, repo: ai-toolkit`. This matters
-  because ai-toolkit is synced *into* other projects: without an explicit target the
-  MCP call defaults to the current project's git remote and misfiles the toolkit's own
-  bug into the host project's tracker. A defect in the **host project's own code** is
-  filed to that project's repo. (Canonical upstream is `mcrilo33/ai-toolkit`; a fork
-  changes it here.)
+- **Target repo — set `owner`/`repo` EXPLICITLY from config, never rely on the ambient
+  default.** Classify the defect against the **configured tooling manifest**
+  (`issue_routing.tooling_paths` in `settings/ai-toolkit.yml`): a defect whose fix touches
+  an ai-toolkit-owned path (a synced rule/skill/hook/script/agent, the `scripts/telemetry/`
+  code — anything matching a `tooling_paths` glob) is an **ai-toolkit tooling** defect;
+  anything else is a **host project** defect. File a tooling defect to the **configured
+  upstream repo** — read `issue_routing.upstream_repo` from `settings/ai-toolkit.yml` and
+  split it into `owner`/`repo` (default `mcrilo33/ai-toolkit`). This matters because
+  ai-toolkit is synced *into* other projects: without an explicit target the MCP call
+  defaults to the current project's git remote and misfiles the toolkit's own bug into the
+  host project's tracker. A host-project defect is filed to that project's repo. A
+  fork/rename changes `issue_routing.upstream_repo` (or `git config
+  ai-toolkit.upstream-repo`) — **not** this prose; the resolver never returns empty
+  (documented default `mcrilo33/ai-toolkit`).
 
 State which path you took, and which repo you filed to and why.
 
