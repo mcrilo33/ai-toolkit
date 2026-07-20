@@ -47,6 +47,13 @@ TEST_SELECT = HOOKS / "test-select.sh"
 ZERO_SHA = "0" * 40
 BREACH_RC = 97
 
+# The tripwire family (issue #328): these tests exercise the repo-integrity tripwire by
+# writing refs (update-ref, reset --hard, commit) and are the canonical "escape isolation
+# and rewrite real refs" set that forces the suite's conservative full-run behaviour. Run
+# them single-process in the serial phase, never under xdist workers (AC#5 — the tripwire
+# family still runs serially and still guards). See docs/test-gate.md.
+pytestmark = pytest.mark.serial
+
 # Pin git config to nothing so a host's global config can't reach these commits.
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
 
