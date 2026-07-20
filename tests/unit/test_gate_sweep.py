@@ -104,11 +104,15 @@ def _run_sweep(
     cmd: str,
     gh_exit: int = 0,
     testmon_cmd: str | None = None,
+    budget_watch: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run gate-sweep.sh in `repo` with a stubbed runner + gh; return (proc, gh log).
 
     `testmon_cmd` (issue #276) stubs the baseline-refresh command via
     GATE_SWEEP_TESTMON_CMD — it runs with TESTMON_DATAFILE pointed at the baseline.
+    `budget_watch` (issue #336) overrides GATE_SWEEP_BUDGET_WATCH — the duration-budget
+    watcher gate-sweep hands its capture to after run_suite; defaults to a no-op stub so
+    the ~existing tests never invoke the real watcher.
     """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -116,6 +120,10 @@ def _run_sweep(
     gh = bindir / "gh"
     gh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{gh_log}"\nexit {gh_exit}\n')
     gh.chmod(0o755)
+    if budget_watch is None:
+        budget_watch = tmp_path / "budget-watch-noop.sh"
+        budget_watch.write_text("#!/usr/bin/env bash\nexit 0\n")
+        budget_watch.chmod(0o755)
     env = {
         **_GIT_ENV,
         "PATH": f"{bindir}:{os.environ['PATH']}",
@@ -124,6 +132,7 @@ def _run_sweep(
         # never falls through to a REAL `pytest --testmon` run (the real pytest on PATH
         # carries testmon). The baseline-refresh tests pass their own stub.
         "GATE_SWEEP_TESTMON_CMD": testmon_cmd if testmon_cmd is not None else ":",
+        "GATE_SWEEP_BUDGET_WATCH": str(budget_watch),
     }
     proc = subprocess.run(
         ["bash", str(GATE_SWEEP), *args],
@@ -864,3 +873,57 @@ def test_run_drains_queue_and_dedupes_same_tree(repo: Path, tmp_path: Path) -> N
     assert not (_sweep_dir(repo) / "queue").exists()  # the follow-up was consumed
     assert runner_log.read_text().count("RUN") == 1  # …but the same tree ran once
     assert "tier=full\n" in _stamp_text(repo)
+
+
+# --- the duration-budget watcher hook (issue #336) --------------------------------
+# After run_suite, the sweep hands the SAME capture (its `-n auto --durations=0` output)
+# to scripts/test-budget-watch.sh — no new suite execution. Best-effort: a watcher
+# failure never fails the sweep. GATE_SWEEP_BUDGET_WATCH overrides the watcher path.
+
+
+def test_sweep_hands_capture_to_budget_watch(repo: Path, tmp_path: Path) -> None:
+    # A green sweep whose runner emits a durations line must pass that capture to the
+    # watcher (the watcher reads timings the sweep already produced).
+    _mint(repo, "testmon")
+    runner_log = tmp_path / "runner.log"
+    cap_seen = tmp_path / "cap-seen.txt"
+    watch = tmp_path / "watch.sh"
+    watch.write_text(
+        f'#!/usr/bin/env bash\ncat "$1" >> "{cap_seen}" 2>/dev/null || true\n'
+    )
+    watch.chmod(0o755)
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        cmd=_runner_cmd(runner_log, extra='printf "122.60s call     tests/x.py::t\\n"'),
+        budget_watch=watch,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _wait_for(cap_seen), "the sweep must hand its capture to the budget watcher"
+    assert "tests/x.py::t" in cap_seen.read_text(), "the watcher receives the sweep's durations"
+
+
+def test_budget_watch_failure_does_not_fail_sweep(repo: Path, tmp_path: Path) -> None:
+    # A watcher that exits non-zero must not fail the sweep nor block the green stamp.
+    _mint(repo, "testmon")
+    runner_log = tmp_path / "runner.log"
+    watch = tmp_path / "watch.sh"
+    watch.write_text("#!/usr/bin/env bash\nexit 7\n")
+    watch.chmod(0o755)
+
+    proc, _ = _run_sweep(
+        repo, tmp_path, "--run", _head(repo), cmd=_runner_cmd(runner_log), budget_watch=watch
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "tier=full\n" in _stamp_text(repo), "a watcher failure must not block the green stamp"
+
+
+def test_run_suite_requests_all_durations() -> None:
+    # The real-runner legs must pass --durations=0 so the capture carries per-test
+    # timings for the watcher to read (no extra suite run).
+    assert "--durations=0" in GATE_SWEEP.read_text()
