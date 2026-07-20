@@ -191,3 +191,9 @@ langfuse:
   name: "langfuse"
   description: "Interact with Langfuse and access its documentation: query or modify traces, prompts, datasets, scores, and sessions via the langfuse-cli, look up concepts/integration/SDK guides, instrument apps, migrate prompts, and debug traces. Use when working with Langfuse observability, the OTel collector pipeline, or per-spoke cost/latency analysis."
   argument-hint: "[topic: instrumentation|cli|error-analysis|prompt-migration|judge-calibration]"
+
+bootstrap-test-suite:
+  name: "bootstrap-test-suite"
+  description: "Opt-in helper that stands up an ai-toolkit-conformant test scaffold in a host project so the pre-push test gate (test-select.sh) stops being friction: pytest config registering the serial marker, a tests/ tree with conftest.py, a starter mirror test encoding the test_*.py-names-its-target convention, and testmon/xdist dev deps. Use when the user says 'bootstrap the test suite' or 'make this repo conformant with the gate'. Strictly opt-in — never auto-invoked."
+  allowed-tools: "run_in_terminal read_file create_file"
+  argument-hint: "[target directory, default current]"
