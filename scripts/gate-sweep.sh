@@ -64,14 +64,16 @@ MODE=""
 SHA=""
 BRANCH=""
 ISSUE=""
+REFRESH_ONLY=""   # --run --refresh-only (issue #327): rebuild the baseline only, no suite
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --spawn)  MODE="spawn"; shift ;;
-    --run)    MODE="run"; shift ;;
-    --branch) [ "$#" -ge 2 ] || { warn "--branch needs a value"; exit 0; }; BRANCH="$2"; shift 2 ;;
-    --issue)  [ "$#" -ge 2 ] || { warn "--issue needs a value"; exit 0; }; ISSUE="$2"; shift 2 ;;
-    -*)       warn "unknown option: $1"; exit 0 ;;
-    *)        SHA="$1"; shift ;;
+    --spawn)        MODE="spawn"; shift ;;
+    --run)          MODE="run"; shift ;;
+    --refresh-only) REFRESH_ONLY=1; shift ;;
+    --branch)       [ "$#" -ge 2 ] || { warn "--branch needs a value"; exit 0; }; BRANCH="$2"; shift 2 ;;
+    --issue)        [ "$#" -ge 2 ] || { warn "--issue needs a value"; exit 0; }; ISSUE="$2"; shift 2 ;;
+    -*)             warn "unknown option: $1"; exit 0 ;;
+    *)              SHA="$1"; shift ;;
   esac
 done
 if [ -z "$MODE" ] || [ -z "$SHA" ]; then
@@ -156,7 +158,18 @@ do_spawn() {
         >> "$LOG" 2>&1 < /dev/null &
       ;;
     full)
-      echo "→ post-land sweep: landed tree already gated 'full' — no sweep needed"
+      # A FULL-tier land needs no safety-net sweep (the gate already proved the whole
+      # suite green at push time), but it must still refresh the pre-warmed baseline —
+      # which previously only pruned tiers did, so the baseline drifted stale exactly
+      # when the most tests changed (issue #327). Detach a --refresh-only worker that
+      # rebuilds the baseline off this already-proven tree: no suite re-run, no stamp
+      # change. Same off-critical-path discipline (nohup / trap 'exit 0' / one-at-a-time
+      # lock) and same refresh_testmon_baseline mechanism as the pruned green path.
+      mkdir -p "$SWEEP_DIR"
+      echo "→ post-land baseline refresh: landed tree already gated 'full' — launching background testmon baseline refresh (log: $LOG)"
+      nohup bash "${BASH_SOURCE[0]}" --run --refresh-only "$SHA" \
+        ${BRANCH:+--branch} ${BRANCH:+"$BRANCH"} ${ISSUE:+--issue} ${ISSUE:+"$ISSUE"} \
+        >> "$LOG" 2>&1 < /dev/null &
       ;;
     "")
       echo "→ post-land sweep: no gate stamp for the landed tree (docs-only or skipped gate) — no sweep"
@@ -177,7 +190,10 @@ release_lock() { [ "$LOCK_OWNED" = "1" ] && rm -f "$PIDFILE" 2>/dev/null || true
 queue_request() {
   local tmp
   tmp="$(mktemp "$SWEEP_DIR/.queue.XXXXXX")" || return 1
-  printf '%s\t%s\t%s\n' "$SHA" "$BRANCH" "$ISSUE" > "$tmp"
+  # Carry REFRESH_ONLY (issue #327) as the 4th field so a newest-wins queued follow-up
+  # runs in its OWN mode — a queued refresh is never run as a full sweep, nor a queued
+  # sweep downgraded to a refresh, when the two modes share this lock.
+  printf '%s\t%s\t%s\t%s\n' "$SHA" "$BRANCH" "$ISSUE" "$REFRESH_ONLY" > "$tmp"
   mv -f "$tmp" "$SWEEP_DIR/queue"
 }
 
@@ -364,6 +380,16 @@ process_request() {
     log "sweep skipped: working tree dirty — cannot key a proof on HEAD^{tree}"
     return 0
   fi
+  # --refresh-only (issue #327): a FULL-tier land already proved this tree green at push
+  # time, so rebuild the pre-warmed baseline off it and stop — no suite re-run (not a
+  # correctness re-check) and no stamp change (the tree is already stamped full). Runs
+  # here so it shares the one-at-a-time lock and newest-wins queue with the sweep path
+  # (both write .testmondata-baseline, so serializing them is correct).
+  if [ -n "$REFRESH_ONLY" ]; then
+    log "baseline refresh (full-tier land): tree $tree for landed ${SHA:0:9}${BRANCH:+ ($BRANCH)}"
+    refresh_testmon_baseline "$tree"
+    return 0
+  fi
   tier="$(stamped_tier "$tree")"
   if [ "$tier" = "full" ]; then
     log "sweep skipped: tree $tree already carries a full-tier stamp"
@@ -411,7 +437,7 @@ do_run() {
     # picked up on the next iteration — a read-then-rm would instead delete a
     # newer request that arrived in the read→rm window, unprocessed.
     mv "$SWEEP_DIR/queue" "$SWEEP_DIR/queue.$$" 2>/dev/null || break
-    IFS=$'\t' read -r SHA BRANCH ISSUE < "$SWEEP_DIR/queue.$$" || true
+    IFS=$'\t' read -r SHA BRANCH ISSUE REFRESH_ONLY < "$SWEEP_DIR/queue.$$" || true
     rm -f "$SWEEP_DIR/queue.$$"
   done
 }

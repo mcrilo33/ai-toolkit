@@ -1889,19 +1889,31 @@ def test_land_launches_one_sweep_for_pruned_gated_tree(hub: Path, tmp_path: Path
     assert runner_log.read_text().count("RUN") == 1  # exactly one sweep
 
 
-def test_land_launches_no_sweep_for_full_gated_tree(hub: Path, tmp_path: Path) -> None:
+def test_land_refreshes_baseline_for_full_gated_tree(hub: Path, tmp_path: Path) -> None:
+    # A FULL-tier land needs no safety-net sweep, but it must still refresh the pre-warmed
+    # baseline so the next spoke seeds cheap (issue #327) — a detached refresh that rebuilds
+    # the baseline WITHOUT re-running the suite.
     _make_spoke(hub, tmp_path, "feature/1-fullswp", push=True)
     _mint_stamp(hub, "feature/1-fullswp", "full")
     runner_log = tmp_path / "sweep-runner.log"
+    baseline = hub / ".git" / ".testmondata-baseline"
 
     proc, _ = _run_land(
-        hub, tmp_path, "1", extra_env={"GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"'}
+        hub,
+        tmp_path,
+        "1",
+        extra_env={
+            "GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"',
+            "GATE_SWEEP_TESTMON_CMD": 'printf "DB" > "$TESTMON_DATAFILE"',
+        },
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "no sweep needed" in proc.stdout  # a full pass needs no safety net
-    time.sleep(0.8)  # grace: a wrongly-spawned worker would have written by now
-    assert not runner_log.exists()
+    assert "launching background testmon baseline refresh" in proc.stdout
+    assert _wait_for_file(baseline), "a full-tier land must refresh the baseline"
+    assert baseline.read_text() == "DB"
+    time.sleep(0.5)  # grace: a wrongly-spawned suite worker would have written by now
+    assert not runner_log.exists(), "a full-tier land must NOT re-run the gate suite"
 
 
 def test_land_launches_no_sweep_without_stamp(hub: Path, tmp_path: Path) -> None:

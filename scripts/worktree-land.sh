@@ -1117,9 +1117,13 @@ cleanup_tmux
 # selection-miss safety net — detached, so the land's exit code and duration stay
 # untouched; gate-sweep.sh owns dedupe (a full-stamped tree is never swept), the
 # one-sweep-at-a-time lock, the stamp upgrade on green, and the issue filing on
-# red. A `full` stamp or no stamp (docs-only skip, --skip-tests) launches
-# nothing. Best-effort like the rest of the tail: a sweep that fails to launch
-# warns and never fails the land. GATE_SWEEP_BIN is the test seam.
+# red. A `full` stamp instead launches a detached baseline REFRESH (issue #327): no
+# safety-net sweep is needed, but the pre-warmed .testmondata-baseline must still be
+# rebuilt off the proven tree so the next spoke seeds cheap. No stamp (docs-only skip,
+# --skip-tests) launches nothing. gate-sweep.sh owns that tier->action decision — this
+# call is the same `--spawn $MERGED_SHA` for every tier. Best-effort like the rest of
+# the tail: a spawn that fails to launch warns and never fails the land. GATE_SWEEP_BIN
+# is the test seam.
 # NOT looped over ISSUES (#278), unlike the close/label/marker blocks above. The sweep is
 # keyed by the MERGED SHA, not by issue: one landed tree needs exactly one full-suite sweep,
 # and gate-sweep dedupes on the stamp and serializes on a one-at-a-time lock anyway — so a
