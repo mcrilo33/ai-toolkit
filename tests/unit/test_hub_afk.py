@@ -3110,6 +3110,62 @@ def test_auto_land_self_handles_dirty_hub(tmp_path: Path) -> None:
     )
 
 
+def test_hub_dirty_recovery_inert_without_main_root(tmp_path: Path) -> None:
+    # The test-safety contract (principle #6): with MAIN_ROOT UNSET the hub root is "unknown",
+    # so _afk_hub_is_dirty is False regardless — the lane never stashes the real repo the
+    # coprocess runs in. A dirty repo passed only via the arg does NOT change that (the helper
+    # reads MAIN_ROOT, not a positional). This is why every stub-land auto_land test stays inert.
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    hub = _dirty_hub(tmp_path, env)
+
+    unset = _call("unset MAIN_ROOT; _afk_hub_is_dirty; echo RC=$?")
+    assert "RC=1" in unset.stdout, "an unset MAIN_ROOT must read NOT-dirty (never stash blind)"
+
+    seen = _call("_afk_hub_is_dirty; echo RC=$?", env={"MAIN_ROOT": str(hub)})
+    assert "RC=0" in seen.stdout, "a set MAIN_ROOT pointing at a tracked-mod hub reads dirty"
+
+
+def test_auto_land_unstashable_dirty_hub_escalates(spoke_repo: Path, tmp_path: Path) -> None:
+    # AC2's "escalate only the irreversible" half: a dirty hub whose dirt _afk_stash_hub cannot
+    # set aside (rc 1) must NOT land — it warn-parks on the LAND lane for a human instead of
+    # looping. Seam the two helpers so no real hub is needed; the land stub must never be reached.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    land_log = tmp_path / "land.log"
+    stub = tmp_path / "wtland.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\n')
+    stub.chmod(0o755)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    expr = (
+        f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; '
+        f"_afk_hub_is_dirty() {{ return 0; }}; "
+        f"_afk_stash_hub() {{ return 1; }}; "
+        f"auto_land"
+    )
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert not land_log.exists(), "an un-stashable dirty hub must NOT land"
+    assert (statedir / "warned-state-5-land").exists(), (
+        "an un-stashable dirty hub must warn-park on the LAND lane (escalate the irreversible)"
+    )
+
+
 def test_auto_land_conflict_budget_distinct_from_crash_resume(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
