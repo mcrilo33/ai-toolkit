@@ -76,6 +76,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 _LEAKED_GIT_HOOK_VARS = (
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -200,4 +202,55 @@ except (OSError, subprocess.SubprocessError) as _cwd_err:
         f"conftest: WARNING — could not build the git-cwd sandbox ({_cwd_err!r}); "
         "the session cwd is still the real repo and bare-git tests may mutate it (#179)",
         file=sys.stderr,
+    )
+
+
+# The serial-tail xdist guard (issue #328). Tests that escape isolation and rewrite real
+# shared refs (the tripwire family) carry `serial` and must run in a single-process phase,
+# NEVER under xdist workers where they corrupt shared state. The full suite runs two-phase
+# — `-n auto -m "not serial"` for the parallel-safe bulk, then `-m serial` single-process
+# (test-select.sh / gate-sweep.sh). This guard is the fail-loud belt-and-suspenders (afk
+# principle #2): if a serial-marked test is ever collected while xdist is active — the bare
+# `-n auto` over the whole suite this quarantine exists to prevent — refuse the run rather
+# than let a ref-mutating test silently corrupt a worker. Regression guard:
+# tests/unit/test_serial_marker.py.
+def _xdist_active(config) -> bool:
+    """True when this run distributes tests to xdist workers.
+
+    A truthy ``numprocesses`` (the ``-n``/``--numprocesses`` option) on the controller, or
+    a ``workerinput`` attribute inside a worker. Falsy when xdist is not installed (the
+    option is unregistered, so the attribute is absent) or ``-n`` was not passed."""
+    return bool(getattr(config.option, "numprocesses", None)) or hasattr(config, "workerinput")
+
+
+def _serial_items(items: list) -> list:
+    """The collected items carrying the ``serial`` marker."""
+    return [it for it in items if it.get_closest_marker("serial") is not None]
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items: list) -> None:
+    """Refuse to run serial-marked tests under xdist workers (issue #328).
+
+    Runs ``trylast`` so pytest's own ``-m`` deselection has already removed serial tests in
+    the parallel phase (``-m "not serial"``); the serial phase runs without ``-n``. So this
+    only fires on a bare ``-n auto`` over the whole suite — the dangerous invocation the
+    two-phase runner replaces."""
+    if not _xdist_active(config):
+        return
+    # An explicit test-file/node selection (`file_or_dir` non-empty) is the caller's
+    # deliberate choice, never the bare path-less whole-suite `-n auto` this guard exists
+    # to catch. The SELECTED gate leg names its mapped files explicitly and legitimately
+    # runs them under `-n auto` (issue #276); guarding that path would hard-block a push
+    # the moment a change maps to a serial-marked file (e.g. utils.sh -> test_tripwire.py).
+    if getattr(config.option, "file_or_dir", None):
+        return
+    offenders = _serial_items(items)
+    if not offenders:
+        return
+    sample = ", ".join(it.nodeid for it in offenders[:5])
+    raise pytest.UsageError(
+        f"#328: {len(offenders)} serial-marked test(s) collected under xdist "
+        f"(e.g. {sample}). Run the full suite two-phase — `-n auto -m 'not serial'` then "
+        "`-m serial` single-process (see docs/test-gate.md)."
     )

@@ -26,7 +26,15 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The git-cwd isolation guard (issues #124/#179/#328): these tests pin the sandbox that
+# keeps bare-git off the real repo — the property the whole suite's xdist-safety rests on.
+# Run them in the single-process serial phase alongside the rest of the tripwire family,
+# never under xdist workers. See docs/test-gate.md.
+pytestmark = pytest.mark.serial
 
 
 def test_bare_git_does_not_resolve_the_real_repo() -> None:

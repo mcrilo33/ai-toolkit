@@ -268,11 +268,30 @@ run_suite() {
   # logs a note (to $LOG) if a genuine escape (config flip / non-FF ref move) is seen.
   # It captures the suite's stdout+stderr into $cap itself. The bare fallback
   # is for an older installed utils.sh that predates the observe helper.
+  # Two-phase sweep (issue #328): the parallel-safe bulk under `-n auto -m "not serial"`,
+  # then the ref-mutating serial tail single-process under `-m serial` — the same split the
+  # push gate runs, so the sweep's floor drops with it. The serial leg's exit 5 ("no tests
+  # collected", nothing marked serial) is a GREEN outcome. Each phase captures to its own
+  # temp file; both are concatenated into $cap so file_red_issue reads failing ids from
+  # either. The green/red verdict is the suite's own (the observe tripwire never returns a
+  # breach code here).
+  local rc=0 rc2=0
   if command -v run_under_tripwire_observe >/dev/null 2>&1; then
-    run_under_tripwire_observe "$cap" "${RUNNER_ARR[@]}" ${xdist[@]+"${xdist[@]}"} 2>>"$LOG"
+    run_under_tripwire_observe "${cap}.par" "${RUNNER_ARR[@]}" ${xdist[@]+"${xdist[@]}"} \
+      -m "not serial" 2>>"$LOG" || rc=$?
+    run_under_tripwire_observe "${cap}.ser" "${RUNNER_ARR[@]}" -m serial 2>>"$LOG" || rc2=$?
   else
-    "${RUNNER_ARR[@]}" ${xdist[@]+"${xdist[@]}"} > "$cap" 2>&1
+    "${RUNNER_ARR[@]}" ${xdist[@]+"${xdist[@]}"} -m "not serial" > "${cap}.par" 2>&1 || rc=$?
+    "${RUNNER_ARR[@]}" -m serial > "${cap}.ser" 2>&1 || rc2=$?
   fi
+  # Exit 5 ("no tests collected") is green on EITHER leg: the serial leg when nothing is
+  # marked serial, the parallel leg for a serial-only suite. Normalize both.
+  [ "$rc" = "5" ] && rc=0
+  [ "$rc2" = "5" ] && rc2=0
+  cat "${cap}.par" "${cap}.ser" > "$cap" 2>/dev/null || true
+  rm -f "${cap}.par" "${cap}.ser" 2>/dev/null || true
+  [ "$rc" -ne 0 ] || rc=$rc2
+  return "$rc"
 }
 
 sweep_fingerprint() {
