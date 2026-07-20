@@ -50,6 +50,50 @@ base_branch:
 # by the sync parser and would be read as part of the value.
 enabled: true
 
+# Per-hook granular gate configuration (issue #334). The finer layer BELOW the
+# global `enabled` switch: enable/disable and rule-configure individual gates so a
+# host project synced with ai-toolkit can adapt the three host-facing gates without
+# the all-or-nothing kill switch. Sync materializes these into the target's
+# `git config ai-toolkit.hook.<name>.*` (the durable default the bash resolvers in
+# shared/hooks/lib/enabled.sh read). Precedence mirrors the global switch:
+#   <git-common-dir>/ai-toolkit-hook-<name>-off marker (sync-safe, `ai-toolkit
+#   hook-off <name>`)  >  git config  >  the default here.
+#
+# DEFAULTS PRESERVE TODAY'S BEHAVIOR: an absent `hooks:` section, or a hook left at
+# `enabled: true` with its rule keys unset, is a byte-for-byte no-op — the three
+# gates behave exactly as before. Rule keys (commit-quality `types`/
+# `require_issue_anchor`, test-select `command`/`skip`) are intentionally LEFT
+# UNSET here so a re-sync never clobbers a host's own `git config` override of them
+# (only explicitly-set values are materialized). Uncomment + set to change behavior.
+#
+# SECURITY (AFK principle #2 — fail loud): the security guards (secrets-scan,
+# secrets-scan-revert, block-no-verify) default ON regardless of any blanket
+# disable and turn off ONLY via their own explicit `enabled: false`, which emits a
+# LOUD banner at sync time and at hook-source time. Never silently strip security.
+hooks:
+  # The main-checkout planning-hub guard. Set `enabled: false` in a host project
+  # where developers legitimately commit on main/master (disable via the sync-safe
+  # `ai-toolkit hook-off hub-guard` marker to survive re-sync).
+  hub-guard:
+    enabled: true
+  # Conventional-commit + issue-anchor gate. Leave `types` unset for the default
+  # feat/fix/docs/... set; set a list (or space/comma string) to supply a host
+  # convention. `require_issue_anchor` defaults true; set false to drop the anchor.
+  commit-quality:
+    enabled: true
+    # types:
+    #   - feat
+    #   - fix
+    # require_issue_anchor: true
+  # Pre-push test gate. `command` is the persistent equivalent of TEST_SELECT_CMD
+  # (a host's own runner); `skip` is the persistent TEST_SELECT_SKIP. Both unset by
+  # default (the live env vars still win when set). Leave unset to keep today's
+  # pytest selection.
+  test-select:
+    enabled: true
+    # command: make test
+    # skip: false
+
 # Client-side telemetry / Langfuse target (issue #228). The SINGLE view of "is
 # telemetry on, and where does it go" — previously scattered across the
 # AI_TOOLKIT_OTEL env toggle, a hardcoded LANGFUSE_HOST default, the

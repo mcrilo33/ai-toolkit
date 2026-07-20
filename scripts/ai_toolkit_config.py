@@ -23,6 +23,7 @@ Effort defaults to ``max`` wherever it is omitted.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -478,6 +479,172 @@ def enabled(config: dict) -> bool:
     return str(value).strip().lower() not in {"false", "0", "off", "no", "disabled"}
 
 
+# --- hooks: per-project granular gate configuration (issue #334) -------------
+# The per-project layer atop the global `enabled` switch: each hook can be
+# enabled/disabled and (for commit-quality/test-select) rule-configured
+# independently. Every accessor defaults to today's behavior, so an un-migrated
+# config (no `hooks:` section) is a byte-for-byte no-op. The bash resolver
+# (shared/hooks/lib/enabled.sh) reads the sync-materialized git-config keys; these
+# accessors are the yml-reading half consumed by the sync + tests.
+
+# Security guards default ON regardless of any blanket disable and are turned off
+# ONLY by their own explicit disable — which must be loud (AFK principle #2; fail
+# loud, never silently strip security).
+SECURITY_GUARDS: frozenset[str] = frozenset(
+    {"secrets-scan", "secrets-scan-revert", "block-no-verify"}
+)
+
+# The default allowed commit types for commit-quality — today's fixed VALID_TYPES
+# list (shared/hooks/commit-quality.sh), returned when a host configures none.
+COMMIT_QUALITY_TYPES_DEFAULT: list[str] = [
+    "feat",
+    "fix",
+    "docs",
+    "style",
+    "refactor",
+    "perf",
+    "test",
+    "build",
+    "ci",
+    "chore",
+    "revert",
+]
+
+
+def _bool_token(value: object) -> bool | None:
+    """Parse a YAML bool or string token, or None when absent/blank.
+
+    Only an explicit false-y token (false/0/off/no/disabled, case-insensitive)
+    is False; any other non-blank value is True. None means "unset" so callers
+    keep their own default rather than fabricating a toggle.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    return text.lower() not in {"false", "0", "off", "no", "disabled"}
+
+
+def _hooks_section(config: dict) -> dict:
+    section = config.get("hooks")
+    return section if isinstance(section, dict) else {}
+
+
+def _hook_section(config: dict, name: str) -> dict:
+    hook = _hooks_section(config).get(name)
+    return hook if isinstance(hook, dict) else {}
+
+
+def _hook_enabled_explicit(config: dict, name: str) -> bool | None:
+    """The explicit ``hooks.<name>.enabled`` bool, or None when unset/blank."""
+    return _bool_token(_hook_section(config, name).get("enabled"))
+
+
+def hook_enabled(config: dict, name: str) -> bool:
+    """Whether hook ``name`` is enabled (issue #334).
+
+    Defaults to True (today's behavior) when unset. A security guard
+    (:data:`SECURITY_GUARDS`) stays True under any blanket/absent config and is
+    turned off ONLY by its own explicit ``enabled: false`` — the loud opt-out is
+    surfaced by :func:`security_guard_disable_warning`.
+    """
+    explicit = _hook_enabled_explicit(config, name)
+    if name in SECURITY_GUARDS:
+        return explicit is not False
+    return True if explicit is None else explicit
+
+
+def security_guard_disable_warning(config: dict) -> str | None:
+    """Warn text naming every explicitly-disabled security guard, or None (#334).
+
+    The LOUD half of the security fail-safe (AFK principle #2): disabling a
+    security guard must never be silent. Returns None when no security guard is
+    explicitly disabled.
+    """
+    disabled = [g for g in sorted(SECURITY_GUARDS) if _hook_enabled_explicit(config, g) is False]
+    if not disabled:
+        return None
+    return (
+        f"security guard(s) {', '.join(disabled)} are explicitly DISABLED in "
+        "settings/ai-toolkit.yml. A security guard should stay ON — remove the "
+        "`enabled: false` (and any ai-toolkit-hook-<name>-off marker) unless this "
+        "opt-out is deliberate (AFK principle #2: never silently strip security)."
+    )
+
+
+def commit_quality_types(config: dict) -> list[str]:
+    """Allowed commit types for commit-quality, or the conventional default (#334).
+
+    Accepts a YAML list or a space/comma/pipe-separated string. Blank/absent ⇒
+    the fixed :data:`COMMIT_QUALITY_TYPES_DEFAULT` list, so an un-migrated config
+    keeps today's conventional-commit set.
+    """
+    value = _hook_section(config, "commit-quality").get("types")
+    if isinstance(value, list):
+        types = [str(t).strip() for t in value if str(t).strip()]
+        return types or list(COMMIT_QUALITY_TYPES_DEFAULT)
+    if isinstance(value, str) and value.strip():
+        return [t for t in re.split(r"[\s,|]+", value.strip()) if t]
+    return list(COMMIT_QUALITY_TYPES_DEFAULT)
+
+
+def commit_quality_require_anchor(config: dict) -> bool:
+    """Whether commit-quality requires an issue anchor; default True (#334)."""
+    explicit = _bool_token(_hook_section(config, "commit-quality").get("require_issue_anchor"))
+    return True if explicit is None else explicit
+
+
+def test_select_command(config: dict) -> str | None:
+    """Persistent test-select runner command (durable ``TEST_SELECT_CMD``), or None."""
+    value = _hook_section(config, "test-select").get("command")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def test_select_skip(config: dict) -> bool:
+    """Persistent test-select skip toggle (durable ``TEST_SELECT_SKIP``); default False."""
+    explicit = _bool_token(_hook_section(config, "test-select").get("skip"))
+    return False if explicit is None else explicit
+
+
+def _hooks_config_records(config: dict) -> str:
+    """Tab-separated materialization records for sync-to-repo.sh (issue #334).
+
+    Two record kinds, one per line — ONLY for explicitly-set values, so a re-sync
+    never clobbers a host's own git-config override of an unset key:
+      ``enabled<TAB><name><TAB><true|false>`` — per hook the config declares enabled
+      ``config<TAB><git-config-key><TAB><value>`` — per explicitly-set rule value
+    """
+    lines: list[str] = []
+    for name in _hooks_section(config):
+        explicit = _hook_enabled_explicit(config, name)
+        if explicit is not None:
+            lines.append(f"enabled\t{name}\t{'true' if explicit else 'false'}")
+    cq = _hook_section(config, "commit-quality")
+    if cq.get("types"):
+        lines.append(
+            "config\tai-toolkit.hook.commit-quality.types\t"
+            + " ".join(commit_quality_types(config))
+        )
+    if _bool_token(cq.get("require_issue_anchor")) is not None:
+        lines.append(
+            "config\tai-toolkit.hook.commit-quality.require-anchor\t"
+            f"{'true' if commit_quality_require_anchor(config) else 'false'}"
+        )
+    ts = _hook_section(config, "test-select")
+    if test_select_command(config) is not None:
+        lines.append(f"config\tai-toolkit.hook.test-select.command\t{test_select_command(config)}")
+    if _bool_token(ts.get("skip")) is not None:
+        lines.append(
+            f"config\tai-toolkit.hook.test-select.skip\t{'true' if test_select_skip(config) else 'false'}"
+        )
+    return "\n".join(lines)
+
+
 def _cli(argv: list[str]) -> str:
     """Emit a config value for sync-to-repo.sh to consume (see :func:`main`)."""
     command = argv[1] if len(argv) > 1 else ""
@@ -540,9 +707,17 @@ def _cli(argv: list[str]) -> str:
         if public_key is not None:
             lines.append(f"LANGFUSE_PUBLIC_KEY_DEFAULT={shlex.quote(public_key)}")
         return "\n".join(lines)
+    if command == "hooks-config":
+        # Materialization records for the per-hook config (issue #334): stdout carries
+        # the tab-separated key/value records apply_hook_config applies to git config;
+        # a disabled security guard is surfaced LOUDLY on stderr (AFK principle #2).
+        warning = security_guard_disable_warning(config)
+        if warning:
+            print(f"ai-toolkit: WARNING: {warning}", file=sys.stderr)
+        return _hooks_config_records(config)
     raise SystemExit(
         "ai_toolkit_config: unknown command "
-        f"{command!r} (base-branch|enabled|upstream-repo|spoke-env|batch-env|telemetry-env)"
+        f"{command!r} (base-branch|enabled|upstream-repo|spoke-env|batch-env|telemetry-env|hooks-config)"
     )
 
 

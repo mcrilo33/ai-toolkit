@@ -756,6 +756,61 @@ apply_enabled_config() {
     fi
 }
 
+# Materialize the per-hook config (issue #334) into the target's git config — the
+# durable tier the ai_toolkit_hook_* resolvers read. Mirrors apply_enabled_config:
+# an `enabled: true`/absent hook CLEARS its key (resolver default ENABLED; a host
+# disable via the sync-safe ai-toolkit-hook-<name>-off marker survives), `false`
+# SETS it. Rule-config keys (types / require-anchor / test-select command+skip) are
+# written ONLY when ai-toolkit's own yml explicitly sets them, so a re-sync never
+# clobbers a host's own git-config override of an unset key. The markers are never
+# touched (sync owns git config, not the markers). Disabling a SECURITY guard is
+# surfaced LOUDLY here and by the CLI's own stderr warning (AFK principle #2).
+apply_hook_config() {
+    [ -e "$TARGET/.git" ] || return 0   # only a git repo carries config
+    section "Per-hook config (ai-toolkit.hook.*)"
+    local records
+    if ! records="$(python3 "$SCRIPT_DIR/ai_toolkit_config.py" hooks-config "$AI_TOOLKIT_CONFIG")"; then
+        warn "could not read per-hook config from $AI_TOOLKIT_CONFIG — skipped"
+        return 0
+    fi
+    if [ -z "$records" ]; then
+        info "no per-hook config declared — nothing to materialize"
+        return 0
+    fi
+    local kind a b
+    while IFS=$'\t' read -r kind a b; do
+        [ -n "$kind" ] || continue
+        case "$kind" in
+            enabled)
+                if [ "$b" = "false" ]; then
+                    if [ "$DRY_RUN" -eq 1 ]; then
+                        echo "[dry-run] would set git config ai-toolkit.hook.$a.enabled=false"
+                    else
+                        git -C "$TARGET" config "ai-toolkit.hook.$a.enabled" false
+                        case " secrets-scan secrets-scan-revert block-no-verify " in
+                            *" $a "*) warn "SECURITY: guard $a is DISABLED in config — a security guard should stay ON (loud opt-out, AFK #2)" ;;
+                            *) warn "hook $a → disabled" ;;
+                        esac
+                    fi
+                elif [ "$DRY_RUN" -eq 1 ]; then
+                    echo "[dry-run] would clear git config ai-toolkit.hook.$a.enabled"
+                else
+                    git -C "$TARGET" config --unset "ai-toolkit.hook.$a.enabled" 2>/dev/null || true
+                    info "hook $a → on (unset; default enforcement)"
+                fi
+                ;;
+            config)
+                if [ "$DRY_RUN" -eq 1 ]; then
+                    echo "[dry-run] would set git config $a=$b"
+                else
+                    git -C "$TARGET" config "$a" "$b"
+                    info "$a → $b"
+                fi
+                ;;
+        esac
+    done <<< "$records"
+}
+
 # ═══════════════════════════════════════════
 #  SYNC MANIFEST + STALE-FILE GC
 # ═══════════════════════════════════════════
@@ -873,6 +928,7 @@ esac
 
 apply_base_branch_config
 apply_enabled_config
+apply_hook_config
 
 if [ "$WITH_GIT_HOOKS" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
     sync_git_hooks

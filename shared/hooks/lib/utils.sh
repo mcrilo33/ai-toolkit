@@ -22,6 +22,13 @@ if [ -f "$_UTILS_LIB_DIR/enabled.sh" ]; then
   # shellcheck source=enabled.sh
   source "$_UTILS_LIB_DIR/enabled.sh"
   ai_toolkit_enabled || exit 0
+  # Per-hook security opt-out banner (issue #334): if any security guard is
+  # explicitly disabled, say so LOUDLY at hook-source time (AFK principle #2 —
+  # never silently strip security). Best-effort: guarded so a probe error can
+  # never abort the hook under set -e (the always-exit-0 discipline, AFK #6).
+  if command -v ai_toolkit_warn_disabled_security_guards >/dev/null 2>&1; then
+    ai_toolkit_warn_disabled_security_guards "$(pwd)" || true
+  fi
 fi
 # shellcheck source=telemetry.sh
 source "$_UTILS_LIB_DIR/telemetry.sh"
