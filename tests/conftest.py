@@ -254,3 +254,26 @@ def pytest_collection_modifyitems(config, items: list) -> None:
         f"(e.g. {sample}). Run the full suite two-phase — `-n auto -m 'not serial'` then "
         "`-m serial` single-process (see docs/test-gate.md)."
     )
+
+
+# Shared git-repo template (issue #330). The subprocess-heavy suites build a throwaway repo
+# per test with `git init` + an initial commit — a repeated bootstrap the #328 profile
+# flagged as broad wall-clock cost. Build that base ONCE per session; a test copies it
+# (`shutil.copytree`) into its OWN tmp dir for a fresh, independent repo, so per-test /
+# per-worker isolation is fully preserved — this amortises the fork+commit, it does NOT
+# share a live repo across tests. Session-scoped so the deferred broad migration (the ~45
+# other git-init call sites, out of #330's scope) can adopt the same fixture.
+@pytest.fixture(scope="session")
+def git_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A minimal git repo (init + empty base commit on `main`), built once per session."""
+    template = tmp_path_factory.mktemp("git-template")
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(template)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "base"],
+        cwd=template,
+        check=True,
+        capture_output=True,
+    )
+    return template

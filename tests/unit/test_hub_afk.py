@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -47,6 +48,12 @@ pytestmark = pytest.mark.skipif(
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_AFK = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-afk.sh"
 SPOKE_READY = REPO_ROOT / "scripts" / "spoke-ready.sh"
+
+# The session git-repo template `_branched_spoke` copies (issue #330), stashed from the
+# `git_template` conftest fixture by the autouse fixture below. `_branched_spoke` is a plain
+# helper (not a fixture), so it reads the template via this module global rather than taking
+# a fixture arg at its 60+ call sites.
+_GIT_TEMPLATE: Path | None = None
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +115,13 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # editing each arming call site) also keeps a future arming test safe by default. The
     # dedicated self-check tests turn it back on (=1) behind fully stubbed probes.
     monkeypatch.setenv("AFK_ARM_SELFCHECK", "0")
+
+
+@pytest.fixture(autouse=True)
+def _use_git_template(git_template: Path) -> None:
+    """Stash the session `git_template` (issue #330) so `_branched_spoke` can copy it."""
+    global _GIT_TEMPLATE
+    _GIT_TEMPLATE = git_template
 
 
 # The #236 gh lifecycle-label mirror is forced OFF for every call: this host has an
@@ -4879,7 +4893,12 @@ def _branched_spoke(
     `ahead=False` ⇒ the branch sits exactly at the branch point (no commits to preserve).
     """
     wt = tmp_path / name
-    wt.mkdir()
+    # #330: copy the session git-template (init + base commit on `main`) instead of
+    # re-forking `git init` + the base commit per call. copytree makes `wt` a fresh,
+    # independent repo under this test's own tmp_path, so per-test isolation is unchanged;
+    # only the checkout (+ optional work commit) still shells out.
+    assert _GIT_TEMPLATE is not None, "_use_git_template autouse fixture did not run"
+    shutil.copytree(_GIT_TEMPLATE, wt)
     env = {
         **os.environ,
         "GIT_AUTHOR_NAME": "t",
@@ -4887,11 +4906,7 @@ def _branched_spoke(
         "GIT_COMMITTER_NAME": "t",
         "GIT_COMMITTER_EMAIL": "t@t",
     }
-    cmds = [
-        ["git", "init", "-q", "-b", "main"],
-        ["git", "commit", "-q", "--allow-empty", "-m", "base"],
-        ["git", "checkout", "-q", "-b", branch],
-    ]
+    cmds = [["git", "checkout", "-q", "-b", branch]]
     if ahead:
         cmds.append(["git", "commit", "-q", "--allow-empty", "-m", "work"])
     for cmd in cmds:
