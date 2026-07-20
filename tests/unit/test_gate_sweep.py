@@ -650,6 +650,34 @@ def test_run_blocked_requests_keep_only_the_newest(repo: Path, tmp_path: Path) -
     assert old_head not in queued  # at most ONE queued follow-up
 
 
+def test_refresh_only_worker_drains_a_queued_sweep_as_a_sweep(repo: Path, tmp_path: Path) -> None:
+    # The 4th queue field carries the mode (issue #327): a --refresh-only worker that
+    # drains a QUEUED pruned-sweep request must run it as a full SWEEP, not downgrade it
+    # to another refresh — otherwise a refresh-only land would silently punch a hole in
+    # the selection-miss safety net. A 3-field read would leave the worker's launch-time
+    # REFRESH_ONLY=1 in place and skip the suite; the 4th field (empty here = sweep)
+    # resets it. The tree is stamped `testmon` so the drained sweep actually runs.
+    _mint(repo, "testmon")
+    _sweep_dir(repo).mkdir(parents=True, exist_ok=True)
+    (_sweep_dir(repo) / "queue").write_text(f"{_head(repo)}\tfeature/2-q\t2\t\n")
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        "--refresh-only",
+        _head(repo),
+        cmd=_runner_cmd(runner_log),
+        testmon_cmd='printf "DB" > "$TESTMON_DATAFILE"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert runner_log.read_text().count("RUN") == 1  # the queued sweep ran — mode carried
+    assert "tier=full\n" in _stamp_text(repo)  # its green upgraded the stamp
+    assert _baseline(repo).read_text() == "DB"  # the launch refresh still ran
+
+
 def test_run_stale_lock_is_taken_over(repo: Path, tmp_path: Path) -> None:
     # A crashed sweep must not wedge the safety net forever: a pidfile whose
     # process is gone is stale, and the next worker takes the lock.

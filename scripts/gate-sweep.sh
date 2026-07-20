@@ -9,13 +9,21 @@
 #
 # Usage:
 #   gate-sweep.sh --spawn <merged-sha> [--branch <b>] [--issue <n>]
-#   gate-sweep.sh --run   <merged-sha> [--branch <b>] [--issue <n>]
+#   gate-sweep.sh --run [--refresh-only] <merged-sha> [--branch <b>] [--issue <n>]
 #
 #   --spawn  synchronous decision (milliseconds): read the green-tree stamp
 #            (issue #122) for <merged-sha>^{tree}. A PRUNED tier (testmon or
-#            selected) detaches a --run worker; a `full` stamp or no stamp at
-#            all (docs-only skip, --skip-tests — the gate certified nothing
-#            pruned) launches nothing. Always exits 0.
+#            selected) detaches a --run worker; a `full` stamp detaches a
+#            --run --refresh-only worker that rebuilds the pre-warmed baseline
+#            off the already-proven tree (no suite, no stamp change — issue
+#            #327); no stamp at all (docs-only skip, --skip-tests — the gate
+#            certified nothing pruned) launches nothing. Always exits 0.
+#   --refresh-only  (with --run) skip the safety-net suite entirely and only
+#            rebuild <git-common-dir>/.testmondata-baseline (issue #327). The
+#            full-tier land already proved the tree green at push time, so this
+#            is a baseline rebuild, never a correctness re-check. Shares the
+#            one-at-a-time lock + newest-wins queue with the sweep path (the
+#            queue carries the mode), since both write the baseline.
 #   --run    the detached worker. One sweep at a time per checkout: a pidfile
 #            lock under <git-common-dir>/.gate-sweep/; a held lock queues at
 #            most ONE newest-wins follow-up in `queue`. The worker re-keys on
