@@ -127,9 +127,16 @@ _detect_breaches() {
         for (i = 4; i <= NF; i++) node = node " " $i
         sum[node] += f1 + 0
       }
-      for (i = 1; i < NF; i++) {
-        if ($i == "in" && $(i + 1) ~ /^[0-9]+(\.[0-9]+)?s/) {
-          t = $(i + 1); sub(/s.*$/, "", t); suite_total += t + 0
+      # Suite total: sum the wall-clock from each pytest SUMMARY line (the sweep runs two
+      # legs — parallel + serial — each with its own summary). ANCHOR on the summary rule
+      # (a line starting with the ==== fill pytest draws around it): a bare "in <N>s"
+      # inside a failing tests captured stdout — which pytest echoes on a RED sweep — must
+      # never inflate the total.
+      if ($0 ~ /^[[:space:]]*=+/) {
+        for (i = 1; i < NF; i++) {
+          if ($i == "in" && $(i + 1) ~ /^[0-9]+(\.[0-9]+)?s/) {
+            t = $(i + 1); sub(/s.*$/, "", t); suite_total += t + 0
+          }
         }
       }
     }
@@ -199,7 +206,11 @@ while IFS=$'\t' read -r kind secs node; do
   printf '#%s test-budget breach — %s\n' "${ISSUE:-?}" "$desc" \
     > "$NOTIFY_DIR/test-budget-breach-$slug.txt" 2>/dev/null || true
 
-  # Dispatch the scoper only for a NEW breach identity (single-writer debounce).
+  # Dispatch the scoper only for a NEW breach IDENTITY (single-writer debounce): a
+  # persistent — or worsening — breach files ONCE per regression, not every sweep. This
+  # is deliberately coarser than the hub-notify content-hash dedup (which re-pings a
+  # worsening number): the filed enhancement is the durable record, the ping is the
+  # attended nudge, so re-filing on every slowdown would spam the tracker.
   if ! printf '%s\n' "$seen" | grep -qxF "$id"; then
     log "NEW breach: $desc${BRANCH:+ (branch $BRANCH)}"
     _dispatch_scoper "$kind" "$secs" "$node" "$desc"

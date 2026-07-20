@@ -212,6 +212,26 @@ def test_cleared_breach_refiles_on_reoccurrence(repo: Path, tmp_path: Path) -> N
     )
 
 
+# --- the suite total counts only the pytest summary, not test output --------------
+
+
+def test_stray_in_seconds_in_test_output_does_not_trip_suite(repo: Path, tmp_path: Path) -> None:
+    # On a RED sweep pytest echoes failing tests' captured stdout; a bare "in <N>s" there
+    # must NOT inflate the suite total (only the ==== summary line counts).
+    capture = (
+        "============================= slowest durations =============================\n"
+        "1.20s call     tests/unit/test_fast.py::test_y\n"
+        "Retrying connection in 600s before timeout\n"  # stray "in 600s" in captured output
+        "===== 1 passed in 130.00s =====\n"
+    )
+    state = tmp_path / "state"
+    proc, scoper_log = _run(repo, tmp_path, capture, state_dir=state)
+
+    assert proc.returncode == 0, proc.stderr
+    assert _read(scoper_log) == "", "a stray 'in <N>s' in test output must not trip the suite"
+    assert _breach_records(state) == []
+
+
 # --- budgets are read from the config file when no env override is given ----------
 
 

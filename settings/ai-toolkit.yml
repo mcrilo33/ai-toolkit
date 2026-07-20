@@ -112,8 +112,10 @@ batch:
 # inline `# comment` is NOT stripped by the sync parser and would be read as part of
 # the value.
 test_budget:
-  slow_test_seconds: 30     # a single test slower than X seconds is flagged
-  suite_seconds: 480        # the whole suite slower than Y seconds is flagged
+  # A single test slower than this many seconds is flagged.
+  slow_test_seconds: 30
+  # The whole suite slower than this many seconds is flagged.
+  suite_seconds: 480
 
 model:
   # The interactive spoke driver launched by worktree-new.sh. Routine spokes run
