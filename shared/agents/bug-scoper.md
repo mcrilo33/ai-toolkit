@@ -99,10 +99,13 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
   split it into `owner`/`repo` (default `mcrilo33/ai-toolkit`). This matters because
   ai-toolkit is synced *into* other projects: without an explicit target the MCP call
   defaults to the current project's git remote and misfiles the toolkit's own bug into the
-  host project's tracker. A host-project defect is filed to that project's repo. A
-  fork/rename changes `issue_routing.upstream_repo` (or `git config
-  ai-toolkit.upstream-repo`) — **not** this prose; the resolver never returns empty
-  (documented default `mcrilo33/ai-toolkit`).
+  host project's tracker. A host-project defect is filed to that project's repo. You have
+  no shell, so honor the `issue_routing.upstream_repo` value in the file; if it is
+  absent/blank, fall back to the documented default `mcrilo33/ai-toolkit` (never empty). A
+  fork/rename reroutes by changing that config key — **not** this prose. (The full resolver,
+  for shell consumers, also layers a `git config ai-toolkit.upstream-repo` override ahead of
+  the file value; a fork setting only that override should also set the file key so the
+  file-reading agent stays in sync.)
 
 State which path you took, and which repo you filed to and why.
 
