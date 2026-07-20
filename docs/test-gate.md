@@ -48,12 +48,15 @@ checkout or a synced repo with none) is normalized to green. This applies to the
 leg and the testmon-absent full fallback in `test-select.sh`, and to `gate-sweep.sh`'s
 post-land sweep; the `--testmon` and SELECTED legs are unchanged.
 
-`tests/conftest.py` installs a fail-loud guard: if a `serial`-marked test is ever
-collected while xdist is active — a bare `-n auto` over the whole suite, the invocation
-this split replaces — the run refuses rather than let a ref-mutating test corrupt a
-worker. Under-marking degrades safely: an unmarked ref-mutator that reaches the parallel
-phase still trips the tripwire (a loud, blocked push), never silent corruption.
-`tests/unit/test_serial_marker.py` guards the marker registration and the guard.
+`tests/conftest.py` installs a fail-loud guard: if a `serial`-marked test is collected
+under a **bare, path-less `-n auto`** — the whole-suite invocation this split replaces —
+the run refuses rather than let a ref-mutating test corrupt a worker. It deliberately does
+NOT fire when the caller names test files explicitly (the SELECTED gate leg, or a dev
+running specific files), since that is a deliberate selection, not the whole-suite run.
+Under-marking degrades safely: an unmarked ref-mutator that reaches the parallel phase
+still trips the tripwire (a loud, blocked push), never silent corruption.
+`tests/unit/test_serial_marker.py` guards the marker registration and the guard's
+fire/no-fire cases.
 
 ## Pre-warmed `.testmondata` baseline
 

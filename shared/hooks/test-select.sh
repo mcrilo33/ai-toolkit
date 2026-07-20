@@ -376,10 +376,12 @@ run_full_two_phase() {
   run_under_tripwire_scoped "$PUSH_SCOPE" "$@" ${XDIST[@]+"${XDIST[@]}"} -m "not serial" || rc=$?
   note "full suite phase 2/2 — serial tail (single process, -m serial)"
   run_under_tripwire_scoped "$PUSH_SCOPE" "$@" -m serial || rc2=$?
-  if [ "$rc2" = "5" ]; then
-    note "serial tail collected no tests (nothing marked serial) — treating as green"
-    rc2=0
-  fi
+  # Exit 5 = "no tests collected" — a GREEN outcome on EITHER leg: the serial leg when
+  # nothing is marked serial (a fresh checkout / a synced repo with none), and the
+  # parallel leg in the symmetric case of a suite with only serial tests. Normalize both
+  # so an empty phase never blocks a clean push.
+  [ "$rc" = "5" ] && rc=0
+  [ "$rc2" = "5" ] && rc2=0
   [ "$rc" -ne 0 ] || rc=$rc2
   return "$rc"
 }

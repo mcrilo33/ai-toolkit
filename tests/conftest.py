@@ -238,6 +238,13 @@ def pytest_collection_modifyitems(config, items: list) -> None:
     two-phase runner replaces."""
     if not _xdist_active(config):
         return
+    # An explicit test-file/node selection (`file_or_dir` non-empty) is the caller's
+    # deliberate choice, never the bare path-less whole-suite `-n auto` this guard exists
+    # to catch. The SELECTED gate leg names its mapped files explicitly and legitimately
+    # runs them under `-n auto` (issue #276); guarding that path would hard-block a push
+    # the moment a change maps to a serial-marked file (e.g. utils.sh -> test_tripwire.py).
+    if getattr(config.option, "file_or_dir", None):
+        return
     offenders = _serial_items(items)
     if not offenders:
         return

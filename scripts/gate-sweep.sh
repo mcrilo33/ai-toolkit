@@ -260,7 +260,10 @@ run_suite() {
     "${RUNNER_ARR[@]}" ${xdist[@]+"${xdist[@]}"} -m "not serial" > "${cap}.par" 2>&1 || rc=$?
     "${RUNNER_ARR[@]}" -m serial > "${cap}.ser" 2>&1 || rc2=$?
   fi
-  [ "$rc2" = "5" ] && rc2=0  # serial leg collected nothing — green
+  # Exit 5 ("no tests collected") is green on EITHER leg: the serial leg when nothing is
+  # marked serial, the parallel leg for a serial-only suite. Normalize both.
+  [ "$rc" = "5" ] && rc=0
+  [ "$rc2" = "5" ] && rc2=0
   cat "${cap}.par" "${cap}.ser" > "$cap" 2>/dev/null || true
   rm -f "${cap}.par" "${cap}.ser" 2>/dev/null || true
   [ "$rc" -ne 0 ] || rc=$rc2
