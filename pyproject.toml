@@ -12,3 +12,12 @@ extraPaths = ["scripts"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Issue #328: the serial tail. Tests that escape isolation and rewrite real shared
+# refs (the tripwire family) cannot run under xdist workers safely. They carry
+# `serial` and run in a single-process second phase, after the parallel-safe bulk
+# (`-n auto -m "not serial"`); the runner wiring lives in test-select.sh /
+# gate-sweep.sh, and a conftest guard fails loud if a serial test is ever collected
+# under xdist.
+markers = [
+    "serial: ref-mutating / isolation-escaping test; runs single-process in the serial phase, never under xdist workers (issue #328)",
+]

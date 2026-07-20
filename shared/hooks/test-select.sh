@@ -361,6 +361,29 @@ if runner_has_xdist; then
   XDIST=(-n auto)
 fi
 
+# Two-phase full run (issue #328): the serial tail. Tests that escape isolation and
+# rewrite real shared refs (the tripwire family) cannot run under xdist workers safely,
+# so a bare `-n auto` over the whole suite caps how well the parallel majority scales.
+# Split it: the parallel-safe bulk under `-n auto -m "not serial"`, then the ref-mutating
+# tail single-process under `-m serial` (never `-n`). Both bracketed by the SAME scoped
+# tripwire; the combined rc is the gate's verdict. The serial leg exits 5 ("no tests
+# collected") when nothing is marked serial (a fresh checkout, or a synced repo with no
+# serial tests) — a GREEN outcome, normalized so it never blocks a clean push.
+# $@ = the pytest prefix (GIT_HOOK_UNSET + RUNNER_ARR); XDIST / PUSH_SCOPE are read live.
+run_full_two_phase() {
+  local rc=0 rc2=0
+  note "full suite phase 1/2 — parallel bulk (-m 'not serial', ${XDIST[*]:-off})"
+  run_under_tripwire_scoped "$PUSH_SCOPE" "$@" ${XDIST[@]+"${XDIST[@]}"} -m "not serial" || rc=$?
+  note "full suite phase 2/2 — serial tail (single process, -m serial)"
+  run_under_tripwire_scoped "$PUSH_SCOPE" "$@" -m serial || rc2=$?
+  if [ "$rc2" = "5" ]; then
+    note "serial tail collected no tests (nothing marked serial) — treating as green"
+    rc2=0
+  fi
+  [ "$rc" -ne 0 ] || rc=$rc2
+  return "$rc"
+}
+
 runner_has_testmon() {
   # testmon advertises --testmon in `pytest --help` when its plugin is installed.
   # Capture the help text rather than piping into grep: under pipefail an early
@@ -461,7 +484,7 @@ case "$DECISION" in
       fi
     else
       note "python-only diff but testmon not installed — full suite (parallel: ${XDIST[*]:-off})"
-      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" ${XDIST[@]+"${XDIST[@]}"} || rc=$?
+      run_full_two_phase "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     fi
     ;;
   SELECTED)
@@ -510,7 +533,7 @@ case "$DECISION" in
     else
       note "non-python or unrecognized changes — full suite (parallel: ${XDIST[*]:-off})"
     fi
-    run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" ${XDIST[@]+"${XDIST[@]}"} || rc=$?
+    run_full_two_phase "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     ;;
 esac
 

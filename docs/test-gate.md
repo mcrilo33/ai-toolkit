@@ -31,6 +31,30 @@ xdist (`pytest --testmon -n auto` is unsupported). This is guarded on the runner
 advertising `-n numprocesses` in `pytest --help`, so a checkout without
 `pytest-xdist` installed degrades to single-process rather than erroring the push.
 
+## The serial tail: two-phase full runs (`serial` marker)
+
+A minority of tests **escape isolation and rewrite real shared refs** (the tripwire
+family) and so cannot run under xdist workers safely; run bare under `-n auto` they
+would corrupt a worker or trip the tripwire, capping how well the parallel majority
+scales (issue #328). These carry the `serial` marker (registered in `pyproject.toml`),
+and every unavoidable full run is **two-phase**:
+
+1. **Parallel bulk** — `-n auto -m "not serial"`: the xdist-safe majority.
+2. **Serial tail** — `-m serial`, single-process (no `-n`): the ref-mutating minority.
+
+Both phases run under the same tripwire; the combined exit code is the verdict. The
+serial leg's exit 5 ("no tests collected" — nothing marked `serial`, e.g. a fresh
+checkout or a synced repo with none) is normalized to green. This applies to the FULL
+leg and the testmon-absent full fallback in `test-select.sh`, and to `gate-sweep.sh`'s
+post-land sweep; the `--testmon` and SELECTED legs are unchanged.
+
+`tests/conftest.py` installs a fail-loud guard: if a `serial`-marked test is ever
+collected while xdist is active — a bare `-n auto` over the whole suite, the invocation
+this split replaces — the run refuses rather than let a ref-mutating test corrupt a
+worker. Under-marking degrades safely: an unmarked ref-mutator that reaches the parallel
+phase still trips the tripwire (a loud, blocked push), never silent corruption.
+`tests/unit/test_serial_marker.py` guards the marker registration and the guard.
+
 ## Pre-warmed `.testmondata` baseline
 
 A fresh worktree has no testmon DB, so its **first push** would run the whole suite

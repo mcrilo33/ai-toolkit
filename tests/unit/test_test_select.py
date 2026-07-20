@@ -1089,7 +1089,7 @@ def test_unmapped_shell_change_escalates_to_full(repo: Path, tmp_path: Path) -> 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto\n" in _runlog(runlog)  # the full suite, not a selection
+    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # the full suite, not a selection
 
 
 def test_unmapped_shell_change_emits_witness_warning(repo: Path, tmp_path: Path) -> None:
@@ -1106,7 +1106,9 @@ def test_unmapped_shell_change_emits_witness_warning(repo: Path, tmp_path: Path)
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto\n" in _runlog(runlog)  # conservative fallback: FULL still runs
+    assert "RUN -n auto -m not serial\n" in _runlog(
+        runlog
+    )  # conservative fallback: FULL still runs
     assert "witness: unmapped-shell" in proc.stderr  # the greppable audit signal …
     assert "scripts/new.sh" in proc.stderr  # … naming the offending script
 
@@ -1183,7 +1185,7 @@ def test_mixed_mapped_and_unmapped_escalates_to_full(repo: Path, tmp_path: Path)
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "RUN -n auto\n" in log
+    assert "RUN -n auto -m not serial\n" in log
     assert "RUN tests/unit/test_do.py\n" not in log  # full subsumes the selection
 
 
@@ -1227,7 +1229,7 @@ def test_exempt_list_change_itself_escalates_to_full(repo: Path, tmp_path: Path)
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto\n" in _runlog(runlog)
+    assert "RUN -n auto -m not serial\n" in _runlog(runlog)
 
 
 def test_selected_failing_suite_blocks_push(repo: Path, tmp_path: Path) -> None:
@@ -1286,7 +1288,7 @@ def test_missing_reverse_index_lib_degrades_to_full(repo: Path, tmp_path: Path) 
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto\n" in _runlog(runlog)  # today's behavior, unchanged
+    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # today's behavior, unchanged
 
 
 # --- the enforcement meta-test rides every pytest-running tier (#123) ------------
@@ -1355,7 +1357,7 @@ def test_full_tier_does_not_append_meta_test(repo: Path, tmp_path: Path) -> None
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "RUN -n auto\n" in log
+    assert "RUN -n auto -m not serial\n" in log
     assert "TestControlPlaneCoverage" not in log
 
 
@@ -1372,7 +1374,7 @@ def test_script_under_docs_dir_is_never_a_doc(repo: Path, tmp_path: Path) -> Non
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto\n" in _runlog(runlog)  # unmapped script → FULL, never NOTHING
+    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # unmapped script → FULL, never NOTHING
 
 
 # --- selected-tier stamps: consume and mint with the set that ran (#123-D) --------
@@ -1488,7 +1490,7 @@ def test_mixed_diff_without_testmon_falls_back_to_full(repo: Path, tmp_path: Pat
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "RUN -n auto\n" in log  # the python part demands the full suite
+    assert "RUN -n auto -m not serial\n" in log  # the python part demands the full suite
     assert "--testmon" not in log
     assert "RUN tests/unit/test_do.py" not in log  # full subsumes the selection
 
@@ -1510,7 +1512,7 @@ def test_mapping_to_vanished_test_escalates_full(repo: Path, tmp_path: Path) -> 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto\n" in _runlog(runlog)  # escalated to full
+    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # escalated to full
     assert "mapped test missing" in proc.stderr
 
 
@@ -1571,7 +1573,7 @@ def test_missing_lib_ignores_exempt_entries_and_runs_full(repo: Path, tmp_path: 
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto\n" in _runlog(runlog)  # FULL, never a silent exempt skip
+    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # FULL, never a silent exempt skip
 
 
 # ── Part 1 (issue #276): pytest-xdist on the non-testmon legs ────────────────────
@@ -1591,7 +1593,7 @@ def test_full_suite_runs_under_xdist(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto\n" in _runlog(runlog)  # the full suite, parallelized
+    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # the full suite, parallelized
 
 
 def test_python_without_testmon_full_suite_runs_under_xdist(repo: Path, tmp_path: Path) -> None:
@@ -1603,7 +1605,7 @@ def test_python_without_testmon_full_suite_runs_under_xdist(repo: Path, tmp_path
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto\n" in _runlog(runlog)
+    assert "RUN -n auto -m not serial\n" in _runlog(runlog)
 
 
 def test_selected_mapped_leg_runs_under_xdist(repo: Path, tmp_path: Path) -> None:
@@ -1666,5 +1668,7 @@ def test_full_suite_degrades_to_single_process_without_xdist(repo: Path, tmp_pat
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "RUN \n" in log  # bare full suite, no -n auto
+    # Two-phase (#328) still applies without xdist — just no `-n auto` on the bulk leg.
+    assert "RUN -m not serial\n" in log  # bulk leg, single-process, no -n auto
+    assert "RUN -m serial\n" in log  # serial tail
     assert "-n auto" not in log
