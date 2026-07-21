@@ -328,6 +328,63 @@ _afk_route_conflict_resolution() {
   fi
 }
 
+# --- #339: recover a REVERSIBLE dirty hub so a mergeable land is not stalled forever ---------
+# The land script refuses to land while the hub checkout carries a TRACKED modification
+# (`git status --porcelain -uno`) — a generic exit-1 die auto_land cannot tell apart from a
+# transient push rejection, so the old lane warn-parked + retried "at low frequency" FOREVER.
+# But a tracked-mod dirty hub never clears itself (the #333 self-sync .gitignore block, a stray
+# *.bak, a half-finished manual edit), so every retry re-failed identically until the watchdog
+# fired auto-land-skipped 900s later (#338) — a silent stall (principle #2) escalating a
+# REVERSIBLE condition (principle #3). The lane now ACTS: detect the dirty hub EXPLICITLY (git
+# status, never inferred from a shared exit code — principle #1), stash it so the guard passes,
+# land, then restore. Only a hub whose dirt cannot be safely stashed is escalated for a human.
+#
+# The hub root is MAIN_ROOT (the checkout the supervisor arms + lands on). When it is unset — the
+# land unit tests that drive auto_land with a stubbed land script and no MAIN_ROOT — recovery is
+# INERT (an absent hub root is "unknown", never a basis to mutate a working tree — principle #6),
+# so the lane never stashes the real repo the test coprocess runs in.
+_afk_hub_root() { printf '%s\n' "${MAIN_ROOT:-}"; }
+
+# _afk_hub_is_dirty -> true when the hub checkout carries a tracked modification (the exact
+# condition the land script's dirty-hub guard refuses on; untracked ignored via -uno). False
+# when the hub root is unknown — never stash blind.
+_afk_hub_is_dirty() {
+  local root; root="$(_afk_hub_root)"
+  [ -n "$root" ] || return 1
+  [ -n "$(git -C "$root" status --porcelain -uno 2>/dev/null)" ]
+}
+
+# _afk_stash_hub <issue> -> set the hub's tracked dirt aside (git stash) so the dirty-hub land
+# guard passes; journal the reversible action for the morning audit (principle #3). rc 0 when the
+# hub is now clean (a stash was created — the caller MUST restore after the land), rc 1 when the
+# dirt could not be set aside (not safely reversible — the caller escalates instead of looping).
+_afk_stash_hub() {
+  local issue="$1" root; root="$(_afk_hub_root)"
+  git -C "$root" stash push -m "afk-land-$issue-$(afk_now)" >/dev/null 2>&1 || true
+  # Still dirty ⇒ the dirt could not be set aside — escalate. (A partial stash that left the tree
+  # dirty is preserved in the stash list for the escalation-handling human, never silently dropped.)
+  _afk_hub_is_dirty && return 1
+  log "  #$issue: stashed a dirty hub checkout so the land can proceed (reversible; restored after)"
+  broker_journal_decision "$issue" land "stashed a dirty hub checkout before landing; restored after" reversible
+  return 0
+}
+
+# _afk_restore_hub <issue> -> re-apply the dirt stashed by _afk_stash_hub after the land. A pop
+# that does not apply cleanly (rare: the land does not touch the stashed paths) KEEPS the stash
+# entry AND leaves conflict markers in the tree, so the changes are never dropped — it warns
+# LOUDLY (principle #2/#6). The next tick reads that tree dirty and re-stashes it (loud, not a
+# silent loop — the warn re-fires when due), so a human sees it rather than losing the dirt.
+_afk_restore_hub() {
+  local issue="$1" root; root="$(_afk_hub_root)"
+  if git -C "$root" stash pop >/dev/null 2>&1; then
+    log "  #$issue: restored the hub checkout dirt after landing"
+    return 0
+  fi
+  log "  #$issue: could not cleanly restore the stashed hub dirt — it is preserved in the hub git stash"
+  broker_warn "$issue" "hub-dirt stash did not re-apply cleanly after landing — preserved in the hub git stash; a human should reconcile it"
+  return 1
+}
+
 # auto_land -> land every ready/<issue> spoke. The ready/<issue> marker is the readiness
 # contract (enforced by _ready_at_tip above), so a foreign ready/<issue> left by a parallel
 # session is adopted and landed by default (#95). A failed land (merge conflict) emits
@@ -363,7 +420,7 @@ _afk_route_conflict_resolution() {
 # a false positive. Set AFK_REVIEW_GATE=0 to opt back out (restore the #152 land-anything
 # behavior); the mechanical anti-gutting scan stays the advisory residual signal either way.
 auto_land() {
-  local wt_land path issue verdict max tries land_log land_rc land_before
+  local wt_land path issue verdict max tries land_log land_rc land_before hub_stashed
   wt_land="$(_afk_find_script "${WT_LAND:-}" worktree-land.sh)" || { log "worktree-land.sh not found — skipping land"; return 0; }
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
@@ -438,6 +495,20 @@ auto_land() {
     fi
     log "→ land #$issue"
     _afk_set_last_action "land #$issue"
+    # #339: a dirty hub checkout (a tracked modification — the #333 sync .gitignore litter, a
+    # half-finished manual edit) makes the land script refuse with a generic exit-1 die that this
+    # lane would warn-park + retry forever (a silent stall surfacing only via the watchdog's 900s
+    # auto-land-skipped). A tracked-mod dirty hub is REVERSIBLE: stash it so the guard passes
+    # (restored after the land); only an un-stashable hub escalates for a human (warn-park LAST).
+    hub_stashed=0
+    if _afk_hub_is_dirty; then
+      if _afk_stash_hub "$issue"; then
+        hub_stashed=1
+      else
+        _warn_parked_last "$path" "$issue" "hub checkout is dirty and could not be safely stashed for landing — needs a human to clean the hub" land
+        continue
+      fi
+    fi
     # Capture the land's output to a per-issue log (#198): the old >/dev/null discarded exactly
     # what an operator needs when a land half-completes. mkdir so the log write can't fail on a
     # not-yet-created state dir. _afk_run_with_heartbeat returns worktree-land's exit code.
@@ -449,6 +520,9 @@ auto_land() {
     # .ai-toolkit/spoke-run-id is gone by the time we record the reaped transition.
     land_run="$(_afk_spoke_run_id "$path")"
     _afk_run_with_heartbeat bash "$wt_land" "$issue" --skip-tests >"$land_log" 2>&1; land_rc=$?
+    # #339: restore the pre-land dirt on EVERY land outcome (success, teardown-incomplete,
+    # conflict, or failure) before the rc-branch dispatch, so the hub returns to its prior state.
+    [ "$hub_stashed" -eq 1 ] && _afk_restore_hub "$issue"
     if [ "$land_rc" -eq 0 ]; then
       log "  landed #$issue"
       _afk_clear_land_retries "$issue"   # a successful land resets the retry budget (#202 D)

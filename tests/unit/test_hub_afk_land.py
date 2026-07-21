@@ -26,6 +26,9 @@ LAND_FUNCTIONS = [
     "_afk_land_retry_max",
     "_afk_route_conflict_resolution",
     "_afk_conflict_resolve_prompt",
+    "_afk_hub_is_dirty",
+    "_afk_stash_hub",
+    "_afk_restore_hub",
 ]
 
 
