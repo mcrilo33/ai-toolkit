@@ -1437,7 +1437,7 @@ class TestConfigFileSync:
 
         assert not (target_repo / "ruff.toml").exists()
         assert "shadow" in result.stdout
-        assert "pyproject.toml" in result.stdout
+        assert "ruff already configured via pyproject.toml" in result.stdout
 
     def test_pyproject_tool_ruff_block_is_idempotent(self, target_repo: Path) -> None:
         """A re-sync into a [tool.ruff] host stays a no-op — ruff.toml never appears."""
