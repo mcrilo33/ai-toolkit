@@ -1421,6 +1421,52 @@ class TestConfigFileSync:
         assert editorconfig.exists()
         assert editorconfig.read_text() == "root = true\n[*]\nindent_size = 2\n"
 
+    # ── Tier (a): ruff.toml never shadows a host's ruff config (#340) ──
+
+    def test_pyproject_tool_ruff_blocks_ruff_toml_copy(self, target_repo: Path) -> None:
+        """A host that configures ruff via pyproject.toml gets no shadowing ruff.toml.
+
+        A root ruff.toml wins over pyproject.toml [tool.ruff] in ruff's discovery,
+        so the format-blind -f check must treat [tool.ruff] as "already configured"
+        and skip the copy loudly (fail-loud, AFK principle #2).
+        """
+        pyproject = target_repo / "pyproject.toml"
+        pyproject.write_text('[project]\nname = "host-app"\n\n[tool.ruff]\nline-length = 79\n')
+
+        result = _run_sync(target_repo, "claude")
+
+        assert not (target_repo / "ruff.toml").exists()
+        assert "shadow" in result.stdout
+        assert "ruff already configured via pyproject.toml" in result.stdout
+
+    def test_pyproject_tool_ruff_block_is_idempotent(self, target_repo: Path) -> None:
+        """A re-sync into a [tool.ruff] host stays a no-op — ruff.toml never appears."""
+        pyproject = target_repo / "pyproject.toml"
+        pyproject.write_text("[tool.ruff]\nline-length = 79\n")
+
+        _run_sync(target_repo, "claude")
+        _run_sync(target_repo, "claude")
+
+        assert not (target_repo / "ruff.toml").exists()
+
+    def test_existing_dot_ruff_toml_blocks_copy(self, target_repo: Path) -> None:
+        """A host .ruff.toml is an equivalent ruff config — no root ruff.toml copied."""
+        dot_ruff = target_repo / ".ruff.toml"
+        dot_ruff.write_text("line-length = 79\n")
+
+        _run_sync(target_repo, "claude")
+
+        assert not (target_repo / "ruff.toml").exists()
+        assert dot_ruff.read_text() == "line-length = 79\n"
+
+    def test_no_ruff_config_still_copies_ruff_toml(self, target_repo: Path) -> None:
+        """No ruff config in any form → shared ruff.toml is copied (unchanged path)."""
+        _run_sync(target_repo, "claude")
+
+        copied = target_repo / "ruff.toml"
+        assert copied.exists()
+        assert copied.read_bytes() == (REPO_ROOT / "shared" / "ruff.toml").read_bytes()
+
 
 # ── MCP servers (review-stamp) ────────────────────────────
 
