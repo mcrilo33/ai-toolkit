@@ -628,8 +628,26 @@ sync_config_files() {
     _sync_config() {
         local filename="$1"
         [ -f "$SHARED_DIR/$filename" ] || return 0
+        # Ruff config discovery gives a root ruff.toml/.ruff.toml absolute
+        # precedence over pyproject.toml [tool.ruff] (issue #340). The -f check
+        # below is format-blind — it sees only the ruff.toml name — so a host
+        # that configures ruff elsewhere would get the shared file dropped in,
+        # silently shadowing its own config. Treat any recognized ruff config as
+        # "already present" and skip loudly (fail-loud, AFK principle #2),
+        # mirroring the detection idiom in shared/hooks/lib/utils.sh.
+        local ruff_src=""
+        if [ "$filename" = "ruff.toml" ] && [ ! -f "$TARGET/$filename" ]; then
+            if [ -f "$TARGET/.ruff.toml" ]; then
+                ruff_src=".ruff.toml"
+            elif [ -f "$TARGET/pyproject.toml" ] &&
+                grep -q '\[tool\.ruff\]' "$TARGET/pyproject.toml" 2>/dev/null; then
+                ruff_src="pyproject.toml [tool.ruff]"
+            fi
+        fi
         if [ -f "$TARGET/$filename" ]; then
             warn "$filename already exists in target — skipped (merge manually if needed)"
+        elif [ -n "$ruff_src" ]; then
+            warn "ruff already configured via $ruff_src — not installing ruff.toml (it would shadow the host config)"
         elif [ "$DRY_RUN" -eq 1 ]; then
             echo "[dry-run] would write $filename"
         else
