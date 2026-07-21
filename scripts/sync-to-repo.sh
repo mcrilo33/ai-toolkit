@@ -25,9 +25,10 @@ usage() {
     echo "Flags:"
     echo "  --with-git-hooks   Also install the cage scripts as NATIVE git hooks"
     echo "                     (fallback enforcement, independent of the agent runtime)"
-    echo "  --local-only       Exclude the synced ai-toolkit paths in the target's"
-    echo "                     .git/info/exclude (per-clone, never committed), so a"
-    echo "                     PERSONAL deployment does not propagate to teammates"
+    echo "  --local-only       Also exclude the synced ai-toolkit DEPLOYMENT dirs (.claude/,"
+    echo "                     .cursor/, .github/ subdirs) in the target's .git/info/exclude,"
+    echo "                     so a PERSONAL deployment does not propagate to teammates. The"
+    echo "                     toolkit's generated state is excluded there by default regardless."
     echo "  --dry-run          Print what would be written/deleted without touching"
     echo "                     the target"
     echo ""
@@ -656,49 +657,14 @@ sync_config_files() {
         fi
     }
 
-    # Tier (b) — reconcile the ai-toolkit managed block into a line-based config
-    # (issue #333). config_reconciler.py replaces the sentinel-marked owned block
-    # with the fresh shared set while preserving every host-authored line, and
-    # converges to a fixed point. NOT recorded in the manifest: reconciler-owned
-    # and GC-protected, exactly like the hooks reconcile.
-    _reconcile_config() {
-        local filename="$1" kind="$2"
-        [ -f "$SHARED_DIR/$filename" ] || return 0
-        # Self-sync guard (issue #338): when the target IS the ai-toolkit source
-        # repo (same dir on disk — `-ef` compares device+inode, so it matches
-        # regardless of path spelling whenever the sync runs from within the
-        # checkout it targets), skip the host-managed reconcile. The source
-        # maintains its own tracked $filename by hand; injecting the managed block
-        # would leave it modified-but-uncommitted, silently blocking worktree-land.
-        # A separate host project / fork has a different inode and still reconciles.
-        if [ "$TARGET" -ef "$REPO_DIR" ]; then
-            info "$filename (self-sync — source maintains its own; skipped)"
-            return 0
-        fi
-        local target_file="$TARGET/$filename"
-        if [ "$DRY_RUN" -eq 1 ]; then
-            echo "[dry-run] would reconcile $filename"
-            return 0
-        fi
-        # Write to a temp file first: a reconcile failure leaves the target
-        # untouched and warns (graceful degradation, matching spoke-model.env
-        # and apply_base_branch_config above) instead of aborting the sync or
-        # truncating the file. The mv is an atomic swap on success — the original
-        # is intact until it lands, so no separate backup is needed (issue #338:
-        # a .gitignore.bak beside a tracked .gitignore littered the tree).
-        if python3 "$SCRIPT_DIR/config_reconciler.py" "$kind" \
-            "$target_file" < "$SHARED_DIR/$filename" > "$target_file.tmp"; then
-            mv "$target_file.tmp" "$target_file"
-            info "$filename (reconciled)"
-        else
-            rm -f "$target_file.tmp"
-            warn "could not reconcile $filename — left unchanged"
-        fi
-    }
-
+    # The toolkit no longer reconciles a managed block into the host's TRACKED
+    # .gitignore (issue #341): that overreached (generic hygiene the host already
+    # ignores) and shipped hazardous name-based *secret*/*credentials* globs, and
+    # dirtied a versioned file for a purely local deployment. The toolkit-owned
+    # state entries now go to .git/info/exclude via sync_local_exclude (per-clone,
+    # unversioned), which runs unconditionally on the default path.
     _sync_config "pyproject.toml"
     _sync_config "ruff.toml"
-    _reconcile_config ".gitignore" "gitignore"
     _sync_config ".editorconfig"
     _sync_config ".python-version"
 }
@@ -905,17 +871,26 @@ sync_git_hooks() {
     bash "$SCRIPT_DIR/install-git-hooks.sh" "$TARGET"
 }
 
-# --local-only: exclude the ai-toolkit-managed paths from the target repo LOCALLY, so a
-# personal deployment never gets committed or propagated to teammates. Uses the target's
-# .git/info/exclude (per-clone, NOT tracked) rather than .gitignore (which would itself be a
-# committed change). Idempotent: a marked block is replaced, never duplicated. Surgical about
-# .github — only the ai-toolkit SUBDIRS are excluded, never .github/ or .github/workflows/
-# (the project's real CI). Resolves the git common dir so it also works from inside a worktree.
+# Exclude the ai-toolkit-owned paths from the target repo LOCALLY, via the target's
+# .git/info/exclude (per-clone, NOT tracked) rather than the tracked .gitignore (which would
+# dirty a versioned file for a purely local deployment — issue #341). Idempotent: a marked
+# block is replaced, never duplicated. Resolves the git common dir so it also works from inside
+# a worktree. Self-sync-safe for free: .git/info/exclude is never tracked, so writing it in the
+# ai-toolkit source repo cannot dirty the tree (#338 parity, no special-casing needed).
+#
+# Two footprints share one marked block:
+#   default          — only the toolkit's own GENERATED state (regenerated by sync /
+#                      review-stamp / testmon / the spoke), which no one ever commits, so
+#                      excluding it locally is universally safe. This runs on every sync.
+#   --local-only     — additionally excludes the synced DEPLOYMENT dirs (.claude/, .cursor/,
+#                      the .github/ ai-toolkit SUBDIRS), so a PERSONAL deployment of the toolkit
+#                      itself never propagates to teammates. Surgical about .github — only the
+#                      ai-toolkit subdirs, never .github/ or .github/workflows/ (the real CI).
 sync_local_exclude() {
-    section "Local git exclude (personal, not committed)"
+    section "Local git exclude (per-clone, not committed)"
     local common exclude
     common="$(git -C "$TARGET" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
-        warn "Target is not a git repository — skipping --local-only exclude"
+        warn "Target is not a git repository — skipping .git/info/exclude write"
         return 0
     }
     exclude="$common/info/exclude"
@@ -934,12 +909,22 @@ sync_local_exclude() {
     fi
     {
         printf '%s\n' "$begin"
-        printf '/.claude/\n/.cursor/\n/.ai-toolkit/\n'
-        printf '/.github/instructions/\n/.github/skills/\n/.github/agents/\n/.github/prompts/\n/.github/hooks/\n'
+        # Generated toolkit state (always) — never committed by anyone.
+        printf '/.ai-toolkit/\n.ai-toolkit-manifest.json\n/.review/\n'
         printf '.testmondata\n.testmondata-shm\n.testmondata-wal\n'
+        printf 'pyrightconfig.json\n'
+        if [ "$LOCAL_ONLY" -eq 1 ]; then
+            # Personal deployment dirs (opt-in) — the synced toolkit config itself.
+            printf '/.claude/\n/.cursor/\n'
+            printf '/.github/instructions/\n/.github/skills/\n/.github/agents/\n/.github/prompts/\n/.github/hooks/\n'
+        fi
         printf '%s\n' "$end"
     } >> "$exclude"
-    info "wrote local exclude block to .git/info/exclude (ai-toolkit paths ignored on this clone only)"
+    if [ "$LOCAL_ONLY" -eq 1 ]; then
+        info "wrote local exclude block to .git/info/exclude (toolkit state + personal deployment dirs)"
+    else
+        info "wrote local exclude block to .git/info/exclude (toolkit generated state)"
+    fi
 }
 
 # ═══════════════════════════════════════════
@@ -964,9 +949,10 @@ if [ "$WITH_GIT_HOOKS" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
     sync_git_hooks
 fi
 
-if [ "$LOCAL_ONLY" -eq 1 ]; then
-    sync_local_exclude
-fi
+# The toolkit-owned state exclude (issue #341) is unconditional: the default footprint is
+# generated state only; --local-only widens the same block to the personal deployment dirs.
+# (Dry-run reporting is handled inside sync_local_exclude.)
+sync_local_exclude
 
 echo ""
 if [ "$DRY_RUN" -eq 1 ]; then
