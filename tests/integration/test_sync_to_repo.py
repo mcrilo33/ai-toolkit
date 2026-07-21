@@ -1824,3 +1824,18 @@ class TestGitInfoExclude:
 
         text = self._exclude(target_repo).read_text()
         assert text.count(self.MARKER) == 1, "the block must not duplicate on re-sync"
+
+    def test_plain_sync_after_local_only_warns_before_narrowing(self, target_repo: Path) -> None:
+        """A plain re-sync drops the deployment dirs a prior --local-only added — say so loudly.
+
+        Each run rewrites the whole block from its own flags, so a plain sync narrows the
+        footprint back to generated state. That is by design, but doing it SILENTLY would let a
+        personal-deployment user re-expose .claude/ / .cursor/ for accidental commit — the
+        fail-loud violation AFK principle #2 forbids. The removal must be announced.
+        """
+        self._run_local_only(target_repo)
+        result = _run_sync(target_repo, "claude")  # plain: narrows the block
+
+        text = self._exclude(target_repo).read_text()
+        assert "/.claude/" not in text  # narrowed as designed
+        assert "--local-only" in result.stdout  # ...but the removal was announced
