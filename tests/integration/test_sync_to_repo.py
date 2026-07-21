@@ -282,7 +282,11 @@ def _build_isolated_source(dest: Path) -> Path:
     """
     for name in ("scripts", "shared", "settings", "mcp"):
         shutil.copytree(REPO_ROOT / name, dest / name)
-    shutil.copy2(REPO_ROOT / ".gitignore", dest / ".gitignore")
+    # Mirror the tracked root files the real source carries, so a self-sync's
+    # copy-if-absent config pass finds them present and skips (as it does against
+    # the real REPO_ROOT) rather than creating untracked copies from shared/.
+    for name in (".gitignore", "pyproject.toml", "ruff.toml", ".python-version", ".editorconfig"):
+        shutil.copy2(REPO_ROOT / name, dest / name)
     git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
     subprocess.run([*git, "init"], cwd=dest, check=True, capture_output=True)
     subprocess.run([*git, "add", "-A"], cwd=dest, check=True, capture_output=True)
@@ -1292,99 +1296,48 @@ class TestManifestAndGC:
 
 
 class TestConfigFileSync:
-    """Config files: tier-(a) copy-if-absent + tier-(b) .gitignore reconcile.
+    """Config files: tier-(a) copy-if-absent + GC protection.
 
     Issue #333: an existing host config is never deleted (GC-protected) nor
-    clobbered; ``.gitignore`` is reconciled in place (host lines preserved, the
-    ai-toolkit managed block refreshed), converging to a fixed point.
+    clobbered. Issue #341: the toolkit no longer reconciles a managed block into
+    the tracked ``.gitignore`` — its generated state now goes to
+    ``.git/info/exclude`` (see ``TestGitInfoExclude``), so a sync never dirties the
+    versioned file.
     """
 
     MANIFEST_NAME = ".ai-toolkit-manifest.json"
-    BEGIN_MARKER = "# >>> ai-toolkit managed (do not edit) >>>"
-    END_MARKER = "# <<< ai-toolkit managed <<<"
+    # The retired reconcile block marker — asserted ABSENT from tracked files now.
+    RECONCILE_MARKER = "# >>> ai-toolkit managed (do not edit) >>>"
 
-    # ── Tier (b): .gitignore reconcile ────────────────────
+    # ── #341: the tracked .gitignore is never touched ─────
 
-    def test_fresh_gitignore_gets_managed_block(self, target_repo: Path) -> None:
-        """No host .gitignore → sync writes one managed block (copy path)."""
+    def test_sync_leaves_tracked_gitignore_untouched(self, target_repo: Path) -> None:
+        """A host .gitignore is byte-identical after sync — no managed block injected."""
+        gitignore = target_repo / ".gitignore"
+        gitignore.write_text("# host owned\n/my-secret-dir/\ncoverage.host.xml\n")
+        before = gitignore.read_bytes()
+
+        _run_sync(target_repo, "claude")
+
+        assert gitignore.read_bytes() == before
+        assert self.RECONCILE_MARKER not in gitignore.read_text()
+
+    def test_sync_creates_no_gitignore_when_absent(self, target_repo: Path) -> None:
+        """No host .gitignore → sync does not create one (state goes to the exclude)."""
         assert not (target_repo / ".gitignore").exists()
 
         _run_sync(target_repo, "claude")
 
-        content = (target_repo / ".gitignore").read_text()
-        assert self.BEGIN_MARKER in content
-        assert self.END_MARKER in content
-        assert ".ai-toolkit-manifest.json" in content  # a shared managed pattern
+        assert not (target_repo / ".gitignore").exists()
 
-    def test_existing_gitignore_host_lines_preserved(self, target_repo: Path) -> None:
-        """An existing host .gitignore is reconciled, not clobbered (reconcile path)."""
-        gitignore = target_repo / ".gitignore"
-        gitignore.write_text("# host owned\n/my-secret-dir/\ncoverage.host.xml\n")
-
-        _run_sync(target_repo, "claude")
-
-        content = gitignore.read_text()
-        assert "/my-secret-dir/" in content
-        assert "coverage.host.xml" in content
-        assert self.BEGIN_MARKER in content  # managed block added alongside
-
-    def test_gitignore_byte_identical_across_runs(self, target_repo: Path) -> None:
-        """Reconcile is idempotent: a second sync is a byte-for-byte no-op."""
-        gitignore = target_repo / ".gitignore"
-        gitignore.write_text("/host-only/\n")
-
-        _run_sync(target_repo, "claude")
-        first = gitignore.read_text()
-        _run_sync(target_repo, "claude")
-        second = gitignore.read_text()
-
-        assert first == second
-        assert "/host-only/" in second
-
-    def test_gitignore_not_recorded_in_manifest(self, target_repo: Path) -> None:
-        """The reconciled .gitignore is reconciler-owned — never manifest-listed."""
-        _run_sync(target_repo, "claude")
-
-        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
-        for paths in manifest["tools"].values():
-            assert ".gitignore" not in paths
-
-    def test_host_sync_leaves_no_gitignore_bak(self, target_repo: Path) -> None:
-        """A host reconcile refreshes the block but leaves no .gitignore.bak (#338).
-
-        #333's reconcile cp'd a .bak beside the target; the repo-root .gitignore.bak
-        is not itself gitignored, so it littered the tree. The atomic tmp-write + mv
-        already covers graceful-degrade, so no backup should remain.
-        """
+    def test_sync_leaves_no_gitignore_bak(self, target_repo: Path) -> None:
+        """No .gitignore.bak is littered beside the tracked file (#338/#341)."""
         gitignore = target_repo / ".gitignore"
         gitignore.write_text("# host owned\n/my-secret-dir/\n")
 
         _run_sync(target_repo, "claude")
 
-        assert self.BEGIN_MARKER in gitignore.read_text()  # reconcile still ran
         assert not (target_repo / ".gitignore.bak").exists()
-
-    def test_self_sync_leaves_tree_clean(self, tmp_path: Path) -> None:
-        """A self-sync (target == the ai-toolkit source repo) stays clean (#338).
-
-        The source repo maintains its own .gitignore by hand; injecting the host
-        managed block into its tracked .gitignore left it dirty-but-uncommitted,
-        silently blocking worktree-land.sh. A self-sync must skip the reconcile and
-        leave neither a .gitignore modification nor a .gitignore.bak.
-        """
-        source = _build_isolated_source(tmp_path / "toolkit")
-        gitignore = source / ".gitignore"
-        before = gitignore.read_bytes()
-
-        subprocess.run(
-            ["bash", str(source / "scripts" / "sync-to-repo.sh"), str(source), "claude"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        assert gitignore.read_bytes() == before  # tracked .gitignore untouched
-        assert not (source / ".gitignore.bak").exists()  # no stray backup
 
     # ── Tier (a): copy-if-absent + GC protection ──────────
 
@@ -1709,14 +1662,39 @@ class TestBaseBranchCamelCaseGuard:
         assert "baseBranch" in result.stdout
 
 
-class TestLocalOnlyExclude:
-    """--local-only writes the ai-toolkit paths to the target's .git/info/exclude,
-    so a personal deployment never propagates to teammates (per-clone, not committed)."""
+class TestGitInfoExclude:
+    """The toolkit writes its owned paths to .git/info/exclude, not the tracked .gitignore (#341).
+
+    Default footprint: only the toolkit's GENERATED state (regenerated by sync / review-stamp /
+    testmon / the spoke) — never committed by anyone, so excluding it locally is universally
+    safe, and it runs on every sync. --local-only widens the SAME marked block to the synced
+    DEPLOYMENT dirs, so a personal deployment does not propagate. Per-clone, never committed;
+    idempotent (the block is replaced, never duplicated).
+    """
+
+    MARKER = "# >>> ai-toolkit (local, personal — do not commit) >>>"
+    STATE_ENTRIES = (
+        "/.ai-toolkit/",
+        ".ai-toolkit-manifest.json",
+        "/.review/",
+        ".testmondata",
+        ".testmondata-shm",
+        ".testmondata-wal",
+        "pyrightconfig.json",
+    )
+    DEPLOYMENT_ENTRIES = ("/.claude/", "/.cursor/", "/.github/instructions/", "/.github/hooks/")
 
     def _exclude(self, target: Path) -> Path:
         return target / ".git" / "info" / "exclude"
 
-    def _run(self, target: Path, tool: str = "claude") -> subprocess.CompletedProcess[str]:
+    def _exclude_text(self, target: Path) -> str:
+        """The exclude file's text, or "" if the sync wrote none (clean-fail helper)."""
+        p = self._exclude(target)
+        return p.read_text() if p.exists() else ""
+
+    def _run_local_only(
+        self, target: Path, tool: str = "claude"
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(SYNC_SCRIPT), str(target), tool, "--local-only"],
             capture_output=True,
@@ -1724,16 +1702,101 @@ class TestLocalOnlyExclude:
             check=True,
         )
 
-    def test_writes_the_ai_toolkit_block(self, target_repo: Path) -> None:
-        self._run(target_repo)
+    # ── default footprint: generated state only ───────────
+
+    def test_default_sync_writes_state_block(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "claude")
+
+        text = self._exclude_text(target_repo)
+        assert self.MARKER in text
+        for entry in self.STATE_ENTRIES:
+            assert entry in text, f"{entry} missing from the default exclude block"
+
+    def test_default_sync_omits_deployment_dirs(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "claude")
+
+        text = self._exclude_text(target_repo)
+        for entry in self.DEPLOYMENT_ENTRIES:
+            assert entry not in text, f"{entry} must be --local-only, not default"
+
+    def test_default_exclude_is_idempotent(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "claude")
+        first = self._exclude(target_repo).read_text()
+        _run_sync(target_repo, "claude")
+        second = self._exclude(target_repo).read_text()
+
+        assert first == second
+        assert second.count(self.MARKER) == 1
+
+    def test_state_entries_are_ignored(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "claude")
+
+        for p in (".ai-toolkit/", ".review/", ".testmondata", "pyrightconfig.json"):
+            r = subprocess.run(
+                ["git", "check-ignore", p], cwd=target_repo, capture_output=True, text=True
+            )
+            assert r.returncode == 0, f"{p} should be locally ignored, got rc={r.returncode}"
+
+    def test_no_secret_or_generic_globs_in_any_ignore_file(self, target_repo: Path) -> None:
+        # #341: the retired shared/.gitignore shipped these; they must appear nowhere now.
+        (target_repo / ".gitignore").write_text("# host owned\n/keep/\n")
+
+        _run_sync(target_repo, "claude")
+
+        blobs = [(target_repo / ".gitignore").read_text(), self._exclude_text(target_repo)]
+        joined = "\n".join(blobs)
+        for banned in (
+            "*secret*",
+            "*credentials*",
+            "*.pem",
+            "*.key",
+            ".env",
+            "node_modules/",
+            ".DS_Store",
+            "secrets-scan",
+        ):
+            assert banned not in joined, f"{banned} must not be emitted into any host ignore file"
+
+    def test_self_sync_leaves_tree_clean(self, tmp_path: Path) -> None:
+        """A self-sync writes only the untracked .git/info/exclude — tracked tree stays clean.
+
+        #338/#341: the retired reconcile injected a managed block into the source's tracked
+        .gitignore, leaving it dirty-but-uncommitted and silently blocking worktree-land.sh.
+        Writing to .git/info/exclude (never tracked) cannot dirty the tree.
+        """
+        source = _build_isolated_source(tmp_path / "toolkit")
+
+        subprocess.run(
+            ["bash", str(source / "scripts" / "sync-to-repo.sh"), str(source), "claude"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=source,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert status.stdout == "", f"self-sync dirtied the tree: {status.stdout!r}"
+        assert not (source / ".gitignore.bak").exists()
+
+    # ── --local-only: widens the block to the deployment dirs ──
+
+    def test_local_only_adds_deployment_dirs(self, target_repo: Path) -> None:
+        self._run_local_only(target_repo)
 
         text = self._exclude(target_repo).read_text()
-        assert "# >>> ai-toolkit (local, personal — do not commit) >>>" in text
         assert "/.claude/" in text
+        assert "/.cursor/" in text
+        # the generated-state entries stay in the same block
         assert "/.ai-toolkit/" in text
+        assert "/.review/" in text
 
-    def test_ai_toolkit_paths_are_ignored(self, target_repo: Path) -> None:
-        self._run(target_repo)
+    def test_local_only_ai_toolkit_paths_are_ignored(self, target_repo: Path) -> None:
+        self._run_local_only(target_repo)
 
         for p in (".claude/", ".ai-toolkit/", ".github/hooks/", ".cursor/"):
             r = subprocess.run(
@@ -1741,11 +1804,11 @@ class TestLocalOnlyExclude:
             )
             assert r.returncode == 0, f"{p} should be locally ignored, got rc={r.returncode}"
 
-    def test_real_github_ci_is_not_ignored(self, target_repo: Path) -> None:
+    def test_local_only_real_github_ci_is_not_ignored(self, target_repo: Path) -> None:
         # SURGICAL: the project's real .github/workflows must never be caught.
         (target_repo / ".github" / "workflows").mkdir(parents=True)
         (target_repo / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
-        self._run(target_repo)
+        self._run_local_only(target_repo)
 
         r = subprocess.run(
             ["git", "check-ignore", ".github/workflows/ci.yml"],
@@ -1755,17 +1818,9 @@ class TestLocalOnlyExclude:
         )
         assert r.returncode != 0, ".github/workflows/ci.yml must NOT be excluded (real CI)"
 
-    def test_is_idempotent(self, target_repo: Path) -> None:
-        self._run(target_repo)
-        self._run(target_repo)
+    def test_local_only_is_idempotent(self, target_repo: Path) -> None:
+        self._run_local_only(target_repo)
+        self._run_local_only(target_repo)
 
         text = self._exclude(target_repo).read_text()
-        assert text.count("# >>> ai-toolkit") == 1, "the block must not duplicate on re-sync"
-
-    def test_default_sync_writes_no_exclude(self, target_repo: Path) -> None:
-        # Opt-in only: without --local-only, nothing is added (teams that commit
-        # ai-toolkit are unaffected).
-        _run_sync(target_repo, "claude")
-
-        exclude = self._exclude(target_repo)
-        assert not exclude.exists() or "ai-toolkit (local" not in exclude.read_text()
+        assert text.count(self.MARKER) == 1, "the block must not duplicate on re-sync"
