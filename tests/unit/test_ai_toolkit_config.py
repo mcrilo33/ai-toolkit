@@ -38,20 +38,20 @@ SECRETS_SCAN = REPO_ROOT / "shared" / "hooks" / "secrets-scan.sh"
 # carries no contiguous secret literal (which the pre-write scanner would block).
 FAKE_SECRET = "AKIA" + "1234567890ABCDEF"
 
+FABLE = "claude-fable-5"
 OPUS = "claude-opus-4-8"
 SONNET = "claude-sonnet-5"
 
 # Mirrors shared/agents/metadata.yml's #141 routing — now sourced from the config.
-# architect/planner carried claude-fable-5 until it went unavailable again;
-# they fall back to OPUS, the strongest reasoning model still available (same
-# fallback as the #218 retirement window).
+# architect/planner returned to FABLE when claude-fable-5 became available again
+# (they fell back to OPUS during the #218 retirement window).
 # (model, effort) per agent — budget routing (2026-07-15): design/judgment agents
-# keep max effort on the strongest model; the routine workhorses (reviews, scoping,
+# keep max effort on the scarce models; the routine workhorses (reviews, scoping,
 # green/refactor) run Sonnet at high effort. Per-issue escalation stays available
 # via the lane:reasoning label override.
 EXPECTED_AGENT_ROUTING = {
-    "architect": (OPUS, "max"),
-    "planner": (OPUS, "max"),
+    "architect": (FABLE, "max"),
+    "planner": (FABLE, "max"),
     "debug": (OPUS, "max"),
     "security-reviewer": (OPUS, "max"),
     "code-review": (OPUS, "high"),

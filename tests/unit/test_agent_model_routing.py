@@ -1,10 +1,9 @@
 """Unit tests for the agent model routing POLICY (issues #141, #142).
 
-The per-agent model routes by role: Opus 4.8 for the design/plan agents
-(`architect`, `planner`) and the reasoning-heavy ones, Sonnet 5 for the
-capable-but-routine ones, and Haiku for none. (`claude-fable-5` is unavailable
-again, so the design/plan roles it used to carry fall back to Opus 4.8, as
-during the #218 retirement window.) Effort routes by role too
+Fable credit is scarce; Opus 4.8 is plentiful. The per-agent model must
+therefore route by role: Fable only for the design/plan agents (`architect`,
+`planner`), Opus 4.8 for the reasoning-heavy ones, Sonnet 5 for the
+capable-but-routine ones, and Haiku for none. Effort routes by role too
 (budget policy, 2026-07-15): `max` is reserved for the design/judgment agents;
 the routine workhorses run `high`. Per-issue escalation stays available via the
 `lane:reasoning` label override in the config.
@@ -38,13 +37,12 @@ SONNET = "claude-sonnet-5"
 
 # (model, effort) per agent. Budget routing (2026-07-15): reviews and scoping
 # moved to Sonnet/high — the volume drivers of subagent usage — while design and
-# judgment agents keep their strongest model at max.
+# judgment agents keep their scarce models at max.
 EXPECTED_ROUTING = {
-    # architect/planner carried claude-fable-5 until it went unavailable again;
-    # they fall back to opus, the strongest reasoning model still available
-    # (same fallback as the #218 retirement window).
-    "architect": (OPUS, "max"),
-    "planner": (OPUS, "max"),
+    # architect/planner returned to claude-fable-5 when it became available again
+    # (they fell back to opus during the #218 retirement window).
+    "architect": (FABLE, "max"),
+    "planner": (FABLE, "max"),
     "debug": (OPUS, "max"),
     "security-reviewer": (OPUS, "max"),
     "code-review": (OPUS, "high"),
@@ -88,10 +86,13 @@ def test_max_effort_reserved_for_judgment_agents(config: dict, name: str) -> Non
     assert routed[1] == expected
 
 
-def test_fable_is_fully_retired(config: dict) -> None:
-    # claude-fable-5 is unavailable again; no agent may route to it any more
-    # (architect/planner fell back to opus, as during the #218 retirement window).
+def test_fable_reserved_for_design_agents(config: dict) -> None:
+    # claude-fable-5 is back after the #218 retirement window, but stays scarce:
+    # only the design/plan agents (architect, planner) may route to it.
     for name in EXPECTED_ROUTING:
         routed = cfg.agent_model(config, name)
         assert routed is not None
-        assert routed[0] != FABLE
+        if name in ("architect", "planner"):
+            assert routed[0] == FABLE
+        else:
+            assert routed[0] != FABLE

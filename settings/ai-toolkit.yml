@@ -191,18 +191,16 @@ model:
       model: claude-opus-4-8
       effort: high
 
-  # Per sub-agent model routing (issue #141): the design/plan agents get the
-  # strongest reasoning model, Opus 4.8, for the reasoning-heavy ones too; Sonnet
-  # 5 for the capable-but-routine ones; Haiku for none. Sync stamps these into
-  # each agent's claude `model:`/`effort:` frontmatter. (claude-fable-5 is
-  # unavailable again; the design/plan roles it used to carry fall back to
-  # claude-opus-4-8, as during the #218 retirement window.)
+  # Per sub-agent model routing (issue #141): Fable is scarce, so it is reserved
+  # for the design/plan agents; Opus 4.8 for the reasoning-heavy ones; Sonnet 5
+  # for the capable-but-routine ones; Haiku for none. Sync stamps these into
+  # each agent's claude `model:`/`effort:` frontmatter.
   subagents:
     architect:
-      model: claude-opus-4-8
+      model: claude-fable-5
       effort: max
     planner:
-      model: claude-opus-4-8
+      model: claude-fable-5
       effort: max
     debug:
       model: claude-opus-4-8
