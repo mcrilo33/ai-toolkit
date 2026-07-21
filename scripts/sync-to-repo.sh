@@ -901,6 +901,14 @@ sync_local_exclude() {
         return 0
     fi
     make_dir "$common/info"
+    # Each run rewrites the whole block from its own flags, so a plain sync narrows a
+    # prior --local-only footprint back to generated state. That is intended, but doing it
+    # silently would let a personal-deployment user re-expose .claude/ for accidental commit —
+    # detect the drop and announce it (fail-loud, AFK principle #2) instead of dropping quietly.
+    local dropping_deployment=0
+    if [ "$LOCAL_ONLY" -eq 0 ] && [ -f "$exclude" ] && grep -q '^/\.claude/$' "$exclude"; then
+        dropping_deployment=1
+    fi
     # Strip any prior block (idempotent), then append a fresh one.
     if [ -f "$exclude" ]; then
         awk -v b="$begin" -v e="$end" '
@@ -922,6 +930,8 @@ sync_local_exclude() {
     } >> "$exclude"
     if [ "$LOCAL_ONLY" -eq 1 ]; then
         info "wrote local exclude block to .git/info/exclude (toolkit state + personal deployment dirs)"
+    elif [ "$dropping_deployment" -eq 1 ]; then
+        warn "removed the personal deployment-dir exclusions (.claude/, .cursor/, .github/ subdirs) from .git/info/exclude — re-run with --local-only to keep them"
     else
         info "wrote local exclude block to .git/info/exclude (toolkit generated state)"
     fi
