@@ -248,6 +248,16 @@ if [ -n "$EXCLUDE_FILE" ]; then
   done
 fi
 
+# --- provision the pre-push gate's testmon/xdist deps (issue #342) ------------
+# Without a project .venv carrying pytest-testmon/pytest-xdist, this fresh worktree's first
+# push runs the FULL suite SINGLE-process (detect_pytest falls back to a bare pytest lacking
+# the plugins). Provision a .venv so the first push runs a testmon incremental under -n auto.
+# Run the SHIPPED copy from the worktree's marker-script dir (MARKER_DIR is worktree-relative;
+# this script runs from REPO_ROOT). Best-effort: ensure-test-venv.sh always exits 0.
+if [ -x "$WT_DIR/$MARKER_DIR/ensure-test-venv.sh" ]; then
+  bash "$WT_DIR/$MARKER_DIR/ensure-test-venv.sh" "$WT_DIR" || true
+fi
+
 # --- pre-warm .testmondata from the hub baseline (issue #276) -----------------
 # The first push per fresh worktree otherwise runs the FULL multi-thousand-test suite
 # SOLELY to build .testmondata (12-47 min observed): test-select.sh's python tier has no
