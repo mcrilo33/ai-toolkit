@@ -41,6 +41,24 @@ exclude_venv() {
   grep -qxF '.venv/' "$exclude" 2>/dev/null || printf '%s\n' '.venv/' >> "$exclude"
 }
 
+# Guarantee the .venv/bin/pytest console script exists — the exact path detect_pytest keys on.
+# --system-site-packages makes pip treat a HOST-satisfied pytest as "already installed" and skip
+# it, so `pip install -r requirements-dev.txt` never generates that entrypoint on the very host
+# class #342 targets (a bare pytest present but lacking the plugins). Without the script,
+# detect_pytest falls back to the bare interpreter and the gate keeps degrading. Materialize it
+# with a no-deps force-reinstall of pytest INTO the venv (deps stay satisfied from the inherited
+# system site-packages, so it is one small wheel). Pin from requirements-dev.txt so the version
+# never drifts from the manifest.
+ensure_pytest_entrypoint() {
+  [ -x "$VENV/bin/pytest" ] && return 0
+  local spec
+  spec="$(grep -iE '^pytest[[:space:]]*[<>=!~]' "$DIR/requirements-dev.txt" 2>/dev/null | head -1)"
+  [ -n "$spec" ] || spec="pytest"
+  loud "materializing .venv/bin/pytest (pip skipped it as host-satisfied under --system-site-packages)"
+  "$PIP" install -q --force-reinstall --no-deps "$spec" \
+    || loud "could not materialize .venv/bin/pytest -- gate may still fall back to the full suite"
+}
+
 # Skip cleanly if the project ships no dev-deps manifest: nothing to provision, no action taken.
 [ -f "$DIR/requirements-dev.txt" ] || exit 0
 
@@ -60,6 +78,7 @@ if [ ! -x "$VENV/bin/pytest" ]; then
   if ! "$PIP" install -q -r "$DIR/requirements-dev.txt"; then
     loud "pip install -r requirements-dev.txt failed (network?) -- gate falls back to the full suite"
   fi
+  ensure_pytest_entrypoint
 elif ! "$PY" -c 'import testmon, xdist' 2>/dev/null; then
   # .venv exists but the gate's plugins do not import: install ONLY those (cheap repair).
   loud "installing missing pytest-testmon/pytest-xdist into $VENV"

@@ -55,13 +55,18 @@ def _write_shims(shim_dir: Path, log: Path, *, venv_fails: bool = False) -> None
         'd="$(cd "$(dirname "$0")/.." && pwd)"\n'
         '[ -f "$d/.plugins_ok" ] && exit 0 || exit 1\n'
     )
-    # venv pip: record argv, then simulate a successful install (bin/pytest + the marker).
+    # venv pip: record argv, then model pip's REAL --system-site-packages behavior on the host
+    # class #342 targets (host already has a satisfying pytest). Any install makes the plugins
+    # importable (.plugins_ok). But pytest is host-satisfied, so a PLAIN install does NOT
+    # generate the venv's bin/pytest console script — only a --force-reinstall of pytest
+    # materializes it (verified: `pip install --force-reinstall --no-deps pytest` creates the
+    # entrypoint where a bare `-r requirements-dev.txt` does not).
     (shim_dir / "venv_pip").write_text(
         "#!/usr/bin/env bash\n"
         'd="$(cd "$(dirname "$0")/.." && pwd)"\n'
         f'printf "pip %s\\n" "$*" >> "{log}"\n'
-        'touch "$d/bin/pytest" "$d/.plugins_ok"\n'
-        'chmod +x "$d/bin/pytest"\n'
+        'touch "$d/.plugins_ok"\n'
+        'case "$*" in *--force-reinstall*) touch "$d/bin/pytest"; chmod +x "$d/bin/pytest";; esac\n'
     )
     if venv_fails:
         py_body = "#!/usr/bin/env bash\nexit 1\n"
@@ -144,9 +149,16 @@ def test_creates_venv_and_installs_when_absent(project: Path, tmp_path: Path) ->
     result = _run(project, cwd=project, shim_dir=shim)
 
     assert result.returncode == 0, result.stderr
+    pip_calls = log.read_text()
+    assert "-r" in pip_calls, "the create branch installs the full requirements-dev.txt"
+    # detect_pytest keys on .venv/bin/pytest. Under --system-site-packages pip skips a
+    # host-satisfied pytest and never writes that console script, so the helper MUST
+    # materialize it with a force-reinstall — otherwise the gate keeps degrading (blocker).
+    assert "--force-reinstall" in pip_calls, (
+        "must materialize the skipped .venv/bin/pytest entrypoint"
+    )
     assert (project / ".venv" / "bin" / "pytest").is_file(), "the gate keys on .venv/bin/pytest"
     assert "provisioning" in (result.stdout + result.stderr), "a create must emit a loud line"
-    assert "-r" in log.read_text(), "the create branch installs the full requirements-dev.txt"
 
 
 def test_repairs_venv_missing_plugins_installs_only_those(project: Path, tmp_path: Path) -> None:
