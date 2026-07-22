@@ -502,9 +502,7 @@ def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Pat
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert (
-        "CLAUDE_EFFORT=high claude --model claude-opus-4-8 /source; exec " in new_window[0]
-    )
+    assert "CLAUDE_EFFORT=high claude --model claude-opus-4-8 /source; exec " in new_window[0]
 
 
 # ── issue #269: the launcher no longer claims bypass removes the dialog family, ─
@@ -903,10 +901,7 @@ def test_agent_launch_injects_wt_spoke_marker_for_adhoc_slug(hub: Path, tmp_path
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert (
-        "WT_SPOKE=fix-parser CLAUDE_EFFORT=high claude --model claude-opus-4-8"
-        in new_window[0]
-    )
+    assert "WT_SPOKE=fix-parser CLAUDE_EFFORT=high claude --model claude-opus-4-8" in new_window[0]
 
 
 def test_manual_fallback_advice_carries_wt_spoke_marker(hub: Path, tmp_path: Path) -> None:
@@ -996,6 +991,22 @@ def test_agent_launch_injects_otel_env_by_default(hub: Path, tmp_path: Path) -> 
         assert var in cmd, f"expected {var} in the default (on) launch"
     assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=feature/8-some-slug+" in cmd
     assert cmd.index("CLAUDE_CODE_ENABLE_TELEMETRY=1") < cmd.index("WT_SPOKE=8")
+
+
+def test_agent_launch_stamps_repo_on_resource_attributes(hub: Path, tmp_path: Path) -> None:
+    # Multi-project (repo dimension): the launch resource attributes carry repo=<name>
+    # alongside spoke_run_id, so every LIVE span is sliceable per repo in a shared Langfuse
+    # project. The name mirrors the #231 land-time repo: tag — the origin remote's basename
+    # (the `hub` fixture's origin is <base>/hub-remote.git → `hub-remote`).
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    cmd = _calls(log.read_text(), "new-window")[0]
+    assert ",repo=hub-remote" in cmd, "the resource attributes must carry repo=<name>"
+    # repo rides the SAME OTEL_RESOURCE_ATTRIBUTES value as spoke_run_id (comma-joined).
+    attrs = cmd.split("OTEL_RESOURCE_ATTRIBUTES=", 1)[1].split(" ", 1)[0]
+    assert attrs.startswith("spoke_run_id=feature/8-some-slug+")
+    assert attrs.endswith(",repo=hub-remote")
 
 
 def test_agent_launch_omits_otel_env_when_disabled(hub: Path, tmp_path: Path) -> None:

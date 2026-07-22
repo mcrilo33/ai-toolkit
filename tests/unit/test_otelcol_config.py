@@ -190,6 +190,44 @@ def test_environment_stamped_on_spans() -> None:
     )
 
 
+def test_repo_stamped_on_spans_as_tag_and_metadata() -> None:
+    # Multi-project (repo dimension): the spoke launch now carries repo=<name> as a resource
+    # attribute (worktree-lib.sh), mirroring the land-time repo:<name> trace tag (#231). The
+    # collector lifts it onto every LIVE span so one Langfuse project's dashboard can slice per
+    # repo (per-project view) or drop the filter (merged view). Two surfaces so both the
+    # Traces-view group-by (tag) and the Observations/Scores-view filter (metadata) work.
+    statements = _span_statements(_load_config())
+
+    tag_stmts = [
+        s for s in statements if "langfuse.trace.tags" in s and 'resource.attributes["repo"]' in s
+    ]
+    assert tag_stmts, "a transform must stamp the repo: trace tag from the repo resource attribute"
+    assert any("repo:" in s for s in tag_stmts), (
+        "the live repo tag must use the repo:<name> shape shared with the #231 land-time tag"
+    )
+
+    meta_stmts = [
+        s
+        for s in statements
+        if "langfuse.observation.metadata.repo" in s and 'resource.attributes["repo"]' in s
+    ]
+    assert meta_stmts, (
+        "a transform must surface repo as filterable observation metadata (per-project filter)"
+    )
+
+
+def test_repo_stamp_is_conditional_on_the_resource_attribute() -> None:
+    # A spoke launched with native OTel opted out (AI_TOOLKIT_OTEL=0) carries no repo resource
+    # attribute; the stamp must be guarded so it never writes an empty/"nil" repo tag.
+    statements = _span_statements(_load_config())
+
+    repo_stmts = [s for s in statements if 'resource.attributes["repo"]' in s]
+    assert repo_stmts, "expected at least one repo stamp statement"
+    assert all('where resource.attributes["repo"] != nil' in s for s in repo_stmts), (
+        "every repo stamp must be guarded on the repo attribute being present"
+    )
+
+
 def test_environment_override_runs_after_the_production_default() -> None:
     # OTTL runs top-to-bottom, so the deployment.environment override MUST come AFTER the
     # unconditional "production" default, or a test-collector diversion is silently clobbered.
