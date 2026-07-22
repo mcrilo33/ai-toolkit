@@ -335,6 +335,15 @@ if [ -n "$EXCLUDE_FILE" ]; then
   info "Seeded runtime-artifact excludes (.testmondata*, .ai-toolkit/) into info/exclude"
 fi
 
+# --- provision the pre-push gate's testmon/xdist deps (issue #342) ------------
+# The native pre-push gate degrades to the full single-process suite on a host whose resolved
+# pytest lacks pytest-testmon/pytest-xdist. Provision a project .venv carrying them so
+# detect_pytest keys on .venv/bin/pytest and the gate stops silently degrading. Best-effort:
+# ensure-test-venv.sh always exits 0, so it never fails this installer.
+if [ -x "$SCRIPT_DIR/ensure-test-venv.sh" ]; then
+  bash "$SCRIPT_DIR/ensure-test-venv.sh" "$TARGET" || true
+fi
+
 echo ""
 info "ai-toolkit cage installed as native git hooks in $TARGET"
 warn "Blocking gates (commit-quality, commit-gauntlet, red-proof-verify) now enforce on real git commit."
