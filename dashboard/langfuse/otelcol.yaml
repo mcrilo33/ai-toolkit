@@ -128,6 +128,17 @@ processors:
           #     deployment.environment override MUST run last so it wins over the default.
           - set(attributes["langfuse.environment"], "production")
           - set(attributes["langfuse.environment"], resource.attributes["deployment.environment"]) where resource.attributes["deployment.environment"] != nil
+          # 3c) repo dimension (issue #343). The spoke launch carries repo=<name> as a resource
+          #     attribute (worktree-lib.sh); lift it onto every LIVE span so one shared Langfuse
+          #     project is sliceable per repo — as the repo:<name> TRACE TAG (Traces-view
+          #     group-by, matching the #231 land-time tag so live and assembled views share one
+          #     dimension) AND as observation METADATA (an Observations/Scores-view filter, the
+          #     views the spoke-latency widgets query). Both guarded on the attr, so an opted-out
+          #     spoke (AI_TOOLKIT_OTEL=0, no repo attr) writes neither. Langfuse reads trace tags
+          #     from a JSON-array string; the Concat builds ["repo:<name>"]. error_mode: ignore
+          #     means a tag Langfuse can't parse is dropped, but the metadata filter still lands.
+          - set(attributes["langfuse.trace.tags"], Concat(["[\"repo:", resource.attributes["repo"], "\"]"], "")) where resource.attributes["repo"] != nil
+          - set(attributes["langfuse.observation.metadata.repo"], resource.attributes["repo"]) where resource.attributes["repo"] != nil
           # 4) content → Langfuse input/output. Opt-in: needs OTEL_LOG_USER_PROMPTS +
           #    OTEL_LOG_TOOL_DETAILS + OTEL_LOG_TOOL_CONTENT at spoke launch (these ship
           #    content off-box, so they are operator opt-in, NOT in the #83 gate). The

@@ -112,8 +112,20 @@ wt_default_span_endpoint() {
   export AI_TOOLKIT_OTEL_SPAN_ENDPOINT
 }
 
+# Resolve the repo name for the cross-project telemetry dimension (issue #343), mirroring
+# the land-time repo:<name> trace tag (#231): the origin remote's basename (a trailing .git
+# stripped), else the checkout dir basename. Best-effort — an unresolvable name prints empty
+# and the caller omits the repo attribute.
+# Usage: wt_repo_name <dir>
+wt_repo_name() {
+  local dir="$1" name
+  name="$(git -C "$dir" remote get-url origin 2>/dev/null | sed -E 's#.*[/:]##; s#\.git$##')"
+  [ -n "$name" ] || name="$(basename "$dir")"
+  printf '%s' "$name"
+}
+
 wt_native_otel_prefix() {
-  local spoke_run_id="$1" body_dir="$2"
+  local spoke_run_id="$1" body_dir="$2" repo="${3:-}"
   [ "${AI_TOOLKIT_OTEL:-}" = "1" ] || return 0
   # Default the non-secret endpoints when unset (operator override preserved); the
   # normal gRPC :4317 / beta HTTP :4418 split is load-bearing — a beta endpoint on the
@@ -121,13 +133,21 @@ wt_native_otel_prefix() {
   : "${OTEL_EXPORTER_OTLP_ENDPOINT:=http://localhost:4317}"
   : "${BETA_TRACING_ENDPOINT:=http://localhost:4418}"
   wt_default_span_endpoint
+  # OTEL_RESOURCE_ATTRIBUTES is a comma-separated key=value list. repo=<name> rides
+  # alongside spoke_run_id (issue #343) so the collector can stamp a per-repo dimension
+  # (trace tag + observation metadata) onto every live span, making one shared Langfuse
+  # project sliceable per repo. An empty repo is omitted (never an empty attribute).
+  local resource="spoke_run_id=${spoke_run_id}"
+  if [ -n "$repo" ]; then
+    resource="${resource},repo=${repo}"
+  fi
   printf 'CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_EXPORTER_OTLP_ENDPOINT=%s BETA_TRACING_ENDPOINT=%s AI_TOOLKIT_OTEL_SPAN_ENDPOINT=%s OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_LOG_RAW_API_BODIES=%s AI_TOOLKIT_OTEL_BODY_DIR=%s OTEL_RESOURCE_ATTRIBUTES=%s ' \
     "$(printf '%q' "$OTEL_EXPORTER_OTLP_ENDPOINT")" \
     "$(printf '%q' "$BETA_TRACING_ENDPOINT")" \
     "$(printf '%q' "$AI_TOOLKIT_OTEL_SPAN_ENDPOINT")" \
     "$(printf '%q' "file:${body_dir}")" \
     "$(printf '%q' "$body_dir")" \
-    "$(printf '%q' "spoke_run_id=${spoke_run_id}")"
+    "$(printf '%q' "$resource")"
 }
 
 # Resolve the spoke driver's default model + effort (issue #142), layered so it works

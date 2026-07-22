@@ -690,7 +690,9 @@ if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   # OTLP sink (telemetry.sh, gated on AI_TOOLKIT_OTEL_SPAN_ENDPOINT) fires only when it is set —
   # the helper's own defaulting happens in a command-substitution subshell and cannot leak back.
   wt_default_span_endpoint
-  OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$OTEL_BODY_DIR")"
+  # repo=<name> (issue #343): the cross-project dimension, resolved from the main checkout's
+  # origin so it matches the #231 land-time repo: tag; the collector lifts it onto live spans.
+  OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$OTEL_BODY_DIR" "$(wt_repo_name "$REPO_ROOT")")"
 fi
 
 # Resolve the spoke driver's default model/effort via the shared helper (issue #142,

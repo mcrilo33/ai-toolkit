@@ -448,6 +448,43 @@ The land-time view build now stamps three families onto every assembled trace:
   `langfuse.environment` on every live spoke span (defaulting to `production`, overridable via
   `OTEL_RESOURCE_ATTRIBUTES=deployment.environment=<env>` for a test collector).
 
+### The repo dimension on live spans (Issue #343)
+
+The `repo:<name>` tag above lands only on the **assembled** `spoketree-`/`spokecycle-` traces
+at land time, but the spoke-latency dashboard's Observations/Scores widgets query the **live**
+per-turn spans — which historically carried only `spoke_run_id`. So one shared Langfuse project
+could not slice those widgets per repo. #343 closes that: the spoke launch now carries
+`repo=<name>` in `OTEL_RESOURCE_ATTRIBUTES` (resolved by `wt_repo_name` in
+`scripts/worktree-lib.sh` from the origin basename, matching the #231 land-time tag), and
+`otelcol.yaml` lifts it onto every live span two ways —
+
+- as the `repo:<name>` **trace tag** (`langfuse.trace.tags`), so the #231 "group by `tags`"
+  Traces-view recipe now works on live data too; and
+- as `metadata.repo` **observation metadata** (`langfuse.observation.metadata.repo`), a
+  filterable key the Observations/Scores widgets can scope on.
+
+Both stamps are guarded on the attribute, so an opted-out spoke (`AI_TOOLKIT_OTEL=0`) writes
+neither. The unit tests pin only the config **structure**; that Langfuse actually parses the
+JSON-array tag string is an operator-verify step (like the #128/#231 Langfuse behaviour), and
+`error_mode: ignore` means a tag Langfuse cannot parse is dropped while the `metadata.repo`
+filter still lands.
+
+### One project, per-repo + merged dashboards (Model A)
+
+With every tracked repo exporting to the **same** Langfuse project (identical
+`telemetry.langfuse.host`/`project`/keys in each synced `settings/ai-toolkit.yml`), the
+existing dashboards serve both views with no duplication:
+
+- **Merged (all projects)** — the dashboard with no repo filter reads every repo at once.
+- **Per-project** — add a `repo` dashboard **variable** (or a per-widget
+  `{"column": "metadata.repo" | "tags", "operator": "=" | "any of", "value": "<repo>"}` filter)
+  and switch it, rather than cloning the dashboard N times.
+- **Compare** — break down by `repo:` tag (Traces view) or `metadata.repo` (Observations).
+
+The alternative — one Langfuse **project** per repo — gives hard isolation but has no native
+merged dashboard (v3.192.x has no cross-project dashboard) and recreates the dashboard per
+project, so Model A is preferred whenever a merged view is wanted.
+
 ### Excluding test traffic from a dashboard
 
 The store holds ~10k synthetic fixture sessions from earlier test runs. They predate the

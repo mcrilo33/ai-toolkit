@@ -175,7 +175,9 @@ if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
   mkdir -p "$OTEL_BODY_DIR"
   wt_default_span_endpoint
-  OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$OTEL_BODY_DIR")"
+  # repo=<name> (issue #343): the cross-project dimension, resolved like the spawn path so a
+  # relaunched spoke stamps the same repo as a fresh one; the collector lifts it onto live spans.
+  OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$OTEL_BODY_DIR" "$(wt_repo_name "$REPO_ROOT")")"
 fi
 
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "$WT_AGENT_EFFORT") claude --model $(printf '%q' "$WT_AGENT_MODEL")"
