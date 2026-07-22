@@ -81,6 +81,39 @@ def test_travel_local_source_exists_and_is_executable() -> None:
     assert os.access(TRAVEL_LOCAL, os.X_OK), "scripts/travel-local.sh is not executable"
 
 
+# ── ensure-test-venv.sh registration (issue #342) ─────────────────────────────
+# The pre-push gate's testmon/xdist provisioner. worktree-new.sh runs it from a synced
+# target's .ai-toolkit/scripts/ at each spoke spawn, so it must ship there. Like
+# travel-local.sh it lives at the toolkit-root scripts/, so it takes the default source
+# case (no explicit `case` mapping) — the `new-hub-script-needs-sync-registration` convention.
+ENSURE_TEST_VENV = REPO_ROOT / "scripts" / "ensure-test-venv.sh"
+
+
+def test_ensure_test_venv_registered_in_sync_loop() -> None:
+    assert "ensure-test-venv.sh" in _for_name_list(), (
+        "ensure-test-venv.sh is not registered in sync_workflow_scripts() — it will not sync to "
+        ".ai-toolkit/scripts/ and worktree-new.sh could not provision the gate's deps in a target"
+    )
+
+
+def test_ensure_test_venv_takes_the_default_root_source_case() -> None:
+    # A toolkit-root script has no per-name `case` mapping (those route to
+    # shared/skills/hub/scripts/ or shared/hooks/lib/); it must fall through to the default.
+    body = _sync_workflow_scripts_body()
+    hub_case = re.search(r"\n\s*([\w.|-]*ensure-test-venv\.sh[\w.|-]*)\)\s+src=", body)
+    assert hub_case is None, (
+        "ensure-test-venv.sh must not have an explicit case mapping — it takes the default "
+        'src="$SCRIPT_DIR/$name" (toolkit-root scripts/)'
+    )
+
+
+def test_ensure_test_venv_source_exists_and_is_executable() -> None:
+    assert ENSURE_TEST_VENV.is_file(), (
+        "scripts/ensure-test-venv.sh missing — sync would copy nothing"
+    )
+    assert os.access(ENSURE_TEST_VENV, os.X_OK), "scripts/ensure-test-venv.sh is not executable"
+
+
 # ── hub-inject.sh registration (issue #251) ───────────────────────────────────
 # gate-broker.sh now hard-depends on hub-inject.sh as a co-located sibling
 # ($SCRIPT_DIR/hub-inject.sh) for the shared inject_and_verify primitive. If hub-inject.sh
