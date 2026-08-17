@@ -1001,7 +1001,13 @@ if [ -n "$WT_DIR" ]; then
     printf 'landed\n' > "$OUTCOME_FILE" 2>/dev/null \
       || wt_warn "couldn't stamp outcome=landed for $WT_DIR — trace may keep a stale/absent outcome tag"
   fi
-  bash "$SCRIPT_DIR/telemetry-ingest-spoke.sh" "$WT_DIR" ${REBUILD_VIEW:+"$REBUILD_VIEW"} \
+  # Thread the PRE-MERGE default tip (issue #344): the ingest dumps the spoke's commit range
+  # for the #162/#280/#231 enrichments, but it runs here AFTER the merge pushed and advanced
+  # origin/main, so its own origin/main..HEAD range is empty (worktrees share remote-tracking
+  # refs). PRE_SHA is the default tip captured before the merge (line ~565), so PRE_SHA..HEAD
+  # captures the spoke's commits. The ingest resolve-or-skips it and stays best-effort.
+  AI_TOOLKIT_COMMIT_BASE="$PRE_SHA" \
+    bash "$SCRIPT_DIR/telemetry-ingest-spoke.sh" "$WT_DIR" ${REBUILD_VIEW:+"$REBUILD_VIEW"} \
     || wt_warn "post-run Langfuse ingestion errored — landing continues"
 fi
 
