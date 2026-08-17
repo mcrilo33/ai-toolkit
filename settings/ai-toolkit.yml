@@ -163,12 +163,15 @@ test_budget:
 
 model:
   # The interactive spoke driver launched by worktree-new.sh. Routine spokes run
-  # Sonnet at high effort (2026-07-15 budget routing): no `[1m]` tier, so context
-  # compacts at the standard window instead of riding the long-context premium.
-  # Escalate a genuinely reasoning-heavy issue via the `lane:reasoning` label
-  # (model.overrides.by_label below) or an explicit `Model:` line in the issue.
+  # Sonnet 5 at high effort (2026-08-17 Claude 5 modernization): Sonnet 5 matches
+  # or exceeds Opus 4.8 per-turn at a fraction of the cost, so the driver returns to
+  # the budget tier from the 2026-07-16 speed revision's Opus 4.8. Still no `[1m]`
+  # tier, so context compacts at the standard window instead of riding the
+  # long-context premium. Escalate a genuinely reasoning-heavy issue via the
+  # `lane:reasoning` label (model.overrides.by_label below) or an explicit `Model:`
+  # line in the issue.
   spoke:
-    model: claude-opus-4-8
+    model: claude-sonnet-5
     effort: high
 
   # Model per solo-cycle step (issue #182). Realized by delegating each step to
@@ -182,17 +185,17 @@ model:
   # drift fails loud); an absent step fails open to the spoke driver model.
   cycle_steps:
     red:
-      model: claude-opus-4-8
+      model: claude-opus-5
       effort: high
     green:
       model: claude-sonnet-5
       effort: high
     review:
-      model: claude-opus-4-8
+      model: claude-opus-5
       effort: high
 
   # Per sub-agent model routing (issue #141): Fable is scarce, so it is reserved
-  # for the design/plan agents; Opus 4.8 for the reasoning-heavy ones; Sonnet 5
+  # for the design/plan agents; Opus 5 for the reasoning-heavy ones; Sonnet 5
   # for the capable-but-routine ones; Haiku for none. Sync stamps these into
   # each agent's claude `model:`/`effort:` frontmatter.
   subagents:
@@ -203,29 +206,29 @@ model:
       model: claude-fable-5
       effort: max
     debug:
-      model: claude-opus-4-8
+      model: claude-opus-5
       effort: max
     security-reviewer:
-      model: claude-opus-4-8
+      model: claude-opus-5
       effort: max
     code-review:
-      model: claude-opus-4-8
+      model: claude-opus-5
       effort: high
     tdd-red:
-      model: claude-opus-4-8
+      model: claude-opus-5
       effort: high
     devops:
-      model: claude-opus-4-8
+      model: claude-opus-5
       effort: max
     # Accurate Scope: derivation is the whole value of bug-scoper (#220); route
     # it to the strongest reasoning model.
     bug-scoper:
-      model: claude-opus-4-8
+      model: claude-opus-5
       effort: high
     # followup-scoper is bug-scoper's sibling (#331): same Scope:-derivation
     # reasoning is the value, so route it identically (opus / high).
     followup-scoper:
-      model: claude-opus-4-8
+      model: claude-opus-5
       effort: high
     tdd-green:
       model: claude-sonnet-5
@@ -244,7 +247,7 @@ model:
   # for now — the AFK answerer wiring lands in a follow-up (see issue #142).
   afk:
     answerer:
-      model: claude-opus-4-8
+      model: claude-opus-5
       effort: high
 
   # Per-issue-label model overrides. An issue carrying a listed label spawns its
@@ -252,7 +255,7 @@ model:
   overrides:
     by_label:
       lane:reasoning:
-        model: claude-opus-4-8
+        model: claude-opus-5
         effort: max
 
 # Where tooling defects are filed when ai-toolkit is synced into a host project
