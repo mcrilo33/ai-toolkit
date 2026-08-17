@@ -209,17 +209,20 @@ class TestGateParkWaitBucket:
         # immediately (00:00:04Z) — this is what collapses the first-activity window — while the
         # real resumption is at 00:03:25Z (204s after onset).
         gate = {
+            "id": "gate",
             "name": "script:gate",
             "startTime": "2026-01-02T00:00:00Z",
             "endTime": "2026-01-02T00:00:01Z",
         }
         stray = {
+            "id": "stray",
             "type": "GENERATION",
             "name": "llm_request",
             "startTime": "2026-01-02T00:00:04Z",
             "endTime": "2026-01-02T00:00:05Z",
         }
         resume = {
+            "id": "resume",
             "type": "GENERATION",
             "name": "llm_request",
             "startTime": "2026-01-02T00:03:25Z",
@@ -232,16 +235,19 @@ class TestGateParkWaitBucket:
         return root["body"]["metadata"]["rollup"]["duration"]["components"]["wait"]
 
     def test_wait_collapses_to_first_activity_without_answer_epoch(self) -> None:
-        # Onset 00:00:01 -> stray 00:00:04 = 3s: the under-count the issue reports.
+        # 1_000 ms gate emission + onset 00:00:01 -> stray 00:00:04 = 3_000 ms park = 4_000 ms: the
+        # under-count the issue reports (vs the 205_000 ms real park below).
         batch = build_batch(self._traces(), _SPOKE)
-        assert self._wait_ms(batch) < 5_000
+        assert self._wait_ms(batch) == 4_000
 
     def test_wait_widens_to_the_answer_epoch(self) -> None:
-        # Onset 00:00:01 -> answer 00:03:25 = 204_000 ms; the stray span only books its own 1s of
-        # span-time (overlap pinned, not carved), so the root wait bucket is the full park.
+        # 1_000 ms gate emission (script:gate is itself a wait node) + the park onset 00:00:01 ->
+        # answer 00:03:25 = 204_000 ms -> 205_000 ms. The stray activity overlapping the park only
+        # books its own 1s into llm_request (span-time, overlap pinned, not carved out of wait), so
+        # the root wait bucket is the full park -- no ~850x collapse.
         answer = _iso_to_epoch("2026-01-02T00:03:25Z")
         batch = build_batch(self._traces(), _SPOKE, answer_epoch=answer)
-        assert self._wait_ms(batch) == 204_000
+        assert self._wait_ms(batch) == 205_000
 
 
 class TestStripContainerUsage:

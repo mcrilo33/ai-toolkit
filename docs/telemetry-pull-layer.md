@@ -206,7 +206,7 @@ subtraction never erases them:
 | `hook` | `*.sh` spans / `workflow.kind == hook`. |
 | `script` | `workflow.kind == script` spans (`script:worktree-land`, `script:spoke-push`, …). |
 | `step` | Cycle-step nodes' own gap time (step overhead not covered by real spans). |
-| `wait` | Human/gate wait: folded `blocked_on_user_ms` + the gate script (`script:gate`). |
+| `wait` | Human/gate wait: folded `blocked_on_user_ms` + the gate script (`script:gate`) + the `wait:gate-park` block. The park spans the gate onset → the drain's `answer-attempt` epoch when present (the real PLAN-gate wait, matching `gate_park_ms` / `stage_gate_answer_ms`), else the first-activity resume (#345). |
 | `turn` | Interactions' own gap (thinking/streaming outside child spans). |
 | `self` | The container's own unattributed gap — inter-turn idle on the root. |
 | `other` | Anything unclassified; untimed nodes contribute 0. |
@@ -328,8 +328,12 @@ PLAN-gate park emission.
 > high-cardinality dimension the Metrics API only accepts as a *filter*. To read
 > one spoke's wait, add
 > `{"column": "sessionId", "operator": "=", "value": "<spoke_run_id>", "type": "string"}`
-> to the filters — or read `rollup.duration.components.wait` off the spoke's
-> assembled root span, which carries the same answer per spoke.
+> to the filters. For the PLAN-gate park specifically, `gate_park_ms` is the
+> per-spoke answer, and it agrees with `stage_gate_answer_ms` (both measure the park
+> onset → the drain's `answer-attempt` epoch since #345). The root
+> `rollup.duration.components.wait` includes that same park window, but ALSO the gate
+> emission and folded `blocked_on_user_ms` permission wait — so use `gate_park_ms` when
+> you want the park alone, and `wait` for total spoke wait.
 
 ### Widget 5 — per-skill cost (Issue #322)
 
@@ -547,7 +551,9 @@ Five trace-level numeric scores decompose the wall-clock, chartable exactly like
 
 - **`stage_spawn_seed_ms`** — dispatch epoch → first-commit author time.
 - **`stage_gate_answer_ms`** — PLAN-gate park onset → the `answer-attempt-<N>.epoch` the drain
-  stamped (the auto-answer leg, extending the existing `gate_park_ms` park window).
+  stamped (the auto-answer leg). Since #345 fed the same answer epoch into `gate_park_ms`, the two
+  measure the same window and agree; `gate_park_ms` falls back to the first-activity resume only
+  when no answer epoch was stamped (pre-#280 lands / degraded re-runs).
 - **`stage_review_ms`** — Σ the review span windows: the `sub-agent:code-review` containers (the
   real-duration signal) plus any `agent:review` broker span (zero-duration today, so it contributes
   0 and the score skips when only those match).

@@ -266,6 +266,7 @@ def build_score_events(
     batch: list[IngestEvent],
     *,
     base_ts: str,
+    answer_epoch: int | None = None,
 ) -> list[IngestEvent]:
     """Build the numeric Langfuse scores that make a spoke's metadata chartable (#100, #101).
 
@@ -278,7 +279,9 @@ def build_score_events(
       reconstructed ``tool_result_size`` (#101 part 4), so "which tool outputs bloat context"
       is a one-click chart.
     - ``gate_park_ms`` — a trace-level score for the PLAN-gate park (:func:`_gate_park_ms`),
-      emitted only when the spoke parked at a gate.
+      emitted only when the spoke parked at a gate. With ``answer_epoch`` it measures the real park
+      (onset -> answer) and agrees with ``stage_gate_answer_ms`` rather than the collapsed
+      first-activity window (#345).
 
     All ids derive from the spoke run id so a rerun overwrites the same scores.
 
@@ -288,6 +291,9 @@ def build_score_events(
         batch: The assembled events (read for the folded ``blocked_on_user_ms`` /
             ``tool_result_size`` tool metadata).
         base_ts: ISO timestamp stamped on every score event.
+        answer_epoch: The drain's PLAN-gate answer-attempt epoch (``lifecycle.answer_attempt``),
+            widening the ``gate_park_ms`` window when present; None falls back to the
+            first-activity resume (#345).
 
     Returns:
         The ``score-create`` ingestion events (empty when no signal is present).
@@ -321,7 +327,7 @@ def build_score_events(
                     observation_id=body["id"],
                 )
             )
-    park = _gate_park_ms(traces)
+    park = _gate_park_ms(traces, answer_epoch=answer_epoch)
     if park is not None:
         events.append(
             _score_event(
@@ -1584,10 +1590,11 @@ def _spawn_seed_ms(commits: list[dict[str, Any]], lifecycle: Lifecycle) -> int |
 def _gate_answer_ms(traces: list[TraceObservations], lifecycle: Lifecycle) -> int | None:
     """Return the PLAN-gate answer-latency ms: park onset -> auto-answer attempt, or None (#280).
 
-    Extends the trace-level ``gate_park_ms`` window (:func:`_gate_park_bounds`, the park onset) with
-    the ``answer-attempt-<N>.epoch`` the drain stamps when it delivers a PLAN-gate answer. None when
-    the spoke never parked at a gate, no answer was attempted, or the attempt predates the park
-    onset (an unrelated stale epoch).
+    Reads the park onset from :func:`_gate_park_bounds` (called WITHOUT ``answer_epoch``, so only
+    ``bounds[0]`` — the onset — is used) and the ``answer-attempt-<N>.epoch`` the drain stamps when
+    it delivers a PLAN-gate answer. Since #345 fed the same answer epoch into ``gate_park_ms``, the
+    two now measure the same window and agree by design. None when the spoke never parked at a gate,
+    no answer was attempted, or the attempt predates the park onset (an unrelated stale epoch).
     """
     bounds = _gate_park_bounds(traces)
     answer = lifecycle.answer_attempt

@@ -187,6 +187,29 @@ class TestGatePark:
         answer = _iso_to_epoch("2026-01-02T00:01:41Z")
         assert _gate_park_ms(self._traces(), answer_epoch=answer) == 100000
 
+    def test_answer_path_floors_both_ends_matching_stage_arithmetic(self) -> None:
+        # A sub-second gate end: the answer path floors BOTH bounds to whole seconds, so
+        # gate_park_ms == stage_gate_answer_ms's (answer - floor(onset)) * 1000 exactly -- never a
+        # sub-second-drifted or negative window (#345 review).
+        traces = [
+            (
+                "tr",
+                [
+                    {
+                        "name": "script:gate",
+                        "startTime": "2026-01-02T00:00:00Z",
+                        "endTime": "2026-01-02T00:00:01.700Z",
+                    }
+                ],
+            )
+        ]
+        answer = _iso_to_epoch("2026-01-02T00:01:41Z")
+        assert _gate_park_bounds(traces, answer_epoch=answer) == (
+            "2026-01-02T00:00:01Z",
+            "2026-01-02T00:01:41Z",
+        )
+        assert _gate_park_ms(traces, answer_epoch=answer) == 100000
+
     def test_gate_park_event_ends_at_answer_epoch(self) -> None:
         answer = _iso_to_epoch("2026-01-02T00:01:41Z")
         event = _gate_park_event(

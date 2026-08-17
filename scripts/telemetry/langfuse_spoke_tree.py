@@ -320,6 +320,7 @@ def build_batch(
     *,
     keep_noop_guards: bool = False,
     commits: list[dict[str, Any]] | None = None,
+    answer_epoch: int | None = None,
 ) -> list[IngestEvent]:
     """Assemble one nested trace from a spoke's source traces and their observations.
 
@@ -400,7 +401,12 @@ def build_batch(
     )
     events.extend(commit_events)
     gate_park = _gate_park_event(
-        traces, spoke_run_id=spoke_run_id, trace_id=trace_id, cycle=False, parent_id=root_id
+        traces,
+        spoke_run_id=spoke_run_id,
+        trace_id=trace_id,
+        cycle=False,
+        parent_id=root_id,
+        answer_epoch=answer_epoch,
     )
     if gate_park is not None:
         events.append(gate_park)
@@ -496,6 +502,7 @@ def build_cycle_batch(
     *,
     keep_noop_guards: bool = False,
     commits: list[dict[str, Any]] | None = None,
+    answer_epoch: int | None = None,
 ) -> list[IngestEvent]:
     """Assemble the View B (steps -> work) ``spokecycle-<spoke>`` trace (#113).
 
@@ -604,7 +611,12 @@ def build_cycle_batch(
     # Commit instants are likewise excluded so an out-of-window author time cannot stretch the root.
     duration_exclude = marker_ids | _hook_event_exclude(events) | {e["id"] for e in commit_events}
     gate_park = _gate_park_event(
-        traces, spoke_run_id=spoke_run_id, trace_id=trace_id, cycle=True, parent_id=root_id
+        traces,
+        spoke_run_id=spoke_run_id,
+        trace_id=trace_id,
+        cycle=True,
+        parent_id=root_id,
+        answer_epoch=answer_epoch,
     )
     if gate_park is not None:
         events.append(gate_park)
@@ -1097,7 +1109,11 @@ def _enrich_scores(ctx: EnrichmentContext) -> None:
     leaving the out-of-scope registry equality assertion transparently true.
     """
     ctx.score_events = build_score_events(
-        ctx.spoke_run_id, ctx.traces, ctx.batch, base_ts=ctx.base_ts
+        ctx.spoke_run_id,
+        ctx.traces,
+        ctx.batch,
+        base_ts=ctx.base_ts,
+        answer_epoch=ctx.lifecycle.answer_attempt,
     )
     stage_scores = build_lifecycle_stage_scores(
         ctx.spoke_run_id, ctx.traces, ctx.commits, ctx.lifecycle, base_ts=ctx.base_ts
@@ -1284,12 +1300,16 @@ def main(argv: list[str] | None = None) -> int:
     scan_root = transcript_scan_root(args.projects, args.root.resolve())
     tool_content = scan_transcripts(scan_root, _tool_span_ids(traces))
     commits = _load_commits(args.commits)
+    # Loaded before the batch builds (moved up from the timeline step) so the drain's PLAN-gate
+    # answer epoch widens the wait:gate-park node to the real park window (#345).
+    lifecycle = _load_lifecycle(args.lifecycle)
     batch = build_batch(
         traces,
         args.spoke_run_id,
         tool_content,
         keep_noop_guards=args.keep_noop_guards,
         commits=commits,
+        answer_epoch=lifecycle.answer_attempt,
     )
     cycle_batch = build_cycle_batch(
         traces,
@@ -1297,6 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
         tool_content,
         keep_noop_guards=args.keep_noop_guards,
         commits=commits,
+        answer_epoch=lifecycle.answer_attempt,
     )
     mode, lane = read_mode_lane(args.root.resolve())
     apply_mode_lane_tags(batch, mode, lane)
@@ -1306,7 +1327,6 @@ def main(argv: list[str] | None = None) -> int:
     apply_outcome_tag(cycle_batch, outcome)
     apply_repo_tag(batch, args.repo)
     apply_repo_tag(cycle_batch, args.repo)
-    lifecycle = _load_lifecycle(args.lifecycle)
     timeline = build_lifecycle_timeline(lifecycle, commits, traces)
     apply_lifecycle_metadata(batch, cycle_batch, timeline)
 
