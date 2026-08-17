@@ -1797,6 +1797,40 @@ def test_land_after_prior_block_outcome_passes_rebuild(hub: Path, tmp_path: Path
     assert (wt / ".ai-toolkit" / "outcome").read_text().strip() == "landed"
 
 
+def test_land_threads_pre_merge_tip_to_ingest(hub: Path, tmp_path: Path) -> None:
+    # Regression for #344: the land runs the ingest AFTER the merge pushes, so origin/main
+    # already contains the spoke's commit (worktrees share remote-tracking refs) and the
+    # ingest's origin/main..HEAD range is EMPTY — every commit-derived enrichment is lost.
+    # The land must thread the PRE-MERGE default tip so the range predates the merge. Prove it
+    # end-to-end: the view builder gets a non-empty --commits dump carrying the spoke commit.
+    wt = _make_spoke(hub, tmp_path, "feature/1-commitbase", push=True)
+    _seed_otel_spoke(hub, wt, raw_bodies=True)
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_BASIC_AUTH="Basic-test-127"\n')
+
+    proc, logs = _run_land(
+        hub,
+        tmp_path,
+        "1",
+        stub_python312=True,
+        stub_curl=True,
+        extra_env={
+            "AFK_TELEMETRY_CONF": str(conf),
+            "AI_TOOLKIT_INGEST_FLUSH_WAIT": "0",
+            "WT_DONE": str(_noop_wt_done(tmp_path)),  # keep the worktree so commits.dump survives
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    ingest_log = _log_text(logs["python3.12"])
+    assert "--commits" in ingest_log, (
+        "the pre-merge tip must be threaded so origin/main..HEAD's post-push emptiness "
+        "does not drop the commits dump"
+    )
+    dump = (wt / ".ai-toolkit" / "commits.dump").read_text()
+    assert "feat: work" in dump, "the spoke's own commit must be captured in the dump"
+
+
 def test_land_without_ai_toolkit_dir_writes_no_outcome(hub: Path, tmp_path: Path) -> None:
     # #231: a non-OTel worktree (no .ai-toolkit) must NOT gain an outcome pointer — writing there
     # would only dirty a tree the teardown then refuses to remove. The land still succeeds.
