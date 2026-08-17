@@ -324,8 +324,8 @@ if [ -n "$BODY_DIR" ]; then
   #
   # The base is the PRE-MERGE default tip handed in by worktree-land.sh via AI_TOOLKIT_COMMIT_BASE
   # (issue #344): the land runs this AFTER the merge pushes, so origin/main already contains HEAD
-  # (worktrees share remote-tracking refs) and origin/main..HEAD is EMPTY. PRE_SHA predates the
-  # merge, so PRE_SHA..HEAD captures the spoke's own commits. Fallback to origin/main only for a
+  # (worktrees share remote-tracking refs) and origin/main..HEAD is EMPTY. The base predates the
+  # merge, so <base>..HEAD captures the spoke's own commits. Fallback to origin/main only for a
   # manual re-run that hands in no base. Resolve-or-skip (#344 guard): an unresolvable base
   # (bare-branch/--local, bad sha) SKIPS --commits rather than falling back to the empty post-push
   # range — absence of a dump is not evidence of zero churn.

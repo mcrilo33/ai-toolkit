@@ -836,15 +836,17 @@ def test_commit_base_env_used_under_rebuild(worktree: Path, tmp_path: Path) -> N
 
 def test_skips_commits_when_base_unresolvable(worktree: Path, tmp_path: Path) -> None:
     # #344 item 2: an unresolvable base (here a bogus sha) must SKIP --commits, NOT silently fall
-    # back to the empty post-push origin/main..HEAD range.
+    # back to origin/main..HEAD. Pin origin/main BEHIND HEAD (at the base commit) so the two
+    # behaviors are distinguishable: a correct skip yields no --commits, but a regressed
+    # fall-back-to-origin/main would leak a non-empty base..HEAD dump and flip --commits present.
     _git(worktree, "init", "-q")
     (worktree / "base.txt").write_text("base\n")
     _git(worktree, "add", "-A")
     _git(worktree, "commit", "-qm", "chore: base")
+    _git(worktree, "update-ref", "refs/remotes/origin/main", "HEAD")  # origin/main at the base
     (worktree / "a.py").write_text("x\n")
     _git(worktree, "add", "a.py")
-    _git(worktree, "commit", "-qm", "feat: add a")
-    _git(worktree, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(worktree, "commit", "-qm", "feat: add a")  # HEAD is now ahead of origin/main
     bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
     _make_python_stub(bindir, runlog)
 
