@@ -773,6 +773,91 @@ def test_no_commits_flag_when_not_a_git_repo(worktree: Path, tmp_path: Path) -> 
     assert "--commits" not in tree
 
 
+def test_commit_base_env_overrides_post_push_range(worktree: Path, tmp_path: Path) -> None:
+    # Regression for #344: the land calls this AFTER the merge pushes, so origin/main already
+    # contains HEAD (worktrees share remote-tracking refs). origin/main..HEAD is then EMPTY and
+    # the spoke's own commits are lost. The land passes the pre-merge tip in AI_TOOLKIT_COMMIT_BASE
+    # so the range predates the merge even though origin/main == HEAD.
+    _git(worktree, "init", "-q")
+    (worktree / "base.txt").write_text("base\n")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-qm", "chore: base")
+    base_sha = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    (worktree / "a.py").write_text("x\ny\n")
+    _git(worktree, "add", "a.py")
+    _git(worktree, "commit", "-qm", "feat: add a")
+    # Model the post-push shared-ref state: origin/main already points at HEAD.
+    _git(worktree, "update-ref", "refs/remotes/origin/main", "HEAD")
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    result = _run(worktree, bindir, extra_env={"AI_TOOLKIT_COMMIT_BASE": base_sha})
+
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "--commits" in tree, "the pre-merge base must yield a non-empty commits dump"
+    dump = (worktree / ".ai-toolkit" / "commits.dump").read_text()
+    assert "feat: add a" in dump
+    assert "a.py" in dump
+    assert "chore: base" not in dump  # only base..HEAD, not the base commit itself
+
+
+def test_commit_base_env_used_under_rebuild(worktree: Path, tmp_path: Path) -> None:
+    # #344 item 3: a --rebuild re-run must also base on the pre-merge tip, not the empty range.
+    _git(worktree, "init", "-q")
+    (worktree / "base.txt").write_text("base\n")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-qm", "chore: base")
+    base_sha = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    (worktree / "a.py").write_text("x\n")
+    _git(worktree, "add", "a.py")
+    _git(worktree, "commit", "-qm", "feat: add a")
+    _git(worktree, "update-ref", "refs/remotes/origin/main", "HEAD")
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    result = _run(
+        worktree, bindir,
+        argv=[str(worktree), "--rebuild"],
+        extra_env={"AI_TOOLKIT_COMMIT_BASE": base_sha},
+    )
+
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "--rebuild" in tree
+    assert "--commits" in tree
+
+
+def test_skips_commits_when_base_unresolvable(worktree: Path, tmp_path: Path) -> None:
+    # #344 item 2: an unresolvable base (here a bogus sha) must SKIP --commits, NOT silently fall
+    # back to the empty post-push origin/main..HEAD range.
+    _git(worktree, "init", "-q")
+    (worktree / "base.txt").write_text("base\n")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-qm", "chore: base")
+    (worktree / "a.py").write_text("x\n")
+    _git(worktree, "add", "a.py")
+    _git(worktree, "commit", "-qm", "feat: add a")
+    _git(worktree, "update-ref", "refs/remotes/origin/main", "HEAD")
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    result = _run(
+        worktree, bindir,
+        extra_env={"AI_TOOLKIT_COMMIT_BASE": "0" * 40},
+    )
+
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "--commits" not in tree
+
+
 # --- #280 per-issue cycle-time source gathering -------------------------------
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "t",
