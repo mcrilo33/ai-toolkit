@@ -358,6 +358,7 @@ def build_normalization_scores(
     subtasks: int,
     *,
     base_ts: str,
+    commits_dump_present: bool,
 ) -> list[IngestEvent]:
     """Build the trace-level normalization scores that size a spoke's cost + latency (#231).
 
@@ -377,9 +378,13 @@ def build_normalization_scores(
       figure :func:`build_step_total_cost_scores` reconciles to ``totalCost``) ÷ ``lines_changed``.
     - ``wall_per_subtask`` — the root subtree wall-clock (ms) ÷ ``subtasks``.
 
-    The four base counts are always emitted (0 included); a ratio is SKIPPED when its denominator
-    is 0 so an empty spoke never divides by zero. All are trace-level NUMERIC scores; ids derive
-    from the spoke run id so a rerun overwrites the same scores.
+    ``subtasks`` is always emitted (0 included). The three churn base counts (``commits`` /
+    ``files_changed`` / ``lines_changed``) are emitted only when a commits dump was actually parsed
+    (``commits_dump_present``): an absent dump is not evidence of zero churn, so scoring it 0 would
+    be a wrong value that poisons the #231 dashboards — it is SKIPPED instead (#344). A
+    present-but-empty dump (a genuinely empty spoke) still legitimately reads 0. A ratio is SKIPPED
+    when its denominator is 0 so an empty spoke never divides by zero. All are trace-level NUMERIC
+    scores; ids derive from the spoke run id so a rerun overwrites the same scores.
 
     Args:
         spoke_run_id: The spoke run identifier (keys the deterministic score ids + the root id).
@@ -387,10 +392,12 @@ def build_normalization_scores(
         batch: The assembled View A events (its generations' ``costDetails`` + root duration read).
         subtasks: The cycle-window count (the ledger subtask count).
         base_ts: ISO timestamp stamped on every score event.
+        commits_dump_present: Whether a commits dump was handed to the builder. False (no ``--commits``)
+            skips the churn base counts rather than emitting misleading zeros (#344).
 
     Returns:
-        The four base-count ``score-create`` events plus each derived ratio whose denominator is
-        non-zero.
+        ``subtasks`` plus (when a dump was present) the three churn base-count ``score-create``
+        events, plus each derived ratio whose denominator is non-zero.
     """
     trace_id = trace_id_for(spoke_run_id)
     files_changed = len({path for commit in commits for path in commit.get("files") or []})
@@ -402,12 +409,16 @@ def build_normalization_scores(
         for event in batch
         if event.get("type") == "generation-create"
     )
-    values: dict[str, float] = {
-        _FILES_CHANGED_SCORE: files_changed,
-        _LINES_CHANGED_SCORE: lines_changed,
-        _COMMITS_SCORE: len(commits),
-        _SUBTASKS_SCORE: subtasks,
-    }
+    # subtasks is derived from the cycle windows, independent of the commit dump, so it is always
+    # emitted. The three churn base counts are emitted ONLY when a dump was actually parsed: an
+    # absent dump (the #344 empty-range bug, or a bare-branch/--local checkout) carries no churn
+    # information, so scoring it 0 would be a WRONG value that poisons the #231 dashboards — skip it
+    # instead. A present-but-empty dump (a genuinely empty spoke) still legitimately reads 0.
+    values: dict[str, float] = {_SUBTASKS_SCORE: subtasks}
+    if commits_dump_present:
+        values[_FILES_CHANGED_SCORE] = files_changed
+        values[_LINES_CHANGED_SCORE] = lines_changed
+        values[_COMMITS_SCORE] = len(commits)
     if lines_changed:
         values[_COST_PER_CHANGED_LINE_SCORE] = total_cost / lines_changed
     if subtasks:

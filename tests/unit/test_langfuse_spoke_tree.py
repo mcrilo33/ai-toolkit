@@ -5023,6 +5023,7 @@ class TestNormalizationScores:
             self._batch(total_ms=6000, cost=1.0),
             3,
             base_ts="2026-01-01T00:00:00Z",
+            commits_dump_present=True,
         )
 
         assert self._val(scores, "files_changed") == 3  # x, y, z — y de-duplicated
@@ -5037,6 +5038,7 @@ class TestNormalizationScores:
             self._batch(total_ms=6000, cost=2.0),
             3,
             base_ts="2026-01-01T00:00:00Z",
+            commits_dump_present=True,
         )
 
         assert self._val(scores, "cost_per_changed_line") == pytest.approx(2.0 / 20)
@@ -5048,13 +5050,22 @@ class TestNormalizationScores:
             self._batch(total_ms=6000, cost=1.0),
             3,
             base_ts="2026-01-01T00:00:00Z",
+            commits_dump_present=True,
         )
 
         assert self._val(scores, "wall_per_subtask") == pytest.approx(2000)
 
     def test_no_cost_ratio_when_no_lines_changed(self) -> None:
+        # A present-but-empty dump (a genuinely empty spoke) legitimately reads 0 for the base
+        # counts — distinct from an absent dump, which skips them (see TestNormalizationDumpPresence
+        # in test_spoke_tree_scores.py, #344).
         scores = build_normalization_scores(
-            SPOKE, [], self._batch(total_ms=6000, cost=1.0), 3, base_ts="2026-01-01T00:00:00Z"
+            SPOKE,
+            [],
+            self._batch(total_ms=6000, cost=1.0),
+            3,
+            base_ts="2026-01-01T00:00:00Z",
+            commits_dump_present=True,
         )
 
         assert self._val(scores, "lines_changed") == 0
@@ -5067,6 +5078,7 @@ class TestNormalizationScores:
             self._batch(total_ms=6000, cost=1.0),
             0,
             base_ts="2026-01-01T00:00:00Z",
+            commits_dump_present=True,
         )
 
         assert self._val(scores, "subtasks") == 0
@@ -5079,6 +5091,7 @@ class TestNormalizationScores:
             self._batch(total_ms=6000, cost=1.0),
             3,
             base_ts="2026-01-01T00:00:00Z",
+            commits_dump_present=True,
         )
 
         body = self._by_name(scores, "files_changed")[0]["body"]

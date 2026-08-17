@@ -451,7 +451,12 @@ The land-time view build now stamps three families onto every assembled trace:
 - **Normalization** — `files_changed`, `lines_changed`, `commits`, `subtasks` numeric scores
   plus the derived `cost_per_changed_line` and `wall_per_subtask`, so a cheap one-line fix
   and an expensive refactor are comparable. Computed from the commit numstat + cycle windows
-  the builder already has (a ratio is skipped when its denominator is 0).
+  the builder already has (a ratio is skipped when its denominator is 0). `subtasks` is always
+  emitted; the three churn base counts are emitted only when a commits dump was actually parsed
+  (the land threads the pre-merge tip so the range is non-empty, issue #344) — when no dump
+  reaches the builder they are **skipped, not scored 0**, since an absent dump is not evidence of
+  zero churn (the pull layer's skip-rather-than-emit-a-wrong-value rule). A present-but-empty dump
+  (a genuinely empty spoke) still reads 0.
 - **Cross-project** — a `repo:<name>` trace tag (resolved by `telemetry-ingest-spoke.sh` from
   the origin remote, else the checkout dir basename) and the Langfuse `environment` field:
   the assembled views are stamped `production`, and `dashboard/langfuse/otelcol.yaml` stamps

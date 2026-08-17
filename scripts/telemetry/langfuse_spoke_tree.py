@@ -996,6 +996,11 @@ class EnrichmentContext:
     root: Path
     n_requests: int = 0
     commits: list[dict[str, Any]] = field(default_factory=list)
+    # Whether a commits dump was actually handed to the builder (#344). Distinct from an empty
+    # `commits` list: absence of a dump (the empty-range bug, or a bare-branch/--local checkout the
+    # ingest resolve-or-skips) is NOT evidence of zero churn, so the normalization base counts are
+    # skipped rather than emitted as misleading zeros.
+    commits_dump_present: bool = False
     lifecycle: Lifecycle = field(default_factory=Lifecycle)
     # Accumulated outputs (populated by the passes, read by the summary line).
     context_events: list[IngestEvent] = field(default_factory=list)
@@ -1203,7 +1208,12 @@ def _enrich_normalization(ctx: EnrichmentContext) -> None:
     """
     subtasks = len(build_cycle_windows(ctx.traces, ctx.tool_content))
     ctx.normalization_scores = build_normalization_scores(
-        ctx.spoke_run_id, ctx.commits, ctx.batch, subtasks, base_ts=ctx.base_ts
+        ctx.spoke_run_id,
+        ctx.commits,
+        ctx.batch,
+        subtasks,
+        base_ts=ctx.base_ts,
+        commits_dump_present=ctx.commits_dump_present,
     )
 
 
@@ -1323,6 +1333,7 @@ def main(argv: list[str] | None = None) -> int:
         root=args.root.resolve(),
         n_requests=main_loop_request_count(traces),
         commits=commits,
+        commits_dump_present=args.commits is not None,
         lifecycle=lifecycle,
     )
     for _name, enrich in _ENRICHMENTS:
