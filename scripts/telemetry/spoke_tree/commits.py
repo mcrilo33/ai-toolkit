@@ -22,7 +22,9 @@ from telemetry.spoke_tree.observations import (
     IngestEvent,
     TraceObservations,
     _elapsed_ms,
+    _epoch_to_iso,
     _is_gate_observation,
+    _iso_to_epoch,
     _parse_ts,
 )
 
@@ -73,14 +75,35 @@ def _earliest_after(candidates: list[str], floor: datetime) -> str | None:
     return best_str
 
 
-def _gate_park_bounds(traces: list[TraceObservations]) -> tuple[str, str] | None:
+def _gate_park_bounds(
+    traces: list[TraceObservations], *, answer_epoch: int | None = None
+) -> tuple[str, str] | None:
     """Return the PLAN-gate park's ``(start, end)`` ISO bounds, or None when the spoke never parked.
 
     The park starts at the end of the earliest gate observation (:func:`_is_gate_observation`,
-    the ``spoke-ready.sh --gate`` emission) and ends at the first genuine spoke activity
-    (:func:`_is_activity_observation`) that starts after it — the resumption once the plan was
-    approved. All comparisons parse the ISO timestamps. None when there is no gate observation or
-    nothing resumed after it.
+    the ``spoke-ready.sh --gate`` emission). Its end is:
+
+    - the drain's PLAN-gate answer-attempt epoch (``answer_epoch``, ``lifecycle.answer_attempt``)
+      when present and at or after the onset second — the true resumption, the same window
+      ``stage_gate_answer_ms`` measures (#345). On this path BOTH bounds are floored to whole
+      seconds via ``_iso_to_epoch``/``_epoch_to_iso`` — the exact arithmetic ``_gate_answer_ms``
+      applies — so ``gate_park_ms`` equals ``stage_gate_answer_ms`` to the millisecond (no
+      sub-second drift) and the window can never be negative when ``answer_epoch >= onset``; otherwise
+    - the first genuine spoke activity (:func:`_is_activity_observation`) that starts after the
+      onset — the fallback for pre-#280 lands / degraded re-runs with no answer epoch, and for a
+      stale epoch that predates the onset. This path keeps the raw gate-end / activity ISO strings.
+
+    Widening to the answer epoch corrects the ``wait:gate-park`` node, the root ``wait`` bucket, and
+    ``gate_park_ms`` in one place: under the ``/afk`` drain the first activity fires almost
+    immediately, collapsing the fallback window to a few hundred ms rather than the real park.
+
+    All comparisons parse the ISO timestamps. None when there is no gate observation, or when
+    neither an answer epoch nor a resume bounds the end.
+
+    UPGRADE: the answer path assumes ``answer_epoch`` (the drain's own on-machine epoch) is not far
+    past the last real activity; a corrupt far-future value would stretch View A's end-time-less
+    root subtree and inflate ``total_ms``. Clamp the park end to the last activity end if a degraded
+    lifecycle ever supplies one.
     """
     gate_ends: list[str] = []
     activity_starts: list[str] = []
@@ -96,15 +119,31 @@ def _gate_park_bounds(traces: list[TraceObservations]) -> tuple[str, str] | None
     if not parsed_gates:
         return None
     gate_floor, gate_end = min(parsed_gates, key=lambda pair: pair[0])
+    # Onset epoch via _iso_to_epoch (naive-as-UTC), the SAME conversion _gate_answer_ms applies to
+    # bounds[0]. Flooring BOTH bounds to whole seconds makes gate_park_ms == stage_gate_answer_ms
+    # exactly and keeps the window non-negative for any answer at/after the onset second (#345).
+    onset_epoch = _iso_to_epoch(gate_end)
+    if answer_epoch is not None and onset_epoch is not None and answer_epoch >= onset_epoch:
+        onset_iso = _epoch_to_iso(onset_epoch)
+        answered = _epoch_to_iso(answer_epoch)
+        if onset_iso is not None and answered is not None:
+            return onset_iso, answered
     resume = _earliest_after(activity_starts, gate_floor)
     if resume is None:
         return None
     return gate_end, resume
 
 
-def _gate_park_ms(traces: list[TraceObservations]) -> int | None:
-    """Return the PLAN-gate park wait in ms, or None when the spoke never parked at a gate."""
-    bounds = _gate_park_bounds(traces)
+def _gate_park_ms(
+    traces: list[TraceObservations], *, answer_epoch: int | None = None
+) -> int | None:
+    """Return the PLAN-gate park wait in ms, or None when the spoke never parked at a gate.
+
+    Passes ``answer_epoch`` through so ``gate_park_ms`` measures the real park (onset -> answer)
+    and agrees with ``stage_gate_answer_ms``, falling back to the first-activity window when the
+    epoch is absent or stale (#345).
+    """
+    bounds = _gate_park_bounds(traces, answer_epoch=answer_epoch)
     return _elapsed_ms(*bounds) if bounds is not None else None
 
 
@@ -250,18 +289,20 @@ def _gate_park_event(
     trace_id: str,
     cycle: bool,
     parent_id: str,
+    answer_epoch: int | None = None,
 ) -> IngestEvent | None:
     """Build the ``wait:gate-park`` timeline block from the gate-park bounds, or None (#162).
 
-    The block spans the gate's end to the resumption after approval (:func:`_gate_park_bounds`);
-    its ``wait:`` name routes it into the duration ``wait`` bucket, so in View A the park time
-    moves out of the root's ``self`` gap without changing ``total_ms``.
+    The block spans the gate's end to the resumption after approval (:func:`_gate_park_bounds`,
+    the drain's ``answer_epoch`` when present, else the first-activity resume — #345); its ``wait:``
+    name routes it into the duration ``wait`` bucket, so in View A the park time moves out of the
+    root's ``self`` gap without changing ``total_ms``.
 
     UPGRADE: in the rare case a non-activity span (a second gate, a hook) falls inside the park
     window, both it and this node book the overlap into ``wait`` (span-time, not wall-time) — carve
     the node's interval around such spans if the wait bucket ever needs to be exact.
     """
-    bounds = _gate_park_bounds(traces)
+    bounds = _gate_park_bounds(traces, answer_epoch=answer_epoch)
     if bounds is None:
         return None
     start, end = bounds

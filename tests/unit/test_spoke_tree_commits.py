@@ -16,6 +16,7 @@ from telemetry.spoke_tree.commits import (
     _gate_park_ms,
     _parse_commits,
 )
+from telemetry.spoke_tree.observations import _iso_to_epoch
 
 _US = _COMMIT_FIELD_SEP
 
@@ -137,3 +138,87 @@ class TestGatePark:
         assert event is not None
         assert event["body"]["name"] == "wait:gate-park"
         assert event["body"]["endTime"] == "2026-01-02T00:00:11Z"
+
+    # #345: the park ends at the drain's answer-attempt epoch when present (the true resumption
+    # stage_gate_answer_ms already uses), not the first-activity resume that collapses the window
+    # under /afk; it falls back to the resume when the epoch is absent or predates the onset.
+    def test_bounds_end_at_answer_epoch_when_present(self) -> None:
+        answer = _iso_to_epoch("2026-01-02T00:01:41Z")
+        assert _gate_park_bounds(self._traces(), answer_epoch=answer) == (
+            "2026-01-02T00:00:01Z",
+            "2026-01-02T00:01:41Z",
+        )
+
+    def test_bounds_fall_back_to_resume_when_answer_epoch_absent(self) -> None:
+        assert _gate_park_bounds(self._traces(), answer_epoch=None) == (
+            "2026-01-02T00:00:01Z",
+            "2026-01-02T00:00:11Z",
+        )
+
+    def test_bounds_fall_back_when_answer_epoch_predates_onset(self) -> None:
+        stale = _iso_to_epoch("2026-01-01T00:00:00Z")
+        assert _gate_park_bounds(self._traces(), answer_epoch=stale) == (
+            "2026-01-02T00:00:01Z",
+            "2026-01-02T00:00:11Z",
+        )
+
+    def test_bounds_use_answer_epoch_even_without_a_resume(self) -> None:
+        # Gate but no post-gate activity: the answer epoch still bounds the park (the resume
+        # fallback alone would yield None).
+        traces = [
+            (
+                "tr",
+                [
+                    {
+                        "name": "script:gate",
+                        "startTime": "2026-01-02T00:00:00Z",
+                        "endTime": "2026-01-02T00:00:01Z",
+                    }
+                ],
+            )
+        ]
+        answer = _iso_to_epoch("2026-01-02T00:01:41Z")
+        assert _gate_park_bounds(traces, answer_epoch=answer) == (
+            "2026-01-02T00:00:01Z",
+            "2026-01-02T00:01:41Z",
+        )
+
+    def test_gate_park_ms_widens_to_answer_epoch(self) -> None:
+        answer = _iso_to_epoch("2026-01-02T00:01:41Z")
+        assert _gate_park_ms(self._traces(), answer_epoch=answer) == 100000
+
+    def test_answer_path_floors_both_ends_matching_stage_arithmetic(self) -> None:
+        # A sub-second gate end: the answer path floors BOTH bounds to whole seconds, so
+        # gate_park_ms == stage_gate_answer_ms's (answer - floor(onset)) * 1000 exactly -- never a
+        # sub-second-drifted or negative window (#345 review).
+        traces = [
+            (
+                "tr",
+                [
+                    {
+                        "name": "script:gate",
+                        "startTime": "2026-01-02T00:00:00Z",
+                        "endTime": "2026-01-02T00:00:01.700Z",
+                    }
+                ],
+            )
+        ]
+        answer = _iso_to_epoch("2026-01-02T00:01:41Z")
+        assert _gate_park_bounds(traces, answer_epoch=answer) == (
+            "2026-01-02T00:00:01Z",
+            "2026-01-02T00:01:41Z",
+        )
+        assert _gate_park_ms(traces, answer_epoch=answer) == 100000
+
+    def test_gate_park_event_ends_at_answer_epoch(self) -> None:
+        answer = _iso_to_epoch("2026-01-02T00:01:41Z")
+        event = _gate_park_event(
+            self._traces(),
+            spoke_run_id="sp",
+            trace_id="T",
+            cycle=False,
+            parent_id="ROOT",
+            answer_epoch=answer,
+        )
+        assert event is not None
+        assert event["body"]["endTime"] == "2026-01-02T00:01:41Z"
