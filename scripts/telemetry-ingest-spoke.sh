@@ -317,14 +317,24 @@ if [ -n "$BODY_DIR" ]; then
     | sed -E 's#.*[/:]##; s#\.git$##')"
   [ -n "$REPO_NAME" ] || REPO_NAME="$(basename "$WT_DIR")"
   [ -n "$REPO_NAME" ] && BUILD_ARGS+=(--repo "$REPO_NAME")
-  # Commit timeline nodes (#162): dump the spoke branch's origin/main..HEAD commits with numstat
-  # for the view builder to synthesize commit:<sha7> nodes. Best-effort — a checkout without an
-  # origin/main ref (or no commits ahead) yields no dump, so no --commits is passed. The unit
-  # separator (\037) delimits the format fields so a commit subject never collides with them.
+  # Commit timeline nodes (#162): dump the spoke branch's <base>..HEAD commits with numstat for
+  # the view builder to synthesize commit:<sha7> nodes. Best-effort — a checkout whose base cannot
+  # be resolved (or no commits ahead) yields no dump, so no --commits is passed. The unit separator
+  # (\037) delimits the format fields so a commit subject never collides with them.
+  #
+  # The base is the PRE-MERGE default tip handed in by worktree-land.sh via AI_TOOLKIT_COMMIT_BASE
+  # (issue #344): the land runs this AFTER the merge pushes, so origin/main already contains HEAD
+  # (worktrees share remote-tracking refs) and origin/main..HEAD is EMPTY. PRE_SHA predates the
+  # merge, so PRE_SHA..HEAD captures the spoke's own commits. Fallback to origin/main only for a
+  # manual re-run that hands in no base. Resolve-or-skip (#344 guard): an unresolvable base
+  # (bare-branch/--local, bad sha) SKIPS --commits rather than falling back to the empty post-push
+  # range — absence of a dump is not evidence of zero churn.
+  COMMIT_BASE="${AI_TOOLKIT_COMMIT_BASE:-origin/main}"
   COMMITS_DUMP="$AIT_DIR/commits.dump"
   US=$'\037'
-  if git -C "$WT_DIR" log --numstat --format="commit${US}%H${US}%aI${US}%s" \
-       origin/main..HEAD > "$COMMITS_DUMP" 2>/dev/null && [ -s "$COMMITS_DUMP" ]; then
+  if BASE_SHA="$(git -C "$WT_DIR" rev-parse -q --verify "${COMMIT_BASE}^{commit}" 2>/dev/null)" \
+     && git -C "$WT_DIR" log --numstat --format="commit${US}%H${US}%aI${US}%s" \
+          "${BASE_SHA}..HEAD" > "$COMMITS_DUMP" 2>/dev/null && [ -s "$COMMITS_DUMP" ]; then
     BUILD_ARGS+=(--commits "$COMMITS_DUMP")
   fi
   # Per-issue cycle-time sources (#280): gather the timeline instants + drain-window snapshot the
