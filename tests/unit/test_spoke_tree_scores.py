@@ -88,6 +88,32 @@ class TestBuildScoreEvents:
         batch = [{"body": {"id": "t1", "metadata": {}}}]
         assert build_score_events(SPOKE, [("tr", [])], batch, base_ts="x") == []
 
+    def _park_value(self, events: list) -> int | None:
+        for event in events:
+            if event["body"]["name"] == "gate_park_ms":
+                return event["body"]["value"]
+        return None
+
+    def test_gate_park_ms_uses_resume_without_answer_epoch(self) -> None:
+        # gate onset 01:00:00Z -> resume 02:00:00Z = 3_600_000 ms (the narrow first-activity window).
+        events = build_score_events(SPOKE, _stage_traces(), [], base_ts=_BASE_TS)
+        assert self._park_value(events) == 3_600_000
+
+    def test_gate_park_ms_widens_to_answer_epoch(self) -> None:
+        # #345: with the drain's answer epoch (01:05:00Z), the park is onset -> answer = 300_000 ms,
+        # agreeing with stage_gate_answer_ms rather than the 3_600_000 ms first-activity window.
+        events = build_score_events(
+            SPOKE, _stage_traces(), [], base_ts=_BASE_TS, answer_epoch=_ANSWER_ATTEMPT
+        )
+        assert self._park_value(events) == 300_000
+
+    def test_gate_park_ms_falls_back_when_answer_epoch_stale(self) -> None:
+        # An epoch before the gate onset is a stale/unrelated attempt -> fall back to the resume.
+        events = build_score_events(
+            SPOKE, _stage_traces(), [], base_ts=_BASE_TS, answer_epoch=_DISPATCHED
+        )
+        assert self._park_value(events) == 3_600_000
+
 
 class TestBuildScriptSuccessScores:
     """#233: mirror each control-script span's status into a script_success:<name> 0/1 score."""
