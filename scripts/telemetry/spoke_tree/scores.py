@@ -358,6 +358,7 @@ def build_normalization_scores(
     subtasks: int,
     *,
     base_ts: str,
+    commits_dump_present: bool,
 ) -> list[IngestEvent]:
     """Build the trace-level normalization scores that size a spoke's cost + latency (#231).
 

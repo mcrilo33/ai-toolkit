@@ -21,6 +21,7 @@ from telemetry.spoke_tree.scores import (
     build_mcp_call_scores,
     build_mcp_carry_cost_scores,
     build_mcp_def_load_scores,
+    build_normalization_scores,
     build_score_events,
     build_script_success_scores,
     build_skill_cost_scores,
@@ -947,3 +948,42 @@ class TestBuildWindowRollupScores:
         lifecycle = Lifecycle(spokes_serviced=2, window_start=_DISPATCHED, landed=_DISPATCHED)
         events = build_window_rollup_scores(SPOKE, [], [], lifecycle, base_ts=_BASE_TS)
         assert all(e["body"]["name"] != "issues_per_hour" for e in events)
+
+
+class TestNormalizationDumpPresence:
+    """#344: the commits/files/lines base counts must reflect whether a commit dump was PARSED.
+
+    A land whose commits dump was dropped (the #344 empty-range bug, or a bare-branch/--local
+    checkout the ingest resolve-or-skips) gives the builder no `--commits`, so `commits` here is
+    an empty list that carries NO information about churn. Emitting `commits=0 / files_changed=0 /
+    lines_changed=0` then is a WRONG value that poisons the #231 normalization dashboards —
+    absence of a dump is not evidence of zero churn. So the three base counts are emitted only
+    when a dump was actually present; `subtasks` (independent of commits) stays unconditional.
+    A genuinely empty spoke with a present-but-empty dump still legitimately reads 0.
+    """
+
+    def _names(self, scores: list[dict]) -> set[str]:
+        return {s["body"]["name"] for s in scores}
+
+    def _val(self, scores: list[dict], name: str) -> float:
+        return next(s["body"]["value"] for s in scores if s["body"]["name"] == name)
+
+    def test_no_base_counts_when_commits_dump_absent(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE, [], [], 3, base_ts=_BASE_TS, commits_dump_present=False
+        )
+
+        names = self._names(scores)
+        assert "commits" not in names
+        assert "files_changed" not in names
+        assert "lines_changed" not in names
+        assert self._val(scores, "subtasks") == 3  # independent of commits, still emitted
+
+    def test_base_counts_zero_when_dump_present_but_empty(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE, [], [], 3, base_ts=_BASE_TS, commits_dump_present=True
+        )
+
+        assert self._val(scores, "commits") == 0
+        assert self._val(scores, "files_changed") == 0
+        assert self._val(scores, "lines_changed") == 0
