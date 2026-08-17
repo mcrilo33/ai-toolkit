@@ -14,11 +14,13 @@ against #21's frozen span schema (`docs/telemetry-span-schema.md`) verbatim.
 > `dashboard/langfuse/otelcol.yaml` + `langfuse_*.py`). Issue #140 then retired
 > the transcript backfill (`langfuse_backfill.py` + `causal_tree.py`, #92) —
 > live capture is complete by construction, so no after-the-fact healing path
-> exists. The transcript parsers documented here survive solely as the view
-> builder's input layer. Read that narrowly: what #140 retired is the *transcript*
-> backfill. The view builder itself sources from Langfuse, so a single lost land is
-> still re-runnable from its id alone (`--spoke-run-id`) — see the #319 note below
-> for why that is not a fleet backfill.
+> exists. The view builder itself **sources from Langfuse**, not from the transcript
+> parsers: it copies push-span observations and grafts only `input`/`output`. It
+> touches `session_parser.py` for one thing only — `project_dir_for_worktree`, to
+> resolve the loaded-context root (#87) — never its span/`summary` derivation, which
+> has **no production consumer** today. Because the builder reads from Langfuse, a
+> single lost land is still re-runnable from its id alone (`--spoke-run-id`) — see the
+> #319 note below for why that is not a fleet backfill.
 
 > [!NOTE]
 > Issue #91 retired `ccusage` and the pull-cost layer (`telemetry/cost.py`). The
@@ -73,15 +75,23 @@ failure is the one that costs days.
 
 Everything here is **read-only and 100% local**. Session logs contain prompt
 content, so they are parsed on-machine and only metadata / metrics are surfaced —
-never raw prompt, answer, thinking, or tool-output text. **Exception (Issue #47):**
-each node carries a few-word `summary` for display — the todo a step advances
-(`TodoWrite`/`TaskCreate`/`TaskUpdate`), an agent's short task `description`, the
-first line of a human prompt or question, and a tool's single main parameter (the
-`Bash` command, the file path a `Read`/`Edit`/`Write` acted on, a `Grep` pattern).
-This widens the surface to *short intent* metadata only; long-form content —
-extended thinking, an agent's full task prompt, a tool's secondary input
-(replacement text, file content) and its output, and human answers — stays
-filtered.
+never raw prompt, answer, thinking, or tool-output text.
+
+> [!NOTE]
+> **The `summary` field (Issue #47) does not reach the assembled views.** The pull
+> parser (`session_parser.py`) can derive a few-word `summary` per node — the todo a
+> step advances, an agent's short task `description`, the first line of a prompt or
+> question, a tool's single main parameter — but that is a **pull-parser artifact**
+> (`spans.py` documents `summary` as "pull-only"). The land-time view builder
+> `langfuse_spoke_tree.py` sources push-span observations from Langfuse and copies
+> them verbatim: `spoke_tree/assembly.py::_copy_event` grafts only transcript
+> `input`/`output` plus `tool_result_size`/`skill` metadata, and its `_COPIED_FIELDS`
+> tuple does not include `summary`. So short-intent-per-node is **not currently
+> surfaced** on the `spoketree-`/`spokecycle-` views. Resurfacing it (grafting it in
+> `_copy_event`) is a separate enhancement, out of scope here. What the builder does
+> graft — the `input`/`output` content — still stays *short intent* only; long-form
+> content (extended thinking, an agent's full task prompt, a tool's secondary input,
+> and human answers) stays filtered.
 
 ## Client-side telemetry config (Issue #228)
 
@@ -130,8 +140,8 @@ All live in `scripts/telemetry/`:
 
 | Module | Responsibility |
 |--------|----------------|
-| `spans.py` | The `Span` dataclass — the frozen schema plus the additive, optional, pull-only `summary` field (Issue #47). |
-| `session_parser.py` | Parse `~/.claude/projects/*/*.jsonl` into `skill` / `agent` / `todo` / `human` spans plus a `tool` leaf per `tool_use` (Issue #47). Walk `<session>/subagents/agent-<id>.jsonl` transcripts into `UsageEvent`s **and** the sub-agent's own step spans (#47 S3) — re-homed onto the parent session with `parent_id` = the agent span, so they nest under it. |
+| `spans.py` | The `Span` dataclass — the frozen schema plus the additive, optional, `summary` field (Issue #47). `summary` is **pull-only**: it is populated by `session_parser.py` and does **not** reach the assembled views (the builder's `_COPIED_FIELDS` omits it). |
+| `session_parser.py` | Parse `~/.claude/projects/*/*.jsonl` into `skill` / `agent` / `todo` / `human` spans plus a `tool` leaf per `tool_use` (Issue #47). Walk `<session>/subagents/agent-<id>.jsonl` transcripts into `UsageEvent`s **and** the sub-agent's own step spans (#47 S3) — re-homed onto the parent session with `parent_id` = the agent span, so they nest under it. **The span/`summary` parsing has no production consumer** since #90/#140 retired the DuckDB store and transcript backfill; the view builder uses only `project_dir_for_worktree` from this module (loaded-context root resolution, #87). |
 | `spoke_runs.py` | Group spans into spoke-run lifetimes; per-invocation normalized metrics. |
 | `langfuse_spoke_tree.py` | The land-time view builder — assemble the `spoketree-` nested view and `spokecycle-` todo view for one spoke (Issues #87/#100/#114/#128). Since #166 this is the **orchestrator**: it holds `build_batch`/`build_cycle_batch` and drives the post-build enrichments through an ordered `_ENRICHMENTS` registry; the families live in the `telemetry/spoke_tree/` package (see below). |
 | `spoke_tree/` | The view-builder families, split out of the monolith (#166) so view-builder features touch disjoint files. Foundation (`ids`, `observations`); core span-copy plumbing (`indices`, `folding`, `assembly`); `rollups`; view lenses (`steps` = View A, `cycle` = View B); enrichments (`loaded_context`, `llm_decomp`, `context_deltas`, `metadata`, `commits`, `scores`). Each has a `tests/unit/test_spoke_tree_<family>.py`. |
