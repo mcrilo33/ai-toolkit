@@ -1,0 +1,92 @@
+{
+  "name": "spoke outcomes",
+  "description": "How do spokes END, and what does the drain cost to get there? The #231 outcome family (landed / blocked / reaped / abandoned) and the #280 throughput family had scores/tags but ZERO widgets — this dashboard charts them. The governance widget is 'Cost by model': it breaks generation cost down by providedModelName so a banned tier (the opus-4-8[1m] model-config leaks, #291/#305/#306) shows up as a bar — a snapshot copy plus a daily time-series copy for drift-over-time. Also: terminal outcomes, per-stage overhead, drain KPIs, and per-script success rate + volume. SCOPE THE DASHBOARD to environment=production (the store holds ~10k fixture sessions; use the dashboard-level Environment selector) or every widget mixes fixtures into the numbers. DELIBERATELY EXCLUDES the normalization family (files_changed / lines_changed / commits / cost_per_changed_line): #344 (open) documents those emit false zeros on every land, so charting them before #344 lands poisons the view — add them only after #344. Saved once via the Langfuse UI (v3.192.x has no public dashboards API); each widget's metricsQuery is the exact /api/public/metrics query that backs it — add fromTimestamp/toTimestamp when running one. See docs/telemetry-pull-layer.md.",
+  "widgets": [
+    {
+      "title": "Cost by model (governance) — total by providedModelName [scope to environment=production]",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "observations",
+        "dimensions": [{ "field": "providedModelName" }],
+        "metrics": [{ "measure": "totalCost", "aggregation": "sum" }],
+        "filters": [
+          { "column": "type", "operator": "=", "value": "GENERATION", "type": "string" }
+        ]
+      }
+    },
+    {
+      "title": "Cost by model over time (drift/leak watch) — daily total by providedModelName [scope to environment=production]",
+      "chart": "stacked-bar-time-series",
+      "metricsQuery": {
+        "view": "observations",
+        "dimensions": [{ "field": "providedModelName" }],
+        "metrics": [{ "measure": "totalCost", "aggregation": "sum" }],
+        "filters": [
+          { "column": "type", "operator": "=", "value": "GENERATION", "type": "string" }
+        ],
+        "timeDimension": { "granularity": "day" }
+      }
+    },
+    {
+      "title": "Terminal outcomes by state (landed / blocked / reaped / abandoned) [scope to environment=production]",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "traces",
+        "dimensions": [{ "field": "tags" }],
+        "metrics": [{ "measure": "count", "aggregation": "count" }],
+        "filters": [
+          {
+            "column": "tags",
+            "operator": "any of",
+            "type": "arrayOptions",
+            "value": ["outcome:landed", "outcome:blocked", "outcome:reaped", "outcome:abandoned"]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Per-stage overhead — total ms by stage (spawn/gate-answer/review/push-gate/land) [scope to environment=production]",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [{ "measure": "value", "aggregation": "sum" }],
+        "filters": [
+          { "column": "name", "operator": "starts with", "value": "stage_", "type": "string" }
+        ]
+      }
+    },
+    {
+      "title": "Drain KPIs — avg (issues/hr, overhead ratio, autonomy, wall/subtask) [scope to environment=production]",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [{ "measure": "value", "aggregation": "avg" }],
+        "filters": [
+          {
+            "column": "name",
+            "operator": "any of",
+            "type": "stringOptions",
+            "value": ["issues_per_hour", "overhead_work_ratio", "autonomy_score", "wall_per_subtask"]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Per-script success rate + volume (script_success:<name>) [scope to environment=production]",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [
+          { "measure": "value", "aggregation": "avg" },
+          { "measure": "count", "aggregation": "count" }
+        ],
+        "filters": [
+          { "column": "name", "operator": "starts with", "value": "script_success:", "type": "string" }
+        ]
+      }
+    }
+  ]
+}
