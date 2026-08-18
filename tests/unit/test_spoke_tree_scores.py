@@ -382,10 +382,12 @@ class TestBuildSkillCostScores:
         }
 
     def test_generation_without_start_time_is_ignored(self) -> None:
-        # A generation with no startTime cannot be placed in any window, so it credits nothing.
+        # A generation with no startTime cannot be placed in any window, so it credits nothing. The
+        # skill also has an empty start so ONLY the missing-start guard prevents a credit here (were
+        # the guard gone, ``"" <= ""`` would place the generation and this would emit a score).
         batch = [
             self._interaction("i1"),
-            self._skill("sc", "skill:code-review", parent="i1", start="t1"),
+            self._skill("sc", "skill:code-review", parent="i1", start=""),
             self._gen("g", "i1", {"total": 2.0}, start=""),
         ]
 
