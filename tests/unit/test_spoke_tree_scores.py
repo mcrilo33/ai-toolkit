@@ -367,6 +367,30 @@ class TestBuildSkillCostScores:
 
         assert build_skill_cost_scores(SPOKE, batch, base_ts="t") == []
 
+    def test_generation_at_same_time_as_skill_is_credited(self) -> None:
+        # Boundary: a generation whose start equals the skill span's start is in-window (``<=``).
+        batch = [
+            self._interaction("i1"),
+            self._skill("sc", "skill:code-review", parent="i1", start="t1"),
+            self._gen("g", "i1", {"total": 2.0}, start="t1"),
+        ]
+
+        events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
+
+        assert {e["body"]["name"]: e["body"]["value"] for e in events} == {
+            "skill_cost_usd:code-review": pytest.approx(2.0)
+        }
+
+    def test_generation_without_start_time_is_ignored(self) -> None:
+        # A generation with no startTime cannot be placed in any window, so it credits nothing.
+        batch = [
+            self._interaction("i1"),
+            self._skill("sc", "skill:code-review", parent="i1", start="t1"),
+            self._gen("g", "i1", {"total": 2.0}, start=""),
+        ]
+
+        assert build_skill_cost_scores(SPOKE, batch, base_ts="t") == []
+
     def test_explicit_total_wins_over_component_sum(self) -> None:
         batch = [
             self._interaction("i1"),

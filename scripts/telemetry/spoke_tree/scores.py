@@ -95,18 +95,19 @@ _STATUS_SUCCESS = "success"
 # contract stamps a status. Read from the skill span attributes, in priority order.
 _SKILL_SUCCESS_SCORE = "skill_success"
 _SKILL_STATUS_KEYS = ("skill.status", "skill_exit_status")
-# Per-skill cost (#322): a ``skill:<name>`` span is a relabeled ``tool:Skill`` span whose OWN
-# ``costDetails`` is $0 — the real LLM spend lives in its generation DESCENDANTS. Langfuse's
-# metrics/dashboard API sums each observation's own cost, so a ``skill:`` filter returns $0; mirror
-# the rule/step carry-cost builders and emit the summed descendant-generation cost as a numeric
-# ``skill_cost_usd:<name>`` score. A skill with no generation descendants is SKIPPED (never scored 0)
-# — absence of spend is not a cost (AFK Design Principle 1; the ready-but-latent skill_success idiom).
+# Per-skill cost (#322, #349): a ``skill:<name>`` span is a relabeled ``tool:Skill`` span whose OWN
+# ``costDetails`` is $0, so Langfuse's own-cost-summing metrics API returns $0 for a ``skill:`` filter.
+# The generations a skill drives are NOT its subtree descendants — assembly leaves them as SIBLINGS of
+# the skill span under their shared ``claude_code.interaction`` — so each generation is credited to the
+# latest skill invoked before it within that interaction (its influence window) and the summed cost is
+# emitted as a numeric ``skill_cost_usd:<name>`` score. A skill with no in-window generation is SKIPPED
+# (never scored 0) — absence of spend is not a cost (AFK Design Principle 1; the skill_success idiom).
 _SKILL_COST_SCORE = "skill_cost_usd"
 # Per-sub-agent cost (#323): the exact analog for a ``sub-agent:<type>`` container — the otelcol-
 # renamed ``tool:Agent`` span whose OWN ``costDetails`` is $0 while the real LLM spend lives in its
 # ``sub-agent:llm`` generation DESCENDANTS. Langfuse's own-cost-summing metrics API returns $0 for a
 # ``sub-agent:`` filter, so the summed descendant-generation cost is emitted as a numeric
-# ``agent_cost_usd:<type>`` score, reusing the #322 subtree-rollup helper (:func:`_cost_subtree_ancestors`).
+# ``agent_cost_usd:<type>`` score, reusing the #323 subtree-rollup helper (:func:`_cost_subtree_ancestors`).
 # A container with no generation descendants is SKIPPED (never scored 0). ``agent_cost_usd:<type>`` is
 # a SUBSET of the ``step_total_cost_usd`` of the step the agent sits in (that step already folds
 # ``sub-agent:llm``), so the two must not be read as additive.
