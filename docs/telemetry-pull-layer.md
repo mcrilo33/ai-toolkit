@@ -338,12 +338,16 @@ PLAN-gate park emission.
 ### Widget 5 — per-skill cost (Issue #322)
 
 The dashboard twin of the rule carry-cost chart. A `skill:<name>` node is a relabeled
-`tool:Skill` **span** (#234) whose own `costDetails` is $0 — the real LLM spend lives in
-its generation descendants — so an Observations → Total Cost widget filtered to `skill:`
-returns $0. The builder therefore emits a per-skill `skill_cost_usd:<name>` numeric score
-(:func:`build_skill_cost_scores`) summing the full `costDetails` of every generation in the
-skill's subtree, so the $ is a queryable Scores value rather than a UI-only trace-view
-rollup.
+`tool:Skill` **span** (#234) whose own `costDetails` is $0, so an Observations → Total Cost
+widget filtered to `skill:` returns $0. The LLM generations a skill drives are **not** its
+subtree descendants — assembly leaves them as **siblings** of the skill span under their
+shared `claude_code.interaction` (#349). The builder therefore attributes each generation to
+the latest skill invoked before it within that interaction — the skill's **influence window**,
+mirroring the time-window attribution used for cycle steps — and emits a per-skill
+`skill_cost_usd:<name>` numeric score (:func:`build_skill_cost_scores`) summing the full
+`costDetails` of the generations the skill drove, so the $ is a queryable Scores value rather
+than a UI-only trace-view rollup. Each generation credits exactly one skill, so an inner
+skill's spend is never double-counted onto an outer one.
 
 | Field | Value |
 |-------|-------|
@@ -372,8 +376,9 @@ and previously a cost blind spot. A `sub-agent:<type>` node is the otelcol-renam
 in its `sub-agent:llm` generation descendants — so an Observations → Total Cost widget
 filtered to `sub-agent:` returns $0. The builder therefore emits a per-agent
 `agent_cost_usd:<type>` numeric score (:func:`build_agent_cost_scores`) summing the full
-`costDetails` of every generation in the agent's subtree, reusing the same
-`_cost_subtree_ancestors` rollup helper as `skill_cost_usd`. A fan-out of N same-type agents
+`costDetails` of every generation in the agent's subtree via the `_cost_subtree_ancestors`
+rollup helper — a subtree walk works here (unlike `skill_cost_usd`, #349) because a sub-agent's
+generations run in its own transcript and are re-homed under the container. A fan-out of N same-type agents
 emits N observation-scoped scores under one name, so the *Sum / breakdown Name* below folds
 them into one volume-aware bar.
 

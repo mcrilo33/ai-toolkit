@@ -413,8 +413,9 @@ class TestBuildAgentCostScores:
     so Langfuse's own-cost-summing metrics API returns $0 for a ``sub-agent:`` filter. Each
     container therefore emits ``agent_cost_usd:<type>``, the summed ``costDetails`` of every
     generation in its subtree, observation-scoped to the container. A container with no generation
-    descendants is SKIPPED (never scored 0), mirroring the #322 skill-cost discipline. This reuses
-    the same subtree-rollup helper as :func:`build_skill_cost_scores`.
+    descendants is SKIPPED (never scored 0), mirroring the skill-cost skip-not-zero discipline. A
+    subtree walk is valid here (unlike ``skill_cost_usd``, #349) because a sub-agent's generations
+    run in its own transcript and are re-homed under the container.
     """
 
     def _agent(self, obs_id: str, name: str, parent: str | None = None) -> dict:
