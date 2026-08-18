@@ -218,100 +218,184 @@ class TestBuildSkillSuccessScores:
 
 
 class TestBuildSkillCostScores:
-    """#322: sum a skill span's generation-descendant cost into a skill_cost_usd:<name> score.
+    """#349: credit each generation to the skill whose influence window it falls in.
 
-    A ``skill:<name>`` span is a relabeled ``tool:Skill`` span whose own ``costDetails`` is $0 — the
-    real spend lives in its generation descendants — so Langfuse's own-cost-summing metrics API
-    returns $0 for a ``skill:`` filter. Each skill node therefore emits ``skill_cost_usd:<name>``, the
-    summed ``costDetails`` of every generation in its subtree, observation-scoped to the skill node.
-    A skill with no generation descendants is SKIPPED (never scored 0) — absence of spend is not a
-    cost, mirroring the ready-but-latent ``skill_success`` idiom.
+    A ``skill:<name>`` span is a relabeled ``tool:Skill`` span (#234) whose own ``costDetails`` is
+    $0. Assembly leaves the LLM generations the skill drives as SIBLINGS of the skill span under
+    their shared ``claude_code.interaction`` — never descendants — so a subtree walk finds nothing
+    (the #349 bug). ``build_skill_cost_scores`` instead attributes each generation to the LATEST
+    skill invoked before it within the same interaction (its influence window), so a skill's score
+    is the summed ``costDetails`` of the generations it drove, observation-scoped to the skill node.
+    A skill with no in-window generation is SKIPPED (never scored 0) — absence of spend is not a
+    cost, mirroring the ready-but-latent ``skill_success`` idiom. Each generation credits exactly
+    ONE skill, so an inner skill's generations are never double-counted onto an outer skill.
     """
 
-    def _skill(self, obs_id: str, name: str, parent: str | None = None) -> dict:
+    def _interaction(self, obs_id: str) -> dict:
         return {
             "type": "span-create",
-            "body": {"id": obs_id, "name": name, "parentObservationId": parent},
+            "body": {"id": obs_id, "name": "claude_code.interaction", "parentObservationId": None},
         }
 
-    def _gen(self, obs_id: str, parent: str, cost: dict[str, float]) -> dict:
+    def _skill(self, obs_id: str, name: str, parent: str, start: str) -> dict:
+        return {
+            "type": "span-create",
+            "body": {
+                "id": obs_id,
+                "name": name,
+                "parentObservationId": parent,
+                "startTime": start,
+            },
+        }
+
+    def _gen(self, obs_id: str, parent: str, cost: dict[str, float], start: str) -> dict:
         return {
             "type": "generation-create",
-            "body": {"id": obs_id, "parentObservationId": parent, "costDetails": cost},
+            "body": {
+                "id": obs_id,
+                "parentObservationId": parent,
+                "costDetails": cost,
+                "startTime": start,
+            },
         }
 
-    def test_two_skill_nodes_sum_generation_descendants(self) -> None:
-        # skill:code-review has a generation nested one level down under a sub-agent container
-        # (subtree depth > 1) plus a direct generation; skill:brainstorming has one generation.
+    def test_sibling_generation_in_window_is_credited(self) -> None:
+        # The real assembled shape: skill span + the generation it drives are SIBLINGS under the
+        # interaction, generation starting AFTER the skill span. A subtree walk finds nothing here.
         batch = [
-            self._skill("sc", "skill:code-review"),
-            {"type": "span-create", "body": {"id": "sac", "parentObservationId": "sc"}},
-            self._gen("g_rev", "sac", {"total": 2.0}),
-            self._gen("g_rev2", "sc", {"input": 0.3, "output": 0.7}),
-            self._skill("sb", "skill:brainstorming"),
-            self._gen("g_bs", "sb", {"total": 5.0}),
+            self._interaction("i1"),
+            self._skill("sc", "skill:code-review", parent="i1", start="t1"),
+            self._gen("g_rev", "i1", {"total": 2.0}, start="t2"),
+        ]
+
+        events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
+
+        assert len(events) == 1
+        assert events[0]["type"] == "score-create"
+        body = events[0]["body"]
+        assert body["name"] == "skill_cost_usd:code-review"
+        assert body["value"] == pytest.approx(2.0)
+        assert body["observationId"] == "sc"
+
+    def test_generation_nested_below_interaction_still_credited(self) -> None:
+        # The generation is nested one level under an llm_request-like span whose parent is the
+        # interaction (subtree depth > 1): the enclosing-interaction walk must still reach i1.
+        batch = [
+            self._interaction("i1"),
+            self._skill("sc", "skill:code-review", parent="i1", start="t1"),
+            {"type": "span-create", "body": {"id": "req", "parentObservationId": "i1"}},
+            self._gen("g_rev", "req", {"total": 3.0}, start="t2"),
+        ]
+
+        events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
+
+        by_name = {e["body"]["name"]: e["body"]["value"] for e in events}
+        assert by_name == {"skill_cost_usd:code-review": pytest.approx(3.0)}
+
+    def test_two_skills_in_one_interaction_credit_by_window(self) -> None:
+        # Two sequential skills in one interaction: each generation credits ONLY the latest skill
+        # invoked before it, never both (the exactly-one-attribution / no-double-count contract).
+        batch = [
+            self._interaction("i1"),
+            self._skill("sa", "skill:code-review", parent="i1", start="t1"),
+            self._gen("g_a", "i1", {"total": 2.0}, start="t2"),
+            self._skill("sb", "skill:brainstorming", parent="i1", start="t3"),
+            self._gen("g_b", "i1", {"total": 5.0}, start="t4"),
         ]
 
         events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
 
         by_name = {e["body"]["name"]: e["body"] for e in events}
         assert set(by_name) == {"skill_cost_usd:code-review", "skill_cost_usd:brainstorming"}
-        assert all(e["type"] == "score-create" for e in events)
-        assert by_name["skill_cost_usd:code-review"]["value"] == pytest.approx(3.0)
-        assert by_name["skill_cost_usd:code-review"]["observationId"] == "sc"
+        assert by_name["skill_cost_usd:code-review"]["value"] == pytest.approx(2.0)
+        assert by_name["skill_cost_usd:code-review"]["observationId"] == "sa"
         assert by_name["skill_cost_usd:brainstorming"]["value"] == pytest.approx(5.0)
         assert by_name["skill_cost_usd:brainstorming"]["observationId"] == "sb"
 
-    def test_zero_descendant_skill_is_skipped(self) -> None:
+    def test_inner_skill_generation_not_double_credited_to_outer(self) -> None:
+        # An outer skill runs, then invokes an inner skill; a generation after the inner invocation
+        # credits ONLY the inner skill. The generation between the two credits only the outer. The
+        # outer's score is its own-window generation alone — the inner's spend is NOT rolled in.
         batch = [
-            self._skill("sc", "skill:code-review"),
-            self._gen("g_rev", "sc", {"total": 2.0}),
-            self._skill("sl", "skill:land"),  # no generation descendants
+            self._interaction("i1"),
+            self._skill("sout", "skill:code-review", parent="i1", start="t1"),
+            self._gen("g_mid", "i1", {"total": 1.0}, start="t2"),
+            self._skill("sin", "skill:brainstorming", parent="i1", start="t3"),
+            self._gen("g_inner", "i1", {"total": 4.0}, start="t4"),
+        ]
+
+        events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
+
+        by_name = {e["body"]["name"]: e["body"]["value"] for e in events}
+        assert by_name["skill_cost_usd:code-review"] == pytest.approx(1.0)
+        assert by_name["skill_cost_usd:brainstorming"] == pytest.approx(4.0)
+
+    def test_generation_before_skill_is_not_credited(self) -> None:
+        # The generation that REQUESTED the skill starts before the skill span — it is not the
+        # skill's output, so it credits nothing and the skill (with no later generation) is skipped.
+        batch = [
+            self._interaction("i1"),
+            self._gen("g_req", "i1", {"total": 9.0}, start="t1"),
+            self._skill("sc", "skill:code-review", parent="i1", start="t2"),
+        ]
+
+        assert build_skill_cost_scores(SPOKE, batch, base_ts="t") == []
+
+    def test_skill_with_no_in_window_generation_is_skipped(self) -> None:
+        # skill:code-review drove a generation; skill:land, later, drove none — it is skipped, not
+        # scored 0 (skip-not-zero preserved).
+        batch = [
+            self._interaction("i1"),
+            self._skill("sc", "skill:code-review", parent="i1", start="t1"),
+            self._gen("g_rev", "i1", {"total": 2.0}, start="t2"),
+            self._skill("sl", "skill:land", parent="i1", start="t3"),
         ]
 
         events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
 
         assert {e["body"]["name"] for e in events} == {"skill_cost_usd:code-review"}
 
+    def test_generation_in_other_interaction_is_not_credited(self) -> None:
+        # A skill's influence is bounded to its own interaction; a later interaction's generation is
+        # unrelated work and is not credited to the earlier skill.
+        batch = [
+            self._interaction("i1"),
+            self._skill("sc", "skill:code-review", parent="i1", start="t1"),
+            self._interaction("i2"),
+            self._gen("g2", "i2", {"total": 5.0}, start="t2"),
+        ]
+
+        assert build_skill_cost_scores(SPOKE, batch, base_ts="t") == []
+
     def test_explicit_total_wins_over_component_sum(self) -> None:
         batch = [
-            self._skill("sc", "skill:code-review"),
-            self._gen("g", "sc", {"input": 0.3, "output": 0.7, "total": 1.0}),
+            self._interaction("i1"),
+            self._skill("sc", "skill:code-review", parent="i1", start="t1"),
+            self._gen("g", "i1", {"input": 0.3, "output": 0.7, "total": 1.0}, start="t2"),
         ]
 
         events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
 
         assert events[0]["body"]["value"] == pytest.approx(1.0)
 
-    def test_nested_skills_each_report_their_subtree(self) -> None:
-        # skill:brainstorming nested under skill:code-review: the inner generation rolls into BOTH
-        # (the subtree-rollup boundary), while code-review's own direct generation is only its own.
-        batch = [
-            self._skill("sc", "skill:code-review"),
-            self._gen("g_outer", "sc", {"total": 1.0}),
-            self._skill("sb", "skill:brainstorming", parent="sc"),
-            self._gen("g_inner", "sb", {"total": 4.0}),
-        ]
-
-        events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
-
-        by_name = {e["body"]["name"]: e["body"]["value"] for e in events}
-        assert by_name["skill_cost_usd:code-review"] == pytest.approx(5.0)
-        assert by_name["skill_cost_usd:brainstorming"] == pytest.approx(4.0)
-
     def test_generation_under_no_skill_is_ignored(self) -> None:
-        batch = [self._gen("g", "i1", {"total": 9.0})]
+        batch = [
+            self._interaction("i1"),
+            self._gen("g", "i1", {"total": 9.0}, start="t1"),
+        ]
 
         assert build_skill_cost_scores(SPOKE, batch, base_ts="t") == []
 
     def test_same_skill_run_twice_keeps_both_scores(self) -> None:
-        # Two distinct spans share the skill name; each gets its own observation-scoped score with a
-        # distinct id (keyed off the span id), so both survive ingest rather than upserting onto one.
+        # Two distinct spans share the skill name (one per interaction); each gets its own
+        # observation-scoped score with a distinct id, so both survive ingest rather than upserting.
         batch = [
-            self._skill("sc1", "skill:code-review"),
-            self._gen("g1", "sc1", {"total": 2.0}),
-            self._skill("sc2", "skill:code-review"),
-            self._gen("g2", "sc2", {"total": 5.0}),
+            self._interaction("i1"),
+            self._skill("sc1", "skill:code-review", parent="i1", start="t1"),
+            self._gen("g1", "i1", {"total": 2.0}, start="t2"),
+            self._interaction("i2"),
+            self._skill("sc2", "skill:code-review", parent="i2", start="t3"),
+            self._gen("g2", "i2", {"total": 5.0}, start="t4"),
         ]
 
         events = build_skill_cost_scores(SPOKE, batch, base_ts="t")
