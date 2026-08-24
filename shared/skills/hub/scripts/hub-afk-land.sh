@@ -211,6 +211,54 @@ _afk_land_retry_max() {
 : "${WT_LAND_CONFLICT_EXIT:=4}"
 case "$WT_LAND_CONFLICT_EXIT" in '' | *[!0-9]*) WT_LAND_CONFLICT_EXIT=4 ;; esac
 
+# --- #354: the INVARIANT upstream-precondition escalation lane -----------------
+# worktree-land exits WT_LAND_PRECONDITION_EXIT (default 5) when the branch is unpushed /
+# ahead / behind / --local-but-tracked — a precondition NO hub lane can clear (only the
+# spoke's push fixes it). Routed onto the transient warn-retry backoff (the generic-exit
+# path) it re-failed identically until the 900s watchdog ceiling fired a misleading
+# "mergeable branch un-landed" (#352). auto_land instead escalates LOUDLY + immediately
+# via broker_warn (the durable, hub-notify-pinged record — NOT the transient backoff, so
+# the ladder never arms), naming the real blocker + the concrete human action, and journals
+# the decision ONCE per branch tip. The cheap pre-merge re-land still runs each tick, so a
+# later push (ahead->0) lands autonomously — the reversible action Principle #3 asks for.
+: "${WT_LAND_PRECONDITION_EXIT:=5}"
+case "$WT_LAND_PRECONDITION_EXIT" in '' | *[!0-9]*) WT_LAND_PRECONDITION_EXIT=5 ;; esac
+
+# The per-issue escalation marker records the branch tip already escalated for, so the
+# gh-comment/journal fires once per tip (a fresh push moves the tip or lands it) while
+# broker_warn's durable record is rewritten every tick. Cleared on a successful land.
+_afk_precondition_escalated_marker() { printf '%s\n' "$(_afk_state_dir)/precondition-escalated-$1"; }
+_afk_read_precondition_escalated_tip() {
+  local m; m="$(_afk_precondition_escalated_marker "$1")"
+  [ -f "$m" ] && head -n1 "$m" 2>/dev/null || true
+}
+_afk_mark_precondition_escalated() {
+  local issue="$1" tip="${2:-}" m
+  m="$(_afk_precondition_escalated_marker "$issue")"
+  mkdir -p "$(dirname "$m")" 2>/dev/null || true
+  printf '%s\n' "$tip" > "$m" 2>/dev/null || true
+}
+_afk_clear_precondition_escalated() { rm -f "$(_afk_precondition_escalated_marker "$1")" 2>/dev/null || true; }
+
+# _afk_escalate_land_precondition <wt> <issue> <land_log> -> escalate an INVARIANT upstream
+# land precondition (#354). broker_warn fires every tick (loud, durable; hub-notify owns the
+# re-ping cadence off the record); the journal + its gh comment fire ONCE per branch tip so a
+# genuine stall is not comment-spammed. NEVER arms the transient LAND backoff. rev=reversible:
+# the spoke's committed work is intact — a human pushing it (or re-dispatching the spoke to
+# push) clears it, and the re-land each tick lands it once pushed.
+_afk_escalate_land_precondition() {
+  local wt="$1" issue="$2" land_log="$3" tip reason
+  tip="$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)"
+  reason="cannot land #$issue: its branch is unpushed or ahead of the base branch and no drain lane can push a spoke branch (the spoke's push is its ship gate). A human must push it from the spoke (or re-dispatch the spoke to push), or land it manually. See $land_log."
+  broker_warn "$issue" "$reason"
+  _afk_set_last_action "land-blocked #$issue"
+  if [ "$(_afk_read_precondition_escalated_tip "$issue")" != "$tip" ]; then
+    broker_journal_decision "$issue" land \
+      "escalated: unpushed/ahead branch — no hub lane can push it; a human must push or land manually (#354)" reversible
+    _afk_mark_precondition_escalated "$issue" "$tip"
+  fi
+}
+
 _afk_land_conflict_fp_file() { printf '%s\n' "$(_afk_state_dir)/land-conflict-$1"; }
 _afk_read_land_conflict_fp() {
   local f; f="$(_afk_land_conflict_fp_file "$1")"
@@ -526,6 +574,7 @@ auto_land() {
     if [ "$land_rc" -eq 0 ]; then
       log "  landed #$issue"
       _afk_clear_land_retries "$issue"   # a successful land resets the retry budget (#202 D)
+      _afk_clear_precondition_escalated "$issue"  # #354: pushed + landed → drop the escalation marker
       _afk_clear_warned "$issue"         # #241: progress → drop the land's warned-retry backoff
       _afk_incr_landed   # tally for the drain-complete notification (#150)
       _afk_detect_selfupdate "$land_before" "$(_afk_local_default_sha)" "$issue"  # #250
@@ -538,6 +587,7 @@ auto_land() {
       # shipped, so NEVER stamp blocked over merged work. Tally it and point at the log.
       log "  landed #$issue but teardown incomplete (worktree-land exit 3) — see $land_log; NOT escalating (main already advanced)"
       _afk_clear_land_retries "$issue"
+      _afk_clear_precondition_escalated "$issue"  # #354: shipped → drop the escalation marker
       _afk_clear_warned "$issue"         # #241: shipped → drop the warned-retry backoff
       _afk_incr_landed
       _afk_detect_selfupdate "$land_before" "$(_afk_local_default_sha)" "$issue"  # #250: shipped ⇒ still deploy
@@ -553,6 +603,13 @@ auto_land() {
       log "  land #$issue conflicts with the base branch (exit $land_rc) — routing to the resolution lane (see $land_log)"
       _afk_write_land_conflict_fp "$issue" "$(_afk_land_conflict_fingerprint "$path")"
       _afk_route_conflict_resolution "$path" "$issue"
+    elif [ "$land_rc" -eq "$WT_LAND_PRECONDITION_EXIT" ]; then
+      # #354: an INVARIANT upstream precondition (branch unpushed / ahead / behind) — no hub
+      # lane can clear it, so it must NOT sit on the transient warn-retry backoff (which
+      # re-fails identically until the 900s watchdog ceiling, #352). Escalate the REAL blocker
+      # immediately + loudly; the cheap pre-merge re-land each tick still detects a later push.
+      log "  land #$issue blocked by an upstream precondition (exit $land_rc) — branch unpushed/ahead; no hub lane can push it (see $land_log)"
+      _afk_escalate_land_precondition "$path" "$issue" "$land_log"
     else
       # #241 §5: a TRANSIENT / non-conflict auto-land failure (push rejection, dirty-tree guard,
       # etc. — any non-conflict wt_die exit) warns + retries on the backoff instead of parking

@@ -29,6 +29,7 @@ LAND_FUNCTIONS = [
     "_afk_hub_is_dirty",
     "_afk_stash_hub",
     "_afk_restore_hub",
+    "_afk_escalate_land_precondition",
 ]
 
 
