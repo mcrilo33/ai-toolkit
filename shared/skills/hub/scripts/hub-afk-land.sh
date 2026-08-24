@@ -434,6 +434,128 @@ _afk_restore_hub() {
   return 1
 }
 
+# --- #356: the cross-scope land guard ----------------------------------------
+# Scope disjointness used to be enforced ONLY at dispatch (batch-plan.sh, via the dispatcher's
+# _inflight_scope_args). A spoke that wrote OUTSIDE its declared Scope: hit no signal at commit,
+# push, or land, so auto_land merged one spoke's out-of-scope edit into a file a LIVE sibling
+# owned -- manufacturing a conflict (#352/#353). This guard compares the landing diff against
+# the landing issue's Scope: and, tiered by liveness, refuses to land an out-of-scope file that
+# falls inside a live sibling's Scope: (Principle #7: concurrency is scope-graph-bound, so the
+# disjointness must be a GUARANTEE, not merely computed at dispatch and discarded).
+
+# _afk_issue_scope <issue> -> the live issue's Scope: line via gh (dispatcher semantics), empty
+# on no Scope: line. rc 1 when the gh fetch fails -- the caller fails CLOSED. Shares the ONE
+# Scope-line writer _afk_scope_line_of (#5) so the land lane and the dispatcher never drift.
+_afk_issue_scope() {
+  local issue="$1" body
+  body="$(_afk_with_timeout "$AFK_GH_TIMEOUT" gh issue view "$issue" --json body -q .body 2>/dev/null)" || return 1
+  _afk_scope_line_of "$body"
+}
+
+# _afk_land_own_scope <wt> <issue> -> the LANDING issue's Scope: line, read from the spoke's own
+# on-disk contract .ai-toolkit/task.md (the Scope: it was dispatched for) -- hermetic, no gh, and
+# it is the footprint the spoke actually agreed to. rc 1 when unresolvable (no task.md). Goes
+# through the same _afk_scope_line_of writer as every other scope read.
+# UPGRADE: fall back to a live gh fetch (_afk_issue_scope) if task.md is ever stale vs an edited
+#   issue -- today the spawn-time snapshot is authoritative enough and keeps the common land gh-free.
+_afk_land_own_scope() {
+  local wt="$1" tm="$1/.ai-toolkit/task.md"
+  [ -f "$tm" ] || return 1
+  _afk_scope_line_of "$(cat "$tm" 2>/dev/null)"
+}
+
+# _afk_file_in_scope <file> <scope-line> -> true when <file> is covered by any token in the
+# Scope: line: an exact path, a glob (a/*, *.py), a directory prefix (dir/), or the whole-repo
+# `*`. noglob for the token split so a literal glob token is not cwd-expanded.
+_afk_file_in_scope() {
+  local file="$1" scope="$2" tok
+  set -f
+  for tok in $scope; do
+    [ "$tok" = "*" ] && { set +f; return 0; }
+    case "$file" in
+      $tok) set +f; return 0 ;;
+    esac
+    case "$tok" in
+      */) case "$file" in "$tok"*) set +f; return 0 ;; esac ;;
+    esac
+  done
+  set +f
+  return 1
+}
+
+# _afk_landing_changed_files <wt> -> the files the branch would introduce on the base branch: the
+# name-only diff from the merge-base of the local default branch to HEAD. Empty when the base
+# cannot be resolved (the guard then degrades to a loud land, never a silent block).
+_afk_landing_changed_files() {
+  local wt="$1" base mb
+  base="$(_afk_local_default_sha)"
+  [ -n "$base" ] || return 0
+  mb="$(git -C "$wt" merge-base "$base" HEAD 2>/dev/null)" || return 0
+  [ -n "$mb" ] || return 0
+  git -C "$wt" diff --name-only "$mb" HEAD 2>/dev/null || true
+}
+
+# _afk_live_scope_owner <file> <landing-issue> -> the number of the FIRST live in-flight sibling
+# whose Scope: covers <file>, empty when none does. The live-scope map is the dispatcher's
+# (inflight_issues + _afk_issue_scope, #5/AC3). Fails CLOSED: a sibling whose Scope: cannot be
+# resolved (gh failure) or is unknown/exclusive conservatively OWNS the file, so an unresolved
+# collision refuses rather than silently lands (Principle #6 / AC4). Skips the landing issue.
+_afk_live_scope_owner() {
+  local file="$1" landing="$2" m scope
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    [ "$m" = "$landing" ] && continue
+    if scope="$(_afk_issue_scope "$m")"; then
+      { [ -z "$scope" ] || [ "$scope" = "*" ]; } && { printf '%s\n' "$m"; return 0; }
+      _afk_file_in_scope "$file" "$scope" && { printf '%s\n' "$m"; return 0; }
+    else
+      printf '%s\n' "$m"; return 0   # gh fetch failed -> unknown footprint -> fail closed
+    fi
+  done < <(inflight_issues)
+  return 1
+}
+
+# _afk_land_scope_guard <wt> <issue> -> 0 = safe to land, 1 = REFUSE (a live-sibling collision).
+# The load-bearing #356 check, called by auto_land before the land runs:
+#   * own Scope: unresolvable (no task.md) -> a loud drain signal + land (never silent; #6/#3:
+#     do not stall every land on the landing issue's own missing record).
+#   * `Scope: *` / a diff wholly inside the own Scope: -> land silently (AC5).
+#   * out-of-scope file inside a LIVE sibling's Scope: -> broker_warn + journal + REFUSE (AC2).
+#   * out-of-scope file with no live owner -> broker_warn + land (dead-sibling tier, AC7).
+_afk_land_scope_guard() {
+  local wt="$1" issue="$2" own changed f owner
+  local out_of_scope=() collisions=()
+  if ! own="$(_afk_land_own_scope "$wt" "$issue")"; then
+    log "  #$issue: no .ai-toolkit/task.md -- cannot run the cross-scope land guard (#356); landing (verify no live-sibling collision)"
+    return 0
+  fi
+  [ "$own" = "*" ] && return 0                 # owns everything -> nothing out of scope (AC5)
+  if [ -z "$own" ]; then
+    broker_warn "$issue" "declares no Scope: line -- landing without the cross-scope disjointness guard; verify no live-sibling collision (#356)"
+    return 0
+  fi
+  changed="$(_afk_landing_changed_files "$wt")"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    _afk_file_in_scope "$f" "$own" || out_of_scope+=("$f")
+  done <<EOF
+$changed
+EOF
+  [ "${#out_of_scope[@]}" -gt 0 ] || return 0  # diff wholly in the own Scope: (AC5)
+  log "  #$issue landing diff touches file(s) outside its Scope: ${out_of_scope[*]}"
+  for f in "${out_of_scope[@]}"; do
+    owner="$(_afk_live_scope_owner "$f" "$issue")" || owner=""
+    [ -n "$owner" ] && collisions+=("$f (owner #$owner)")
+  done
+  if [ "${#collisions[@]}" -gt 0 ]; then
+    broker_warn "$issue" "refusing to land: out-of-scope file(s) ${collisions[*]} fall inside a LIVE sibling's Scope: -- landing would collide with running work (#356/#7); not landing, resolve or route"
+    broker_journal_decision "$issue" land "refused a land carrying file(s) owned by a live sibling (#356): ${collisions[*]}" reversible
+    return 1
+  fi
+  broker_warn "$issue" "landing with out-of-scope file(s) ${out_of_scope[*]} -- no live sibling owns them; landing, now visible (#356)"
+  return 0
+}
+
 # auto_land -> land every ready/<issue> spoke. The ready/<issue> marker is the readiness
 # contract (enforced by _ready_at_tip above), so a foreign ready/<issue> left by a parallel
 # session is adopted and landed by default (#95). A failed land (merge conflict) emits
@@ -541,6 +663,14 @@ auto_land() {
           continue
         fi
       fi
+    fi
+    # #356: refuse to land a diff carrying an out-of-scope file that a LIVE sibling owns -- the
+    # disjointness the scheduler computes at dispatch, now enforced at land. A refusal is
+    # reversible: it warn-parks on the LAND backoff and re-lands once the sibling lands (which
+    # frees the file), and escalates blocked/<issue> only if it stalls dependents past the bound.
+    if ! _afk_land_scope_guard "$path" "$issue"; then
+      _warn_parked_last "$path" "$issue" "land carries file(s) owned by a live sibling's Scope: -- refused to avoid a cross-scope collision (#356); retrying at low frequency until the sibling lands" land
+      continue
     fi
     log "→ land #$issue"
     _afk_set_last_action "land #$issue"
