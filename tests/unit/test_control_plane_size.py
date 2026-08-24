@@ -65,7 +65,9 @@ LINE_BUDGET = 1200
 # Files knowingly over budget, each with the issue tracking its split. A file may sit
 # here ONLY while its split is an open, tracked commitment — this is a countdown, not
 # a parking lot. Removing the entry (by landing the split) is the goal.
-KNOWN_OVER_BUDGET: dict[str, str] = {}
+KNOWN_OVER_BUDGET: dict[str, str] = {
+    "worktree-lib.sh": "1346 lines; split behind a thin entry lib tracked in #353",
+}
 
 
 def _is_spoke_control_plane(name: str) -> bool:
