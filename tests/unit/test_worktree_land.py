@@ -40,6 +40,12 @@ _GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
 _GIT_ENV.pop("GIT_SSH_COMMAND", None)
 
 
+# The dedicated exit code (#354) for an INVARIANT upstream precondition the hub cannot clear
+# (branch never pushed / ahead / behind / --local-with-upstream). Distinct from 1 (generic
+# die), 3 (teardown-incomplete), and 4 (merge conflict) so auto_land can branch on the kind.
+_WT_LAND_PRECONDITION_EXIT = 5
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=str(repo), check=True, capture_output=True, text=True, env=_GIT_ENV
@@ -419,7 +425,7 @@ def test_refuses_never_pushed_spoke(hub: Path, tmp_path: Path) -> None:
 
     proc, _ = _run_land(hub, tmp_path, "1")
 
-    assert proc.returncode != 0
+    assert proc.returncode == _WT_LAND_PRECONDITION_EXIT, proc.stderr
     assert "push" in proc.stderr.lower()
     assert not (hub / "feature-1-local.txt").exists()
 
@@ -432,7 +438,7 @@ def test_refuses_spoke_ahead_of_upstream(hub: Path, tmp_path: Path) -> None:
 
     proc, _ = _run_land(hub, tmp_path, "1")
 
-    assert proc.returncode != 0
+    assert proc.returncode == _WT_LAND_PRECONDITION_EXIT, proc.stderr
     assert "push" in proc.stderr.lower()
 
 
@@ -450,7 +456,7 @@ def test_refuses_spoke_behind_upstream(hub: Path, tmp_path: Path) -> None:
 
     proc, _ = _run_land(hub, tmp_path, "1")
 
-    assert proc.returncode != 0
+    assert proc.returncode == _WT_LAND_PRECONDITION_EXIT, proc.stderr
     assert "behind" in proc.stderr.lower()
     assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha
     assert _remote_sha(hub, "feature/1-behind") != ""  # remote ref untouched
@@ -1552,7 +1558,7 @@ def test_local_refuses_branch_with_upstream(hub: Path, tmp_path: Path) -> None:
 
     proc, _ = _run_land(hub, tmp_path, "9", "--local")
 
-    assert proc.returncode != 0
+    assert proc.returncode == _WT_LAND_PRECONDITION_EXIT, proc.stderr
     assert "upstream" in proc.stderr.lower()
     assert not (hub / "feature-9-pushed.txt").exists()  # nothing was merged
 
@@ -1590,7 +1596,7 @@ def test_local_refuses_bare_branch_with_upstream(hub: Path, tmp_path: Path) -> N
 
     proc, _ = _run_land(hub, tmp_path, "feature/9-bare-pushed", "--local")
 
-    assert proc.returncode != 0
+    assert proc.returncode == _WT_LAND_PRECONDITION_EXIT, proc.stderr
     assert "upstream" in proc.stderr.lower()
     assert not (hub / "feature-9-bare-pushed.txt").exists()  # nothing was merged
 
