@@ -1135,3 +1135,19 @@ class TestNowMsLocaleRobust:
         result = _now_ms("1700000000.5")
         assert result.stdout == "1700000000500"
         assert result.returncode == 0
+
+    def test_leading_zero_seconds_not_parsed_as_octal(self) -> None:
+        # An all-digit seconds field with a leading zero must be read base-10,
+        # not as invalid octal (which would crash with "value too great").
+        result = _now_ms("089,999999")
+        assert result.stdout == "89999"
+        assert result.stderr == ""
+        assert result.returncode == 0
+
+    def test_garbage_falls_through_silently(self) -> None:
+        # Inert-safe (criterion 3): an unparseable value falls through to the
+        # slower tiers and still returns a valid integer with no stderr, rc 0.
+        result = _now_ms("abc")
+        assert result.stderr == ""
+        assert result.returncode == 0
+        assert result.stdout.strip().isdigit()

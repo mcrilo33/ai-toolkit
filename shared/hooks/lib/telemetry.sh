@@ -36,12 +36,27 @@
 #   4. second-precision date (coarse, but always a valid integer).
 _telemetry_now_ms() {
   if [ -n "${EPOCHREALTIME:-}" ]; then
-    # "1700000000.123456" -> strip the dot, keep ms (first 3 frac digits).
-    # The fractional field is not fixed-width ("…0.5" means 500ms, not 5ms), so
-    # right-pad with zeros BEFORE truncating to 3 digits.
-    local s="${EPOCHREALTIME%%.*}" f="${EPOCHREALTIME#*.}000"
-    printf '%d' "$((10#$s * 1000 + 10#${f:0:3}))"
-    return
+    # "1700000000.123456" -> keep ms (first 3 frac digits). $EPOCHREALTIME is
+    # locale-formatted: a dot on the C locale, but a COMMA on comma-decimal
+    # locales (e.g. fr_FR), so normalize the separator to a dot before splitting
+    # seconds/fraction (#352). The fractional field is not fixed-width ("…0.5"
+    # means 500ms, not 5ms), so right-pad with zeros BEFORE truncating to 3.
+    local rt="${EPOCHREALTIME/,/.}"
+    local s="${rt%%.*}" frac="${rt#*.}"
+    [ "$frac" = "$rt" ] && frac=""   # no separator -> no fraction
+    # Inert-safe (invisibility / AFK Principle 6): only all-digit fields reach
+    # the arithmetic. On any unexpected format, fall through to the slower tiers
+    # rather than surfacing an arithmetic error to the (unredirected) caller.
+    case "$s" in ''|*[!0-9]*) s="" ;; esac
+    case "$frac" in *[!0-9]*) frac="" ;; esac
+    if [ -n "$s" ]; then
+      # 10# on BOTH fields: a leading-zero seconds or fraction (e.g. "089" or
+      # "045") must be read base-10, not parsed as invalid octal. Safe here
+      # because the guards above rejected empty/non-digit s and frac.
+      local f="${frac}000"
+      printf '%d' "$(( 10#$s * 1000 + 10#${f:0:3} ))"
+      return
+    fi
   fi
   if command -v python3 >/dev/null 2>&1; then
     python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null && return
