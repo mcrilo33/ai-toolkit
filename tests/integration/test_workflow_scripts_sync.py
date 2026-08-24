@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,11 @@ WORKTREE_SCRIPTS = (
     "worktree-land.sh",
     "worktree-done.sh",
     "worktree-lib.sh",
+    # The two modules issue #353 split out of worktree-lib.sh; the thin entry sources
+    # them as co-located siblings, so both MUST land next to worktree-lib.sh or the
+    # entry warns loudly (OTel preflight / gh lifecycle labels dead in the target).
+    "worktree-otel-lib.sh",
+    "worktree-gh-lib.sh",
     "spoke-push.sh",
     "spoke-ready.sh",
     # The dead-pane relaunch script (issue #233) ships alongside its spoke siblings so a
@@ -207,7 +213,7 @@ def _import_from_target(target: Path, module: str) -> subprocess.CompletedProces
 
 
 @pytest.fixture()
-def source_pycache() -> Path:
+def source_pycache() -> Iterator[Path]:
     """A ``__pycache__`` in the source package — the hub's steady state.
 
     The hub runs the view builder straight out of ``scripts/telemetry``, so CPython writes

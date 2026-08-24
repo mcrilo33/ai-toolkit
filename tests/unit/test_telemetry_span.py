@@ -128,6 +128,49 @@ def _read_events(events_file: Path) -> list[dict]:
     return [json.loads(line) for line in events_file.read_text().splitlines()]
 
 
+# Comma-decimal locales format bash's $EPOCHREALTIME as "1700000000,123456"; under
+# any of these _telemetry_now_ms must still yield a valid integer, not die on
+# `10#...,...` ("value too large for base"). Probed at runtime and skipped when the
+# host ships none, so the guard is portable (it can never vacuously pass under C).
+_COMMA_LOCALES = ("fr_FR.UTF-8", "de_DE.UTF-8", "fr_FR", "de_DE", "nl_NL.UTF-8")
+
+
+def _comma_decimal_locale() -> str | None:
+    for loc in _COMMA_LOCALES:
+        out = subprocess.run(
+            ["bash", "-c", 'printf "%s" "$EPOCHREALTIME"'],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "LC_ALL": loc},
+        )
+        if "," in out.stdout:
+            return loc
+    return None
+
+
+def test_now_ms_survives_comma_decimal_locale() -> None:
+    # Regression: on a comma-decimal host (e.g. fr_FR) the '.'-only strip left the
+    # whole "…,…" string and `10#…,…` aborted the whole telemetry emit, corrupting
+    # every span's end timestamp. The [.,] class in _telemetry_now_ms fixes it.
+    loc = _comma_decimal_locale()
+    if loc is None:
+        pytest.skip("no comma-decimal locale installed on this host")
+
+    result = subprocess.run(
+        ["bash", "-c", f'source "{TELEMETRY_LIB}"; _telemetry_now_ms'],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LC_ALL": loc},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "base" not in result.stderr, f"locale-parse error leaked: {result.stderr!r}"
+    assert result.stdout.isdigit(), f"expected a pure-integer epoch-ms, got {result.stdout!r}"
+    assert len(result.stdout) >= 13, (
+        f"epoch-ms too short — comma truncated the seconds: {result.stdout!r}"
+    )
+
+
 @pytest.fixture()
 def project_root(tmp_path: Path) -> Path:
     root = tmp_path / "sample-project"

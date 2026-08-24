@@ -36,10 +36,15 @@
 #   4. second-precision date (coarse, but always a valid integer).
 _telemetry_now_ms() {
   if [ -n "${EPOCHREALTIME:-}" ]; then
-    # "1700000000.123456" -> strip the dot, keep ms (first 3 frac digits).
+    # "1700000000.123456" -> strip the separator, keep ms (first 3 frac digits).
+    # Split on EITHER '.' or ',': under a comma-decimal locale (e.g. fr_FR) bash
+    # formats EPOCHREALTIME as "1700000000,123456", so a '.'-only strip leaves the
+    # whole comma-bearing string and `10#...` dies "value too large for base" —
+    # the same locale trap #189 hardened for the process probes. The [.,] class
+    # handles both without forcing a locale on this hot path.
     # The fractional field is not fixed-width ("…0.5" means 500ms, not 5ms), so
     # right-pad with zeros BEFORE truncating to 3 digits.
-    local s="${EPOCHREALTIME%%.*}" f="${EPOCHREALTIME#*.}000"
+    local s="${EPOCHREALTIME%%[.,]*}" f="${EPOCHREALTIME#*[.,]}000"
     printf '%d' "$((10#$s * 1000 + 10#${f:0:3}))"
     return
   fi

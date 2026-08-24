@@ -1900,35 +1900,57 @@ def test_gh_bounds_a_hung_gh_without_coreutils_timeout(tmp_path: Path) -> None:
     # (black-hole network, not clean-offline) must STILL be killed within the budget so
     # a caller — hub-afk's escalation path calls wt_gh directly — is never frozen (#170
     # portability guarantee). Force the no-coreutils branch by overriding the detector.
+    #
+    # The two properties (bounded AND actually invoked) are checked in SEPARATE race-free
+    # invocations. A single "hung gh writes a marker then is killed" run raced the killer:
+    # under the pre-push gate's `-n auto` saturation the forked gh could be TERMed before
+    # it wrote its marker, so the marker check flaked (the wt_gh logic is unchanged — it
+    # passes in isolation). Splitting removes the race entirely.
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    mark = tmp_path / "mark"
     gh = bindir / "gh"
-    gh.write_text('#!/bin/sh\nprintf start >> "$MARK"\nsleep 6\nprintf done >> "$MARK"\n')
+
+    def _run_wt_gh(budget: str, mark: Path) -> tuple[subprocess.CompletedProcess[str], float]:
+        script = (
+            f'source "{WT_LIB}"; '
+            "_wt_gh_timeout_bin() { :; }; "  # force the portable fallback (no coreutils timeout)
+            "wt_gh issue edit 7 --add-label status:blocked; echo rc=$?"
+        )
+        env = {
+            **os.environ,
+            "TZ": "UTC",
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "MARK": str(mark),
+            "AI_TOOLKIT_GH_TIMEOUT": budget,
+            "WT_GH_SEED_DIR": str(tmp_path / "seed"),
+        }
+        start = time.time()
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+        return proc, time.time() - start
+
+    # (1) BOUNDED: a hung gh is killed FAR under its own 30s hang. A load-insensitive
+    # UPPER bound — the kill lands at the ~2s budget; a wt_gh that failed to bound would
+    # take the full 30s. No lower-bound/marker assertion here, so nothing races the killer.
+    gh.write_text('#!/bin/sh\nprintf start >> "$MARK"\nsleep 30\n')
     gh.chmod(0o755)
-    script = (
-        f'source "{WT_LIB}"; '
-        "_wt_gh_timeout_bin() { :; }; "  # force the portable fallback (no coreutils timeout)
-        "wt_gh issue edit 7 --add-label status:blocked; echo rc=$?"
-    )
-    env = {
-        **os.environ,
-        "TZ": "UTC",
-        "PATH": f"{bindir}:{os.environ['PATH']}",
-        "MARK": str(mark),
-        "AI_TOOLKIT_GH_TIMEOUT": "1",
-        "WT_GH_SEED_DIR": str(tmp_path / "seed"),
-    }
-    start = time.time()
-    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
-    elapsed = time.time() - start
+    proc, elapsed = _run_wt_gh("2", tmp_path / "hung")
 
     assert proc.returncode == 0, proc.stderr
     assert "rc=0" in proc.stdout
-    assert elapsed < 4, (
+    assert elapsed < 15, (
         f"wt_gh must bound a hung gh even with no coreutils timeout (took {elapsed:.1f}s)"
     )
-    assert mark.exists() and "start" in mark.read_text(), "gh must actually have been invoked"
+
+    # (2) INVOKED: a FAST gh (no hang) completes long before the 30s budget's killer could
+    # fire, so its marker is written RACE-FREE regardless of scheduling latency — proving
+    # wt_gh actually runs gh (never short-circuits) without betting on winning a race.
+    gh.write_text('#!/bin/sh\nprintf start >> "$MARK"\n')
+    gh.chmod(0o755)
+    fast_mark = tmp_path / "fast"
+    proc, _ = _run_wt_gh("30", fast_mark)
+
+    assert proc.returncode == 0, proc.stderr
+    assert fast_mark.exists() and "start" in fast_mark.read_text(), "gh must actually be invoked"
 
 
 def test_gh_seed_marker_only_persists_on_success_and_self_heals(tmp_path: Path) -> None:
