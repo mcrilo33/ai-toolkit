@@ -39,7 +39,8 @@ LAND_FUNCTIONS = [
     "_afk_land_own_scope",
     "_afk_file_in_scope",
     "_afk_landing_changed_files",
-    "_afk_live_scope_owner",
+    "_afk_live_scopes",
+    "_afk_scope_owner",
     "_afk_land_scope_guard",
 ]
 
@@ -107,7 +108,13 @@ def _seed_task_md(wt: Path, scope_line: str) -> None:
         ),
         pytest.param("scripts/x.sh", "shared/hooks/lib/telemetry.sh", False, id="not-listed"),
         pytest.param("a/b/c.py", "a/*", True, id="glob-star"),
-        pytest.param("shared/hooks/lib/x.sh", "shared/hooks/lib/", True, id="dir-prefix"),
+        pytest.param(
+            "shared/hooks/lib/x.sh", "shared/hooks/lib/", True, id="dir-prefix-trailing-slash"
+        ),
+        pytest.param("shared/hooks/lib/x.sh", "shared/hooks/lib", True, id="dir-prefix-bare"),
+        pytest.param(
+            "shared/hooks/libextra.sh", "shared/hooks/lib", False, id="bare-dir-no-false-prefix"
+        ),
         pytest.param("anything/at/all.sh", "*", True, id="star-owns-everything"),
         pytest.param("other.sh", "a/*", False, id="glob-miss"),
     ],
@@ -225,6 +232,24 @@ def test_land_scope_guard_no_task_md_lands_loudly(tmp_path: Path) -> None:
     assert "356" in r.stderr, r.stderr  # a visible drain signal naming the guard
 
 
+def test_land_scope_guard_loud_when_base_unresolvable(tmp_path: Path) -> None:
+    # The landing base cannot be resolved (the diff-scope comparison cannot run) → land but
+    # LOUD, never a silent fail-open (AC4).
+    wt = tmp_path / "s353"
+    wt.mkdir()
+    _seed_task_md(wt, "Scope: a.sh")
+    expr = (
+        "_afk_landing_changed_files() { return 1; }; "
+        "inflight_issues() { printf '353\\n'; }; "
+        f"_afk_land_scope_guard '{wt}' 353; echo RC=$?"
+    )
+
+    r = _call(expr, env={"AFK_STATE_DIR": str(tmp_path / "st")})
+
+    assert "RC=0" in r.stdout, r.stdout + r.stderr
+    assert "WARNING: #353" in r.stderr and "base" in r.stderr, r.stderr
+
+
 def _git(repo: Path, *args: str) -> None:
     env = {
         "GIT_AUTHOR_NAME": "t",
@@ -236,6 +261,36 @@ def _git(repo: Path, *args: str) -> None:
         "PATH": os.environ["PATH"],
     }
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
+
+
+def test_landing_changed_files_is_the_merge_base_diff(tmp_path: Path) -> None:
+    # The load-bearing crux: the file set is merge-base(default, HEAD)..HEAD — it INCLUDES the
+    # branch's new + modified files and EXCLUDES commits added to the default branch after the
+    # branch point (so a diverged base never masks or manufactures an out-of-scope file).
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "base.txt").write_text("base\n")
+    _git(repo, "add", "base.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "feature/9-x")
+    (repo / "new.txt").write_text("new\n")
+    (repo / "base.txt").write_text("changed\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "work")
+    # A commit landed on main AFTER the branch point — must NOT appear in the landing diff.
+    _git(repo, "checkout", "-q", "main")
+    (repo / "main_only.txt").write_text("m\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "main-only")
+    _git(repo, "checkout", "-q", "feature/9-x")
+
+    r = _call(
+        f"_afk_landing_changed_files '{repo}'",
+        env={"MAIN_ROOT": str(repo), "AFK_DEFAULT_BRANCH": "main"},
+    )
+
+    assert set(r.stdout.split()) == {"new.txt", "base.txt"}, r.stdout + r.stderr
 
 
 def test_auto_land_refuses_to_invoke_land_on_live_sibling_collision(tmp_path: Path) -> None:

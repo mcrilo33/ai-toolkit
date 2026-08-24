@@ -465,53 +465,71 @@ _afk_land_own_scope() {
 }
 
 # _afk_file_in_scope <file> <scope-line> -> true when <file> is covered by any token in the
-# Scope: line: an exact path, a glob (a/*, *.py), a directory prefix (dir/), or the whole-repo
-# `*`. noglob for the token split so a literal glob token is not cwd-expanded.
+# Scope: line: an exact path, a glob (a/*, *.py), a directory prefix (whether the token is
+# written `dir/` OR bare `dir`), or the whole-repo `*`. The bare-dir case matters: a scope
+# token `shared/hooks/lib` (no trailing slash) must still own `shared/hooks/lib/telemetry.sh`,
+# else a dir-style scope fails OPEN and silently re-admits the very #352/#353 collision this
+# guard prevents. noglob for the token split so a literal glob token is not cwd-expanded.
 _afk_file_in_scope() {
-  local file="$1" scope="$2" tok
+  local file="$1" scope="$2" tok pfx
   set -f
   for tok in $scope; do
     [ "$tok" = "*" ] && { set +f; return 0; }
     case "$file" in
-      $tok) set +f; return 0 ;;
+      $tok) set +f; return 0 ;;     # exact path or glob
     esac
-    case "$tok" in
-      */) case "$file" in "$tok"*) set +f; return 0 ;; esac ;;
+    pfx="${tok%/}"                  # a dir token, with or without a trailing slash
+    case "$file" in
+      "$pfx"/*) set +f; return 0 ;;
     esac
   done
   set +f
   return 1
 }
 
-# _afk_landing_changed_files <wt> -> the files the branch would introduce on the base branch: the
-# name-only diff from the merge-base of the local default branch to HEAD. Empty when the base
-# cannot be resolved (the guard then degrades to a loud land, never a silent block).
+# _afk_landing_changed_files <wt> -> the files the branch would introduce on the base branch:
+# the name-only diff from the merge-base of the local default branch to HEAD (so it excludes
+# what is already on the base and includes the spoke's new files). rc 1 when the base cannot be
+# resolved -- the caller then lands LOUDLY (the diff-scope comparison could not run), never a
+# silent fail-open. rc 0 with empty output is a genuinely empty diff.
 _afk_landing_changed_files() {
   local wt="$1" base mb
   base="$(_afk_local_default_sha)"
-  [ -n "$base" ] || return 0
-  mb="$(git -C "$wt" merge-base "$base" HEAD 2>/dev/null)" || return 0
-  [ -n "$mb" ] || return 0
+  [ -n "$base" ] || return 1
+  mb="$(git -C "$wt" merge-base "$base" HEAD 2>/dev/null)" || return 1
+  [ -n "$mb" ] || return 1
   git -C "$wt" diff --name-only "$mb" HEAD 2>/dev/null || true
 }
 
-# _afk_live_scope_owner <file> <landing-issue> -> the number of the FIRST live in-flight sibling
-# whose Scope: covers <file>, empty when none does. The live-scope map is the dispatcher's
-# (inflight_issues + _afk_issue_scope, #5/AC3). Fails CLOSED: a sibling whose Scope: cannot be
-# resolved (gh failure) or is unknown/exclusive conservatively OWNS the file, so an unresolved
-# collision refuses rather than silently lands (Principle #6 / AC4). Skips the landing issue.
-_afk_live_scope_owner() {
-  local file="$1" landing="$2" m scope
+# _afk_live_scopes <landing-issue> -> the live-scope map, one `<num>\t<scope-line>` line per live
+# in-flight sibling (the landing issue excluded). Each sibling's Scope: is resolved ONCE here --
+# invariant within a guard invocation -- so the file loop below never re-fetches (a K-file x
+# M-sibling gh storm would stall the synchronous land tick, #170). Derived from the dispatcher
+# resolver (inflight_issues + _afk_issue_scope -> the shared _afk_scope_line_of, #5/AC3). A gh
+# fetch failure emits an EMPTY scope, which _afk_scope_owner reads as fail-closed (AC4).
+_afk_live_scopes() {
+  local landing="$1" m scope
   while IFS= read -r m; do
     [ -n "$m" ] || continue
     [ "$m" = "$landing" ] && continue
-    if scope="$(_afk_issue_scope "$m")"; then
-      { [ -z "$scope" ] || [ "$scope" = "*" ]; } && { printf '%s\n' "$m"; return 0; }
-      _afk_file_in_scope "$file" "$scope" && { printf '%s\n' "$m"; return 0; }
-    else
-      printf '%s\n' "$m"; return 0   # gh fetch failed -> unknown footprint -> fail closed
-    fi
+    scope="$(_afk_issue_scope "$m")" || scope=""   # gh fail -> empty -> fail-closed downstream
+    printf '%s\t%s\n' "$m" "$scope"
   done < <(inflight_issues)
+}
+
+# _afk_scope_owner <file> <map> -> the FIRST sibling number in <map> (from _afk_live_scopes)
+# whose Scope: covers <file>, empty when none does. A pure lookup (no gh). Fails CLOSED: a
+# sibling whose scope is empty (unresolved) or `*` (exclusive) conservatively OWNS the file, so
+# an unresolved collision refuses rather than silently lands (Principle #6 / AC4).
+_afk_scope_owner() {
+  local file="$1" map="$2" num scope
+  while IFS=$'\t' read -r num scope; do
+    [ -n "$num" ] || continue
+    { [ -z "$scope" ] || [ "$scope" = "*" ]; } && { printf '%s\n' "$num"; return 0; }
+    _afk_file_in_scope "$file" "$scope" && { printf '%s\n' "$num"; return 0; }
+  done <<EOF
+$map
+EOF
   return 1
 }
 
@@ -523,7 +541,7 @@ _afk_live_scope_owner() {
 #   * out-of-scope file inside a LIVE sibling's Scope: -> broker_warn + journal + REFUSE (AC2).
 #   * out-of-scope file with no live owner -> broker_warn + land (dead-sibling tier, AC7).
 _afk_land_scope_guard() {
-  local wt="$1" issue="$2" own changed f owner
+  local wt="$1" issue="$2" own changed f owner map
   local out_of_scope=() collisions=()
   if ! own="$(_afk_land_own_scope "$wt" "$issue")"; then
     log "  #$issue: no .ai-toolkit/task.md -- cannot run the cross-scope land guard (#356); landing (verify no live-sibling collision)"
@@ -534,7 +552,10 @@ _afk_land_scope_guard() {
     broker_warn "$issue" "declares no Scope: line -- landing without the cross-scope disjointness guard; verify no live-sibling collision (#356)"
     return 0
   fi
-  changed="$(_afk_landing_changed_files "$wt")"
+  if ! changed="$(_afk_landing_changed_files "$wt")"; then
+    broker_warn "$issue" "could not resolve the landing base -- landing without the diff-scope comparison; verify no live-sibling collision (#356)"
+    return 0
+  fi
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     _afk_file_in_scope "$f" "$own" || out_of_scope+=("$f")
@@ -543,8 +564,11 @@ $changed
 EOF
   [ "${#out_of_scope[@]}" -gt 0 ] || return 0  # diff wholly in the own Scope: (AC5)
   log "  #$issue landing diff touches file(s) outside its Scope: ${out_of_scope[*]}"
+  # Resolve every live sibling's Scope: ONCE (no per-file gh re-fetch, #170), then look each
+  # out-of-scope file up in that map.
+  map="$(_afk_live_scopes "$issue")"
   for f in "${out_of_scope[@]}"; do
-    owner="$(_afk_live_scope_owner "$f" "$issue")" || owner=""
+    owner="$(_afk_scope_owner "$f" "$map")" || owner=""
     [ -n "$owner" ] && collisions+=("$f (owner #$owner)")
   done
   if [ "${#collisions[@]}" -gt 0 ]; then
