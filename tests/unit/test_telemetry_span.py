@@ -1089,3 +1089,49 @@ class TestOtlpHookAttributes:
 
         span = _read_events(telemetry_dir / "events.jsonl")[0]
         assert set(span.keys()) == SCHEMA_KEYS
+
+
+# ── _telemetry_now_ms locale robustness (#352) ────────────
+
+
+def _now_ms(epochrealtime: str) -> subprocess.CompletedProcess[str]:
+    """Call ``_telemetry_now_ms`` with a stubbed ``$EPOCHREALTIME``.
+
+    Bash reformats ``$EPOCHREALTIME`` with the locale decimal separator (a comma
+    on fr_FR); a literal comma value reproduces that without needing the locale
+    installed on the test host.
+    """
+    script = f'source "{TELEMETRY_LIB}"; EPOCHREALTIME={epochrealtime!r} _telemetry_now_ms'
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+    )
+
+
+class TestNowMsLocaleRobust:
+    """The ``$EPOCHREALTIME`` tier must survive a comma decimal separator (#352)."""
+
+    def test_comma_locale_returns_correct_ms(self) -> None:
+        # fr_FR formats EPOCHREALTIME with a comma; the helper must still split
+        # seconds/fraction and return the correct epoch-ms integer.
+        result = _now_ms("1787582294,045580")
+        assert result.stdout == "1787582294045"
+
+    def test_no_stderr_and_zero_exit_under_comma(self) -> None:
+        # Invisibility / AFK Principle 6: a best-effort timestamp read must never
+        # surface an arithmetic error to its (possibly unredirected) caller.
+        result = _now_ms("1787582294,045580")
+        assert result.stderr == ""
+        assert result.returncode == 0
+
+    def test_dot_locale_unchanged(self) -> None:
+        result = _now_ms("1787582294.045580")
+        assert result.stdout == "1787582294045"
+        assert result.returncode == 0
+
+    def test_half_second_is_500ms(self) -> None:
+        # The fraction is not fixed-width: "...0.5" is 500ms, not 5ms.
+        result = _now_ms("1700000000.5")
+        assert result.stdout == "1700000000500"
+        assert result.returncode == 0
