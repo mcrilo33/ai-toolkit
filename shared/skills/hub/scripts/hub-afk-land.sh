@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # hub-afk-land.sh -- split out of hub-afk.sh (issue #307).
 #
-# The LAND lane of the /afk supervisor: auto_land + the land-retry and #285 conflict-
-# resolution lanes, the review-gate consult, the auto-answer pass, and the ready/blocked
-# tip probes (plus the #285 conflict-resolve prompt, whose resolution lane lives here). A
+# The LAND lane of the /afk supervisor: auto_land + the land-retry, #285 conflict-
+# resolution, and #354 invariant-upstream-precondition-escalation lanes, the review-gate
+# consult, the auto-answer pass, and the ready/blocked tip probes (plus the #285
+# conflict-resolve prompt, whose resolution lane lives here). A
 # pure function-definition module sourced by the entry lib hub-afk.sh AFTER worktree-lib /
 # gate-broker / log / afk_now and the entry's own state/time primitives, and BEFORE any
 # function is called, so every cross-module helper resolves at call time. Not run on its own.
