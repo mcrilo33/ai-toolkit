@@ -22,6 +22,16 @@ set -uo pipefail
 : "${HUB_WATCHDOG_IDLE_CEILING:=3600}"  # a dead/idle spoke unrevived this long ⇒ reaper missed it
 : "${HUB_WATCHDOG_LAND_CEILING:=900}"   # a ready-at-tip branch un-landed this long ⇒ auto-land skipped
 : "${HUB_WATCHDOG_LAND_ACTIVE:=900}"    # a land-<issue>.log quiet this long ⇒ that land is NOT in flight
+# a blocked/ marker behind the tip this long ⇒ reconcile_markers missed it (#357). >= 2x the drain's
+# AFK_TICK_SECONDS reconcile cadence (the full-tick backstop, 300s), so a CORRECT drain reconciling on
+# its own tick never trips this — the grace margin condition 3 lacked, unlike the ceilings above.
+# AFK_TICK_SECONDS is not sourced into the watchdog, so it is guarded to hub-afk.sh's own default; a
+# non-numeric slip ("5m") FLOORS to that default rather than evaluating a bareword and aborting the
+# whole detection-module source under set -u — a silent tier-2 non-arm (§2 fail-loud/safe, §6).
+_wd_tick_secs="${AFK_TICK_SECONDS:-300}"
+case "$_wd_tick_secs" in '' | *[!0-9]*) _wd_tick_secs=300 ;; esac
+: "${HUB_WATCHDOG_MARKER_CEILING:=$(( 2 * _wd_tick_secs ))}"
+unset _wd_tick_secs
 
 # _wd_epoch_stale <epoch> <now> <ceiling> -> true when now-epoch > ceiling. Empty/non-numeric
 # reads as NOT stale (can't measure → never fire), guarding set -u arithmetic against a bareword.
@@ -585,8 +595,48 @@ _wd_dead_idle_reason() {
     "${done_epoch:-none}" "$(_wd_last_action)"
 }
 
-# Condition 3: a stale blocked/ marker reconcile_markers should have cleared.
-_wd_detect_stale_marker() { _wd_blocked_stale "$1" "$2"; }
+# _wd_stale_onset_file <issue> -> path of the stale-marker onset epoch (#357): the FIRST tick the
+# detector observes blocked/<issue> a strict ancestor of the tip, mirroring park-onset-<issue>.epoch's
+# #283 role for condition 1. Lives beside the dedup markers — _afk_state_dir when the gate-broker is
+# in scope, else _wd_common_dir for a standalone watchdog (the _wd_fired_marker dir idiom).
+_wd_stale_onset_file() {
+  local dir
+  if command -v _afk_state_dir >/dev/null 2>&1; then dir="$(_afk_state_dir)"; else dir="$(_wd_common_dir)"; fi
+  printf '%s\n' "$dir/wd-stale-onset-$1.epoch"
+}
+# stamp-once: hold the onset constant across consecutive stale ticks so the age measures from the
+# FIRST observation, not the latest tick. Best-effort (§6): a failed write leaves no onset, so
+# _wd_epoch_stale reads it as not-stale and the detector never fires on an unrecorded onset.
+_wd_stamp_stale_onset_once() {
+  local f; f="$(_wd_stale_onset_file "$1")"
+  [ -f "$f" ] && return 0
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\n' "$(_wd_now)" > "$f" 2>/dev/null || true
+}
+_wd_read_stale_onset()  { local f; f="$(_wd_stale_onset_file "$1")"; [ -f "$f" ] && cat "$f" 2>/dev/null || true; }
+_wd_clear_stale_onset() { rm -f "$(_wd_stale_onset_file "$1")" 2>/dev/null || true; }
+
+# Condition 3: a stale blocked/ marker reconcile_markers should have cleared — but only once it has
+# PERSISTED behind the tip past HUB_WATCHDOG_MARKER_CEILING, the grace margin over the drain's own
+# reconcile cadence (#357). _wd_blocked_stale is a pure ref-topology predicate with no time
+# dimension — byte-identical to the drain's _blocked_tag_is_stale — so firing on it raw just re-runs
+# the drain's predicate on a 60s loop against a 300s consumer and wins the race: every blocked spoke
+# answered-then-committed within a tick false-fired an afk-defect (#347). The fix mirrors condition
+# 1's #283 stamp-as-you-measure: RECORD the stale-onset the first tick the tag is seen behind the tip
+# (afk-design-principles §1 — record, don't infer), fire only once now-onset exceeds the ceiling, and
+# clear the onset on any quiet observation (tag gone or back at the tip) so a genuine later recurrence
+# re-arms from a fresh onset. An unreadable/empty onset reads "unknown" and never fires (§6), via
+# _wd_epoch_stale's empty-is-not-stale guard. `now` defaults to _wd_now so the 2-arg dispatcher call
+# is unchanged (this detector has no dry-run/status caller that would re-stamp the clock speculatively).
+_wd_detect_stale_marker() {
+  local wt="$1" issue="$2" now="${3:-$(_wd_now)}"
+  if ! _wd_blocked_stale "$wt" "$issue"; then
+    _wd_clear_stale_onset "$issue"   # quiet: tag gone or back at tip → re-arm a future recurrence
+    return 1
+  fi
+  _wd_stamp_stale_onset_once "$issue"
+  _wd_epoch_stale "$(_wd_read_stale_onset "$issue")" "$now" "$HUB_WATCHDOG_MARKER_CEILING"
+}
 
 # _wd_land_lane_servicing <issue> -> true when the drain's LAND lane has a FRESH armed retry
 # (warned-state-<issue>-land next-due in the FUTURE): the drain is actively re-attempting the land
