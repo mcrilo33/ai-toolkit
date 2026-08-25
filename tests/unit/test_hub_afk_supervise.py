@@ -30,7 +30,7 @@ SUPERVISE_FUNCTIONS = [
     "_afk_capture_hang_forensics",
 ]
 
-ALL_MODULES = ("land", "dispatch", "arm", "supervise", "recover")
+ALL_MODULES = ("land", "dispatch", "arm", "supervise", "recover", "state")
 
 
 @pytest.mark.parametrize("fn", SUPERVISE_FUNCTIONS)

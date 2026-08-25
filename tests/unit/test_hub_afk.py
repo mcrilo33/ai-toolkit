@@ -6273,7 +6273,7 @@ def test_self_copy_copies_sibling_set(tmp_path: Path) -> None:
     # The #307 hub-afk-<lane>.sh modules the entry sources must ride along too, or a self-copy
     # supervisor sources missing siblings and (fail-closed) refuses to arm — the *.sh glob
     # carries them, and this pins that it does.
-    for _mod in ("land", "dispatch", "arm", "supervise", "recover"):
+    for _mod in ("land", "dispatch", "arm", "supervise", "recover", "state"):
         assert _wait_for_glob(tmp_path, f"hub-afk-self.*/hub-afk-{_mod}.sh"), (
             f"hub-afk-{_mod}.sh must ride along in the self-copy"
         )
