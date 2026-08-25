@@ -724,3 +724,61 @@ def test_spoke_main_push_still_denied_when_base_configured(spoke: Path) -> None:
     result = run_guard(payload, cwd=spoke)
 
     assert result.returncode == BLOCK
+
+
+# ── Out-of-scope FILE advisory (issue #356) ───────────────
+# A spoke's own-branch push is in scope (branch-wise), but the guard ALSO reads the spoke's
+# declared Scope: from .ai-toolkit/task.md and, when the pushed commits touch a file OUTSIDE
+# that Scope:, emits an advisory naming it — the earliest visible signal of the cross-scope
+# write the hub-side land guard enforces. It is ADVISORY on every platform (never a new deny;
+# a spoke may legitimately need an out-of-scope edit whose gate is red on that file), and
+# degrades silent when there is no task.md, no Scope: line, a `Scope: *`, or a non-feature
+# branch. The spoke fixture's commit adds `work.txt`.
+
+
+def _seed_scope(wt: Path, scope_line: str) -> None:
+    (wt / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (wt / ".ai-toolkit" / "task.md").write_text(f"# task\n\n{scope_line}\nGate: plan\n")
+
+
+def test_spoke_warns_on_out_of_scope_file_but_still_allows(spoke: Path) -> None:
+    # Scope: declares a different file, so the pushed work.txt is out of scope → advisory
+    # names it, but the own-branch push is STILL allowed (exit 0, never a deny).
+    _seed_scope(spoke, "Scope: docs/only.md")
+
+    payload = _payload(f"git push -u origin {OWN}")
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == ALLOW, result.stderr
+    assert "work.txt" in result.stderr and "Scope" in result.stderr, result.stderr
+
+
+def test_spoke_no_warning_when_push_in_scope(spoke: Path) -> None:
+    # work.txt is inside the declared Scope: → no out-of-scope advisory.
+    _seed_scope(spoke, "Scope: work.txt")
+
+    payload = _payload(f"git push -u origin {OWN}")
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == ALLOW, result.stderr
+    assert "work.txt" not in result.stderr, result.stderr
+
+
+def test_spoke_no_scope_advisory_without_task_md(spoke: Path) -> None:
+    # No .ai-toolkit/task.md → the advisory degrades silent (existing behavior intact).
+    payload = _payload(f"git push -u origin {OWN}")
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == ALLOW, result.stderr
+    assert "work.txt" not in result.stderr, result.stderr
+
+
+def test_spoke_star_scope_suppresses_advisory(spoke: Path) -> None:
+    # Scope: * owns everything → no out-of-scope advisory.
+    _seed_scope(spoke, "Scope: *")
+
+    payload = _payload(f"git push -u origin {OWN}")
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == ALLOW, result.stderr
+    assert "work.txt" not in result.stderr, result.stderr

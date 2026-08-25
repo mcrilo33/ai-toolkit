@@ -39,8 +39,9 @@ _telemetry_now_ms() {
     # "1700000000.123456" -> keep ms (first 3 frac digits). $EPOCHREALTIME is
     # locale-formatted: a dot on the C locale, but a COMMA on comma-decimal
     # locales (e.g. fr_FR), so normalize the separator to a dot before splitting
-    # seconds/fraction (#352). The fractional field is not fixed-width ("…0.5"
-    # means 500ms, not 5ms), so right-pad with zeros BEFORE truncating to 3.
+    # seconds/fraction (#352, same locale trap #189 hardened for the process
+    # probes). The fractional field is not fixed-width ("…0.5" means 500ms, not
+    # 5ms), so right-pad with zeros BEFORE truncating to 3.
     local rt="${EPOCHREALTIME/,/.}"
     local s="${rt%%.*}" frac="${rt#*.}"
     [ "$frac" = "$rt" ] && frac=""   # no separator -> no fraction
