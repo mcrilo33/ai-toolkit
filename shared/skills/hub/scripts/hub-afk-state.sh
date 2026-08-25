@@ -215,7 +215,7 @@ afk_heartbeat_file() {
 # must record the SUPERVISOR's pid (its parent), not its own (#202 B), so the pid stays the truth
 # afk_supervisor_state cross-checks; afk_write_heartbeat is the common "stamp my own pid" case.
 # The optional trailing wake-capability token (#207) is appended only when this supervisor has
-# armed its USR1 trap (_AFK_WAKE_TOKEN set below), so afk-notify-wake never SIGUSR1s — and thus
+# armed its USR1 trap (_AFK_WAKE_TOKEN set by the entry lib), so afk-notify-wake never SIGUSR1s — and thus
 # never KILLs — a pre-#176 supervisor whose default SIGUSR1 action is terminate.
 afk_write_heartbeat_pid() {
   _afk_atomic_write "$(afk_heartbeat_file)" "$1 $(afk_now)${_AFK_WAKE_TOKEN:+ $_AFK_WAKE_TOKEN}" || true

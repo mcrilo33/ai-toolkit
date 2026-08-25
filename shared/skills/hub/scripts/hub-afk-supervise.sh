@@ -7,7 +7,7 @@
 # the #243 hang-forensics capture (proc-tree + fingerprint before a kill; called by recover's
 # revive path).
 # A pure function-definition module sourced by the entry lib hub-afk.sh AFTER worktree-lib /
-# gate-broker / log / afk_now and the entry's own state/time primitives, and BEFORE any
+# gate-broker / log / afk_now and hub-afk-state.sh's state/time primitives, and BEFORE any
 # function is called, so every cross-module helper resolves at call time. Not run on its own.
 set -uo pipefail
 

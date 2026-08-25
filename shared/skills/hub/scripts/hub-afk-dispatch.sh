@@ -5,7 +5,7 @@
 # dispatch_batch, kickoff_for, the in-flight scope args, the concurrency cap + stagger, the
 # dispatch-failure ceiling, the #278 subtask-chain packing/routing, and the afk:* GitHub
 # status labels. A pure function-definition module sourced by the entry lib hub-afk.sh AFTER
-# worktree-lib / gate-broker / log / afk_now and the entry's own state/time primitives, and
+# worktree-lib / gate-broker / log / afk_now and hub-afk-state.sh's state/time primitives, and
 # BEFORE any function is called, so every cross-module helper resolves at call time. Not run
 # on its own.
 set -uo pipefail

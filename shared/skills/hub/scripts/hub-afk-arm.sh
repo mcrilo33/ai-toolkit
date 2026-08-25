@@ -5,7 +5,7 @@
 # the sleep-inhibitor / power status warnings, and the arm-time liveness probes +
 # preconditions + the ONE arm verdict + the self-check -- everything that runs ONCE before
 # the supervisor loop starts. A pure function-definition module sourced by the entry lib
-# hub-afk.sh AFTER worktree-lib / gate-broker / log / afk_now and the entry's own state/time
+# hub-afk.sh AFTER worktree-lib / gate-broker / log / afk_now and hub-afk-state.sh's state/time
 # primitives, and BEFORE any function is called, so every cross-module helper resolves at
 # call time. Not run on its own.
 set -uo pipefail

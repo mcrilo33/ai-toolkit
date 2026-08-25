@@ -7,7 +7,7 @@
 # #241 revive-first / warned-parked-last lane, _reap_or_resume,
 # the auth/network reap-prep probes, reap_pass, and recover_dead_panes. A pure function-
 # definition module sourced by the entry lib hub-afk.sh AFTER worktree-lib / gate-broker /
-# log / afk_now and the entry's own state/time primitives, and BEFORE any function is called,
+# log / afk_now and hub-afk-state.sh's state/time primitives, and BEFORE any function is called,
 # so every cross-module helper resolves at call time. Not run on its own.
 set -uo pipefail
 

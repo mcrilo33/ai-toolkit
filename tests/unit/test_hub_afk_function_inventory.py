@@ -30,11 +30,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
 
-# A top-level bash function definition: `name() {`, optionally `function`-prefixed,
-# optionally indented (so a definition nested in a block would still match — none of the
-# hub-afk*.sh modules currently nest one, so this is over-inclusive by design rather than
-# a gap).
-_FUNC_DEF_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{", re.MULTILINE)
+# A top-level bash function definition, either `name() {` or the parenless `function name {`
+# form, optionally indented (so a definition nested in a block would still match — none of
+# the hub-afk*.sh modules currently nest one, so this is over-inclusive by design rather
+# than a gap).
+_FUNC_DEF_RE = re.compile(r"^\s*(?:function\s+(\w+)\s*(?:\(\))?|(\w+)\s*\(\))\s*\{", re.MULTILINE)
 
 
 def _function_defs() -> dict[str, list[str]]:
@@ -42,7 +42,8 @@ def _function_defs() -> dict[str, list[str]]:
     defs: dict[str, list[str]] = defaultdict(list)
     for path in sorted(HUB_SCRIPTS_DIR.glob("hub-afk*.sh")):
         for match in _FUNC_DEF_RE.finditer(path.read_text()):
-            defs[match.group(1)].append(path.name)
+            name = match.group(1) or match.group(2)
+            defs[name].append(path.name)
     return defs
 
 
