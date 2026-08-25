@@ -12,6 +12,13 @@ This complements, but does not replace, the per-module mirror tests
 (test_hub_afk_<lane>.py): those pin that a SPECIFIC named function reachable through the
 entry resolves to a SPECIFIC module file; this test is the repo-wide sweep that would catch
 a name accidentally left in two files (or two modules) that the mirror tests don't cover.
+
+Covers hub-afk.sh, hub-afk-land.sh, hub-afk-dispatch.sh, hub-afk-arm.sh,
+hub-afk-supervise.sh, hub-afk-recover.sh, hub-afk-state.sh, and every lane added after —
+named explicitly (not only via the glob below) so this file reaches the SELECTED test
+tier: the reverse-index selector (shared/hooks/lib/test-reverse-index.sh) maps a changed
+file to a test by scanning for its basename as an exact token, and a bare `hub-afk*.sh`
+glob is not a token it can extract.
 """
 
 from __future__ import annotations
@@ -23,10 +30,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
 
-# A top-level bash function definition: `name() {` or `function name {`, optionally
-# preceded by whitespace (never inside another block — a nested helper is not part of
-# this family's public/registered function surface, and none of the hub-afk*.sh modules
-# define nested functions).
+# A top-level bash function definition: `name() {`, optionally `function`-prefixed,
+# optionally indented (so a definition nested in a block would still match — none of the
+# hub-afk*.sh modules currently nest one, so this is over-inclusive by design rather than
+# a gap).
 _FUNC_DEF_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{", re.MULTILINE)
 
 

@@ -1,7 +1,7 @@
 """Shared bash-coprocess harness for the hub-afk module test suite (issue #307).
 
 `hub-afk.sh` is split into hub-afk-<lane>.sh functional modules (dispatch / recover / land /
-arm / supervise), mirroring the #275 gate-broker split. Each module has a mirror test file
+arm / supervise / state), mirroring the #275 gate-broker split. Each module has a mirror test file
 (test_hub_afk_<lane>.py) that sources the ENTRY lib (hub-afk.sh) — which in turn sources the
 modules — and drives the module's functions, exactly as the gate-broker module tests source
 gate-broker.sh. This module owns the one shared coprocess so the multi-thousand-line source
