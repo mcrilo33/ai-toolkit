@@ -19,7 +19,18 @@ import pytest
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 HOOKS_LIB_DIR = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "lib"
-WORKTREE_SCRIPTS = ("worktree-new.sh", "worktree-land.sh", "worktree-done.sh", "worktree-lib.sh")
+# worktree-lib.sh is the thin entry; issue #353 split its native-OTel preflight and gh
+# lifecycle-label machinery into worktree-{otel,gh}-lib.sh, which the entry sources as
+# co-located siblings and worktree-new.sh calls unconditionally. sync-to-repo.sh ships
+# all three next to each other, so a realistic foreign checkout stages them together.
+WORKTREE_SCRIPTS = (
+    "worktree-new.sh",
+    "worktree-land.sh",
+    "worktree-done.sh",
+    "worktree-lib.sh",
+    "worktree-otel-lib.sh",
+    "worktree-gh-lib.sh",
+)
 # Co-located next to the scripts by sync-to-repo.sh (like telemetry.sh) so
 # worktree-lib.sh finds it as a sibling in a synced target (issue #117).
 COLOCATED_LIBS = ("base-branch.sh",)

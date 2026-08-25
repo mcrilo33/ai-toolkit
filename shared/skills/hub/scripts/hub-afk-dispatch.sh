@@ -53,6 +53,16 @@ genuinely dangerous or irreversible ops (force-push, history rewrites, anything 
 EOF
 }
 
+# _afk_scope_line_of <body> -> the value of the issue body's first `Scope:` line (the tokens
+# after the label), or empty when the body has no `Scope:` line. THE single writer of the
+# Scope-line extraction semantics (#356/#5): factored out of _inflight_scope_args so the
+# dispatcher and the land lane's cross-scope guard (hub-afk-land.sh) share ONE parser instead
+# of two `sed` copies kept equal by a test. Case-insensitive, leading-space tolerant, first
+# line wins — exactly what batch-plan's scope_of and the dispatcher have always used.
+_afk_scope_line_of() {
+  printf '%s\n' "$1" | sed -n 's/^[[:space:]]*[Ss]cope:[[:space:]]*//p' | head -1
+}
+
 # _inflight_scope_args -> repeated `--inflight "<scope>"` flags, one per live spoke, so
 # batch-plan holds back a ready issue that collides with work already running. The Scope:
 # line is read from each in-flight issue's body (the same source batch-plan reads). When a
@@ -71,7 +81,7 @@ _inflight_scope_args() {
       log "  gh issue view #$issue timed out or failed — treating its scope as unknown (exclusive)"
       body=""
     fi
-    scope="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*[Ss]cope:[[:space:]]*//p' | head -1)"
+    scope="$(_afk_scope_line_of "$body")"   # #356/#5: the one shared Scope-line extractor
     printf -- '--inflight\n%s\n' "${scope:-*}"
   done < <(inflight_issues)
 }

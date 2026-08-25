@@ -554,6 +554,10 @@ sync_mcp_servers() {
 # ensure-test-venv.sh ships so worktree-new.sh can provision the pre-push gate's
 # testmon/xdist deps into each spawn's .venv (issue #342); toolkit-root script, so
 # it too takes the loop's default source case.
+# worktree-otel-lib.sh / worktree-gh-lib.sh are the two modules issue #353 split out
+# of worktree-lib.sh; the thin entry sources them as co-located siblings, so both
+# MUST ship next to worktree-lib.sh (toolkit-root default case) or a synced target's
+# entry sources a missing sibling and warns loudly (OTel preflight / gh labels dead).
 # Sources: worktree-*.sh, spoke-push.sh, spoke-ready.sh and
 # telemetry-ingest-spoke.sh at the toolkit root scripts/, hub-status.sh,
 # hub-ready-watch.sh, hub-otel-watch.sh, hub-afk.sh and batch-plan.sh under
@@ -570,7 +574,7 @@ sync_workflow_scripts() {
     # hooks/lib/) so the worktree scripts can source them as siblings — see
     # worktree-lib.sh's telemetry and base-branch blocks.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh ensure-test-venv.sh spoke-push.sh spoke-ready.sh spoke-relaunch.sh gate-sweep.sh travel-local.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh hub-afk-land.sh hub-afk-dispatch.sh hub-afk-arm.sh hub-afk-supervise.sh hub-afk-recover.sh hub-agent.sh gate-broker.sh gate-broker-markers.sh gate-broker-detect.sh gate-broker-classify.sh gate-broker-danger.sh gate-broker-answerer.sh gate-broker-permission.sh transition-log.sh hub-inject.sh hub-watchdog.sh hub-watchdog-detect.sh hub-watchdog-intervene.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-otel-lib.sh worktree-gh-lib.sh worktree-quick.sh ensure-test-venv.sh spoke-push.sh spoke-ready.sh spoke-relaunch.sh gate-sweep.sh travel-local.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh hub-afk-land.sh hub-afk-dispatch.sh hub-afk-arm.sh hub-afk-supervise.sh hub-afk-recover.sh hub-agent.sh gate-broker.sh gate-broker-markers.sh gate-broker-detect.sh gate-broker-classify.sh gate-broker-danger.sh gate-broker-answerer.sh gate-broker-permission.sh transition-log.sh hub-inject.sh hub-watchdog.sh hub-watchdog-detect.sh hub-watchdog-intervene.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh; do
         case "$name" in
             hub-status.sh|hub-ready-watch.sh|hub-notify.sh|hub-otel-watch.sh|hub-afk.sh|hub-afk-land.sh|hub-afk-dispatch.sh|hub-afk-arm.sh|hub-afk-supervise.sh|hub-afk-recover.sh|hub-agent.sh|gate-broker.sh|gate-broker-markers.sh|gate-broker-detect.sh|gate-broker-classify.sh|gate-broker-danger.sh|gate-broker-answerer.sh|gate-broker-permission.sh|transition-log.sh|hub-inject.sh|hub-watchdog.sh|hub-watchdog-detect.sh|hub-watchdog-intervene.sh|batch-plan.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
             telemetry.sh|base-branch.sh|enabled.sh)      src="$SHARED_DIR/hooks/lib/$name" ;;

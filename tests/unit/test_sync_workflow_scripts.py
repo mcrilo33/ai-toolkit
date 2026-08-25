@@ -439,3 +439,40 @@ def test_telemetry_package_source_exists() -> None:
     assert (TELEMETRY_PKG / "__init__.py").is_file(), (
         "scripts/telemetry/__init__.py missing — the synced tree would not be importable"
     )
+
+
+# ── worktree-lib functional modules (issue #353) ──────────────────────────────
+# worktree-lib.sh (the thin entry) sources each worktree-<mod>-lib.sh as a co-located
+# sibling; a module absent from a synced target makes the entry source a missing sibling
+# and warn loudly (OTel preflight / gh lifecycle labels dead there). Unlike the hub-skill
+# modules, these live at the toolkit-root scripts/ next to worktree-lib.sh, so they take
+# the loop's DEFAULT source case (src="$SCRIPT_DIR/$name") — never a hub-skill mapping.
+# Extend this tuple as further modules are extracted.
+WORKTREE_LIB_MODULES = ("otel", "gh")
+
+
+@pytest.mark.parametrize("module", WORKTREE_LIB_MODULES)
+def test_worktree_lib_module_registered_in_sync_loop(module: str) -> None:
+    assert f"worktree-{module}-lib.sh" in _for_name_list(), (
+        f"worktree-{module}-lib.sh is not registered in sync_workflow_scripts() — a synced "
+        "target's worktree-lib.sh entry would source a missing sibling and warn loudly"
+    )
+
+
+@pytest.mark.parametrize("module", WORKTREE_LIB_MODULES)
+def test_worktree_lib_module_takes_the_toolkit_root_default_case(module: str) -> None:
+    # These modules must NOT be mapped to the hub-skill or hooks/lib source cases: they are
+    # toolkit-root scripts/ siblings of worktree-lib.sh, so they fall through to the default.
+    body = _sync_workflow_scripts_body()
+    mapped = re.search(rf"\n\s*([\w.|-]*worktree-{module}-lib\.sh[\w.|-]*)\)\s+src=", body)
+    assert mapped is None, (
+        f"worktree-{module}-lib.sh must take the toolkit-root default case "
+        '(src="$SCRIPT_DIR/$name"), not an explicit case mapping'
+    )
+
+
+@pytest.mark.parametrize("module", WORKTREE_LIB_MODULES)
+def test_worktree_lib_module_source_exists_and_is_executable(module: str) -> None:
+    src = REPO_ROOT / "scripts" / f"worktree-{module}-lib.sh"
+    assert src.is_file(), f"scripts/worktree-{module}-lib.sh missing"
+    assert os.access(src, os.X_OK), f"worktree-{module}-lib.sh is not executable"

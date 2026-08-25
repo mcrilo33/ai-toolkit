@@ -3018,6 +3018,121 @@ def test_auto_land_push_rejection_takes_generic_warn_park(spoke_repo: Path, tmp_
     )
 
 
+# ── auto_land escalates an INVARIANT upstream precondition (issue #354) ────────
+# worktree-land exits WT_LAND_PRECONDITION_EXIT (5) when the branch is unpushed / ahead /
+# behind — a precondition no hub lane can clear (only the spoke's push fixes it). The old
+# generic-exit path warn-parked it on the transient LAND backoff and re-failed identically
+# until the 900s watchdog ceiling fired a misleading "mergeable branch un-landed" (#352).
+# auto_land must instead escalate LOUDLY + immediately (the durable broker_warn record, NOT
+# the transient backoff) naming the real blocker, and still re-attempt each tick so a later
+# push lands autonomously.
+
+_WT_LAND_PRECONDITION_EXIT = 5
+
+
+def test_auto_land_precondition_escalates_off_transient_backoff(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC: exit 5 drives the new path — it writes the durable warned record and does NOT arm
+    # the transient `warned-state-<issue>-land` backoff (the 900s-silent ladder, #352).
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, land_log = _land_stub(tmp_path, _WT_LAND_PRECONDITION_EXIT)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert land_log.read_text().split() == ["5"], (
+        "the land is attempted (its exit code classifies it)"
+    )
+    assert not (statedir / "warned-state-5-land").exists(), (
+        "an invariant precondition must NOT arm the transient land warn-retry backoff"
+    )
+    assert (statedir / "warned-5.txt").exists(), (
+        "it must escalate loudly via the durable broker_warn record"
+    )
+    warned = (statedir / "warned-5.txt").read_text().lower()
+    assert "push" in warned, (
+        "the escalation reason must name the real blocker (the unpushed branch)"
+    )
+
+
+def test_auto_land_precondition_journals_once_per_tip(spoke_repo: Path, tmp_path: Path) -> None:
+    # AC hygiene: a genuine stall must not be gh-comment-spammed every tick — the decision is
+    # journaled ONCE per branch tip (a fresh push moves the tip / lands it), while broker_warn's
+    # durable record + hub-notify own the human re-ping cadence.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, _ = _land_stub(tmp_path, _WT_LAND_PRECONDITION_EXIT)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+    base_env = {
+        "WT_LAND": str(wt_land),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    _call(expr, env={**base_env, "AFK_NOW": "1000"})  # tick 1: escalate + journal for this tip
+    _call(expr, env={**base_env, "AFK_NOW": "9999999999"})  # tick 2: same tip → no re-journal
+
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert journal.count("#354") == 1, (
+        "the precondition escalation is journaled once per tip, not spammed every tick"
+    )
+
+
+def test_auto_land_precondition_reattempts_and_lands_after_push(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC autonomy: the cheap pre-merge re-land runs each tick, so when the branch is finally
+    # pushed (worktree-land stops exiting 5) the drain lands it with NO human intervention.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    land_log = tmp_path / "land-calls.log"
+    # A stub that exits 5 on the first call (unpushed) and 0 on the second (the push arrived).
+    stub = tmp_path / "wtland.sh"
+    counter = tmp_path / "n"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$1" >> "{land_log}"\n'
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); printf "%s" "$n" > "{counter}"\n'
+        f'[ "$n" -ge 2 ] && exit 0\n'
+        f"exit {_WT_LAND_PRECONDITION_EXIT}\n"
+    )
+    stub.chmod(0o755)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+    base_env = {
+        "WT_LAND": str(stub),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    _call(expr, env={**base_env, "AFK_NOW": "1000"})  # tick 1: exit 5 → escalate, no backoff
+    _call(
+        expr, env={**base_env, "AFK_NOW": "1001"}
+    )  # tick 2: exit 0 → lands (not blocked by a backoff)
+
+    assert land_log.read_text().split() == ["5", "5"], "the land is re-attempted each tick"
+    assert not (statedir / "precondition-escalated-5").exists(), (
+        "a successful land clears the precondition escalation marker"
+    )
+
+
 # ── auto_land self-handles a REVERSIBLE dirty hub (issue #339) ─────────────────
 # worktree-land refuses to land while the hub checkout carries a TRACKED modification
 # (`git status --porcelain -uno`) with a generic exit-1 die. The old lane could not tell that

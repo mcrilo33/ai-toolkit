@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # hub-afk-land.sh -- split out of hub-afk.sh (issue #307).
 #
-# The LAND lane of the /afk supervisor: auto_land + the land-retry and #285 conflict-
-# resolution lanes, the review-gate consult, the auto-answer pass, and the ready/blocked
-# tip probes (plus the #285 conflict-resolve prompt, whose resolution lane lives here). A
+# The LAND lane of the /afk supervisor: auto_land + the land-retry, #285 conflict-
+# resolution, and #354 invariant-upstream-precondition-escalation lanes, the review-gate
+# consult, the auto-answer pass, and the ready/blocked tip probes (plus the #285
+# conflict-resolve prompt, whose resolution lane lives here). A
 # pure function-definition module sourced by the entry lib hub-afk.sh AFTER worktree-lib /
 # gate-broker / log / afk_now and the entry's own state/time primitives, and BEFORE any
 # function is called, so every cross-module helper resolves at call time. Not run on its own.
@@ -211,6 +212,54 @@ _afk_land_retry_max() {
 : "${WT_LAND_CONFLICT_EXIT:=4}"
 case "$WT_LAND_CONFLICT_EXIT" in '' | *[!0-9]*) WT_LAND_CONFLICT_EXIT=4 ;; esac
 
+# --- #354: the INVARIANT upstream-precondition escalation lane -----------------
+# worktree-land exits WT_LAND_PRECONDITION_EXIT (default 5) when the branch is unpushed /
+# ahead / behind / --local-but-tracked — a precondition NO hub lane can clear (only the
+# spoke's push fixes it). Routed onto the transient warn-retry backoff (the generic-exit
+# path) it re-failed identically until the 900s watchdog ceiling fired a misleading
+# "mergeable branch un-landed" (#352). auto_land instead escalates LOUDLY + immediately
+# via broker_warn (the durable, hub-notify-pinged record — NOT the transient backoff, so
+# the ladder never arms), naming the real blocker + the concrete human action, and journals
+# the decision ONCE per branch tip. The cheap pre-merge re-land still runs each tick, so a
+# later push (ahead->0) lands autonomously — the reversible action Principle #3 asks for.
+: "${WT_LAND_PRECONDITION_EXIT:=5}"
+case "$WT_LAND_PRECONDITION_EXIT" in '' | *[!0-9]*) WT_LAND_PRECONDITION_EXIT=5 ;; esac
+
+# The per-issue escalation marker records the branch tip already escalated for, so the
+# gh-comment/journal fires once per tip (a fresh push moves the tip or lands it) while
+# broker_warn's durable record is rewritten every tick. Cleared on a successful land.
+_afk_precondition_escalated_marker() { printf '%s\n' "$(_afk_state_dir)/precondition-escalated-$1"; }
+_afk_read_precondition_escalated_tip() {
+  local m; m="$(_afk_precondition_escalated_marker "$1")"
+  [ -f "$m" ] && head -n1 "$m" 2>/dev/null || true
+}
+_afk_mark_precondition_escalated() {
+  local issue="$1" tip="${2:-}" m
+  m="$(_afk_precondition_escalated_marker "$issue")"
+  mkdir -p "$(dirname "$m")" 2>/dev/null || true
+  printf '%s\n' "$tip" > "$m" 2>/dev/null || true
+}
+_afk_clear_precondition_escalated() { rm -f "$(_afk_precondition_escalated_marker "$1")" 2>/dev/null || true; }
+
+# _afk_escalate_land_precondition <wt> <issue> <land_log> -> escalate an INVARIANT upstream
+# land precondition (#354). broker_warn fires every tick (loud, durable; hub-notify owns the
+# re-ping cadence off the record); the journal + its gh comment fire ONCE per branch tip so a
+# genuine stall is not comment-spammed. NEVER arms the transient LAND backoff. rev=reversible:
+# the spoke's committed work is intact — a human pushing it (or re-dispatching the spoke to
+# push) clears it, and the re-land each tick lands it once pushed.
+_afk_escalate_land_precondition() {
+  local wt="$1" issue="$2" land_log="$3" tip reason
+  tip="$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)"
+  reason="cannot land #$issue: its branch is unpushed or ahead of the base branch and no drain lane can push a spoke branch (the spoke's push is its ship gate). A human must push it from the spoke (or re-dispatch the spoke to push), or land it manually. See $land_log."
+  broker_warn "$issue" "$reason"
+  _afk_set_last_action "land-blocked #$issue"
+  if [ "$(_afk_read_precondition_escalated_tip "$issue")" != "$tip" ]; then
+    broker_journal_decision "$issue" land \
+      "escalated: unpushed/ahead branch — no hub lane can push it; a human must push or land manually (#354)" reversible
+    _afk_mark_precondition_escalated "$issue" "$tip"
+  fi
+}
+
 _afk_land_conflict_fp_file() { printf '%s\n' "$(_afk_state_dir)/land-conflict-$1"; }
 _afk_read_land_conflict_fp() {
   local f; f="$(_afk_land_conflict_fp_file "$1")"
@@ -385,6 +434,152 @@ _afk_restore_hub() {
   return 1
 }
 
+# --- #356: the cross-scope land guard ----------------------------------------
+# Scope disjointness used to be enforced ONLY at dispatch (batch-plan.sh, via the dispatcher's
+# _inflight_scope_args). A spoke that wrote OUTSIDE its declared Scope: hit no signal at commit,
+# push, or land, so auto_land merged one spoke's out-of-scope edit into a file a LIVE sibling
+# owned -- manufacturing a conflict (#352/#353). This guard compares the landing diff against
+# the landing issue's Scope: and, tiered by liveness, refuses to land an out-of-scope file that
+# falls inside a live sibling's Scope: (Principle #7: concurrency is scope-graph-bound, so the
+# disjointness must be a GUARANTEE, not merely computed at dispatch and discarded).
+
+# _afk_issue_scope <issue> -> the live issue's Scope: line via gh (dispatcher semantics), empty
+# on no Scope: line. rc 1 when the gh fetch fails -- the caller fails CLOSED. Shares the ONE
+# Scope-line writer _afk_scope_line_of (#5) so the land lane and the dispatcher never drift.
+_afk_issue_scope() {
+  local issue="$1" body
+  body="$(_afk_with_timeout "$AFK_GH_TIMEOUT" gh issue view "$issue" --json body -q .body 2>/dev/null)" || return 1
+  _afk_scope_line_of "$body"
+}
+
+# _afk_land_own_scope <wt> <issue> -> the LANDING issue's Scope: line, read from the spoke's own
+# on-disk contract .ai-toolkit/task.md (the Scope: it was dispatched for) -- hermetic, no gh, and
+# it is the footprint the spoke actually agreed to. rc 1 when unresolvable (no task.md). Goes
+# through the same _afk_scope_line_of writer as every other scope read.
+# UPGRADE: fall back to a live gh fetch (_afk_issue_scope) if task.md is ever stale vs an edited
+#   issue -- today the spawn-time snapshot is authoritative enough and keeps the common land gh-free.
+_afk_land_own_scope() {
+  local wt="$1" tm="$1/.ai-toolkit/task.md"
+  [ -f "$tm" ] || return 1
+  _afk_scope_line_of "$(cat "$tm" 2>/dev/null)"
+}
+
+# _afk_file_in_scope <file> <scope-line> -> true when <file> is covered by any token in the
+# Scope: line: an exact path, a glob (a/*, *.py), a directory prefix (whether the token is
+# written `dir/` OR bare `dir`), or the whole-repo `*`. The bare-dir case matters: a scope
+# token `shared/hooks/lib` (no trailing slash) must still own `shared/hooks/lib/telemetry.sh`,
+# else a dir-style scope fails OPEN and silently re-admits the very #352/#353 collision this
+# guard prevents. noglob for the token split so a literal glob token is not cwd-expanded.
+_afk_file_in_scope() {
+  local file="$1" scope="$2" tok pfx
+  set -f
+  for tok in $scope; do
+    [ "$tok" = "*" ] && { set +f; return 0; }
+    case "$file" in
+      $tok) set +f; return 0 ;;     # exact path or glob
+    esac
+    pfx="${tok%/}"                  # a dir token, with or without a trailing slash
+    case "$file" in
+      "$pfx"/*) set +f; return 0 ;;
+    esac
+  done
+  set +f
+  return 1
+}
+
+# _afk_landing_changed_files <wt> -> the files the branch would introduce on the base branch:
+# the name-only diff from the merge-base of the local default branch to HEAD (so it excludes
+# what is already on the base and includes the spoke's new files). rc 1 when the base cannot be
+# resolved -- the caller then lands LOUDLY (the diff-scope comparison could not run), never a
+# silent fail-open. rc 0 with empty output is a genuinely empty diff.
+_afk_landing_changed_files() {
+  local wt="$1" base mb
+  base="$(_afk_local_default_sha)"
+  [ -n "$base" ] || return 1
+  mb="$(git -C "$wt" merge-base "$base" HEAD 2>/dev/null)" || return 1
+  [ -n "$mb" ] || return 1
+  git -C "$wt" diff --name-only "$mb" HEAD 2>/dev/null || true
+}
+
+# _afk_live_scopes <landing-issue> -> the live-scope map, one `<num>\t<scope-line>` line per live
+# in-flight sibling (the landing issue excluded). Each sibling's Scope: is resolved ONCE here --
+# invariant within a guard invocation -- so the file loop below never re-fetches (a K-file x
+# M-sibling gh storm would stall the synchronous land tick, #170). Derived from the dispatcher
+# resolver (inflight_issues + _afk_issue_scope -> the shared _afk_scope_line_of, #5/AC3). A gh
+# fetch failure emits an EMPTY scope, which _afk_scope_owner reads as fail-closed (AC4).
+_afk_live_scopes() {
+  local landing="$1" m scope
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    [ "$m" = "$landing" ] && continue
+    scope="$(_afk_issue_scope "$m")" || scope=""   # gh fail -> empty -> fail-closed downstream
+    printf '%s\t%s\n' "$m" "$scope"
+  done < <(inflight_issues)
+}
+
+# _afk_scope_owner <file> <map> -> the FIRST sibling number in <map> (from _afk_live_scopes)
+# whose Scope: covers <file>, empty when none does. A pure lookup (no gh). Fails CLOSED: a
+# sibling whose scope is empty (unresolved) or `*` (exclusive) conservatively OWNS the file, so
+# an unresolved collision refuses rather than silently lands (Principle #6 / AC4).
+_afk_scope_owner() {
+  local file="$1" map="$2" num scope
+  while IFS=$'\t' read -r num scope; do
+    [ -n "$num" ] || continue
+    { [ -z "$scope" ] || [ "$scope" = "*" ]; } && { printf '%s\n' "$num"; return 0; }
+    _afk_file_in_scope "$file" "$scope" && { printf '%s\n' "$num"; return 0; }
+  done <<EOF
+$map
+EOF
+  return 1
+}
+
+# _afk_land_scope_guard <wt> <issue> -> 0 = safe to land, 1 = REFUSE (a live-sibling collision).
+# The load-bearing #356 check, called by auto_land before the land runs:
+#   * own Scope: unresolvable (no task.md) -> a loud drain signal + land (never silent; #6/#3:
+#     do not stall every land on the landing issue's own missing record).
+#   * `Scope: *` / a diff wholly inside the own Scope: -> land silently (AC5).
+#   * out-of-scope file inside a LIVE sibling's Scope: -> broker_warn + journal + REFUSE (AC2).
+#   * out-of-scope file with no live owner -> broker_warn + land (dead-sibling tier, AC7).
+_afk_land_scope_guard() {
+  local wt="$1" issue="$2" own changed f owner map
+  local out_of_scope=() collisions=()
+  if ! own="$(_afk_land_own_scope "$wt" "$issue")"; then
+    log "  #$issue: no .ai-toolkit/task.md -- cannot run the cross-scope land guard (#356); landing (verify no live-sibling collision)"
+    return 0
+  fi
+  [ "$own" = "*" ] && return 0                 # owns everything -> nothing out of scope (AC5)
+  if [ -z "$own" ]; then
+    broker_warn "$issue" "declares no Scope: line -- landing without the cross-scope disjointness guard; verify no live-sibling collision (#356)"
+    return 0
+  fi
+  if ! changed="$(_afk_landing_changed_files "$wt")"; then
+    broker_warn "$issue" "could not resolve the landing base -- landing without the diff-scope comparison; verify no live-sibling collision (#356)"
+    return 0
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    _afk_file_in_scope "$f" "$own" || out_of_scope+=("$f")
+  done <<EOF
+$changed
+EOF
+  [ "${#out_of_scope[@]}" -gt 0 ] || return 0  # diff wholly in the own Scope: (AC5)
+  log "  #$issue landing diff touches file(s) outside its Scope: ${out_of_scope[*]}"
+  # Resolve every live sibling's Scope: ONCE (no per-file gh re-fetch, #170), then look each
+  # out-of-scope file up in that map.
+  map="$(_afk_live_scopes "$issue")"
+  for f in "${out_of_scope[@]}"; do
+    owner="$(_afk_scope_owner "$f" "$map")" || owner=""
+    [ -n "$owner" ] && collisions+=("$f (owner #$owner)")
+  done
+  if [ "${#collisions[@]}" -gt 0 ]; then
+    broker_warn "$issue" "refusing to land: out-of-scope file(s) ${collisions[*]} fall inside a LIVE sibling's Scope: -- landing would collide with running work (#356/#7); not landing, resolve or route"
+    broker_journal_decision "$issue" land "refused a land carrying file(s) owned by a live sibling (#356): ${collisions[*]}" reversible
+    return 1
+  fi
+  broker_warn "$issue" "landing with out-of-scope file(s) ${out_of_scope[*]} -- no live sibling owns them; landing, now visible (#356)"
+  return 0
+}
+
 # auto_land -> land every ready/<issue> spoke. The ready/<issue> marker is the readiness
 # contract (enforced by _ready_at_tip above), so a foreign ready/<issue> left by a parallel
 # session is adopted and landed by default (#95). A failed land (merge conflict) emits
@@ -493,6 +688,14 @@ auto_land() {
         fi
       fi
     fi
+    # #356: refuse to land a diff carrying an out-of-scope file that a LIVE sibling owns -- the
+    # disjointness the scheduler computes at dispatch, now enforced at land. A refusal is
+    # reversible: it warn-parks on the LAND backoff and re-lands once the sibling lands (which
+    # frees the file), and escalates blocked/<issue> only if it stalls dependents past the bound.
+    if ! _afk_land_scope_guard "$path" "$issue"; then
+      _warn_parked_last "$path" "$issue" "land carries file(s) owned by a live sibling's Scope: -- refused to avoid a cross-scope collision (#356); retrying at low frequency until the sibling lands" land
+      continue
+    fi
     log "→ land #$issue"
     _afk_set_last_action "land #$issue"
     # #339: a dirty hub checkout (a tracked modification — the #333 sync .gitignore litter, a
@@ -526,6 +729,7 @@ auto_land() {
     if [ "$land_rc" -eq 0 ]; then
       log "  landed #$issue"
       _afk_clear_land_retries "$issue"   # a successful land resets the retry budget (#202 D)
+      _afk_clear_precondition_escalated "$issue"  # #354: pushed + landed → drop the escalation marker
       _afk_clear_warned "$issue"         # #241: progress → drop the land's warned-retry backoff
       _afk_incr_landed   # tally for the drain-complete notification (#150)
       _afk_detect_selfupdate "$land_before" "$(_afk_local_default_sha)" "$issue"  # #250
@@ -538,6 +742,7 @@ auto_land() {
       # shipped, so NEVER stamp blocked over merged work. Tally it and point at the log.
       log "  landed #$issue but teardown incomplete (worktree-land exit 3) — see $land_log; NOT escalating (main already advanced)"
       _afk_clear_land_retries "$issue"
+      _afk_clear_precondition_escalated "$issue"  # #354: shipped → drop the escalation marker
       _afk_clear_warned "$issue"         # #241: shipped → drop the warned-retry backoff
       _afk_incr_landed
       _afk_detect_selfupdate "$land_before" "$(_afk_local_default_sha)" "$issue"  # #250: shipped ⇒ still deploy
@@ -553,6 +758,13 @@ auto_land() {
       log "  land #$issue conflicts with the base branch (exit $land_rc) — routing to the resolution lane (see $land_log)"
       _afk_write_land_conflict_fp "$issue" "$(_afk_land_conflict_fingerprint "$path")"
       _afk_route_conflict_resolution "$path" "$issue"
+    elif [ "$land_rc" -eq "$WT_LAND_PRECONDITION_EXIT" ]; then
+      # #354: an INVARIANT upstream precondition (branch unpushed / ahead / behind) — no hub
+      # lane can clear it, so it must NOT sit on the transient warn-retry backoff (which
+      # re-fails identically until the 900s watchdog ceiling, #352). Escalate the REAL blocker
+      # immediately + loudly; the cheap pre-merge re-land each tick still detects a later push.
+      log "  land #$issue blocked by an upstream precondition (exit $land_rc) — branch unpushed/ahead; no hub lane can push it (see $land_log)"
+      _afk_escalate_land_precondition "$path" "$issue" "$land_log"
     else
       # #241 §5: a TRANSIENT / non-conflict auto-land failure (push rejection, dirty-tree guard,
       # etc. — any non-conflict wt_die exit) warns + retries on the backoff instead of parking

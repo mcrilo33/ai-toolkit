@@ -128,6 +128,49 @@ def _read_events(events_file: Path) -> list[dict]:
     return [json.loads(line) for line in events_file.read_text().splitlines()]
 
 
+# Comma-decimal locales format bash's $EPOCHREALTIME as "1700000000,123456"; under
+# any of these _telemetry_now_ms must still yield a valid integer, not die on
+# `10#...,...` ("value too large for base"). Probed at runtime and skipped when the
+# host ships none, so the guard is portable (it can never vacuously pass under C).
+_COMMA_LOCALES = ("fr_FR.UTF-8", "de_DE.UTF-8", "fr_FR", "de_DE", "nl_NL.UTF-8")
+
+
+def _comma_decimal_locale() -> str | None:
+    for loc in _COMMA_LOCALES:
+        out = subprocess.run(
+            ["bash", "-c", 'printf "%s" "$EPOCHREALTIME"'],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "LC_ALL": loc},
+        )
+        if "," in out.stdout:
+            return loc
+    return None
+
+
+def test_now_ms_survives_comma_decimal_locale() -> None:
+    # Regression: on a comma-decimal host (e.g. fr_FR) the '.'-only strip left the
+    # whole "…,…" string and `10#…,…` aborted the whole telemetry emit, corrupting
+    # every span's end timestamp. The [.,] class in _telemetry_now_ms fixes it.
+    loc = _comma_decimal_locale()
+    if loc is None:
+        pytest.skip("no comma-decimal locale installed on this host")
+
+    result = subprocess.run(
+        ["bash", "-c", f'source "{TELEMETRY_LIB}"; _telemetry_now_ms'],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LC_ALL": loc},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "base" not in result.stderr, f"locale-parse error leaked: {result.stderr!r}"
+    assert result.stdout.isdigit(), f"expected a pure-integer epoch-ms, got {result.stdout!r}"
+    assert len(result.stdout) >= 13, (
+        f"epoch-ms too short — comma truncated the seconds: {result.stdout!r}"
+    )
+
+
 @pytest.fixture()
 def project_root(tmp_path: Path) -> Path:
     root = tmp_path / "sample-project"
@@ -1089,3 +1132,65 @@ class TestOtlpHookAttributes:
 
         span = _read_events(telemetry_dir / "events.jsonl")[0]
         assert set(span.keys()) == SCHEMA_KEYS
+
+
+# ── _telemetry_now_ms locale robustness (#352) ────────────
+
+
+def _now_ms(epochrealtime: str) -> subprocess.CompletedProcess[str]:
+    """Call ``_telemetry_now_ms`` with a stubbed ``$EPOCHREALTIME``.
+
+    Bash reformats ``$EPOCHREALTIME`` with the locale decimal separator (a comma
+    on fr_FR); a literal comma value reproduces that without needing the locale
+    installed on the test host.
+    """
+    script = f'source "{TELEMETRY_LIB}"; EPOCHREALTIME={epochrealtime!r} _telemetry_now_ms'
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+    )
+
+
+class TestNowMsLocaleRobust:
+    """The ``$EPOCHREALTIME`` tier must survive a comma decimal separator (#352)."""
+
+    def test_comma_locale_returns_correct_ms(self) -> None:
+        # fr_FR formats EPOCHREALTIME with a comma; the helper must still split
+        # seconds/fraction and return the correct epoch-ms integer.
+        result = _now_ms("1787582294,045580")
+        assert result.stdout == "1787582294045"
+
+    def test_no_stderr_and_zero_exit_under_comma(self) -> None:
+        # Invisibility / AFK Principle 6: a best-effort timestamp read must never
+        # surface an arithmetic error to its (possibly unredirected) caller.
+        result = _now_ms("1787582294,045580")
+        assert result.stderr == ""
+        assert result.returncode == 0
+
+    def test_dot_locale_unchanged(self) -> None:
+        result = _now_ms("1787582294.045580")
+        assert result.stdout == "1787582294045"
+        assert result.returncode == 0
+
+    def test_half_second_is_500ms(self) -> None:
+        # The fraction is not fixed-width: "...0.5" is 500ms, not 5ms.
+        result = _now_ms("1700000000.5")
+        assert result.stdout == "1700000000500"
+        assert result.returncode == 0
+
+    def test_leading_zero_seconds_not_parsed_as_octal(self) -> None:
+        # An all-digit seconds field with a leading zero must be read base-10,
+        # not as invalid octal (which would crash with "value too great").
+        result = _now_ms("089,999999")
+        assert result.stdout == "89999"
+        assert result.stderr == ""
+        assert result.returncode == 0
+
+    def test_garbage_falls_through_silently(self) -> None:
+        # Inert-safe (criterion 3): an unparseable value falls through to the
+        # slower tiers and still returns a valid integer with no stderr, rc 0.
+        result = _now_ms("abc")
+        assert result.stderr == ""
+        assert result.returncode == 0
+        assert result.stdout.strip().isdigit()

@@ -392,6 +392,41 @@ clause_auto_allowable() {
   [ "$dst" = "$CURRENT" ]
 }
 
+# ── Out-of-scope FILE advisory (issue #356, advisory-only) ───────────────────
+# The earliest visible signal of a cross-scope write: when a spoke pushes its own branch, read
+# its declared Scope: from .ai-toolkit/task.md and, if the pushed commits touch a file OUTSIDE
+# that Scope:, warn naming it. NEVER a deny — a spoke may legitimately need an out-of-scope edit
+# whose gate is red on that file (Principle #3); the hub-side land guard (hub-afk-land.sh) is
+# the enforcement tier. Degrades silent on no task.md / no Scope: line / `Scope: *` / an
+# unresolvable base. This is a self-contained, synced hook (it cannot source the hub scripts),
+# so it carries its own minimal Scope reader mirroring _afk_scope_line_of's semantics.
+scope_file_advisory() {
+  local task_md="$ROOT/.ai-toolkit/task.md" scope base files f tok in_scope oos=""
+  [ -f "$task_md" ] || return 0
+  scope=$(sed -n 's/^[[:space:]]*[Ss]cope:[[:space:]]*//p' "$task_md" 2>/dev/null | head -1)
+  [ -n "$scope" ] || return 0
+  case " $scope " in *' * '*) return 0 ;; esac   # a bare `*` token owns everything → silent
+  base=$(git -C "$ROOT" merge-base "$DEFAULT" HEAD 2>/dev/null) || return 0
+  [ -n "$base" ] || return 0
+  files=$(git -C "$ROOT" diff --name-only "$base" HEAD 2>/dev/null) || return 0
+  [ -n "$files" ] || return 0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    in_scope=0
+    set -f
+    for tok in $scope; do
+      case "$f" in $tok) in_scope=1; break ;; esac
+      case "$tok" in */) case "$f" in "$tok"*) in_scope=1; break ;; esac ;; esac
+    done
+    set +f
+    [ "$in_scope" = "0" ] && oos="$oos $f"
+  done <<EOF
+$files
+EOF
+  [ -n "$oos" ] && warn "Push touches file(s) outside this task's declared Scope: (.ai-toolkit/task.md):$oos -- allowed, but the hub land guard (#356) refuses these if a live sibling owns the file. Confirm the edit belongs on $CURRENT."
+  return 0
+}
+
 # ── Emit a cross-platform ALLOW decision (auto-approve, never deny) ──────────
 # Claude reads hookSpecificOutput.permissionDecision; Cursor's
 # beforeShellExecution reads the top-level permission. jq is required to emit
@@ -463,9 +498,14 @@ done <<EOF
 $CLAUSES
 EOF
 
-# Reaching here means no clause enforced (a deny/warn would have exited): a
-# spoke push proven to target only its own branch is auto-approved, removing the
-# redundant ask.  Everything else falls through to silent.
+# Reaching here means no clause enforced (a deny/warn would have exited): emit the earliest
+# out-of-scope-FILE signal (#356, advisory) for any spoke push before the auto-allow decision.
+if [ "$IS_SPOKE" = "1" ] && [ "$PUSH_SEEN" = "1" ]; then
+  scope_file_advisory
+fi
+
+# A spoke push proven to target only its own branch is auto-approved, removing the redundant
+# ask.  Everything else falls through to silent.
 if [ "$IS_SPOKE" = "1" ] && [ "$PUSH_SEEN" = "1" ] && [ "$AUTO_ALLOW" = "1" ]; then
   allow "push-scope-guard: a linked worktree pushing only its own current branch ($CURRENT) is in scope — auto-allowed (force/delete/mirror/all/tag/other-branch/default-branch pushes still prompt)"
 fi

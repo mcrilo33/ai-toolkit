@@ -45,6 +45,7 @@ from telemetry.spoke_tree.observations import (
     _duration_ms,
     _is_gate_observation,
     _is_hook_event,
+    _is_interaction,
     _is_mcp_group,
     _is_script_node,
     _is_skill_span,
@@ -94,18 +95,19 @@ _STATUS_SUCCESS = "success"
 # contract stamps a status. Read from the skill span attributes, in priority order.
 _SKILL_SUCCESS_SCORE = "skill_success"
 _SKILL_STATUS_KEYS = ("skill.status", "skill_exit_status")
-# Per-skill cost (#322): a ``skill:<name>`` span is a relabeled ``tool:Skill`` span whose OWN
-# ``costDetails`` is $0 — the real LLM spend lives in its generation DESCENDANTS. Langfuse's
-# metrics/dashboard API sums each observation's own cost, so a ``skill:`` filter returns $0; mirror
-# the rule/step carry-cost builders and emit the summed descendant-generation cost as a numeric
-# ``skill_cost_usd:<name>`` score. A skill with no generation descendants is SKIPPED (never scored 0)
-# — absence of spend is not a cost (AFK Design Principle 1; the ready-but-latent skill_success idiom).
+# Per-skill cost (#322, #349): a ``skill:<name>`` span is a relabeled ``tool:Skill`` span whose OWN
+# ``costDetails`` is $0, so Langfuse's own-cost-summing metrics API returns $0 for a ``skill:`` filter.
+# The generations a skill drives are NOT its subtree descendants — assembly leaves them as SIBLINGS of
+# the skill span under their shared ``claude_code.interaction`` — so each generation is credited to the
+# latest skill invoked before it within that interaction (its influence window) and the summed cost is
+# emitted as a numeric ``skill_cost_usd:<name>`` score. A skill with no in-window generation is SKIPPED
+# (never scored 0) — absence of spend is not a cost (AFK Design Principle 1; the skill_success idiom).
 _SKILL_COST_SCORE = "skill_cost_usd"
 # Per-sub-agent cost (#323): the exact analog for a ``sub-agent:<type>`` container — the otelcol-
 # renamed ``tool:Agent`` span whose OWN ``costDetails`` is $0 while the real LLM spend lives in its
 # ``sub-agent:llm`` generation DESCENDANTS. Langfuse's own-cost-summing metrics API returns $0 for a
 # ``sub-agent:`` filter, so the summed descendant-generation cost is emitted as a numeric
-# ``agent_cost_usd:<type>`` score, reusing the #322 subtree-rollup helper (:func:`_cost_subtree_ancestors`).
+# ``agent_cost_usd:<type>`` score, reusing the #323 subtree-rollup helper (:func:`_cost_subtree_ancestors`).
 # A container with no generation descendants is SKIPPED (never scored 0). ``agent_cost_usd:<type>`` is
 # a SUBSET of the ``step_total_cost_usd`` of the step the agent sits in (that step already folds
 # ``sub-agent:llm``), so the two must not be read as additive.
@@ -1330,11 +1332,12 @@ def _cost_subtree_ancestors(
 ) -> set[str]:
     """Walk ``parentObservationId`` up from ``node_id``, collecting EVERY boundary-span ancestor.
 
-    The shared subtree-cost rollup helper (#322 skill cost, #323 agent cost): a generation is a
-    descendant of every boundary span on its ancestor chain, so for nested boundaries (a
-    ``skill:brainstorming`` under a ``skill:code-review``, or a ``sub-agent:planner`` under a
-    ``sub-agent:general-purpose``) an inner generation credits BOTH — the subtree-rollup boundary.
-    The visited set guards against a malformed parent cycle.
+    The subtree-cost rollup helper for #323 agent cost (skill cost uses an influence window instead,
+    since skill-driven generations are siblings, not descendants — see :func:`build_skill_cost_scores`
+    / #349): a generation is a descendant of every boundary span on its ancestor chain, so for nested
+    boundaries (a ``sub-agent:planner`` under a ``sub-agent:general-purpose``) an inner generation
+    credits BOTH — the subtree-rollup boundary. The visited set guards against a malformed parent
+    cycle.
     """
     ancestors: set[str] = set()
     seen: set[str] = set()
@@ -1347,45 +1350,103 @@ def _cost_subtree_ancestors(
     return ancestors
 
 
+def _enclosing_interaction(
+    node_id: str, parent_of: dict[str, str | None], interaction_ids: set[str]
+) -> str | None:
+    """Walk ``parentObservationId`` up from ``node_id`` to the nearest interaction ancestor, or None.
+
+    A skill span or a generation may sit a direct child of its ``claude_code.interaction`` or nested
+    a level below (e.g. under an ``llm_request``), so the enclosing turn is found by ancestry, not
+    direct parent. The visited set guards against a malformed parent cycle.
+    """
+    seen: set[str] = set()
+    current = parent_of.get(node_id)
+    while current is not None and current not in seen:
+        if current in interaction_ids:
+            return current
+        seen.add(current)
+        current = parent_of.get(current)
+    return None
+
+
+def _skill_in_window(gen_start: str, skills_in_interaction: list[tuple[str, str]]) -> str | None:
+    """Return the id of the latest skill invoked at or before ``gen_start``, or None.
+
+    ``skills_in_interaction`` is ``(startTime, skill_id)`` sorted ascending. A generation is credited
+    to the last skill whose start does not exceed its own — the skill whose loaded instructions were
+    most recently active. An inner skill invoked later therefore wins over an earlier-loaded one, so a
+    generation credits EXACTLY ONE skill and an inner skill's spend is never rolled onto an outer one.
+    """
+    chosen: str | None = None
+    for start, skill_id in skills_in_interaction:
+        if start <= gen_start:
+            chosen = skill_id
+        else:
+            break
+    return chosen
+
+
 def build_skill_cost_scores(
     spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
 ) -> list[IngestEvent]:
-    """Build per-skill ``skill_cost_usd:<name>`` scores summing each skill's descendant cost (#322).
+    """Build per-skill ``skill_cost_usd:<name>`` scores from each skill's influence window (#322, #349).
 
-    A first-class ``skill:<name>`` span (relabeled from ``tool:Skill``, :func:`_skill_relabel`) is a
-    span whose OWN ``costDetails`` is $0 — the real LLM spend lives in its generation descendants — so
-    Langfuse's own-cost-summing metrics API returns $0 for a ``skill:`` filter. Mirroring
-    :func:`build_step_total_cost_scores`, every ``generation-create`` in the assembled batch is walked
-    up ``parentObservationId`` (:func:`_cost_subtree_ancestors`) and its full Langfuse
-    ``costDetails`` (:func:`_generation_total_cost`) is summed into each skill span on its chain, so a
-    skill node's score is the total cost of its SUBTREE. Only actual generation leaves are summed —
-    never a nested skill span's own field — so there is no double counting within one skill's score.
-    Observation-scoped to the skill node with a deterministic id (a skill run twice keeps both scores).
+    A first-class ``skill:<name>`` span (relabeled from ``tool:Skill``, :func:`_skill_relabel`) has an
+    OWN ``costDetails`` of $0, so Langfuse's own-cost-summing metrics API returns $0 for a ``skill:``
+    filter. The generations the skill drives are NOT its subtree descendants: assembly leaves them as
+    SIBLINGS of the skill span under their shared ``claude_code.interaction`` (a subtree walk finds
+    nothing — the #349 bug). So each generation is instead credited to the LATEST skill invoked before
+    it within the same interaction (:func:`_skill_in_window`) — its influence window — mirroring the
+    time-window attribution :func:`~telemetry.spoke_tree.cycle._cycle_step_for` uses for cycle steps.
+    The skill's score is the summed ``costDetails`` (:func:`_generation_total_cost`) of the
+    generations it drove. Each generation credits exactly one skill, so an inner skill's generations
+    are never double-counted onto an outer skill. Observation-scoped to the skill node with a
+    deterministic id (a skill run twice keeps both scores).
 
-    A skill span with no generation descendants never enters the accumulator, so it is SKIPPED rather
-    than scored 0 — absence of spend is not a cost (mirrors the ready-but-latent ``skill_success``
-    idiom; AFK Design Principle 1). Read off View A (the same batch :func:`build_skill_success_scores`
+    A skill with no in-window generation never enters the accumulator, so it is SKIPPED rather than
+    scored 0 — absence of spend is not a cost (mirrors the ready-but-latent ``skill_success`` idiom;
+    AFK Design Principle 1). Read off View A (the same batch :func:`build_skill_success_scores`
     reads), so it is trace-level like the other skill scores.
 
     Args:
         spoke_run_id: The spoke run identifier (keys the deterministic score ids).
-        batch: The assembled View A events (its ``skill:`` spans and generation copies are read).
+        batch: The assembled View A events (its ``skill:`` spans, interactions, and generation
+            copies are read).
         base_ts: ISO timestamp stamped on every score event.
 
     Returns:
-        The ``score-create`` events, one per skill node with generation descendants (empty when none).
+        The ``score-create`` events, one per skill node with an in-window generation (empty when none).
     """
     trace_id = trace_id_for(spoke_run_id)
     by_id = {event["body"]["id"]: event["body"] for event in batch}
     parent_of = {node_id: body.get("parentObservationId") for node_id, body in by_id.items()}
-    skill_ids = {node_id for node_id, body in by_id.items() if _is_skill_span(body)}
+    interaction_ids = {node_id for node_id, body in by_id.items() if _is_interaction(body)}
+    skills_by_interaction: dict[str, list[tuple[str, str]]] = {}
+    for node_id, body in by_id.items():
+        if not _is_skill_span(body):
+            continue
+        interaction = _enclosing_interaction(node_id, parent_of, interaction_ids)
+        if interaction is not None:
+            skills_by_interaction.setdefault(interaction, []).append(
+                (body.get("startTime") or "", node_id)
+            )
+    for skills in skills_by_interaction.values():
+        skills.sort()
     cost_by_skill: dict[str, float] = {}
     for event in batch:
         if event["type"] != "generation-create":
             continue
-        cost = _generation_total_cost(event["body"])
-        for skill_id in _cost_subtree_ancestors(event["body"]["id"], parent_of, skill_ids):
-            cost_by_skill[skill_id] = cost_by_skill.get(skill_id, 0.0) + cost
+        gen = event["body"]
+        gen_start = gen.get("startTime") or ""
+        if not gen_start:
+            continue
+        interaction = _enclosing_interaction(gen["id"], parent_of, interaction_ids)
+        if interaction is None:
+            continue
+        skill_id = _skill_in_window(gen_start, skills_by_interaction.get(interaction, []))
+        if skill_id is None:
+            continue
+        cost_by_skill[skill_id] = cost_by_skill.get(skill_id, 0.0) + _generation_total_cost(gen)
     return [
         _score_event(
             spoke_run_id,
@@ -1425,9 +1486,10 @@ def build_agent_cost_scores(
     A ``sub-agent:<type>`` span is the otelcol-renamed ``tool:Agent`` container (:data:`_SUB_AGENT_PREFIX`)
     whose OWN ``costDetails`` is $0 — the real LLM spend lives in its ``sub-agent:llm`` generation
     descendants — so Langfuse's own-cost-summing metrics API returns $0 for a ``sub-agent:`` filter.
-    Mirroring :func:`build_skill_cost_scores`, every ``generation-create`` in the assembled batch is
-    walked up ``parentObservationId`` (:func:`_cost_subtree_ancestors`, the shared #322 rollup helper)
-    and its full Langfuse ``costDetails`` (:func:`_generation_total_cost`) is summed into each sub-agent
+    A sub-agent runs in its own transcript, so the session parser re-homes its generations UNDER the
+    container (#47 S3); every ``generation-create`` in the assembled batch is therefore walked up
+    ``parentObservationId`` (:func:`_cost_subtree_ancestors`) and its full Langfuse ``costDetails``
+    (:func:`_generation_total_cost`) is summed into each sub-agent
     container on its chain, so a container's score is the total cost of its SUBTREE. Only actual
     generation leaves are summed — never a nested container's own field — so there is no double counting
     within one agent's score; a nested ``sub-agent:planner`` under a ``sub-agent:general-purpose``

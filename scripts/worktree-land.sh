@@ -418,6 +418,23 @@ else
   fi
 fi
 
+# --- the invariant upstream-precondition exit code (issue #354) ------------------
+# The upstream guards below refuse a branch whose push state only the SPOKE can fix
+# (never pushed / ahead / behind / --local-but-tracked). This is INVARIANT from the
+# hub side: nothing here pushes a spoke branch, so an unattended auto_land that got a
+# generic exit-1 die routed it onto the transient retry ladder and re-failed
+# identically until the 900s watchdog ceiling (#352). Signal the class with a
+# dedicated exit code — distinct from 1 (generic die), 3 (teardown-incomplete), and
+# 4 (merge conflict) — so auto_land can escalate the real blocker immediately instead
+# of retrying. The stderr text is unchanged (it still names the specific remediation);
+# the exit code IS the machine contract, so a non-numeric override falls back to 5.
+: "${WT_LAND_PRECONDITION_EXIT:=5}"
+case "$WT_LAND_PRECONDITION_EXIT" in '' | *[!0-9]*) WT_LAND_PRECONDITION_EXIT=5 ;; esac
+wt_land_precondition_die() {
+  printf '%s: %s\n' "${WT_PROG:-worktree}" "$*" >&2
+  exit "$WT_LAND_PRECONDITION_EXIT"
+}
+
 if [ -z "$LOCAL" ]; then
   # A failed fetch is FATAL, not a warning (issue #195): the ahead/behind guards
   # below would otherwise run against the LAST-KNOWN origin/<branch> — a spoke
@@ -426,25 +443,34 @@ if [ -z "$LOCAL" ]; then
   # never run on stale remote state. One immediate retry absorbs a transient
   # blip (the #119 SSH-staleness class — a fresh short connection usually
   # clears it) so an unattended /afk land isn't escalated blocked/<N> over a
-  # moment of network noise; a real outage still dies.
+  # moment of network noise; a real outage still dies. A fetch failure is
+  # TRANSIENT (network), so it keeps the generic exit-1 die — not the invariant
+  # precondition code below.
   git fetch origin --quiet 2>/dev/null \
     || git fetch origin --quiet 2>/dev/null \
     || wt_die "fetch from origin failed — refusing to land on last-known remote state (a spoke push this checkout never fetched would be silently pruned). Restore connectivity and re-run."
-  # Upstream guards: the spoke's push is its ship gate.
+  # Upstream guards: the spoke's push is its ship gate. Each is an INVARIANT the hub
+  # cannot clear, so it exits WT_LAND_PRECONDITION_EXIT (issue #354), not 1.
   UPSTREAM="$(git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" 2>/dev/null || true)"
-  [ -n "$UPSTREAM" ] || wt_die "branch $WT_BRANCH has never been pushed — the spoke's push is its ship gate"
+  [ -n "$UPSTREAM" ] || wt_land_precondition_die "branch $WT_BRANCH has never been pushed — the spoke's push is its ship gate"
   AHEAD="$(git rev-list --count "${UPSTREAM}..${WT_BRANCH}")"
-  [ "$AHEAD" -eq 0 ] || wt_die "branch $WT_BRANCH is $AHEAD commit(s) ahead of $UPSTREAM — push from the spoke first"
+  [ "$AHEAD" -eq 0 ] || wt_land_precondition_die "branch $WT_BRANCH is $AHEAD commit(s) ahead of $UPSTREAM — push from the spoke first"
   # Behind is just as fatal as ahead: landing a reduced local branch would later
   # prune the remote ref and silently lose the commits only the remote still has.
   BEHIND="$(git rev-list --count "${WT_BRANCH}..${UPSTREAM}")"
-  [ "$BEHIND" -eq 0 ] || wt_die "branch $WT_BRANCH is $BEHIND commit(s) behind $UPSTREAM — the remote has work this checkout lacks; reconcile on the spoke first"
+  [ "$BEHIND" -eq 0 ] || wt_land_precondition_die "branch $WT_BRANCH is $BEHIND commit(s) behind $UPSTREAM — the remote has work this checkout lacks; reconcile on the spoke first"
 else
   # --local is for micro-spokes, which never push. A branch WITH an upstream is
   # not a micro-spoke: skipping the behind guard could merge a reduced local tip
   # and later prune the remote ref, losing the commits only the remote still has.
+  # This is the OTHER half of the #354 --local-vs-upstream deadlock: a drain branch
+  # tracks origin/main (created with branch.<b>.merge=refs/heads/main), so the ahead
+  # guard above refuses `worktree-land <issue>` AND this guard refuses
+  # `worktree-land <issue> --local` — no worktree-land invocation can land it. That
+  # is intentional and now surfaced STRUCTURALLY (the same precondition exit code):
+  # it is resolvable only by the spoke pushing, never by the hub.
   ! git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" >/dev/null 2>&1 \
-    || wt_die "branch $WT_BRANCH has an upstream — not a micro-spoke; land it without --local"
+    || wt_land_precondition_die "branch $WT_BRANCH has an upstream — not a micro-spoke; land it without --local"
 fi
 
 # --- heal a hub left behind origin (issue #315) ---------------------------------
