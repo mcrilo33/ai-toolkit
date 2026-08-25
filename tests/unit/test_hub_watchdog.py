@@ -1679,8 +1679,14 @@ def test_run_conditions_dead_pane_re_arms_when_a_recorded_phase_is_impossibly_ol
     assert (tmp_path / "revived").read_text() == "284"
 
 
-# Condition 3 — stale blocked marker (real git)
-def test_stale_marker_fires_when_blocked_is_ancestor_of_tip(tmp_path: Path) -> None:
+# Condition 3 — stale blocked marker (real git). #357: the detector no longer fires on the raw
+# ref-topology predicate (which was byte-identical to the drain's own _blocked_tag_is_stale, so it
+# re-ran that predicate on a 60s loop against a 300s reconcile consumer and won the race). It now
+# RECORDS a stale-onset the first tick the tag is observed behind the tip and fires only once
+# now-onset exceeds HUB_WATCHDOG_MARKER_CEILING — the grace margin over the drain's own reconcile
+# cadence — mirroring condition 1's #283 stamp-as-you-measure. So a correct drain never trips it.
+def _stale_blocked_repo(tmp_path: Path) -> Path:
+    """A repo where blocked/5 is a STRICT ancestor of the tip (the #347 answered-then-committed shape)."""
     wt = _git_repo(tmp_path)
     env = {
         **os.environ,
@@ -1697,11 +1703,93 @@ def test_stale_marker_fires_when_blocked_is_ancestor_of_tip(tmp_path: Path) -> N
         env=env,
         capture_output=True,
     )
+    return wt
 
-    assert _call(f"_wd_detect_stale_marker '{wt}' 5").returncode == 0
+
+def _seed_stale_onset(state_dir: Path, epoch: int, issue: str = "5") -> Path:
+    """Pre-stamp the detector's recorded stale-onset epoch, the #357 stamp-as-you-measure record."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    f = state_dir / f"wd-stale-onset-{issue}.epoch"
+    f.write_text(f"{epoch}\n")
+    return f
 
 
-def test_stale_marker_quiet_when_blocked_at_tip(tmp_path: Path) -> None:
+def test_stale_marker_ceiling_defaults_to_twice_the_drain_tick() -> None:
+    # The one condition that had no ceiling now carries one, beside PARK/IDLE/LAND — >= 2x the
+    # drain's AFK_TICK_SECONDS reconcile cadence (600s at the 300s default), so a correct drain
+    # reconciling on its own tick never trips the watchdog (#347).
+    assert "CEIL=600" in _call('printf "CEIL=%s" "$HUB_WATCHDOG_MARKER_CEILING"').stdout
+    assert (
+        "CEIL=240"
+        in _call(
+            'printf "CEIL=%s" "$HUB_WATCHDOG_MARKER_CEILING"', env={"AFK_TICK_SECONDS": "120"}
+        ).stdout
+    )
+
+
+def test_stale_marker_ceiling_floors_a_non_numeric_tick_instead_of_aborting() -> None:
+    # §2/§6: a human unit-slip (AFK_TICK_SECONDS="5m") must not make the arithmetic default evaluate
+    # a bareword and abort sourcing the whole detection module under set -u — a silent tier-2
+    # non-arm. It floors to the 300s default (ceiling 600) rather than failing the arm.
+    assert (
+        "CEIL=600"
+        in _call(
+            'printf "CEIL=%s" "$HUB_WATCHDOG_MARKER_CEILING"', env={"AFK_TICK_SECONDS": "5m"}
+        ).stdout
+    )
+
+
+def test_stale_marker_quiet_when_onset_is_fresh(tmp_path: Path) -> None:
+    # (a) tag behind the tip but the onset is fresher than the ceiling → QUIET. This is the #347
+    # false-fire: answered-then-committed within a tick, only ~53s behind the tip, well inside the
+    # 600s grace the drain's reconcile tick needs.
+    wt = _stale_blocked_repo(tmp_path)
+    state = tmp_path / "state"
+    _seed_stale_onset(state, int(NOW) - 10)
+
+    rc = _call(
+        f"_wd_detect_stale_marker '{wt}' 5", env={"AFK_STATE_DIR": str(state), "AFK_NOW": NOW}
+    ).returncode
+
+    assert rc == 1
+
+
+def test_stale_marker_fires_when_onset_older_than_ceiling(tmp_path: Path) -> None:
+    # (b) tag behind the tip AND the recorded onset predates the ceiling → the drain genuinely
+    # missed a reconcile → fire.
+    wt = _stale_blocked_repo(tmp_path)
+    state = tmp_path / "state"
+    _seed_stale_onset(state, int(NOW) - 700)  # > 600s ceiling
+
+    rc = _call(
+        f"_wd_detect_stale_marker '{wt}' 5", env={"AFK_STATE_DIR": str(state), "AFK_NOW": NOW}
+    ).returncode
+
+    assert rc == 0
+
+
+def test_stale_marker_fires_when_blocked_is_ancestor_of_tip(tmp_path: Path) -> None:
+    # (d) AC3(d): the historical instant-fire test, now AGED. The FIRST observation only stamps the
+    # onset and stays quiet; only once the recorded onset ages past the ceiling does it fire —
+    # proving the detector no longer wins the race against the drain's own reconcile tick.
+    wt = _stale_blocked_repo(tmp_path)
+    state = tmp_path / "state"
+    old = str(int(NOW) - 700)
+
+    first = _call(
+        f"_wd_detect_stale_marker '{wt}' 5", env={"AFK_STATE_DIR": str(state), "AFK_NOW": old}
+    )
+    assert first.returncode == 1, "first observation only stamps the onset — never fires instantly"
+
+    second = _call(
+        f"_wd_detect_stale_marker '{wt}' 5", env={"AFK_STATE_DIR": str(state), "AFK_NOW": NOW}
+    )
+    assert second.returncode == 0, "onset now older than the ceiling → fires"
+
+
+def test_stale_marker_quiet_when_blocked_at_tip_clears_the_onset(tmp_path: Path) -> None:
+    # (c) tag back AT the tip (or gone) is a quiet observation: return 1 AND drop any recorded
+    # onset, so a genuine LATER recurrence re-arms from a fresh onset rather than an aged one.
     wt = _git_repo(tmp_path)
     env = {
         **os.environ,
@@ -1711,8 +1799,15 @@ def test_stale_marker_quiet_when_blocked_at_tip(tmp_path: Path) -> None:
         "GIT_COMMITTER_EMAIL": "t@t",
     }
     subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, env=env, capture_output=True)
+    state = tmp_path / "state"
+    onset = _seed_stale_onset(state, int(NOW) - 700)
 
-    assert _call(f"_wd_detect_stale_marker '{wt}' 5").returncode == 1
+    rc = _call(
+        f"_wd_detect_stale_marker '{wt}' 5", env={"AFK_STATE_DIR": str(state), "AFK_NOW": NOW}
+    ).returncode
+
+    assert rc == 1
+    assert not onset.exists(), "a quiet observation must clear the onset so a recurrence re-arms"
 
 
 # Condition 4 — mergeable branch the drain skipped (escalate-only)
