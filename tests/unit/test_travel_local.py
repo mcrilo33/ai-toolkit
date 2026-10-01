@@ -247,8 +247,12 @@ def test_on_rolls_back_disablesleep_when_caffeinate_unavailable(env) -> None:
 
 
 def test_on_rolls_back_disablesleep_when_caffeinate_dies_after_launch(env) -> None:
-    # The daemon launches but exits immediately; a 1s settle makes the exit certain before
-    # the liveness re-check, so the rollback path is exercised deterministically.
+    # The daemon launches but exits immediately. start_caffeinate's final verdict is a `ps`
+    # state check, not `kill -0` — `kill -0` answers 0 for both a genuinely running process
+    # and a zombie still awaiting this shell's reap, so a child that already died could read
+    # as "alive" for as long as reaping took (what made this flaky under load — see #367).
+    # `ps` reports a zombie explicitly as `Z`, so "died" is told apart from "still running"
+    # regardless of scheduling. AFK_TRAVEL_SETTLE only bounds how long that verdict is polled.
     proc = env.run("on", STUB_CAFFEINATE="die", AFK_TRAVEL_SETTLE="1")
 
     assert proc.returncode != 0

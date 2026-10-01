@@ -150,8 +150,16 @@ caffeinate_live() {
 # disablesleep rather than leave the Mac half-configured and falsely report "holding".
 # AFK_TRAVEL_CAFFEINATE overrides the binary name (tests inject an absent name to exercise
 # the rollback); AFK_TRAVEL_SETTLE tunes the post-launch settle before the liveness re-check.
+# The settle loop still polls the cheap `kill -0` builtin (no extra fork per tick, same cost
+# as before) to notice an outright-gone pid early. But `kill -0` alone cannot tell a zombie
+# (exited, still awaiting this shell's reap) from a genuinely running process — both answer 0
+# — so under load a child that already died could read as "alive" for as long as it took this
+# shell to reap it (#367). The final verdict therefore never trusts a bare `kill -0`: it makes
+# one `ps` state check, which reports a zombie explicitly as `Z` and so tells "died" (Z, or
+# gone outright) apart from "still running" regardless of scheduling.
 start_caffeinate() {
-  local pf pid bin; pf="$(caffeinate_pidfile)"; bin="${AFK_TRAVEL_CAFFEINATE:-caffeinate}"
+  local pf pid bin settle step iters n state
+  pf="$(caffeinate_pidfile)"; bin="${AFK_TRAVEL_CAFFEINATE:-caffeinate}"
   if caffeinate_live; then return 0; fi
   command -v "$bin" >/dev/null 2>&1 || return 1
   # Detach stdio so the daemon never holds the launcher's pipes open (a caller that
@@ -159,10 +167,22 @@ start_caffeinate() {
   "$bin" -s </dev/null >/dev/null 2>&1 &
   pid=$!
   printf '%s\n' "$pid" > "$pf"
-  sleep "${AFK_TRAVEL_SETTLE:-0.3}"
-  if kill -0 "$pid" 2>/dev/null; then return 0; fi
-  rm -f "$pf"
-  return 1
+
+  settle="${AFK_TRAVEL_SETTLE:-0.3}"; step=0.02
+  iters=$(awk -v s="$settle" -v st="$step" \
+    'BEGIN{n=s/st; i=int(n); if (n>i) i++; if (i<1) i=1; print i}')
+  n=0
+  while [ "$n" -lt "$iters" ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    n=$((n + 1))
+    sleep "$step"
+  done
+
+  state="$(LC_ALL=C ps -o state= -p "$pid" 2>/dev/null | tr -d ' \t\n')"
+  case "$state" in
+    Z*|'') rm -f "$pf"; return 1 ;;
+  esac
+  return 0
 }
 
 # stop_caffeinate -> kill the recorded caffeinate and drop the pidfile. Idempotent.
