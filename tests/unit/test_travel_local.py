@@ -349,8 +349,14 @@ def test_on_rolls_back_disablesleep_when_caffeinate_dies_after_launch(env) -> No
     # direct measurement (1.3s+ for a one-line `exit 1` script) and 20/20 failures even at
     # moderate host load. That is a latency problem, not a detection-logic bug (see #367's
     # own instruction not to "fix" it by enlarging the settle), so it is deferred to #368
-    # rather than quarantined for a reason this fix could actually address. Single-process
-    # (no xdist worker) this test is deterministic and stays enabled.
+    # rather than quarantined for a reason this fix could actually address.
+    #
+    # This repo's gate (test-select.sh) runs both its SELECTED and FULL paths under
+    # `-n auto` whenever xdist is installed -- the normal state -- so PYTEST_XDIST_WORKER
+    # is set on every gate-enforced run, meaning this skip is NOT merely "quieter under
+    # heavy parallelism": until #368 lands, this test only runs on a manual, no-`-n`
+    # invocation, not in any push-gate or CI run. That is the accepted cost of the
+    # quarantine, not an oversight -- #368 owns restoring gate coverage for this path.
     proc = env.run("on", STUB_CAFFEINATE="die", AFK_TRAVEL_SETTLE="1")
 
     assert proc.returncode != 0
