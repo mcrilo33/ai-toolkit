@@ -166,6 +166,10 @@ _pid_not_zombie() {
   [ -n "$pid" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   state="$(LC_ALL=C ps -o state= -p "$pid" 2>/dev/null)" || return 1
+  # Strip all whitespace before the emptiness check — a blank-but-not-literally-empty
+  # value (padding, an unexpected ps format) must still read as "can't confirm alive",
+  # not fall through to the alive branch below.
+  state="${state//[[:space:]]/}"
   case "$state" in
     *Z*|'') return 1 ;;
   esac

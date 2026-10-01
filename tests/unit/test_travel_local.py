@@ -216,6 +216,8 @@ def _wait_for_zombie(pid: int, timeout: float = 10.0) -> str:
         state = subprocess.run(
             ["ps", "-o", "state=", "-p", str(pid)], capture_output=True, text=True
         ).stdout
+        if "Z" not in state:
+            time.sleep(0.02)
     return state
 
 
@@ -250,7 +252,14 @@ def running_pid() -> Iterator[int]:
 
 @pytest.fixture()
 def gone_pid() -> int:
-    """A pid that has already been fully reaped -- names no process at all."""
+    """A pid that has already been fully reaped -- names no process at all.
+
+    Theoretically the OS could reassign this exact pid to an unrelated new process in the
+    gap before the test's check runs, reintroducing a pid-reuse ambiguity. Accepted here for
+    the same reason #367 accepts it for production: the window alone, not pid reuse, is what
+    made the real bug reproducible -- reuse of one specific freed pid within milliseconds
+    needs its own, separately improbable coincidence on top of the window.
+    """
     child_pid = _fork_and_exit()
     os.waitpid(child_pid, 0)
     return child_pid
