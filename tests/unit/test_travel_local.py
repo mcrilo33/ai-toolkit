@@ -178,6 +178,85 @@ def _wait_for_log(env, needle: str, timeout: float = 5.0) -> str:
         time.sleep(0.02)
 
 
+def _source_functions(tmp_path: Path) -> Path:
+    """A copy of travel-local.sh with its trailing ``main "$@"`` dispatch stripped, so a
+    test can ``source`` just the function definitions without invoking the CLI (which
+    would ``exit`` the sourcing shell before the test gets to call anything)."""
+    lines = SCRIPT.read_text().splitlines(keepends=True)
+    assert lines[-1].strip() == 'main "$@"', 'travel-local.sh no longer ends with main "$@"'
+    functions = tmp_path / "travel-local-functions.sh"
+    functions.write_text("".join(lines[:-1]))
+    return functions
+
+
+# --- _pid_alive (unit) ----------------------------------------------------------
+
+
+def test_pid_alive_treats_zombie_as_dead(tmp_path: Path) -> None:
+    """Regression for #367: a zombie (exited, not yet reaped) must read as dead.
+
+    `kill -0` alone cannot tell a zombie from a genuinely running process -- both answer
+    0 -- which is exactly the ambiguity that made the caffeinate-dies rollback test flaky
+    under load (a reaped-pending zombie misread as "alive"). This forks a real child,
+    lets it exit without reaping it (a real zombie, confirmed via `ps` state `Z`), and
+    asserts `_pid_alive` rejects it -- independent of any timing or host-load luck.
+    """
+    functions = _source_functions(tmp_path)
+    child_pid = os.fork()
+    if child_pid == 0:
+        os._exit(1)
+    try:
+        deadline = time.monotonic() + 2.0
+        state = ""
+        while time.monotonic() < deadline:
+            state = subprocess.run(
+                ["ps", "-o", "state=", "-p", str(child_pid)], capture_output=True, text=True
+            ).stdout
+            if "Z" in state:
+                break
+            time.sleep(0.01)
+        assert "Z" in state, f"expected a zombie, got ps state={state!r}"
+
+        proc = subprocess.run(
+            ["bash", "-c", f'. "{functions}"; _pid_alive "{child_pid}"'],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode != 0, "a zombie pid must not read as alive"
+    finally:
+        os.waitpid(child_pid, 0)
+
+
+def test_pid_alive_accepts_a_genuinely_running_process(tmp_path: Path) -> None:
+    functions = _source_functions(tmp_path)
+    proc = subprocess.Popen(["sleep", "5"])
+    try:
+        result = subprocess.run(
+            ["bash", "-c", f'. "{functions}"; _pid_alive "{proc.pid}"'],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_pid_alive_rejects_an_already_gone_pid(tmp_path: Path) -> None:
+    functions = _source_functions(tmp_path)
+    child_pid = os.fork()
+    if child_pid == 0:
+        os._exit(1)
+    os.waitpid(child_pid, 0)  # fully reap it -- the pid now names no process at all
+
+    proc = subprocess.run(
+        ["bash", "-c", f'. "{functions}"; _pid_alive "{child_pid}"'],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+
+
 # --- guards -------------------------------------------------------------------
 
 
