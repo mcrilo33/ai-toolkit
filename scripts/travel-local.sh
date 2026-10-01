@@ -138,11 +138,14 @@ caffeinate_pidfile() {
 
 # caffeinate_live -> rc 0 when the pidfile names a live process. The pidfile's pid is
 # always written by a DIFFERENT process (a prior `travel-local.sh` invocation) than the one
-# calling this, so it is never this shell's own just-forked child: if that prior process's
-# child died, it was reparented to launchd and reaped immediately, so it can only ever read
-# here as genuinely running or gone outright — never as an unreaped zombie. Plain `kill -0`
-# is therefore correct at this call site (contrast start_caffeinate's post-launch re-check
-# below, which DOES face that ambiguity, on a child it just forked itself).
+# calling this, so it is never this shell's own just-forked child: once that prior process
+# has exited, a child of its that died is reparented to launchd and reaped immediately, so
+# it reads here as genuinely running or gone outright — not an unreaped zombie. (The script
+# has no lock against a second invocation overlapping the first's own post-launch settle —
+# a pre-existing gap, not one this fix introduces or closes.) Plain `kill -0` is therefore
+# the right tool for the common case at this call site (contrast start_caffeinate's
+# post-launch re-check below, which DOES face the zombie ambiguity, on a child it just
+# forked itself, every time it runs).
 caffeinate_live() {
   local pf pid; pf="$(caffeinate_pidfile)"
   [ -f "$pf" ] || return 1

@@ -200,63 +200,89 @@ def _run_pid_not_zombie(functions: Path, pid: int) -> subprocess.CompletedProces
     )
 
 
-# --- _pid_not_zombie (unit) -------------------------------------------------------
-
-
-def test_pid_not_zombie_treats_zombie_as_dead(tmp_path: Path) -> None:
-    """Regression for #367: a zombie (exited, not yet reaped) must read as dead.
-
-    `kill -0` alone cannot tell a zombie from a genuinely running process -- both answer
-    0 -- which is exactly the ambiguity that made the caffeinate-dies rollback test flaky
-    under load (a reaped-pending zombie misread as "alive"). This forks a real child via
-    ``os.fork`` (never auto-reaped by anything but this test process, so it stays a zombie
-    indefinitely -- no race against a deadline), lets it exit without reaping it (confirmed
-    via `ps` state `Z`), and asserts `_pid_not_zombie` rejects it specifically (rc 1, not
-    just "nonzero") -- independent of any timing or host-load luck.
-    """
-    functions = _source_functions(tmp_path)
+def _fork_and_exit() -> int:
+    """Fork a child that exits(1) immediately; return its pid to the parent."""
     child_pid = os.fork()
     if child_pid == 0:
         os._exit(1)
-    try:
-        deadline = time.monotonic() + 10.0
-        state = ""
-        while time.monotonic() < deadline:
-            state = subprocess.run(
-                ["ps", "-o", "state=", "-p", str(child_pid)], capture_output=True, text=True
-            ).stdout
-            if "Z" in state:
-                break
-            time.sleep(0.01)
-        assert "Z" in state, f"expected a zombie, got ps state={state!r}"
+    return child_pid
 
-        proc = _run_pid_not_zombie(functions, child_pid)
-        assert proc.returncode == 1, (
-            f"a zombie pid must read as not-alive (rc 1), got rc={proc.returncode}: {proc.stderr}"
-        )
+
+def _wait_for_zombie(pid: int, timeout: float = 10.0) -> str:
+    """Poll `ps` until <pid> shows a zombie state; return the final state string."""
+    deadline = time.monotonic() + timeout
+    state = ""
+    while time.monotonic() < deadline and "Z" not in state:
+        state = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout
+    return state
+
+
+# --- _pid_not_zombie (unit) -------------------------------------------------------
+
+
+@pytest.fixture()
+def zombie_pid() -> Iterator[int]:
+    """A real zombie pid: fork a child that exits immediately, confirm via `ps` state `Z`
+    that it has actually zombified, and leave it unreaped (nothing but this fixture's own
+    teardown can reap it, so it stays a zombie indefinitely -- no race against a deadline).
+    """
+    child_pid = _fork_and_exit()
+    try:
+        state = _wait_for_zombie(child_pid)
+        assert "Z" in state, f"expected a zombie, got ps state={state!r}"
+        yield child_pid
     finally:
         os.waitpid(child_pid, 0)
 
 
-def test_pid_not_zombie_accepts_a_genuinely_running_process(tmp_path: Path) -> None:
-    functions = _source_functions(tmp_path)
+@pytest.fixture()
+def running_pid() -> Iterator[int]:
+    """A genuinely running process's pid."""
     proc = subprocess.Popen(["sleep", "5"])
     try:
-        result = _run_pid_not_zombie(functions, proc.pid)
-        assert result.returncode == 0, result.stderr
+        yield proc.pid
     finally:
         proc.kill()
         proc.wait()
 
 
-def test_pid_not_zombie_rejects_an_already_gone_pid(tmp_path: Path) -> None:
-    functions = _source_functions(tmp_path)
-    child_pid = os.fork()
-    if child_pid == 0:
-        os._exit(1)
-    os.waitpid(child_pid, 0)  # fully reap it -- the pid now names no process at all
+@pytest.fixture()
+def gone_pid() -> int:
+    """A pid that has already been fully reaped -- names no process at all."""
+    child_pid = _fork_and_exit()
+    os.waitpid(child_pid, 0)
+    return child_pid
 
-    proc = _run_pid_not_zombie(functions, child_pid)
+
+def test_pid_not_zombie_treats_zombie_as_dead(zombie_pid: int, tmp_path: Path) -> None:
+    """Regression for #367: a zombie (exited, not yet reaped) must read as dead.
+
+    `kill -0` alone cannot tell a zombie from a genuinely running process -- both answer
+    0 -- which is exactly the ambiguity that made the caffeinate-dies rollback test flaky
+    under load (a reaped-pending zombie misread as "alive"). `_pid_not_zombie` must reject
+    it specifically (rc 1, not just "nonzero") -- independent of any timing or host-load
+    luck, since `zombie_pid` already confirmed the zombie state before yielding.
+    """
+    functions = _source_functions(tmp_path)
+    proc = _run_pid_not_zombie(functions, zombie_pid)
+    assert proc.returncode == 1, (
+        f"a zombie pid must read as not-alive (rc 1), got rc={proc.returncode}: {proc.stderr}"
+    )
+
+
+def test_pid_not_zombie_accepts_a_genuinely_running_process(
+    running_pid: int, tmp_path: Path
+) -> None:
+    functions = _source_functions(tmp_path)
+    result = _run_pid_not_zombie(functions, running_pid)
+    assert result.returncode == 0, result.stderr
+
+
+def test_pid_not_zombie_rejects_an_already_gone_pid(gone_pid: int, tmp_path: Path) -> None:
+    functions = _source_functions(tmp_path)
+    proc = _run_pid_not_zombie(functions, gone_pid)
     assert proc.returncode == 1, f"a gone pid must read as not-alive (rc 1), got {proc.returncode}"
 
 
