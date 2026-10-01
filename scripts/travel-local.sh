@@ -136,7 +136,16 @@ caffeinate_pidfile() {
   printf '%s\n' "$common/.afk-travel-caffeinate.pid"
 }
 
-# caffeinate_live -> rc 0 when the pidfile names a live process.
+# caffeinate_live -> rc 0 when the pidfile names a live process. The pidfile's pid is
+# always written by a DIFFERENT process (a prior `travel-local.sh` invocation) than the one
+# calling this, so it is never this shell's own just-forked child: once that prior process
+# has exited, a child of its that died is reparented to launchd and reaped immediately, so
+# it reads here as genuinely running or gone outright — not an unreaped zombie. (The script
+# has no lock against a second invocation overlapping the first's own post-launch settle; a
+# daemon that dies during that overlap can still misread as alive here. Out of scope for
+# #367, which concerns start_caffeinate's own post-launch re-check below — the one call
+# site that faces the zombie ambiguity on a child it just forked itself, every time it
+# runs.) Plain `kill -0` is the right tool for the common, non-overlapping case here.
 caffeinate_live() {
   local pf pid; pf="$(caffeinate_pidfile)"
   [ -f "$pf" ] || return 1
@@ -144,14 +153,40 @@ caffeinate_live() {
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
+# _pid_not_zombie <pid> -> rc 0 unless <pid> is a zombie or already gone. `kill -0` alone
+# cannot tell a zombie (exited, still awaiting this shell's reap) from a genuinely running
+# process — both answer 0 — so under load a child that already died could read as "alive"
+# for as long as it took this shell to reap it (#367). `ps`'s own state column does not
+# share that blind spot: a zombie reports `Z` explicitly, so checking it tells "died"
+# (zombie, or gone outright) apart from "still running" regardless of scheduling. Used only
+# by start_caffeinate's post-launch re-check below, the one call site that faces this race
+# (it checks a child it just forked itself, in the same process).
+_pid_not_zombie() {
+  local pid="$1" state
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  state="$(LC_ALL=C ps -o state= -p "$pid" 2>/dev/null)" || return 1
+  # Strip all whitespace before the emptiness check — a blank-but-not-literally-empty
+  # value (padding, an unexpected ps format) must still read as "can't confirm alive",
+  # not fall through to the alive branch below.
+  state="${state//[[:space:]]/}"
+  case "$state" in
+    *Z*|'') return 1 ;;
+  esac
+  return 0
+}
+
 # start_caffeinate -> launch a detached `caffeinate -s`, record its pid, and confirm it
 # actually stayed up. Idempotent: a live caffeinate is reused. rc 1 (pidfile cleared) when
 # the binary is unavailable OR the launch died immediately — so the caller rolls back
 # disablesleep rather than leave the Mac half-configured and falsely report "holding".
 # AFK_TRAVEL_CAFFEINATE overrides the binary name (tests inject an absent name to exercise
-# the rollback); AFK_TRAVEL_SETTLE tunes the post-launch settle before the liveness re-check.
+# the rollback); AFK_TRAVEL_SETTLE tunes the single post-launch sleep before the one-shot
+# liveness re-check, which verdicts via the zombie-aware `_pid_not_zombie` (#367), not a
+# bare `kill -0`.
 start_caffeinate() {
-  local pf pid bin; pf="$(caffeinate_pidfile)"; bin="${AFK_TRAVEL_CAFFEINATE:-caffeinate}"
+  local pf pid bin settle
+  pf="$(caffeinate_pidfile)"; bin="${AFK_TRAVEL_CAFFEINATE:-caffeinate}"
   if caffeinate_live; then return 0; fi
   command -v "$bin" >/dev/null 2>&1 || return 1
   # Detach stdio so the daemon never holds the launcher's pipes open (a caller that
@@ -159,8 +194,9 @@ start_caffeinate() {
   "$bin" -s </dev/null >/dev/null 2>&1 &
   pid=$!
   printf '%s\n' "$pid" > "$pf"
-  sleep "${AFK_TRAVEL_SETTLE:-0.3}"
-  if kill -0 "$pid" 2>/dev/null; then return 0; fi
+  settle="${AFK_TRAVEL_SETTLE:-0.3}"
+  sleep "$settle"
+  if _pid_not_zombie "$pid"; then return 0; fi
   rm -f "$pf"
   return 1
 }
