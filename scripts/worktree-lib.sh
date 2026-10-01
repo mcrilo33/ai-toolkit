@@ -177,9 +177,10 @@ wt_resolve_agent_model() {
   # whenever the self-copy lacked the config (observed thrice: the budget-routing
   # land, #291, #305). A silent fallback to the MOST expensive option is the worst
   # shape a default can have. `claude-sonnet-5-5` / `high` matches the intended
-  # driver default and keeps compaction on (the 5-series has a native 1M window, so
-  # the `[1m]` suffix is now an invalid ID). When the config IS present it wins, so
-  # a Sonnet/budget posture is still honored — this only bounds the config-less case.
+  # driver default, with no `[1m]` suffix (the 5-series has a native 1M window, so
+  # that suffix is now an invalid ID, not a tier to opt into). When the config IS
+  # present it wins, so a Sonnet/budget posture is still honored — this only bounds
+  # the config-less case.
   if [ -z "${WT_AGENT_MODEL:-}" ] && [ -z "${WT_AGENT_MODEL_DEFAULT:-}" ]; then
     wt_warn "spoke model config not found (no spoke-model.env / config) — using the safe default claude-sonnet-5-5/high; a synced target or seeded self-copy should override this (see #306)" || true
   fi

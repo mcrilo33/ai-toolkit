@@ -64,6 +64,7 @@ from telemetry.langfuse_spoke_tree import (
     trace_id_for,
     transcript_scan_root,
 )
+from telemetry.measure_context_cost import DEFAULT_PRICE
 from telemetry.request_body import (
     ContextItem,
     decompose_request_body,
@@ -199,10 +200,11 @@ def _dur(total_ms: int, components: dict[str, int] | None = None) -> dict:
 
 
 def test_default_price_mirrors_measure_context_cost() -> None:
-    # #358: Opus 5.5 input is $4/MTok; the cache-creation write rate is a conservative
-    # upper bound that must move together with measure_context_cost.DEFAULT_PRICE, or
-    # the two cost views diverge.
-    assert _DEFAULT_PRICE == 0.000005
+    # #358: the cache-creation write rate must move together with
+    # measure_context_cost.DEFAULT_PRICE, or the two cost views diverge. Assert the
+    # cross-module equality itself, not a duplicated literal — a future refresh that
+    # updates one constant (and its own pin) but forgets the other must fail here.
+    assert _DEFAULT_PRICE == DEFAULT_PRICE
 
 
 class TestBuildBatch:

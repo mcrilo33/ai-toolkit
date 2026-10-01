@@ -45,9 +45,9 @@ SONNET = "claude-sonnet-5-5"
 # Mirrors shared/agents/metadata.yml's #141 routing — now sourced from the config.
 # architect/planner returned to FABLE when claude-fable-5-1 became available again
 # (they fell back to OPUS during the #218 retirement window).
-# (model, effort) per agent — Claude 5 modernization (2026-08-17): the reasoning
-# tier is Opus 5; design/judgment agents keep max effort on the scarce models,
-# while the routine workhorses (green/refactor/docs) run Sonnet at high effort.
+# (model, effort) per agent — the reasoning tier is Opus 5.5; design/judgment
+# agents keep max effort on the scarce models, while the routine workhorses
+# (green/refactor/docs) run Sonnet 5.5 at high effort.
 # Per-issue escalation stays available via the lane:reasoning label override.
 EXPECTED_AGENT_ROUTING = {
     "architect": (FABLE, "max"),

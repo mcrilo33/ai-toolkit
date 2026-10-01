@@ -133,32 +133,35 @@ security-reviewer → debug → code-review
 
 ## Model and effort assignment
 
-Each agent is matched to a model by **role type** (issue #141): the design/plan
-roles whose output gates everything downstream get the strongest reasoning
-model, `claude-opus-5-5`; reasoning-heavy execution roles also get
-`claude-opus-5-5`; capable-but-routine roles get `claude-sonnet-5-5`; Haiku is
-reserved — no current role is provably trivial. Effort is `max` everywhere.
-(`claude-fable-5-1` was retired in issue #218; the design/plan roles it used to
-carry fell back to `claude-opus-5-5`.)
+Each agent is matched to a model by **role type** (issue #141, routing lives in
+`settings/ai-toolkit.yml` since #142): Fable is scarce and reserved for the
+design/plan agents (`architect`, `planner`); Opus 5.5 is the reasoning tier for
+the other judgment-heavy roles; Sonnet 5.5 covers the capable-but-routine
+workhorses; Haiku is reserved — no current role is provably trivial. Effort is
+`max` for the design/judgment agents (`architect`, `planner`, `debug`,
+`security-reviewer`, `devops`) and `high` for the rest. (`claude-fable-5` was
+retired in issue #218 — architect/planner fell back to Opus for that window —
+and came back as `claude-fable-5-1`; it stays scarce.)
 
 | Agent | Model | Effort | Rationale |
 | ----- | ----- | ------ | --------- |
-| `architect` | `claude-opus-5-5` | `max` | System design needs the strongest reasoning |
-| `planner` | `claude-opus-5-5` | `max` | Decomposition quality gates all downstream work |
-| `code-review` | `claude-opus-5-5` | `max` | Catching subtle bugs needs strong reasoning |
+| `architect` | `claude-fable-5-1` | `max` | System design needs the strongest reasoning |
+| `planner` | `claude-fable-5-1` | `max` | Decomposition quality gates all downstream work |
+| `code-review` | `claude-opus-5-5` | `high` | Catching subtle bugs needs strong reasoning |
 | `security-reviewer` | `claude-opus-5-5` | `max` | Highest stakes; assumes hostile code |
 | `debug` | `claude-opus-5-5` | `max` | Root-cause investigation is hard |
-| `tdd-red` | `claude-opus-5-5` | `max` | Behaviour specification gates the implementation |
+| `tdd-red` | `claude-opus-5-5` | `high` | Behaviour specification gates the implementation |
 | `devops` | `claude-opus-5-5` | `max` | Careful but bounded |
-| `bug-scoper` | `claude-opus-5-5` | `max` | Accurate `Scope:` derivation from investigation is the whole value |
+| `bug-scoper` | `claude-opus-5-5` | `high` | Accurate `Scope:` derivation from investigation is the whole value |
 | `followup-scoper` | `claude-opus-5-5` | `high` | Sibling of `bug-scoper`; the same `Scope:` derivation is the whole value |
-| `refactor` | `claude-sonnet-5-5` | `max` | Wide but mechanical; needs care, not genius |
-| `tdd-green` | `claude-sonnet-5-5` | `max` | Deliberately minimal — over-thinking is a bug |
-| `tdd-refactor` | `claude-sonnet-5-5` | `max` | Quality pass with tests already green |
-| `documentation` | `claude-sonnet-5-5` | `max` | Reads code, writes prose |
+| `refactor` | `claude-sonnet-5-5` | `high` | Wide but mechanical; needs care, not genius |
+| `tdd-green` | `claude-sonnet-5-5` | `high` | Deliberately minimal — over-thinking is a bug |
+| `tdd-refactor` | `claude-sonnet-5-5` | `high` | Quality pass with tests already green |
+| `documentation` | `claude-sonnet-5-5` | `high` | Reads code, writes prose |
 
-These are declared **only under the `claude:` override block** in
-`shared/agents/metadata.yml`. Full model IDs (`claude-opus-5-5`,
+These are declared in `settings/ai-toolkit.yml` (`model.subagents`) and stamped
+into each agent's **`claude:` override block** in `shared/agents/metadata.yml`
+by the sync pipeline. Full model IDs (`claude-opus-5-5`,
 `claude-sonnet-5-5`) and the `effort` field are Claude-specific — Cursor's
 `model` accepts only `inherit`/`fast`/model-id, and `effort` is not a Cursor or
 Copilot field. Scoping them to `claude:` keeps invalid values out of the other

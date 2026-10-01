@@ -165,11 +165,11 @@ model:
   # The interactive spoke driver launched by worktree-new.sh. Routine spokes run
   # Sonnet 5.5 at high effort (2026-10-02 Claude 5.5/5.1 refresh, #358): Sonnet 5.5
   # matches or exceeds Opus's prior-generation per-turn quality at a fraction of the
-  # cost, so the driver stays on the budget tier. Still no `[1m]` tier (the 5-series
-  # models carry a 1M context window natively, making that suffix an invalid ID), so
-  # context compacts at the standard window instead of riding the long-context
-  # premium. Escalate a genuinely reasoning-heavy issue via the `lane:reasoning`
-  # label (model.overrides.by_label below) or an explicit `Model:` line in the issue.
+  # cost, so the driver stays on the budget tier. No `[1m]` suffix: the 5-series
+  # models carry a 1M context window natively, so that suffix is now an invalid ID
+  # rather than a pricing tier to opt into. Escalate a genuinely reasoning-heavy
+  # issue via the `lane:reasoning` label (model.overrides.by_label below) or an
+  # explicit `Model:` line in the issue.
   spoke:
     model: claude-sonnet-5-5
     effort: high

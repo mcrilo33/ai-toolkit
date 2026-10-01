@@ -1,12 +1,12 @@
 """Unit tests for the agent model routing POLICY (issues #141, #142).
 
-Fable is scarce; Opus 5 is the reasoning tier. The per-agent model must
+Fable is scarce; Opus 5.5 is the reasoning tier. The per-agent model must
 therefore route by role: Fable only for the design/plan agents (`architect`,
-`planner`), Opus 5 for the reasoning-heavy ones, Sonnet 5 for the
-capable-but-routine ones, and Haiku for none. Effort routes by role too
-(Claude 5 modernization, 2026-08-17): `max` is reserved for the design/judgment
-agents; the routine workhorses run `high`. Per-issue escalation stays available
-via the `lane:reasoning` label override in the config.
+`planner`), Opus 5.5 for the reasoning-heavy ones, Sonnet 5.5 for the
+capable-but-routine ones, and Haiku for none. Effort routes by role too:
+`max` is reserved for the design/judgment agents; the routine workhorses run
+`high`. Per-issue escalation stays available via the `lane:reasoning` label
+override in the config.
 
 Since #142 the routing lives in `settings/ai-toolkit.yml` (the single source of
 truth), NOT in `shared/agents/metadata.yml` frontmatter — sync stamps it into
@@ -35,9 +35,9 @@ FABLE = "claude-fable-5-1"
 OPUS = "claude-opus-5-5"
 SONNET = "claude-sonnet-5-5"
 
-# (model, effort) per agent. Claude 5 modernization (2026-08-17): the reasoning
-# tier is Opus 5; design/judgment agents keep their scarce models at max, and the
-# routine workhorses (green/refactor/docs) run Sonnet 5 at high.
+# (model, effort) per agent. The reasoning tier is Opus 5.5; design/judgment
+# agents keep their scarce models at max, and the routine workhorses
+# (green/refactor/docs) run Sonnet 5.5 at high.
 EXPECTED_ROUTING = {
     # architect/planner returned to claude-fable-5-1 when it became available again
     # (they fell back to opus during the #218 retirement window).
