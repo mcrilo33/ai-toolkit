@@ -200,6 +200,10 @@ start_caffeinate() {
   printf '%s\n' "$pid" > "$pf"
   settle="${AFK_TRAVEL_SETTLE:-0.3}"
   sleep "$settle"
+  # Unlike every other test seam here, an overridden probe can turn the liveness check
+  # into a no-op in the UNSAFE direction (a probe that exits 0 for a dead process reports
+  # "holding" while the Mac is free to sleep) -- so its use must never be silent.
+  [ -z "${AFK_TRAVEL_LIVENESS_PROBE:-}" ] || warn "liveness probe overridden: $AFK_TRAVEL_LIVENESS_PROBE (test seam)"
   if "${AFK_TRAVEL_LIVENESS_PROBE:-_pid_not_zombie}" "$pid"; then return 0; fi
   rm -f "$pf"
   return 1

@@ -373,11 +373,12 @@ def test_on_rolls_back_disablesleep_when_caffeinate_dies_after_launch(env) -> No
     # against a fixed settle is exactly what made this flaky under `-n auto` load (#368):
     # this host's endpoint-security stack (two AV/EDR agents hooking macOS's Endpoint
     # Security framework, which synchronously authorizes every exec()) can push a trivial
-    # stub's real exit past any settle window under concurrent load -- confirmed via
-    # direct measurement (1.3s+ for a one-line `exit 1` script) and 20/20 failures even at
-    # moderate host load. No fixed settle is both reliable under adversarial load and fast
-    # for every real `on` invocation (see #367's own instruction not to "fix" it by
-    # enlarging the settle).
+    # stub's real exit past any settle window under concurrent load -- observed directly
+    # against this gate's own `-n auto` contention as 20/20 failures even at moderate
+    # host load (an idle, uncontended host does not reproduce the delay in isolation; the
+    # contention itself is the cause). No fixed settle is both reliable under adversarial
+    # load and fast for every real `on` invocation (see #367's own instruction not to
+    # "fix" it by enlarging the settle).
     #
     # The zombie-vs-running distinction itself is already covered, independent of timing,
     # by the `_pid_not_zombie` unit tests above (real forked zombie/running/gone pids).
@@ -386,14 +387,23 @@ def test_on_rolls_back_disablesleep_when_caffeinate_dies_after_launch(env) -> No
     # of racing a real process for it. STUB_CAFFEINATE="die" is kept so the real forked
     # stub still actually exits on its own -- no orphaned background process left for the
     # `env` fixture's pidfile-based reaper to miss (the probe override, not the real
-    # process's fate, decides this test's outcome).
+    # process's fate, decides this test's outcome). The probe logs its own invocation so
+    # the test can pin that it was actually consulted (revert the production seam back to
+    # a bare `_pid_not_zombie "$pid"` call and this fails even on an idle host, instead of
+    # silently re-admitting the old race).
     dead_probe = env.bindir / "fake-dead-probe"
-    _write_stub(dead_probe, "exit 1\n")
+    _write_stub(dead_probe, f'echo "probe $*" >> "{env.log}"\nexit 1\n')
 
-    proc = env.run("on", STUB_CAFFEINATE="die", AFK_TRAVEL_LIVENESS_PROBE=str(dead_probe))
+    proc = env.run(
+        "on",
+        STUB_CAFFEINATE="die",
+        AFK_TRAVEL_SETTLE="0",
+        AFK_TRAVEL_LIVENESS_PROBE=str(dead_probe),
+    )
 
     assert proc.returncode != 0
     calls = _calls(env)
+    assert "probe " in calls, "AFK_TRAVEL_LIVENESS_PROBE was not consulted"
     assert "pmset -a disablesleep 1" in calls
     assert "pmset -a disablesleep 0" in calls
     # A launch that died leaves no live pidfile behind.
