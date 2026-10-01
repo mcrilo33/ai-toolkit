@@ -31,15 +31,15 @@ from metadata_parser import parse  # noqa: E402
 
 AGENTS_METADATA = REPO_ROOT / "shared" / "agents" / "metadata.yml"
 
-FABLE = "claude-fable-5"
-OPUS = "claude-opus-5"
-SONNET = "claude-sonnet-5"
+FABLE = "claude-fable-5-1"
+OPUS = "claude-opus-5-5"
+SONNET = "claude-sonnet-5-5"
 
 # (model, effort) per agent. Claude 5 modernization (2026-08-17): the reasoning
 # tier is Opus 5; design/judgment agents keep their scarce models at max, and the
 # routine workhorses (green/refactor/docs) run Sonnet 5 at high.
 EXPECTED_ROUTING = {
-    # architect/planner returned to claude-fable-5 when it became available again
+    # architect/planner returned to claude-fable-5-1 when it became available again
     # (they fell back to opus during the #218 retirement window).
     "architect": (FABLE, "max"),
     "planner": (FABLE, "max"),
@@ -87,7 +87,7 @@ def test_max_effort_reserved_for_judgment_agents(config: dict, name: str) -> Non
 
 
 def test_fable_reserved_for_design_agents(config: dict) -> None:
-    # claude-fable-5 is back after the #218 retirement window, but stays scarce:
+    # claude-fable-5-1 is back after the #218 retirement window, but stays scarce:
     # only the design/plan agents (architect, planner) may route to it.
     for name in EXPECTED_ROUTING:
         routed = cfg.agent_model(config, name)

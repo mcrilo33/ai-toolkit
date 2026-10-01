@@ -243,7 +243,7 @@ scripts/worktree-new.sh <issue> [slug] [type] [flags]
 | `--no-agent` | spawn the terminal but do not launch `claude` |
 
 The spawned agent's model and effort are pinned at dispatch time
-(`CLAUDE_EFFORT=max claude --model 'claude-opus-4-8[1m]'` by default) so a spoke stays
+(`CLAUDE_EFFORT=high claude --model claude-sonnet-5-5` by default) so a spoke stays
 deterministic even when user-global settings change. The default comes from the
 declarative config (`settings/ai-toolkit.yml`, key `model.spoke`): sync emits it into
 `.ai-toolkit/scripts/spoke-model.env`, which `worktree-new.sh` sources, falling back to
@@ -255,7 +255,7 @@ highest first:
    from the numbered issue like the `Scope:` / `Gate:` lines (first match,
    case-insensitive).
 3. The config default (`model.spoke`) via the emitted env file or the hub config.
-4. The literal `claude-opus-4-8[1m]` / `max`.
+4. The literal `claude-sonnet-5-5` / `high`.
 
 See [metadata and sync](./metadata-and-sync.md) for the config schema.
 

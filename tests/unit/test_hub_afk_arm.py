@@ -63,3 +63,13 @@ def test_build_remote_launch_cmd_is_pure() -> None:
     assert "cd '/repo'" in out
     assert "tmux new -d -s 'afk'" in out
     assert "caffeinate -s bash x drain" in out
+
+
+def test_arm_claude_check_default_probe_runs_on_haiku() -> None:
+    # #358: the auth probe spends an Opus call on a two-token `ok` liveness ping — pure
+    # waste. The default AFK_AUTH_PROBE_CMD belongs on the cheap tier (Haiku), never the
+    # retired claude-opus-4-8 literal.
+    src = _call("declare -f _afk_arm_claude_check").stdout
+
+    assert "claude-haiku-4-5" in src
+    assert "claude-opus-4-8" not in src

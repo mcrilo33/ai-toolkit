@@ -24,6 +24,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.langfuse_spoke_tree import (
+    _DEFAULT_PRICE,
     _DISK_CATEGORY_ORDER,
     _REQUEST_CATEGORY_ORDER,
     EnrichmentContext,
@@ -195,6 +196,13 @@ def _dur(total_ms: int, components: dict[str, int] | None = None) -> dict:
     filled = {key: 0 for key in classes}
     filled.update(components or {})
     return {"total_ms": total_ms, "components": filled}
+
+
+def test_default_price_mirrors_measure_context_cost() -> None:
+    # #358: Opus 5.5 input is $4/MTok; the cache-creation write rate is a conservative
+    # upper bound that must move together with measure_context_cost.DEFAULT_PRICE, or
+    # the two cost views diverge.
+    assert _DEFAULT_PRICE == 0.000005
 
 
 class TestBuildBatch:

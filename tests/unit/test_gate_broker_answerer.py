@@ -65,6 +65,15 @@ def test_answerer_module_surface_loads() -> None:
     assert result.stdout.strip().splitlines()[-1] == "OK"
 
 
+def test_run_answerer_default_model_is_opus_5_5() -> None:
+    # #358: the Claude 5.5/5.1 refresh moves the reasoning answerer off the retired
+    # claude-opus-4-8 literal onto claude-opus-5-5.
+    src = _call("declare -f run_answerer").stdout
+
+    assert "claude-opus-5-5" in src
+    assert "claude-opus-4-8" not in src
+
+
 def test_parse_decision_extracts_answer() -> None:
     # A representative parse lands identically through the split module.
     result = _call("parse_decision 'reasoning here\nANSWER: use Redis'")

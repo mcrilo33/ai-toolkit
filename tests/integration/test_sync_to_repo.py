@@ -1503,17 +1503,18 @@ class TestConfigDrivenSync:
     """settings/ai-toolkit.yml is the source of truth for model + base_branch."""
 
     def test_claude_agent_model_stamped_from_config(self, target_repo: Path) -> None:
-        # The real seed config routes architect→fable, debug→opus-5, tdd-green→sonnet.
+        # The real seed config routes architect→fable, debug→opus-5.5, tdd-green→sonnet.
         # (architect fell back to opus during the #218 fable retirement window.)
         _run_sync(target_repo, "claude")
 
         agents = target_repo / ".claude" / "agents"
         assert (
-            _parse_frontmatter((agents / "architect.md").read_text())["model"] == "claude-fable-5"
+            _parse_frontmatter((agents / "architect.md").read_text())["model"] == "claude-fable-5-1"
         )
-        assert _parse_frontmatter((agents / "debug.md").read_text())["model"] == "claude-opus-5"
+        assert _parse_frontmatter((agents / "debug.md").read_text())["model"] == "claude-opus-5-5"
         assert (
-            _parse_frontmatter((agents / "tdd-green.md").read_text())["model"] == "claude-sonnet-5"
+            _parse_frontmatter((agents / "tdd-green.md").read_text())["model"]
+            == "claude-sonnet-5-5"
         )
 
     def test_claude_agent_effort_stamped_from_config(self, target_repo: Path) -> None:
@@ -1528,10 +1529,10 @@ class TestConfigDrivenSync:
         env = target_repo / ".ai-toolkit" / "scripts" / "spoke-model.env"
         assert env.exists()
         text = env.read_text()
-        # Claude 5 modernization (2026-08-17): the spoke driver runs Sonnet 5/high,
+        # Claude 5.5/5.1 refresh (2026-10-02, #358): the spoke driver runs Sonnet 5.5/high,
         # no 1m tier. (The emitter shell-quotes only values that need it — the old
         # [1m] did; a plain model id is emitted bare.)
-        assert "WT_AGENT_MODEL_DEFAULT=claude-sonnet-5" in text
+        assert "WT_AGENT_MODEL_DEFAULT=claude-sonnet-5-5" in text
         assert "WT_AGENT_EFFORT_DEFAULT=high" in text
 
     def test_base_branch_set_from_config(self, target_repo: Path, tmp_path: Path) -> None:

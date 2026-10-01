@@ -306,7 +306,7 @@ _PURGE_POLL_INTERVAL = 1.0
 _DEFAULT_PROJECTS = Path("~/.claude/projects").expanduser()
 
 # Default cache-creation price (USD per token), Opus tier — mirrors measure_context_cost.
-_DEFAULT_PRICE = 0.00000625
+_DEFAULT_PRICE = 0.000005
 # Env var naming the per-spoke dir of OTEL_LOG_RAW_API_BODIES=file:<dir> dumps.
 _BODY_DIR_ENV = "AI_TOOLKIT_OTEL_BODY_DIR"
 # Conventional per-spoke body dir under a worktree root (worktree-new.sh writes here).

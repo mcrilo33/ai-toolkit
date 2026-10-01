@@ -6279,7 +6279,7 @@ def test_self_copy_copies_sibling_set(tmp_path: Path) -> None:
         )
 
 
-def _stage_synced_scripts_dir(tmp_path: Path, *, model: str = "claude-sonnet-5") -> Path:
+def _stage_synced_scripts_dir(tmp_path: Path, *, model: str = "claude-sonnet-5-5") -> Path:
     # Mimic a synced .ai-toolkit/scripts dir: the real hub-afk.sh next to the two
     # config files sync co-locates there (spoke-model.env rendered from the config,
     # plus the ai_toolkit_config.py seam). Sourcing it with cwd=REPO_ROOT lets the
@@ -6359,7 +6359,7 @@ def test_freshly_armed_self_copy_dispatches_on_config_model(tmp_path: Path) -> N
     # the real self-copy from a synced-style src carrying a Sonnet-budget spoke-model.env, then
     # resolve the model against the self-copy dir and assert it is the config's model — never the
     # opus[1m] literal the config-less fallback would otherwise pick.
-    src_dir = _stage_synced_scripts_dir(tmp_path, model="claude-sonnet-5")
+    src_dir = _stage_synced_scripts_dir(tmp_path, model="claude-sonnet-5-5")
     tmpdir = tmp_path / "selfcopy"
     tmpdir.mkdir()
     env = _self_copy_env(tmpdir)
@@ -6390,7 +6390,7 @@ def test_freshly_armed_self_copy_dispatches_on_config_model(tmp_path: Path) -> N
         cwd=str(REPO_ROOT),
     )
 
-    assert "M=claude-sonnet-5 E=high" in resolve.stdout, resolve.stdout + resolve.stderr
+    assert "M=claude-sonnet-5-5 E=high" in resolve.stdout, resolve.stdout + resolve.stderr
     assert "[1m]" not in resolve.stdout, (
         "a seeded self-copy must never dispatch on the 1M tier fallback (#306)"
     )

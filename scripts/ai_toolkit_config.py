@@ -668,7 +668,7 @@ def _cli(argv: list[str]) -> str:
             print(f"ai-toolkit: WARNING: {warning}", file=sys.stderr)
         return upstream_repo(config)
     if command == "spoke-env":
-        spec = spoke_model(config) or ("claude-opus-4-8[1m]", DEFAULT_EFFORT)
+        spec = spoke_model(config) or ("claude-sonnet-5-5", "high")
         # shell-quote the values: worktree-new.sh sources / evals this output, so
         # an unquoted space or metacharacter would corrupt the assignment (silently
         # unset the default) or execute — even though real model IDs are safe today.
