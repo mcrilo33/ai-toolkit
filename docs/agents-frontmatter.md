@@ -145,7 +145,7 @@ and came back as `claude-fable-5-1`; it stays scarce.)
 
 | Agent | Model | Effort | Rationale |
 | ----- | ----- | ------ | --------- |
-| `architect` | `claude-fable-5-1` | `max` | System design needs the strongest reasoning |
+| `architect` | `claude-fable-5-1` | `max` | System design is scarce-model territory — its output gates everything downstream |
 | `planner` | `claude-fable-5-1` | `max` | Decomposition quality gates all downstream work |
 | `code-review` | `claude-opus-5-5` | `high` | Catching subtle bugs needs strong reasoning |
 | `security-reviewer` | `claude-opus-5-5` | `max` | Highest stakes; assumes hostile code |
@@ -159,9 +159,9 @@ and came back as `claude-fable-5-1`; it stays scarce.)
 | `tdd-refactor` | `claude-sonnet-5-5` | `high` | Quality pass with tests already green |
 | `documentation` | `claude-sonnet-5-5` | `high` | Reads code, writes prose |
 
-These are declared in `settings/ai-toolkit.yml` (`model.subagents`) and stamped
-into each agent's **`claude:` override block** in `shared/agents/metadata.yml`
-by the sync pipeline. Full model IDs (`claude-opus-5-5`,
+These are declared in `settings/ai-toolkit.yml` (`model.subagents`) and stamped by
+the sync pipeline into each agent's emitted `.claude/agents/<name>.md` frontmatter,
+as a **`claude:`-scoped override**. Full model IDs (`claude-opus-5-5`,
 `claude-sonnet-5-5`) and the `effort` field are Claude-specific — Cursor's
 `model` accepts only `inherit`/`fast`/model-id, and `effort` is not a Cursor or
 Copilot field. Scoping them to `claude:` keeps invalid values out of the other

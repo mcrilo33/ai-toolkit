@@ -2154,14 +2154,16 @@ def test_config_less_fallback_warns_loudly() -> None:
 
 
 def test_present_config_overrides_the_literal_fallback(tmp_path: Path) -> None:
-    # The literal is ONLY a last resort — a real spoke-model.env (e.g. a Sonnet budget
-    # posture) must still win, so this fix never overrides an intended routing.
+    # The literal is ONLY a last resort — a real spoke-model.env (e.g. an escalated
+    # reasoning posture) must still win, so this fix never overrides an intended
+    # routing. The fixture model is deliberately NOT claude-sonnet-5-5 — the literal
+    # fallback itself — so this test can actually fail if the config stops winning.
     (tmp_path / "spoke-model.env").write_text(
-        "WT_AGENT_MODEL_DEFAULT=claude-sonnet-5-5\nWT_AGENT_EFFORT_DEFAULT=high\n"
+        "WT_AGENT_MODEL_DEFAULT=claude-haiku-4-5\nWT_AGENT_EFFORT_DEFAULT=max\n"
     )
     result = _call(
         f"wt_resolve_agent_model {tmp_path} /nonexistent-config; "
         'echo "M=$WT_AGENT_MODEL E=$WT_AGENT_EFFORT"'
     )
 
-    assert "M=claude-sonnet-5-5 E=high" in result.stdout, result.stdout
+    assert "M=claude-haiku-4-5 E=max" in result.stdout, result.stdout

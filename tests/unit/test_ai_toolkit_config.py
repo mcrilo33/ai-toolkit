@@ -113,6 +113,17 @@ def test_spoke_effort_defaults_to_max_when_absent(tmp_path: Path) -> None:
     assert cfg.spoke_model(config) == ("claude-opus-4-8[1m]", "max")
 
 
+def test_cli_spoke_env_falls_back_to_sane_default_when_unrouted(tmp_path: Path) -> None:
+    # #358: the CLI's own config-less fallback (no model.spoke block at all) must be
+    # the sane budget default, never an Opus/max/[1m] literal (AFK principle #2 — a
+    # silent fallback must default to the SAFE/CHEAP option).
+    config_path = _write(tmp_path, "base_branch: develop\n").as_posix()
+
+    out = cfg._cli(["prog", "spoke-env", config_path])
+
+    assert out == "WT_AGENT_MODEL_DEFAULT=claude-sonnet-5-5\nWT_AGENT_EFFORT_DEFAULT=high"
+
+
 # ─── agent_model ───
 
 
