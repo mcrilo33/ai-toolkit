@@ -141,11 +141,11 @@ caffeinate_pidfile() {
 # calling this, so it is never this shell's own just-forked child: once that prior process
 # has exited, a child of its that died is reparented to launchd and reaped immediately, so
 # it reads here as genuinely running or gone outright — not an unreaped zombie. (The script
-# has no lock against a second invocation overlapping the first's own post-launch settle —
-# a pre-existing gap, not one this fix introduces or closes.) Plain `kill -0` is therefore
-# the right tool for the common case at this call site (contrast start_caffeinate's
-# post-launch re-check below, which DOES face the zombie ambiguity, on a child it just
-# forked itself, every time it runs).
+# has no lock against a second invocation overlapping the first's own post-launch settle; a
+# daemon that dies during that overlap can still misread as alive here. Out of scope for
+# #367, which concerns start_caffeinate's own post-launch re-check below — the one call
+# site that faces the zombie ambiguity on a child it just forked itself, every time it
+# runs.) Plain `kill -0` is the right tool for the common, non-overlapping case here.
 caffeinate_live() {
   local pf pid; pf="$(caffeinate_pidfile)"
   [ -f "$pf" ] || return 1
@@ -182,8 +182,8 @@ _pid_not_zombie() {
 # disablesleep rather than leave the Mac half-configured and falsely report "holding".
 # AFK_TRAVEL_CAFFEINATE overrides the binary name (tests inject an absent name to exercise
 # the rollback); AFK_TRAVEL_SETTLE tunes the single post-launch sleep before the one-shot
-# liveness re-check (unchanged timing from before this fix — only the re-check itself
-# changed, from bare `kill -0` to the zombie-aware `_pid_not_zombie`).
+# liveness re-check, which verdicts via the zombie-aware `_pid_not_zombie` (#367), not a
+# bare `kill -0`.
 start_caffeinate() {
   local pf pid bin settle
   pf="$(caffeinate_pidfile)"; bin="${AFK_TRAVEL_CAFFEINATE:-caffeinate}"

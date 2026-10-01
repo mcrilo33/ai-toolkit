@@ -214,7 +214,10 @@ def _wait_for_zombie(pid: int, timeout: float = 10.0) -> str:
     state = ""
     while time.monotonic() < deadline and "Z" not in state:
         state = subprocess.run(
-            ["ps", "-o", "state=", "-p", str(pid)], capture_output=True, text=True
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "LC_ALL": "C"},
         ).stdout
         if "Z" not in state:
             time.sleep(0.02)
@@ -373,18 +376,18 @@ def test_on_rolls_back_disablesleep_when_caffeinate_dies_after_launch(env) -> No
     # process and a zombie still awaiting this shell's reap, so a child that already died
     # could read as "alive" for as long as reaping took (what made this flaky under load —
     # see #367). `ps` reports a zombie explicitly as `Z`, so "died" is told apart from
-    # "still running" regardless of scheduling. AFK_TRAVEL_SETTLE is still the single fixed
-    # sleep before that one-shot check (unchanged by this fix) — lowering it still narrows
-    # the window the daemon has to prove itself, same as before #367.
+    # "still running" regardless of scheduling. AFK_TRAVEL_SETTLE is the single fixed sleep
+    # before that one-shot check — lowering it narrows the window the daemon has to prove
+    # itself.
     #
-    # Quarantined under xdist (#368): even with the zombie-aware fix above, this host's
-    # endpoint-security stack (two separate AV/EDR agents hooking macOS's Endpoint Security
-    # framework, which synchronously authorizes every exec()) can push a trivial stub's real
-    # exec-to-exit latency past AFK_TRAVEL_SETTLE under concurrent load -- confirmed via
-    # direct measurement (1.3s+ for a one-line `exit 1` script) and 20/20 failures even at
-    # moderate host load. That is a latency problem, not a detection-logic bug (see #367's
-    # own instruction not to "fix" it by enlarging the settle), so it is deferred to #368
-    # rather than quarantined for a reason this fix could actually address.
+    # Quarantined under xdist (#368): the zombie-aware check above is still race-free, but
+    # this host's endpoint-security stack (two separate AV/EDR agents hooking macOS's
+    # Endpoint Security framework, which synchronously authorizes every exec()) can push a
+    # trivial stub's real exec-to-exit latency past AFK_TRAVEL_SETTLE under concurrent load
+    # -- confirmed via direct measurement (1.3s+ for a one-line `exit 1` script) and 20/20
+    # failures even at moderate host load. That is a latency problem, not a detection-logic
+    # bug (see #367's own instruction not to "fix" it by enlarging the settle), so it is
+    # deferred to #368 rather than quarantined for a reason this check could address.
     #
     # This repo's gate (test-select.sh) runs both its SELECTED and FULL paths under
     # `-n auto` whenever xdist is installed -- the normal state -- so PYTEST_XDIST_WORKER
