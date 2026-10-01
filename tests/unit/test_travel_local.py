@@ -179,34 +179,47 @@ def _wait_for_log(env, needle: str, timeout: float = 5.0) -> str:
 
 
 def _source_functions(tmp_path: Path) -> Path:
-    """A copy of travel-local.sh with its trailing ``main "$@"`` dispatch stripped, so a
-    test can ``source`` just the function definitions without invoking the CLI (which
-    would ``exit`` the sourcing shell before the test gets to call anything)."""
+    """A copy of travel-local.sh with its ``main "$@"`` dispatch line dropped, so a test
+    can ``source`` just the function definitions without invoking the CLI (which would
+    ``exit`` the sourcing shell before the test gets to call anything). Filters by content
+    rather than assuming the dispatch is strictly the last line, so an unrelated edit after
+    it (a trailing blank line, a shellcheck directive) doesn't break this helper."""
     lines = SCRIPT.read_text().splitlines(keepends=True)
-    assert lines[-1].strip() == 'main "$@"', 'travel-local.sh no longer ends with main "$@"'
+    kept = [line for line in lines if line.strip() != 'main "$@"']
+    assert len(kept) == len(lines) - 1, 'expected exactly one main "$@" dispatch line'
     functions = tmp_path / "travel-local-functions.sh"
-    functions.write_text("".join(lines[:-1]))
+    functions.write_text("".join(kept))
     return functions
 
 
-# --- _pid_alive (unit) ----------------------------------------------------------
+def _run_pid_not_zombie(functions: Path, pid: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", f'. "{functions}"; _pid_not_zombie "{pid}"'],
+        capture_output=True,
+        text=True,
+    )
 
 
-def test_pid_alive_treats_zombie_as_dead(tmp_path: Path) -> None:
+# --- _pid_not_zombie (unit) -------------------------------------------------------
+
+
+def test_pid_not_zombie_treats_zombie_as_dead(tmp_path: Path) -> None:
     """Regression for #367: a zombie (exited, not yet reaped) must read as dead.
 
     `kill -0` alone cannot tell a zombie from a genuinely running process -- both answer
     0 -- which is exactly the ambiguity that made the caffeinate-dies rollback test flaky
-    under load (a reaped-pending zombie misread as "alive"). This forks a real child,
-    lets it exit without reaping it (a real zombie, confirmed via `ps` state `Z`), and
-    asserts `_pid_alive` rejects it -- independent of any timing or host-load luck.
+    under load (a reaped-pending zombie misread as "alive"). This forks a real child via
+    ``os.fork`` (never auto-reaped by anything but this test process, so it stays a zombie
+    indefinitely -- no race against a deadline), lets it exit without reaping it (confirmed
+    via `ps` state `Z`), and asserts `_pid_not_zombie` rejects it specifically (rc 1, not
+    just "nonzero") -- independent of any timing or host-load luck.
     """
     functions = _source_functions(tmp_path)
     child_pid = os.fork()
     if child_pid == 0:
         os._exit(1)
     try:
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + 10.0
         state = ""
         while time.monotonic() < deadline:
             state = subprocess.run(
@@ -217,44 +230,34 @@ def test_pid_alive_treats_zombie_as_dead(tmp_path: Path) -> None:
             time.sleep(0.01)
         assert "Z" in state, f"expected a zombie, got ps state={state!r}"
 
-        proc = subprocess.run(
-            ["bash", "-c", f'. "{functions}"; _pid_alive "{child_pid}"'],
-            capture_output=True,
-            text=True,
+        proc = _run_pid_not_zombie(functions, child_pid)
+        assert proc.returncode == 1, (
+            f"a zombie pid must read as not-alive (rc 1), got rc={proc.returncode}: {proc.stderr}"
         )
-        assert proc.returncode != 0, "a zombie pid must not read as alive"
     finally:
         os.waitpid(child_pid, 0)
 
 
-def test_pid_alive_accepts_a_genuinely_running_process(tmp_path: Path) -> None:
+def test_pid_not_zombie_accepts_a_genuinely_running_process(tmp_path: Path) -> None:
     functions = _source_functions(tmp_path)
     proc = subprocess.Popen(["sleep", "5"])
     try:
-        result = subprocess.run(
-            ["bash", "-c", f'. "{functions}"; _pid_alive "{proc.pid}"'],
-            capture_output=True,
-            text=True,
-        )
+        result = _run_pid_not_zombie(functions, proc.pid)
         assert result.returncode == 0, result.stderr
     finally:
         proc.kill()
         proc.wait()
 
 
-def test_pid_alive_rejects_an_already_gone_pid(tmp_path: Path) -> None:
+def test_pid_not_zombie_rejects_an_already_gone_pid(tmp_path: Path) -> None:
     functions = _source_functions(tmp_path)
     child_pid = os.fork()
     if child_pid == 0:
         os._exit(1)
     os.waitpid(child_pid, 0)  # fully reap it -- the pid now names no process at all
 
-    proc = subprocess.run(
-        ["bash", "-c", f'. "{functions}"; _pid_alive "{child_pid}"'],
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode != 0
+    proc = _run_pid_not_zombie(functions, child_pid)
+    assert proc.returncode == 1, f"a gone pid must read as not-alive (rc 1), got {proc.returncode}"
 
 
 # --- guards -------------------------------------------------------------------
@@ -326,12 +329,14 @@ def test_on_rolls_back_disablesleep_when_caffeinate_unavailable(env) -> None:
 
 
 def test_on_rolls_back_disablesleep_when_caffeinate_dies_after_launch(env) -> None:
-    # The daemon launches but exits immediately. start_caffeinate's final verdict is a `ps`
-    # state check, not `kill -0` — `kill -0` answers 0 for both a genuinely running process
-    # and a zombie still awaiting this shell's reap, so a child that already died could read
-    # as "alive" for as long as reaping took (what made this flaky under load — see #367).
-    # `ps` reports a zombie explicitly as `Z`, so "died" is told apart from "still running"
-    # regardless of scheduling. AFK_TRAVEL_SETTLE only bounds how long that verdict is polled.
+    # The daemon launches but exits immediately. start_caffeinate's post-settle verdict is a
+    # `ps` state check, not `kill -0` — `kill -0` answers 0 for both a genuinely running
+    # process and a zombie still awaiting this shell's reap, so a child that already died
+    # could read as "alive" for as long as reaping took (what made this flaky under load —
+    # see #367). `ps` reports a zombie explicitly as `Z`, so "died" is told apart from
+    # "still running" regardless of scheduling. AFK_TRAVEL_SETTLE is still the single fixed
+    # sleep before that one-shot check (unchanged by this fix) — lowering it still narrows
+    # the window the daemon has to prove itself, same as before #367.
     proc = env.run("on", STUB_CAFFEINATE="die", AFK_TRAVEL_SETTLE="1")
 
     assert proc.returncode != 0
