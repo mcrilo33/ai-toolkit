@@ -27,7 +27,7 @@
 #
 # Test seams (env overrides): AFK_TRAVEL_CONF, AFK_TRAVEL_WIFI_DEV, AFK_TRAVEL_PIDFILE,
 # AFK_TRAVEL_API_URL, AFK_TRAVEL_JOIN_RETRIES, AFK_TRAVEL_JOIN_DELAY, AFK_TRAVEL_CAFFEINATE,
-# AFK_TRAVEL_SETTLE, AFK_GATE_BROKER, AFK_HUB_AFK, AFK_STATE_DIR.
+# AFK_TRAVEL_SETTLE, AFK_TRAVEL_LIVENESS_PROBE, AFK_GATE_BROKER, AFK_HUB_AFK, AFK_STATE_DIR.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -183,7 +183,11 @@ _pid_not_zombie() {
 # AFK_TRAVEL_CAFFEINATE overrides the binary name (tests inject an absent name to exercise
 # the rollback); AFK_TRAVEL_SETTLE tunes the single post-launch sleep before the one-shot
 # liveness re-check, which verdicts via the zombie-aware `_pid_not_zombie` (#367), not a
-# bare `kill -0`.
+# bare `kill -0`. AFK_TRAVEL_LIVENESS_PROBE overrides the verdict call itself (default:
+# `_pid_not_zombie`) -- the real zombie-vs-running distinction is covered on its own by
+# the `_pid_not_zombie` unit tests, so a test exercising THIS function's rollback plumbing
+# can inject a deterministic verdict instead of racing a real forked process's exec/exit
+# latency under load (#368).
 start_caffeinate() {
   local pf pid bin settle
   pf="$(caffeinate_pidfile)"; bin="${AFK_TRAVEL_CAFFEINATE:-caffeinate}"
@@ -196,7 +200,7 @@ start_caffeinate() {
   printf '%s\n' "$pid" > "$pf"
   settle="${AFK_TRAVEL_SETTLE:-0.3}"
   sleep "$settle"
-  if _pid_not_zombie "$pid"; then return 0; fi
+  if "${AFK_TRAVEL_LIVENESS_PROBE:-_pid_not_zombie}" "$pid"; then return 0; fi
   rm -f "$pf"
   return 1
 }

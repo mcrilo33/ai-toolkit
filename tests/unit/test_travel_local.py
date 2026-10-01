@@ -366,36 +366,31 @@ def test_on_rolls_back_disablesleep_when_caffeinate_unavailable(env) -> None:
     assert "pmset -a disablesleep 0" in calls
 
 
-@pytest.mark.skipif(
-    bool(os.environ.get("PYTEST_XDIST_WORKER")),
-    reason="flaky under xdist load; quarantined until #368",
-)
 def test_on_rolls_back_disablesleep_when_caffeinate_dies_after_launch(env) -> None:
-    # The daemon launches but exits immediately. start_caffeinate's post-settle verdict is a
-    # `ps` state check, not `kill -0` — `kill -0` answers 0 for both a genuinely running
-    # process and a zombie still awaiting this shell's reap, so a child that already died
-    # could read as "alive" for as long as reaping took (what made this flaky under load —
-    # see #367). `ps` reports a zombie explicitly as `Z`, so "died" is told apart from
-    # "still running" regardless of scheduling. AFK_TRAVEL_SETTLE is the single fixed sleep
-    # before that one-shot check — lowering it narrows the window the daemon has to prove
-    # itself.
+    # The daemon launches but exits immediately. start_caffeinate's post-settle verdict
+    # goes through an injectable probe (default: the zombie-aware `_pid_not_zombie`,
+    # #367) rather than a bare `kill -0`. Racing the real stub's exec-to-exit latency
+    # against a fixed settle is exactly what made this flaky under `-n auto` load (#368):
+    # this host's endpoint-security stack (two AV/EDR agents hooking macOS's Endpoint
+    # Security framework, which synchronously authorizes every exec()) can push a trivial
+    # stub's real exit past any settle window under concurrent load -- confirmed via
+    # direct measurement (1.3s+ for a one-line `exit 1` script) and 20/20 failures even at
+    # moderate host load. No fixed settle is both reliable under adversarial load and fast
+    # for every real `on` invocation (see #367's own instruction not to "fix" it by
+    # enlarging the settle).
     #
-    # Quarantined under xdist (#368): the zombie-aware check above is still race-free, but
-    # this host's endpoint-security stack (two separate AV/EDR agents hooking macOS's
-    # Endpoint Security framework, which synchronously authorizes every exec()) can push a
-    # trivial stub's real exec-to-exit latency past AFK_TRAVEL_SETTLE under concurrent load
-    # -- confirmed via direct measurement (1.3s+ for a one-line `exit 1` script) and 20/20
-    # failures even at moderate host load. That is a latency problem, not a detection-logic
-    # bug (see #367's own instruction not to "fix" it by enlarging the settle), so it is
-    # deferred to #368 rather than quarantined for a reason this check could address.
-    #
-    # This repo's gate (test-select.sh) runs both its SELECTED and FULL paths under
-    # `-n auto` whenever xdist is installed -- the normal state -- so PYTEST_XDIST_WORKER
-    # is set on every gate-enforced run, meaning this skip is NOT merely "quieter under
-    # heavy parallelism": until #368 lands, this test only runs on a manual, no-`-n`
-    # invocation, not in any push-gate or CI run. That is the accepted cost of the
-    # quarantine, not an oversight -- #368 owns restoring gate coverage for this path.
-    proc = env.run("on", STUB_CAFFEINATE="die", AFK_TRAVEL_SETTLE="1")
+    # The zombie-vs-running distinction itself is already covered, independent of timing,
+    # by the `_pid_not_zombie` unit tests above (real forked zombie/running/gone pids).
+    # This test's job is the rollback plumbing in `start_caffeinate`/`cmd_on` given "the
+    # probe says dead" -- so it injects that verdict via AFK_TRAVEL_LIVENESS_PROBE instead
+    # of racing a real process for it. STUB_CAFFEINATE="die" is kept so the real forked
+    # stub still actually exits on its own -- no orphaned background process left for the
+    # `env` fixture's pidfile-based reaper to miss (the probe override, not the real
+    # process's fate, decides this test's outcome).
+    dead_probe = env.bindir / "fake-dead-probe"
+    _write_stub(dead_probe, "exit 1\n")
+
+    proc = env.run("on", STUB_CAFFEINATE="die", AFK_TRAVEL_LIVENESS_PROBE=str(dead_probe))
 
     assert proc.returncode != 0
     calls = _calls(env)
