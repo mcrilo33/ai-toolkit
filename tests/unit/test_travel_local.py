@@ -401,9 +401,9 @@ def test_on_rolls_back_disablesleep_when_caffeinate_dies_after_launch(env) -> No
         AFK_TRAVEL_LIVENESS_PROBE=str(dead_probe),
     )
 
-    assert proc.returncode != 0
     calls = _calls(env)
     assert "probe " in calls, "AFK_TRAVEL_LIVENESS_PROBE was not consulted"
+    assert proc.returncode != 0
     assert "pmset -a disablesleep 1" in calls
     assert "pmset -a disablesleep 0" in calls
     # A launch that died leaves no live pidfile behind.
