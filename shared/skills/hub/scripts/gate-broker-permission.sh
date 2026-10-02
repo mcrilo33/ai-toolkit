@@ -172,7 +172,8 @@ path to tell the spoke>'."
 _decide_permission() {
   local wt="$1" issue="$2" sig="${3:-}" cmd cmd_display decision kind reason want arc
   cmd="$(extract_pending_command "$wt")"
-  want="$(orca_agent_field "$wt" toolInput 2>/dev/null)"   # the dialog being judged: approve only THIS one
+  # The dialog being judged ("<toolName><TAB><toolInput>"): approve only THIS one, whatever replaces it.
+  want="$(orca_agent_field "$wt" toolName 2>/dev/null)"$'\t'"$(orca_agent_field "$wt" toolInput 2>/dev/null)"
   if [ -z "$cmd" ]; then
     # Unreadable command: cannot classify. Decline it (the reversible action) + warn — never
     # park. The spoke gets a denial and keeps going; the backoff paces any retry. Nothing is
