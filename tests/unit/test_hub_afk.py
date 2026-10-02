@@ -11916,6 +11916,49 @@ def test_reap_or_resume_302_replay_reaches_terminal(tmp_path: Path) -> None:
     )
 
 
+def test_reap_or_resume_371_replay_attended_under_armed_drain_reaches_terminal(
+    tmp_path: Path,
+) -> None:
+    # #373 replay (#371's state): mode=attended, drain ARMED, crashed pane already resumed this
+    # window, budget spent, no dependents -> terminal blocked/<issue> through the real
+    # _reap_or_resume route, not just the ladder function.
+    spoke = _afk_mode_spoke(tmp_path, "attended")
+    statedir = tmp_path / "statedir"
+    env = _crash_ready_env(tmp_path, spoke, statedir)
+    armed = tmp_path / "armed"
+    armed.write_text("1700003600\n")
+    env["AFK_STATE"] = str(armed)
+    (statedir / "resumed-5").write_text("1\n")
+    (statedir / "warned-state-5").write_text("3\t1\n")
+
+    _call(
+        "_spoke_still_parked() { return 1; }; _spoke_pane_alive() { return 1; }; "
+        "_spoke_over_any_ceiling() { return 1; }; _spoke_has_commits() { return 0; }; "
+        '_reap_or_resume "$WT" 5',
+        env=env,
+    )
+
+    ready_log = tmp_path / "ready.log"
+    assert ready_log.exists() and "--blocked 5" in ready_log.read_text()
+
+
+def test_reap_pass_attended_re_crash_under_armed_drain_relaunches(tmp_path: Path) -> None:
+    # #373: the reap_pass route for an attended spoke under an armed drain re-attempts the
+    # revival (new tmux window) instead of the old silent warn-park dead-end.
+    spoke = _branched_spoke(tmp_path, ahead=True)  # no .ai-toolkit/mode => attended
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    (statedir / "resumed-5").write_text("1700000000\n")
+    armed = tmp_path / "armed"
+    armed.write_text("1700003600\n")
+    env["AFK_STATE"] = str(armed)
+
+    _call(expr, env=env)
+
+    assert "new-window" in tmux_log.read_text()
+    assert (statedir / "warned-state-5").read_text().split("\t")[0] == "1"
+
+
 # ── #300 step 3: drain-side lifecycle transition writers ──────────────────────
 # The drain records the transition/event it CAUSES (reap / revive / redispatch / nudge)
 # at the moment it acts, keyed by the spoke's run id. Shadow-only: nothing reads the log

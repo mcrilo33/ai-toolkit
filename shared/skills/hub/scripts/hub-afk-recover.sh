@@ -690,13 +690,15 @@ _afk_effective_attendance() {
   if [ -n "$(afk_read_state)" ]; then printf 'attended+armed\n'; else printf 'attended\n'; fi
 }
 
-# _afk_attendance_note <wt> -> the "(effective attendance: mode=…, drain armed=…)" suffix the crash
-# ladder appends to every decision it journals (#241), so the journal names the input it turned on.
+# _afk_attendance_note <wt> <attendance> -> the "(effective attendance: mode=..., drain armed=...)"
+# suffix the crash ladder appends to every decision it journals (#241), so the journal names the
+# input it turned on. <attendance> is the value the caller already decided on (one read of
+# .afk-state), so the note can never contradict the decision it annotates.
 _afk_attendance_note() {
-  local wt="$1" armed=no
-  [ -n "$(afk_read_state)" ] && armed=yes
-  printf '(effective attendance: mode=%s, drain armed=%s)\n' \
-    "$([ -n "$wt" ] && _afk_spoke_mode "$wt" || true)" "$armed"
+  local wt="$1" att="$2" mode="" armed=no
+  [ -n "$wt" ] && mode="$(_afk_spoke_mode "$wt")"
+  case "$att" in attended+armed) armed=yes ;; afk) armed=n/a ;; esac
+  printf '(effective attendance: mode=%s, drain armed=%s)\n' "${mode:-unknown}" "$armed"
 }
 
 # _afk_crash_reresume_or_escalate <wt> <issue> <reason> <retry_fn> -> the #310 crash terminus that
@@ -713,12 +715,13 @@ _afk_attendance_note() {
 # REUSES the warned-lane record (_afk_warn_attempt), so the retry cadence and the escalation bound
 # share one clock — no separate marker to drift (reuse of AFK_WARN_ESCALATE_ATTEMPTS, not a new knob).
 _afk_crash_reresume_or_escalate() {
-  local wt="$1" issue="$2" reason="$3" retry_fn="$4" lane attempts max note
-  note="$(_afk_attendance_note "$wt")"
+  local wt="$1" issue="$2" reason="$3" retry_fn="$4" lane attempts max note att
+  att="$(_afk_effective_attendance "$wt")"
+  note="$(_afk_attendance_note "$wt" "$att")"
   # AC5 regression pin (narrowed by #373): a genuinely attended park (no armed drain) and a
   # worktree-less park keep the old warn-and-parked-LAST — no auto relaunch, no escalation. The
   # warn re-fires on the warned-lane backoff, so the message claims only that (#310 AC4).
-  if [ "$(_afk_effective_attendance "$wt")" = attended ]; then
+  if [ "$att" = attended ]; then
     _warn_parked_last "$wt" "$issue" "$reason — parked LAST; the warn re-fires on its backoff, no automatic relaunch $note"
     return 0
   fi
@@ -748,9 +751,10 @@ _afk_crash_reresume_or_escalate() {
 # race instead of losing the rest of the window to it. Genuinely attended (no armed drain) keeps
 # today's warn-and-wait — the human is the wall (the AC5 regression pin, narrowed by #373).
 _afk_crash_escalate_or_park() {
-  local wt="$1" issue="$2" reason="$3" note
-  note="$(_afk_attendance_note "$wt")"
-  if [ "$(_afk_effective_attendance "$wt")" != attended ]; then
+  local wt="$1" issue="$2" reason="$3" note att
+  att="$(_afk_effective_attendance "$wt")"
+  note="$(_afk_attendance_note "$wt" "$att")"
+  if [ "$att" != attended ]; then
     local ereason="$reason $note. Escalated blocked/$issue for a human (#310/#373)."
     log "→ crash-escalate #$issue: $ereason"
     _afk_set_last_action "crash-escalate #$issue"
