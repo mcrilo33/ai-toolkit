@@ -55,3 +55,8 @@ def test_warm_stubs_raises_when_a_stub_cannot_run(tmp_path: Path) -> None:
 
     with pytest.raises((OSError, subprocess.CalledProcessError)):
         warm_stubs([broken])
+
+
+def test_write_stub_rejects_a_non_shell_shebang(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="sh/bash"):
+        write_stub(tmp_path / "tool", "#!/usr/bin/env python3\nprint(1)\n")
