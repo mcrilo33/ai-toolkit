@@ -585,15 +585,9 @@ except BaseException:
 PY
 }
 
-# wt_workspace_add <ws_file> <wt_dir> -> 0 entry present (appended or already
-# there); 1 missing/unparseable file (caller falls back to `code --add`).
-# Call in a conditional (`if`/`||`) — a bare call aborts a `set -e` caller
-# before the fallback can run.
-wt_workspace_add() { wt_workspace_edit add "$1" "$2"; }
-
 # wt_workspace_remove <ws_file> <wt_dir> -> 0 entry absent (removed, swept, or
 # never there); 1 missing/unparseable file (caller falls back to `code --remove`).
-# Same `set -e` caveat as wt_workspace_add: only call in a conditional.
+# Call in a conditional (`if`/`||`) — a bare call aborts a `set -e` caller before the fallback.
 wt_workspace_remove() { wt_workspace_edit remove "$1" "$2"; }
 
 # --- slug ---------------------------------------------------------------------

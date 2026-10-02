@@ -1419,10 +1419,10 @@ def test_resolve_langfuse_auth_env_project_wins_over_conf(tmp_path: Path) -> Non
 # --- review workspace file management (issue #134) ----------------------------
 # The review "window" is a saved .code-workspace file; `code --add/--remove`
 # target the last-focused window and routinely miss, so worktree-new/-done edit
-# the file's `folders` array directly (VS Code hot-reloads it). The lib owns the
-# three primitives: wt_workspace_file (location resolution), wt_workspace_add,
-# and wt_workspace_remove (which also sweeps entries whose path is gone from
-# disk — self-healing for past misses). A missing or unparseable file returns 1
+# the file's `folders` array directly (VS Code hot-reloads it). The lib owns
+# wt_workspace_file (location resolution) and wt_workspace_remove (which also sweeps
+# entries whose path is gone from disk — self-healing for past misses; dispatch no
+# longer adds entries, #363). A missing or unparseable file returns 1
 # so callers fall back to the legacy `code` CLI path, file left untouched.
 
 
@@ -1528,105 +1528,6 @@ def test_workspace_file_expands_leading_tilde_in_override(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == str(home / "ws" / "review.code-workspace")
-
-
-def test_workspace_add_appends_relative_entry(tmp_path: Path) -> None:
-    # New worktree → one appended {"name", "path"} entry, path relative to the
-    # workspace file's directory; unrelated entries, settings, and the tab
-    # indent VS Code writes are all preserved.
-    ws = tmp_path / "claude" / "review.code-workspace"
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit", "ai-toolkit-42")
-    main_entry = {"name": "ai-toolkit", "path": "../Repos/ai-toolkit"}
-    _write_workspace(ws, [main_entry], settings={"files.exclude": {"**/.git": True}})
-
-    result = _call(f'wt_workspace_add "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 0, result.stderr
-    text = ws.read_text()
-    doc = json.loads(text)
-    assert doc["folders"] == [
-        main_entry,
-        {"name": "ai-toolkit-42", "path": "../Repos/ai-toolkit-42"},
-    ]
-    assert doc["settings"] == {"files.exclude": {"**/.git": True}}
-    assert '\t"folders"' in text, "tab indentation (VS Code's own format) must be kept"
-
-
-def test_workspace_add_stores_resolvable_path_under_symlinked_ancestor(
-    tmp_path: Path,
-) -> None:
-    # The workspace file addressed THROUGH a symlinked ancestor (NFS/corp homes):
-    # the stored relative path must round-trip to the worktree via the physical
-    # layout — a lexical relpath against the unresolved dir produces a `..`-chain
-    # that resolves nowhere (and the next sweep would drop the live entry).
-    # The link is SHALLOWER than the physical tree: a lexical `..`-count computed
-    # from the unresolved side overshoots after the symlink is followed.
-    phys = tmp_path / "a" / "b" / "phys"
-    (phys / "claude").mkdir(parents=True)
-    repos = phys / "Repos"
-    _make_dirs(repos, "ai-toolkit-42")
-    link = tmp_path / "link"
-    link.symlink_to(phys)
-    ws = link / "claude" / "review.code-workspace"
-    _write_workspace(ws, [])
-
-    result = _call(f'wt_workspace_add "{ws}" "{link / "Repos" / "ai-toolkit-42"}"')
-
-    assert result.returncode == 0, result.stderr
-    (entry,) = json.loads(ws.read_text())["folders"]
-    resolved = (ws.parent / entry["path"]).resolve()
-    assert resolved == (repos / "ai-toolkit-42").resolve()
-
-
-def test_workspace_add_is_noop_when_entry_already_present(tmp_path: Path) -> None:
-    # An entry already resolving to the worktree — even a name-less one — must
-    # not be duplicated, and the file must not be rewritten.
-    ws = tmp_path / "claude" / "review.code-workspace"
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit", "ai-toolkit-42")
-    before = _write_workspace(
-        ws,
-        [
-            {"name": "ai-toolkit", "path": "../Repos/ai-toolkit"},
-            {"path": "../Repos/ai-toolkit-42"},
-        ],
-    )
-
-    result = _call(f'wt_workspace_add "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 0, result.stderr
-    assert ws.read_text() == before, "a duplicate add must leave the file byte-identical"
-
-
-def test_workspace_add_missing_file_signals_fallback(tmp_path: Path) -> None:
-    # No workspace file → rc 1 (caller falls back to `code --add`) and the file
-    # must NOT be conjured into existence.
-    ws = tmp_path / "claude" / "review.code-workspace"
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit-42")
-
-    result = _call(f'wt_workspace_add "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 1, result.stderr
-    assert not ws.exists()
-
-
-def test_workspace_add_invalid_json_leaves_file_and_signals_fallback(tmp_path: Path) -> None:
-    # A JSONC file (comments — VS Code tolerates them) fails strict parsing:
-    # warn-and-fallback, never abort, never truncate or rewrite the file.
-    ws = tmp_path / "claude" / "review.code-workspace"
-    ws.parent.mkdir(parents=True)
-    before = '{\n\t// hand-edited review window\n\t"folders": []\n}\n'
-    ws.write_text(before)
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit-42")
-
-    result = _call(f'wt_workspace_add "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 1
-    assert ws.read_text() == before, "an unparseable file must be left untouched"
-    assert "workspace" in result.stderr, "the parse failure must be surfaced as a warning"
 
 
 def test_workspace_remove_drops_target_entry(tmp_path: Path) -> None:

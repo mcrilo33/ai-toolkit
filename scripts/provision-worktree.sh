@@ -3,18 +3,24 @@
 # provision-worktree.sh — provision the policy layer of ONE worktree: the git exclude
 # entries, the testmon pre-warm, .ai-toolkit/{spoke-run-id,lane,mode,task.md,
 # ledger-skeleton.md}, the gitignored .claude/ tree and the spoke's settings.local.json
-# allow/deny rules. Shared by worktree-new.sh (tmux) and Orca's setup hook, so a worktree
-# is gated the same way whichever host created it (issue #359, Orca migration S1).
+# allow/deny rules. Shared by worktree-new.sh / worktree-quick.sh and Orca's setup hook, so a
+# worktree is gated the same way whoever created it (issues #359, #363).
 #
 # Usage:
 #   provision-worktree.sh [--worktree <dir>] [--repo-root <dir>] [--issue <n|slug>]
-#                         [--lane spoke|express] [--mode attended|afk] [--branch <b>]
+#                         [--lane spoke|express|quick] [--mode attended|afk] [--branch <b>]
 #                         [--spoke-run-id <id>] [--otel-body-dir <dir>] [--repo-name <name>]
+#                         [--orca-worktree-id <id>] [--orca-dispatch-id <id>] [--run-id <id>]
+#                         [--identity-only]
 #
 # Inputs, in precedence order: the flag, then the Orca setup env (ORCA_WORKTREE_PATH,
 # ORCA_ROOT_PATH, ORCA_WORKSPACE_NAME), then a derivation (cwd, the git common dir, the
 # branch). With only ORCA_* set and cwd = the worktree it needs no flags at all; with flags
 # and no Orca it runs standalone.
+#
+# --identity-only rewrites just .ai-toolkit/{spoke-run-id,lane,mode,identity}: the dispatcher
+# runs it once more after worker-start, when the dispatch id first exists. Ids no flag names
+# are kept from the previous record, so a re-run never blanks them.
 #
 # Env: PROVISION_TASK_TITLE / PROVISION_TASK_BODY hand over an already-fetched issue so a
 #      caller that fetched them (worktree-new.sh) does not pay a second `gh` round-trip.
@@ -42,12 +48,16 @@ LANE=""
 MODE=""
 BRANCH=""
 SPOKE_RUN_ID=""
+ORCA_WT_ID=""
+ORCA_DISPATCH=""
+RUN_ID=""
+IDENTITY_ONLY=0
 OTEL_BODY_DIR=""
 REPO_NAME=""
 REPO_NAME_SET=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --worktree|--repo-root|--issue|--lane|--mode|--branch|--spoke-run-id|--otel-body-dir|--repo-name)
+    --worktree|--repo-root|--issue|--lane|--mode|--branch|--spoke-run-id|--otel-body-dir|--repo-name|--orca-worktree-id|--orca-dispatch-id|--run-id)
       [ "$#" -ge 2 ] || wt_die "$1 needs a value" ;;
   esac
   case "$1" in
@@ -60,6 +70,10 @@ while [ "$#" -gt 0 ]; do
     --spoke-run-id) SPOKE_RUN_ID="$2"; shift 2 ;;
     --otel-body-dir) OTEL_BODY_DIR="$2"; shift 2 ;;
     --repo-name)    REPO_NAME="$2"; REPO_NAME_SET=1; shift 2 ;;
+    --orca-worktree-id) ORCA_WT_ID="$2"; shift 2 ;;
+    --orca-dispatch-id) ORCA_DISPATCH="$2"; shift 2 ;;
+    --run-id)       RUN_ID="$2"; shift 2 ;;
+    --identity-only) IDENTITY_ONLY=1; shift ;;
     *)              wt_die "unknown argument: $1" ;;
   esac
 done
@@ -98,7 +112,7 @@ if [ -z "$MODE" ]; then
   if [ -f "$WT_DIR/.ai-toolkit/mode" ]; then MODE="$(cat "$WT_DIR/.ai-toolkit/mode")"
   else MODE="attended"; fi
 fi
-case "$LANE" in spoke|express) ;; *) wt_die "lane must be spoke or express (got '$LANE')" ;; esac
+case "$LANE" in spoke|express|quick) ;; *) wt_die "lane must be spoke, express or quick (got '$LANE')" ;; esac
 case "$MODE" in attended|afk) ;; *) wt_die "mode must be attended or afk (got '$MODE')" ;; esac
 
 MARKER_DIR="$(wt_marker_script_dir "$WT_DIR")"
@@ -127,6 +141,7 @@ if [ -n "$EXCLUDE_FILE" ]; then
   done
 fi
 
+if [ "$IDENTITY_ONLY" -eq 0 ]; then
 # --- provision the pre-push gate's testmon/xdist deps (issue #342) ------------
 # Without a project .venv carrying pytest-testmon/pytest-xdist, this fresh worktree's first
 # push runs the FULL suite SINGLE-process (detect_pytest falls back to a bare pytest lacking
@@ -163,9 +178,10 @@ if [ -n "$HUB_COMMON_DIR" ] && [ -r "$HUB_COMMON_DIR/.testmondata-baseline" ]; t
     wt_warn "could not copy the .testmondata baseline — first push falls back to the full-suite seed"
   fi
 fi
+fi
 
 # spoke_run_id: kept when already minted (a re-run must never re-mint), else the caller's
-# (worktree-new mints it so its tmux launch + telemetry share one id), else minted here.
+# (worktree-new mints it so its launch + telemetry share one id), else minted here.
 mkdir -p "$WT_DIR/.ai-toolkit"
 if [ -s "$WT_DIR/.ai-toolkit/spoke-run-id" ]; then
   SPOKE_RUN_ID="$(cat "$WT_DIR/.ai-toolkit/spoke-run-id")"
@@ -186,8 +202,8 @@ echo "→ lane / mode        $LANE / $MODE"
 # Identity record (#360): spoke identity is RECORDED here and read back by the guards
 # through shared/hooks/lib/identity.sh — the env marker, git-dir pattern and branch slug
 # are only its fallbacks. key=value, LF-terminated, no quoting; empty values are allowed
-# (no orca_* means the tmux path). orca_worktree_id comes from ORCA_WORKTREE_ID when set;
-# orca_dispatch_id and run_id are written empty until S4. `issue` is the NUMERIC issue only
+# (empty orca_* means a worktree Orca did not dispatch). Each Orca id is the flag, else (the
+# worktree id only) ORCA_WORKTREE_ID, else the previous record. `issue` is the NUMERIC issue only
 # (an express lane's slug identity lives in lane/slug). Written to a sibling temp file then
 # renamed, so a reader never sees a partial record.
 _id_leaf="${BRANCH##*/}"
@@ -195,9 +211,15 @@ _id_type=""
 case "$BRANCH" in */*) _id_type="${BRANCH%%/*}" ;; esac
 _id_issue=""
 [[ "$ISSUE" =~ ^[0-9]+$ ]] && _id_issue="$ISSUE"
-_id_orca_wt="${ORCA_WORKTREE_ID:-}"
+_id_prev() {
+  [ -f "$WT_DIR/.ai-toolkit/identity" ] || return 0
+  sed -n "s/^$1=//p" "$WT_DIR/.ai-toolkit/identity" | head -n1
+}
+_id_orca_wt="${ORCA_WT_ID:-${ORCA_WORKTREE_ID:-$(_id_prev orca_worktree_id)}}"
+_id_dispatch="${ORCA_DISPATCH:-$(_id_prev orca_dispatch_id)}"
+_id_run="${RUN_ID:-$(_id_prev run_id)}"
 # A CR/LF in a value would inject extra record lines (the reader's first match wins).
-for _v in "$_id_type" "$_id_leaf" "$SPOKE_RUN_ID" "$_id_orca_wt"; do
+for _v in "$_id_type" "$_id_leaf" "$SPOKE_RUN_ID" "$_id_orca_wt" "$_id_dispatch" "$_id_run"; do
   case "$_v" in *$'\n'* | *$'\r'*) wt_die "identity value contains a newline: $_v" ;; esac
 done
 IDENTITY_TMP="$(mktemp "$WT_DIR/.ai-toolkit/identity.XXXXXX")"
@@ -209,15 +231,16 @@ if ! {
   printf 'lane=%s\n' "$LANE"
   printf 'spoke_run_id=%s\n' "$SPOKE_RUN_ID"
   printf 'orca_worktree_id=%s\n' "$_id_orca_wt"
-  printf 'orca_dispatch_id=\n'
-  printf 'run_id=\n'
+  printf 'orca_dispatch_id=%s\n' "$_id_dispatch"
+  printf 'run_id=%s\n' "$_id_run"
 } > "$IDENTITY_TMP" || ! chmod 644 "$IDENTITY_TMP" \
   || ! mv -f "$IDENTITY_TMP" "$WT_DIR/.ai-toolkit/identity"; then
   rm -f "$IDENTITY_TMP"
   wt_die "could not write .ai-toolkit/identity"
 fi
-unset _id_leaf _id_type _id_issue _id_orca_wt _v IDENTITY_TMP
+unset _id_leaf _id_type _id_issue _id_orca_wt _id_dispatch _id_run _v IDENTITY_TMP
 echo "→ identity record    .ai-toolkit/identity"
+[ "$IDENTITY_ONLY" -eq 0 ] || exit 0
 
 # --- write the task contract to disk (issue #177) ----------------------------
 # Anchoring used to be an LLM errand: the seed prompt told the spoke to run
@@ -507,38 +530,40 @@ else
   wt_warn_deny_rules
 fi
 
-# --- spoke OTel env into settings.local.json (issue #359) ----------------------
-# The native-OTel env otherwise exists only as the tmux launch prefix, which an Orca-created
-# worktree never gets. Write the SAME key/value set (wt_native_otel_env_pairs — one source
-# with the prefix) into the `env` block, ADDITIVELY: keys already in the file win, so a
-# re-run is a no-op and user-curated env survives. The tmux prefix stays too (plan §2 keeps
-# "Claude honours settings.local.json env" an open spike). AI_TOOLKIT_OTEL resolves exactly
-# as worktree-new does (env -> settings/ai-toolkit.yml -> default-on); off writes no block.
-# Secrets never enter: OTEL_EXPORTER_OTLP_HEADERS / Langfuse auth are not in the pair set.
+# --- spoke env into settings.local.json (issues #359, #363) ----------------------
+# WT_SPOKE (the role marker the land/done guards read, #26) is always written: Claude honours the
+# settings `env` block for the tool processes it spawns. The native-OTel pairs ride the same
+# block, ADDITIVELY (keys already in the file win, so a re-run is a no-op), but Claude does NOT
+# honour those from settings (03-spike.md Round 4 (b)): the dispatcher also passes them as real
+# process env on the launch command, and this copy is for tooling that reads the file. Same pair
+# set as that prefix (wt_native_otel_env_json), resolved as worktree-new does (env ->
+# settings/ai-toolkit.yml -> default-on). Secrets never enter: OTEL_EXPORTER_OTLP_HEADERS /
+# Langfuse auth are not in the pair set.
 wt_resolve_telemetry_config "${AI_TOOLKIT_CONFIG:-$REPO_ROOT/settings/ai-toolkit.yml}"
 AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"
-if [ "$AI_TOOLKIT_OTEL" = "1" ]; then
-  # Same derivations as worktree-new.sh: the raw-request body dir lives under the gitignored
-  # .ai-toolkit/ and is created here; repo=<name> is the origin basename (never written empty).
-  [ -n "$OTEL_BODY_DIR" ] || OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
-  mkdir -p "$OTEL_BODY_DIR"
-  [ "$REPO_NAME_SET" -eq 1 ] || REPO_NAME="$(wt_repo_name "$REPO_ROOT")"
-  # The tmux launch prefix still carries the same env, so an unmergeable settings file (jq
-  # missing, malformed or empty JSON) only WARNS — exactly as the allow-rule merge above does —
-  # and never truncates the file.
-  if ! command -v jq >/dev/null 2>&1; then
-    wt_warn "jq is missing — the OTel env block was not written to settings.local.json"
+if ! command -v jq >/dev/null 2>&1; then
+  wt_warn "jq is missing — the spoke env block was not written to settings.local.json"
+else
+  SPOKE_ENV_JSON="$(jq -cn --arg tag "$ISSUE" '{WT_SPOKE: $tag}')"
+  if [ "$AI_TOOLKIT_OTEL" = "1" ]; then
+    # The raw-request body dir lives under the gitignored .ai-toolkit/; repo=<name> is the origin
+    # basename (never written empty).
+    [ -n "$OTEL_BODY_DIR" ] || OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
+    mkdir -p "$OTEL_BODY_DIR"
+    [ "$REPO_NAME_SET" -eq 1 ] || REPO_NAME="$(wt_repo_name "$REPO_ROOT")"
+    SPOKE_ENV_JSON="$(wt_native_otel_env_json "$SPOKE_RUN_ID" "$OTEL_BODY_DIR" "$REPO_NAME" \
+      | jq -c --argjson spoke "$SPOKE_ENV_JSON" '$spoke + .')"
+  fi
+  # An unmergeable settings file (malformed or empty JSON) only WARNS and is never truncated,
+  # exactly like the allow-rule merge above.
+  TMP_SETTINGS="$(mktemp)"
+  if jq --argjson spoke_env "$SPOKE_ENV_JSON" '.env = ($spoke_env + (.env // {}))' \
+       "$WT_DIR/.claude/settings.local.json" > "$TMP_SETTINGS" 2>/dev/null && [ -s "$TMP_SETTINGS" ]; then
+    mv "$TMP_SETTINGS" "$WT_DIR/.claude/settings.local.json"
+    echo "→ seeded spoke env (.claude/settings.local.json env)"
   else
-    OTEL_ENV_JSON="$(wt_native_otel_env_json "$SPOKE_RUN_ID" "$OTEL_BODY_DIR" "$REPO_NAME")"
-    TMP_SETTINGS="$(mktemp)"
-    if jq --argjson otel "$OTEL_ENV_JSON" '.env = ($otel + (.env // {}))' \
-         "$WT_DIR/.claude/settings.local.json" > "$TMP_SETTINGS" 2>/dev/null && [ -s "$TMP_SETTINGS" ]; then
-      mv "$TMP_SETTINGS" "$WT_DIR/.claude/settings.local.json"
-      echo "→ seeded spoke OTel env (.claude/settings.local.json env)"
-    else
-      rm -f "$TMP_SETTINGS"
-      wt_warn "could not merge the OTel env into settings.local.json (invalid JSON?) — left untouched"
-    fi
+    rm -f "$TMP_SETTINGS"
+    wt_warn "could not merge the spoke env into settings.local.json (invalid JSON?) — left untouched"
   fi
 fi
 

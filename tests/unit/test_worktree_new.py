@@ -62,6 +62,7 @@ _HOST_VARS = (
     "LANGFUSE_HOST",
     "BRIDGE_PORT",
     "TMUX",
+    "ORCA_TERMINAL_HANDLE",
 )
 
 
@@ -178,7 +179,8 @@ def test_dispatch_runs_the_orca_sequence_and_never_the_retired_paths(
 
     assert proc.returncode == 0, proc.stderr
     steps = [" ".join(c[:2]) for c in _calls(tmp_path) if c[0] != "--version"]
-    kept = [s for s in steps if s != "terminal show"]
+    # `skills installed` is the provisioner's own worker-skills probe; `terminal show` the agent poll
+    kept = [s for s in steps if s not in ("terminal show", "skills installed")]
     assert kept == [
         "orchestration run-current",
         "worktree create",

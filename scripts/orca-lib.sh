@@ -29,7 +29,7 @@ orca_json() {
 }
 
 # orca_field <jq-filter> -> a field of ORCA_OUT (empty when absent or null).
-orca_field() { printf '%s' "$ORCA_OUT" | jq -r "$1 // empty" 2>/dev/null; }
+orca_field() { printf '%s' "$ORCA_OUT" | jq -r "$1 // empty" 2>/dev/null || true; }
 orca_wt_path() { orca_field '.result.worktree.path'; }
 orca_wt_id() { orca_field '.result.worktree.id'; }
 orca_dispatch_id() { orca_field '.result.dispatchId'; }
@@ -72,6 +72,7 @@ orca_call_settled() {
   _orca_unsettled || return "$ORCA_RC"
   first_out="$ORCA_OUT"; first_err="$ORCA_ERR"
   id="$(orca_field '.error.data.orchestrationRequestId')"
+  [ -n "$id" ] || [ -n "$probe" ] || return 1   # nothing read-only to check: unknown
   for ((i = 0; i < ${ORCA_SETTLE_TRIES:-15}; i++)); do
     sleep "${ORCA_SETTLE_SLEEP:-2}"
     if [ -n "$id" ]; then
