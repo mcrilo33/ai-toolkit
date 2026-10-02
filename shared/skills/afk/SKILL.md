@@ -17,9 +17,10 @@ Every tick it:
    planner), seeding each new spoke with the standard ultra kickoff. Already-in-flight
    spokes are picked up, not re-spawned.
 2. **Auto-answers** every spoke parked on a question or PLAN gate (⚠ WAITING ON INPUT). It
-   extracts the prompt from the spoke's transcript and hands it to an **answerer** — a
-   headless `claude` reasoning step with a thinking budget that follows the
-   `afk-answering` rule — then injects the returned answer into the spoke's tmux pane.
+   reads the prompt from the Orca inbox (a worker's `ask`) or the waiting agent's tool input
+   and hands it to an **answerer** — a headless `claude` reasoning step with a thinking budget
+   that follows the `afk-answering` rule — then replies to the recorded question (the ack is
+   the proof) or types into the agent's Orca terminal.
    This is the **one** reasoning step in an otherwise scripted control plane; a decision
    that is genuinely the human's (irreversible, outward-facing, or scope-changing) is
    **escalated** to `blocked/<issue>` instead of answered.

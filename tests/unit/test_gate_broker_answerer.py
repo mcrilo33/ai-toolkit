@@ -11,22 +11,16 @@ from shlex import quote as shlex_quote
 
 import pytest
 from _gate_broker_support import (
-    _DISPLAY_CASE,
-    _PERMISSION_PROMPT,
     FIXTURES,
     RULE_FILE,
-    _agent_ps_stub,
-    _ask_record,
     _assistant_tool_use,
-    _bash_tool_record,
     _call,
-    _fake_tmux_pane,
     _gate_park_transcript,
-    _perm_env,
     _project_dir_for,
     _result_event,
     _tag_gate_at_head,
 )
+from _orca_stub import orca_calls, orca_park
 from _stubs import write_stub
 
 
@@ -35,6 +29,68 @@ def _isolated_afk_state(tmp_path, monkeypatch):
     """Pin the state dir so no test touches the real hub state (mirrors test_gate_broker)."""
     monkeypatch.setenv("AFK_STATE_DIR", str(tmp_path / "afk-state"))
     monkeypatch.setenv("AFK_HEARTBEAT", str(tmp_path / "afk-heartbeat"))
+    # The shared bash coprocess keeps ONE pid, so Orca's per-tick read cache (orca-tick-<pid>
+    # under TMPDIR) would outlive each call and replay the previous test's replies.
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+
+
+_ORCA_REFUSES = [{"rc": 1, "out": {"ok": False, "error": {"code": "x"}}, "stderr": "boom\n"}]
+
+
+def _sent(orca_bin: Path) -> list[str]:
+    """Every text the drain delivered to the spoke, in order (reply bodies and terminal sends)."""
+    flag = {("orchestration", "reply"): "--body", ("terminal", "send"): "--text"}
+    return [
+        a[a.index(flag[(a[0], a[1])]) + 1] for a in orca_calls(orca_bin) if (a[0], a[1]) in flag
+    ]
+
+
+def _orca_perm_env(
+    tmp_path: Path,
+    spoke_repo: Path,
+    orca_bin: Path,
+    command: str,
+    answerer: str = "true",
+    extra: dict | None = None,
+) -> dict[str, str]:
+    """Park spoke #5 on an Orca permission dialog for <command> (a `waiting` Bash agent), stub the
+    reasoner with <answerer>, and record any blocked escalation."""
+    orca_park(orca_bin, spoke_repo, state="waiting", tool="Bash", tool_input=command, extra=extra)
+    statedir = tmp_path / "sd"
+    statedir.mkdir(exist_ok=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    gh = fake_bin / "gh"
+    write_stub(gh, '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    return {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_ANSWERER_CMD": answerer,
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "_READY_LOG": str(ready_log),
+        "_STATEDIR": str(statedir),
+    }
+
+
+def _swap_cmd(orca_bin: Path, wt: Path, **park) -> str:
+    """A shell command that, when the answerer runs it, re-parks the spoke as <park> (the spoke
+    moved on, or now asks a new question) -- the Orca-side stand-in for 'the world changed while
+    the reasoner thought'. The currently scripted scenario is left untouched."""
+    scen = orca_bin / ".orca-stub" / "scenario.json"
+    before = scen.read_text()
+    orca_park(orca_bin, wt, **park)
+    after = scen.read_text()
+    scen.write_text(before)
+    return f"printf %s {shlex_quote(after)} > {shlex_quote(str(scen))}"
+
+
+_PARKED = "Q: Which store?\n  - Redis: fast"  # the question the conftest fixtures park on
 
 
 ANSWERER_SURFACE = (
@@ -745,7 +801,7 @@ def test_broker_service_gate_voids_unmodelled_escape_when_spoke_silent(
 
 
 def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
-    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], orca_bin: Path
 ) -> None:
     # Write isolation headline (#237): a reasoner that writes a TRACKED file via a RELATIVE
     # path (its cwd) leaves $wt byte-for-byte unchanged — the write lands in the throwaway
@@ -768,15 +824,9 @@ def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
         env=git_env,
         capture_output=True,
     )
-    fake_bin = tmp_path / "bin"  # the waiting_spoke_env fake bin (holds gh); add tmux
-    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
-    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     env = {
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": "printf 'mutated' > tracked.txt; printf 'ANSWER: yes, the in-tree chmod is fine'",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
     }
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
@@ -790,27 +840,21 @@ def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
     assert "--blocked" not in ready_text, (
         f"isolation must not escalate a healthy answer: {ready_text}"
     )
-    assert "chmod is fine" in tmux_log.read_text(), (
-        f"the healthy answer must inject despite the in-copy write: {tmux_log.read_text()}"
+    assert any("chmod is fine" in t for t in _sent(orca_bin)), (
+        f"the healthy answer must inject despite the in-copy write: {_sent(orca_bin)}"
     )
 
 
 def test_broker_service_gate_injects_despite_runtime_drift(
-    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], orca_bin: Path
 ) -> None:
     # Issue #168 headline regression: a parked spoke's own push gate writes `.testmondata`
     # during the reason step. That untracked runtime drift must NOT void a healthy answer —
     # the guard only cares about tracked content. The answer INJECTS; the gate does NOT
     # escalate to blocked.
-    fake_bin = tmp_path / "bin"  # the waiting_spoke_env fake bin (holds gh); add tmux
-    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
-    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     env = {
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": "printf x > .testmondata; printf 'ANSWER: use Redis'",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
     }
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
@@ -819,8 +863,8 @@ def test_broker_service_gate_injects_despite_runtime_drift(
     ready_log = Path(env["_READY_LOG"])
     ready_text = ready_log.read_text() if ready_log.exists() else ""
     assert "--blocked" not in ready_text, f"untracked runtime drift must not escalate: {ready_text}"
-    assert "use Redis" in tmux_log.read_text(), (
-        f"the healthy answer must inject despite the .testmondata write: {tmux_log.read_text()}"
+    assert "use Redis" in _sent(orca_bin), (
+        f"the healthy answer must inject despite the .testmondata write: {_sent(orca_bin)}"
     )
 
 
@@ -1065,46 +1109,21 @@ def test_codify_proposes_rule_for_recurring_unanimous_signature(tmp_path: Path) 
     assert "git-clean" not in out, "a conflicting signature must not become a rule"
 
 
-def test_decide_permission_logs_auto_approve(spoke_repo: Path, tmp_path: Path) -> None:
+def test_decide_permission_logs_auto_approve(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # Integration: the #149 git-reset self-stage auto-approve is recorded to the
     # automatable-decisions log with its signature, so codify can later graduate it.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    jsonl = pd / "session.jsonl"
-    jsonl.write_text(json.dumps(_bash_tool_record("git reset -q; git add tests/x.py")) + "\n")
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    tmux_log = fake_bin / "tmux.log"
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" >> "{tmux_log}"\n'
-        'case "$1" in\n'
-        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
-        "esac\nexit 0\n",
-    )
-    _agent_ps_stub(fake_bin)
-    statedir = tmp_path / "sd"
-    statedir.mkdir()
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_STATE_DIR": str(statedir),
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-    }
+    env = _orca_perm_env(tmp_path, spoke_repo, orca_bin, "git reset -q; git add tests/x.py")
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = statedir / "decisions.log"
+    log = Path(env["_STATEDIR"]) / "decisions.log"
     assert log.exists(), "a safe auto-approve must be logged"
     fields = log.read_text().strip().split("\t")
     assert fields[2] == "permission" and fields[3] == "git-reset+git-add" and fields[4] == "APPROVE"
+    assert _sent(orca_bin) == ["1"], "the approval is delivered once, as the Yes keystroke"
 
 
 def test_run_answerer_does_not_pollute_spoke_jsonl(
@@ -1126,17 +1145,12 @@ def test_run_answerer_does_not_pollute_spoke_jsonl(
 def test_still_parked_same_survives_reasoner_transcript(
     spoke_repo: Path, reasoner_env: dict[str, str]
 ) -> None:
-    # `_still_parked_same` must judge freshness against the spoke's transcript alone: a
-    # reasoner write during the reason step is NOT the spoke moving on. Snapshot the clock,
-    # run the reasoner (which writes its own transcript), then assert the spoke still reads
-    # as parked on the same question.
-    question = "Q: Which store?\n  - Redis: fast"
-
+    # `_still_parked_same` judges the park by the Orca inbox alone: a reasoner write during the
+    # reason step is NOT the spoke moving on, so the recorded question id still reads as parked.
     result = _call(
-        f"before=\"$(_transcript_mtime '{spoke_repo}')\"; "
         f"run_answerer 5 'q' '{spoke_repo}' >/dev/null; "
-        f'_still_parked_same \'{spoke_repo}\' 5 0 "$QUESTION" "$before"; echo RC=$?',
-        env={**reasoner_env, "QUESTION": question},
+        f"_still_parked_same '{spoke_repo}' 5 0 'Q' m_q; echo RC=$?",
+        env=reasoner_env,
     )
 
     assert result.stdout.strip().splitlines()[-1] == "RC=0", (
@@ -1252,60 +1266,40 @@ def test_run_answerer_standalone_fallback_bounds_a_slow_answerer(
 
 
 def test_broker_service_gate_drops_escalation_when_spoke_moves_on(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, waiting_spoke_env: dict[str, str], orca_bin: Path
 ) -> None:
-    # The answerer takes minutes; if the spoke moved on meanwhile (a human replied, the turn
-    # resumed) an ESCALATE / no-decision must be DROPPED with a log, never stamped as a
-    # spurious blocked/<N> on an actively-working spoke. Model "moved on" by having the
-    # answerer advance the spoke's own transcript mid-reason, then escalate.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    jsonl = pd / "session.jsonl"
-    jsonl.write_text(json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n")
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the reasoner write advances it
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    ready_log = tmp_path / "ready.log"
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "SPOKE_READY": str(ready_stub),
-        # The reasoner bumps the spoke transcript (a human reply landed) then escalates.
-        "AFK_ANSWERER_CMD": f"printf '{{}}\\n' >> '{jsonl}'; printf 'ESCALATE: needs a human'",
-    }
+    # The answerer takes minutes; if the spoke moved on meanwhile (a human replied, the question
+    # left the inbox) an ESCALATE / no-decision must be DROPPED with a log, never stamped as a
+    # spurious blocked/<N> on an actively-working spoke.
+    moved = _swap_cmd(orca_bin, spoke_repo)
+    env = {**waiting_spoke_env, "AFK_ANSWERER_CMD": f"{moved}; printf 'ESCALATE: needs a human'"}
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
+    ready_log = Path(env["_READY_LOG"])
     ready_text = ready_log.read_text() if ready_log.exists() else ""
     assert "--blocked" not in ready_text, f"a moved-on spoke must not be escalated: {ready_text}"
     assert "dropping the escalation" in result.stderr.lower(), result.stderr
 
 
-def test_spoke_moved_on_requires_a_confirmed_advance(spoke_repo: Path, tmp_path: Path) -> None:
-    # The escalation gate must fail SAFE: it drops a real escalation ONLY on a demonstrated
-    # transcript advance, never on an ambiguous probe (an empty/garbage baseline). Otherwise a
-    # transient stat miss would silently swallow a blocked/<N> and strand the spoke unsurfaced.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    jsonl = pd / "session.jsonl"
-    jsonl.write_text("{}\n")
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    env = {"CLAUDE_PROJECTS_DIR": str(projects)}
-
-    def moved_on(before: str) -> str:
-        out = _call(f"_spoke_moved_on '{spoke_repo}' '{before}'; echo RC=$?", env=env)
+def test_spoke_moved_on_requires_a_confirmed_advance(spoke_repo: Path, orca_bin: Path) -> None:
+    # The escalation gate must fail SAFE: it drops a real escalation ONLY when Orca positively
+    # answers that the recorded question left the inbox, never on a failed read -- otherwise a
+    # transient Orca error would silently swallow a blocked/<N> and strand the spoke unsurfaced.
+    def moved_on(**park) -> str:
+        orca_park(orca_bin, spoke_repo, **park)
+        out = _call(
+            f"rm -rf \"$TMPDIR\"/orca-tick-$$; _spoke_moved_on '{spoke_repo}' 'Q' m_q; echo RC=$?"
+        )
         return out.stdout.strip().splitlines()[-1]
 
-    assert moved_on("1000000000") == "RC=1", "unchanged mtime is not movement"
-    os.utime(jsonl, (1_000_000_050, 1_000_000_050))
-    assert moved_on("1000000000") == "RC=0", "a strictly newer write is movement"
-    assert moved_on("") == "RC=1", "an empty baseline is not confident movement (fail safe)"
-    assert moved_on("nope") == "RC=1", (
-        "a non-numeric baseline is not confident movement (fail safe)"
+    assert moved_on(question="Q") == "RC=1", "the same question still pending is not movement"
+    assert moved_on(question="Q", qid="m_other") == "RC=0", "a different question is movement"
+    assert moved_on() == "RC=0", "an empty inbox is movement"
+    failed = [{"rc": 2, "out": {"ok": False, "error": {"code": "x"}}, "stderr": "boom\n"}]
+    assert moved_on(question="Q", extra={"orchestration check": failed}) == "RC=1", (
+        "a failed Orca read is not confident movement (fail safe)"
     )
 
 
@@ -1313,21 +1307,17 @@ def test_spoke_moved_on_requires_a_confirmed_advance(spoke_repo: Path, tmp_path:
 
 
 def test_slot_state_blocked_at_tip_with_pending_question_is_waiting(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, orca_bin: Path
 ) -> None:
     # A spurious blocked/<N> over a spoke still parked on a question must NOT read as terminal
-    # 'done' (which stranded it — never re-answered, never reaped). With an extractable pending
+    # 'done' (which stranded it — never re-answered, never reaped). With a pending inbox
     # question it reads 'waiting' (re-answerable); reconcile clears the tag once commits land.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    (pd / "session.jsonl").write_text(
-        json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n"
-    )
+    orca_park(orca_bin, spoke_repo, question="Q: Which store?\n  - Redis: fast")
     subprocess.run(
         ["git", "tag", "-f", "blocked/5"], cwd=spoke_repo, check=True, capture_output=True
     )
 
-    result = _call(f"slot_state '{spoke_repo}' 5", env={"CLAUDE_PROJECTS_DIR": str(projects)})
+    result = _call(f"slot_state '{spoke_repo}' 5")
 
     assert result.stdout.strip() == "waiting", result.stdout + result.stderr
 
@@ -1925,7 +1915,7 @@ def test_answerer_prompt_instructs_answer_only(tmp_path: Path) -> None:
 
 
 def test_push_and_ready_park_is_answered_with_the_ship_contract_in_context(
-    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path, orca_bin: Path
 ) -> None:
     """#281 acceptance, scenario: a "should I push my feature branch + emit ready?" park.
 
@@ -1942,22 +1932,16 @@ def test_push_and_ready_park_is_answered_with_the_ship_contract_in_context(
     """
     statedir = tmp_path / "sd"
     statedir.mkdir()
-    fake_bin = tmp_path / "bin"
-    pd = _project_dir_for(Path(waiting_spoke_env["CLAUDE_PROJECTS_DIR"]), spoke_repo)
-    jsonl = pd / "session.jsonl"
     # Re-park the spoke on the #271 question: it had already pushed and asked what to do.
-    jsonl.write_text(
-        json.dumps(
-            _ask_record(
-                "I pushed my feature branch for this subtask. Should I keep that push and "
-                "emit the ready marker, or is the push in error?",
-                [("Keep the push", "ship it"), ("Keep it local", "undo the push")],
-            )
-        )
-        + "\n"
+    orca_park(
+        orca_bin,
+        spoke_repo,
+        question=(
+            "I pushed my feature branch for this subtask. Should I keep that push and "
+            "emit the ready marker, or is the push in error?\n"
+            "  - Keep the push: ship it\n  - Keep it local: undo the push"
+        ),
     )
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # stale, so the inject's append advances it
-    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     prompt_file = tmp_path / "reasoner-prompt.txt"
     answer = "Approved — the push is correct; emit the ready marker."
     env = {
@@ -1969,8 +1953,6 @@ def test_push_and_ready_park_is_answered_with_the_ship_contract_in_context(
             f"cat > '{prompt_file}'; printf 'REVERSIBILITY: reversible\\nANSWER: {answer}'"
         ),
         "AFK_STATE_DIR": str(statedir),
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
         "AFK_JOURNAL_GH_COMMENT": "0",
     }
 
@@ -2002,11 +1984,12 @@ def test_parse_decision_field_extracts_reversibility_and_warn() -> None:
 
 
 def test_permission_escalate_reasoner_approve_injects_yes_and_warns(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
-    env = _perm_env(
+    env = _orca_perm_env(
         tmp_path,
         spoke_repo,
+        orca_bin,
         "npm run deploy",  # unrecognised -> classify ESCALATE
         "printf 'REVERSIBILITY: reversible\\nANSWER: APPROVE'",
     )
@@ -2014,10 +1997,9 @@ def test_permission_escalate_reasoner_approve_injects_yes_and_warns(
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
     assert result.returncode == 0, result.stderr
 
-    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
     statedir = Path(env["_STATEDIR"])
-    # The reasoner approved -> the "Yes" (option 1) keystroke was delivered.
-    assert any(line.split()[-1] == "1" for line in keys.splitlines()), keys
+    # The reasoner approved -> the "Yes" (option 1) keystroke was delivered, once.
+    assert _sent(orca_bin) == ["1"]
     # Taken decision is warned + journaled, and the spoke is NEVER blocked.
     assert (statedir / "warned-5.txt").exists()
     assert (statedir / "decision-journal.jsonl").exists()
@@ -2026,12 +2008,13 @@ def test_permission_escalate_reasoner_approve_injects_yes_and_warns(
 
 
 def test_permission_escalate_reasoner_deny_cancels_and_redirects(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     destructive = "git reset --hard origin/main"  # irreversible -> must be denied
-    env = _perm_env(
+    env = _orca_perm_env(
         tmp_path,
         spoke_repo,
+        orca_bin,
         destructive,
         "printf 'REVERSIBILITY: irreversible\\nANSWER: DENY: do not hard-reset; create a backup branch first'",
     )
@@ -2039,15 +2022,13 @@ def test_permission_escalate_reasoner_deny_cancels_and_redirects(
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
     assert result.returncode == 0, result.stderr
 
-    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
+    sent = _sent(orca_bin)
     statedir = Path(env["_STATEDIR"])
-    # Deny cancels the dialog (Escape) and never sends the bare "Yes" (option 1).
-    assert "Escape" in keys, keys
-    assert not any(line.split()[-1] == "1" for line in keys.splitlines()), (
-        "an irreversible command must never be auto-approved"
-    )
-    # The reversible-path guidance was injected to the spoke.
-    assert "backup branch" in keys, keys
+    # Deny cancels the dialog (Escape first) and never sends the bare "Yes" (option 1); the
+    # reversible-path guidance follows as a new message.
+    assert sent[0] == "\x1b", sent
+    assert "1" not in sent, "an irreversible command must never be auto-approved"
+    assert "backup branch" in sent[-1], sent
     # Warned + journaled with the irreversible class; never blocked.
     assert "irreversible" in (statedir / "decision-journal.jsonl").read_text()
     ready = Path(env["_READY_LOG"])
@@ -2055,66 +2036,43 @@ def test_permission_escalate_reasoner_deny_cancels_and_redirects(
 
 
 def test_permission_approve_delivery_failure_warns_not_blocks(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
-    # A known-safe command classifies APPROVE, but the Yes keystroke fails to register (the
-    # transcript never advances). #241: that no longer parks the spoke blocked/<issue> — it
-    # warns and retries on the backoff.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    jsonl = pd / "session.jsonl"
-    jsonl.write_text(json.dumps(_bash_tool_record("git reset -q; git add tests/x.py")) + "\n")
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pinned mtime: no Enter-append -> no advance
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n",
+    # A known-safe command classifies APPROVE, but Orca refuses the Yes keystroke. #241: that no
+    # longer parks the spoke blocked/<issue> — it warns and retries on the backoff.
+    env = _orca_perm_env(
+        tmp_path,
+        spoke_repo,
+        orca_bin,
+        "git reset -q; git add tests/x.py",
+        extra={"terminal send": _ORCA_REFUSES},
     )
-    _agent_ps_stub(fake_bin)
-    statedir = tmp_path / "sd"
-    statedir.mkdir()
-    ready_log = tmp_path / "ready.log"
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_STATE_DIR": str(statedir),
-        "SPOKE_READY": str(ready_stub),
-        "AFK_JOURNAL_GH_COMMENT": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-        "AFK_INJECT_POLL_SECONDS": "0",
-    }
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
     assert result.returncode == 0, result.stderr
 
-    assert (statedir / "warned-5.txt").exists(), "a failed approval delivery must warn, not park"
+    assert (Path(env["_STATEDIR"]) / "warned-5.txt").exists(), (
+        "a failed approval delivery must warn, not park"
+    )
+    ready_log = Path(env["_READY_LOG"])
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text()
+    assert _sent(orca_bin) == ["1"], "a failed delivery is never resent within the tick"
 
 
 def test_permission_reasoner_auth_failure_warns_not_denies(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # If the supervisor's own token dies while the reasoner decides a permission dialog, the
     # blob is an auth error, not a decision. The permission path must detect it (rc != 0 + auth
     # signature), raise the global halt flag — and #241 §9 WARN the spoke (not block it, not
     # inject a spurious denial into the live dialog).
-    env = {
-        **_perm_env(
-            tmp_path,
-            spoke_repo,
-            "npm run deploy",  # ESCALATE -> reasoner
-            "printf 'Invalid API key . Please run /login'; exit 1",
-        ),
-        "AFK_JOURNAL_GH_COMMENT": "0",
-    }
+    env = _orca_perm_env(
+        tmp_path,
+        spoke_repo,
+        orca_bin,
+        "npm run deploy",  # ESCALATE -> reasoner
+        "printf 'Invalid API key . Please run /login'; exit 1",
+    )
 
     result = _call(
         f"broker_service_gate '{spoke_repo}' 5 unattended; echo AUTH=$_AFK_AUTH_FAILED",
@@ -2128,9 +2086,7 @@ def test_permission_reasoner_auth_failure_warns_not_denies(
         "#241: auth warns, never blocks"
     )
     assert "WARNING: #5" in result.stderr, result.stderr
-    # No spurious denial: the reversible-path guidance was never injected.
-    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
-    assert "reversible, in-scope path" not in keys, "auth failure must not inject a spurious deny"
+    assert _sent(orca_bin) == [], "auth failure must not inject a spurious deny"
 
 
 # ── issue #241 S4: staleness recomputes against the current park, never bare-drops ──
@@ -2142,19 +2098,16 @@ def test_permission_reasoner_auth_failure_warns_not_denies(
 
 
 def test_staleness_recomputes_against_current_park(
-    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path, orca_bin: Path
 ) -> None:
     calls = tmp_path / "answerer.calls"
-    # The reasoner touches the LIVE transcript, so the post-reason _still_parked_same mtime
-    # check always reports "changed" — a false staleness. The pane still shows the park, so #241
-    # must recompute (re-run) rather than drop. The recompute is depth-bounded to one re-run.
-    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
-    os.utime(
-        live_jsonl, (1_000_000_000, 1_000_000_000)
-    )  # pin OLD so the reasoner's touch reads as newer
+    # The spoke asks a NEW question (a new inbox id) while the reasoner thinks, so the recorded
+    # id no longer matches — a changed park. It is still parked, so #241 must recompute (re-run)
+    # rather than drop. The recompute is depth-bounded to one re-run.
+    reparked = _swap_cmd(orca_bin, spoke_repo, question="Q: Which cache?", qid="m_q2")
     env = {
         **waiting_spoke_env,
-        "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; touch '{live_jsonl}'; printf 'ANSWER: pick Redis'",
+        "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; {reparked}; printf 'ANSWER: pick Redis'",
         "AFK_REANSWER_CEILING": "5",  # keep the ceiling out of this test
         "AFK_STATE_DIR": str(tmp_path / "sd"),
         "AFK_JOURNAL_GH_COMMENT": "0",
@@ -2164,6 +2117,7 @@ def test_staleness_recomputes_against_current_park(
 
     n = calls.read_text().count("x") if calls.exists() else 0
     assert n == 2, f"a still-parked staleness must recompute once (not bare-drop); ran {n}"
+    assert _sent(orca_bin) == ["pick Redis"], "only the answer to the CURRENT park is delivered"
 
 
 # ── issue #288 AC3: a genuine drop must be recorded on answer-drop-<issue> ──────
@@ -2177,14 +2131,15 @@ def test_staleness_recomputes_against_current_park(
 
 
 def test_broker_service_gate_records_an_answer_drop_when_the_spoke_moved_on(
-    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path, orca_bin: Path
 ) -> None:
-    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
-    os.utime(live_jsonl, (1_000_000_000, 1_000_000_000))  # pin OLD so a bare touch reads as newer
+    # The same question is re-asked under a new inbox id while the reasoner thinks, so the
+    # recorded id is gone; depth=1 (the #241 recompute already spent) drops the answer.
     statedir = tmp_path / "sd"
+    reasked = _swap_cmd(orca_bin, spoke_repo, question=_PARKED, qid="m_q2")
     env = {
         **waiting_spoke_env,
-        "AFK_ANSWERER_CMD": f"touch '{live_jsonl}'; printf 'ANSWER: pick Redis'",
+        "AFK_ANSWERER_CMD": f"{reasked}; printf 'ANSWER: pick Redis'",
         "AFK_STATE_DIR": str(statedir),
         "AFK_JOURNAL_GH_COMMENT": "0",
     }
@@ -2195,8 +2150,7 @@ def test_broker_service_gate_records_an_answer_drop_when_the_spoke_moved_on(
     assert "dropping the stale answer" in result.stderr, result.stderr
     # Read back against the SAME still-pending park (the real signature inputs) — exactly how the
     # watchdog itself reads it, while slot_state still says `waiting` for this issue.
-    read_env = {"AFK_STATE_DIR": str(statedir), "CLAUDE_PROJECTS_DIR": env["CLAUDE_PROJECTS_DIR"]}
-    out = _call(f"read_answer_drop '{spoke_repo}' 5", env=read_env).stdout
+    out = _call(f"read_answer_drop '{spoke_repo}' 5", env={"AFK_STATE_DIR": str(statedir)}).stdout
     count, _, reason = out.strip().partition("\t")
     assert count == "1", f"the drop must be recorded on answer-drop-5, got: {out!r}"
     assert "moved on" in reason
@@ -2259,64 +2213,37 @@ def test_mutation_void_warns_not_blocks(
 # ── issue #241 hub-review: journal-before-inject + success-path WARN journaling ──
 
 
-def test_permission_approve_journals_before_inject(spoke_repo: Path, tmp_path: Path) -> None:
+def test_permission_approve_journals_before_inject(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # BLOCKER 1: the reasoner-APPROVE decision must be journaled BEFORE approve_permission
     # delivers the "Yes" keypress — so the audit record can never be lost if the inject crashes
-    # or races the command it authorized. The fake tmux records, at the moment the approve "1"
-    # keystroke fires, whether the journal line already exists.
-    statedir = tmp_path / "sd"
-    statedir.mkdir()
-    journal = statedir / "decision-journal.jsonl"
-    probe = tmp_path / "probe"
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    (pd / "session.jsonl").write_text(json.dumps(_bash_tool_record("npm run deploy")) + "\n")
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        "  send-keys)\n"
-        f'    case "$*" in *" 1") [ -f "{journal}" ] && echo EXISTS >> "{probe}" || echo MISSING >> "{probe}" ;; esac ;;\n'
-        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n",
+    # or races the command it authorized. The Orca stub snapshots the journal at the moment the
+    # `terminal send` fires; Orca refuses the send, so delivery FAILS and the outcome line says so.
+    journal = tmp_path / "sd" / "decision-journal.jsonl"
+    env = _orca_perm_env(
+        tmp_path,
+        spoke_repo,
+        orca_bin,
+        "npm run deploy",
+        "printf 'REVERSIBILITY: reversible\\nANSWER: APPROVE'",
+        extra={
+            "terminal send": _ORCA_REFUSES,
+            "_snapshot": [{"key": "terminal send", "path": str(journal)}],
+        },
     )
-    _agent_ps_stub(fake_bin)
-    ready_log = tmp_path / "ready.log"
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_STATE_DIR": str(statedir),
-        "SPOKE_READY": str(ready_stub),
-        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: reversible\\nANSWER: APPROVE'",
-        "AFK_JOURNAL_GH_COMMENT": "0",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-        "AFK_INJECT_POLL_SECONDS": "0",
-    }
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
     assert result.returncode == 0, result.stderr
 
-    # The fake pane never advances/changes, so the #299 bounded retry fires too — both the
-    # first attempt's keystroke and the retry's must see the journal already written; a
-    # "MISSING" anywhere would mean a keypress raced ahead of the journal write.
-    assert probe.read_text().splitlines() == ["EXISTS", "EXISTS"], (
-        "every approve keystroke, including the #299 retry, must be journaled BEFORE it fires"
+    snaps = (orca_bin / ".orca-stub" / "snapshots.jsonl").read_text().splitlines()
+    assert len(snaps) == 1, "the approve keystroke is sent once, never resent"
+    assert "APPROVING (delivery pending)" in json.loads(snaps[0])["content"], (
+        "the approve keystroke must be journaled BEFORE it fires"
     )
-    # The approve keystroke does not advance the transcript here, so delivery FAILS — the durable
-    # journal must record the PROVISIONAL pre-keypress intent and the delivery-failure distinctly,
-    # and must NOT contain a 'delivered' line that would read as authorized-and-ran (#241 review).
+    # The durable journal then records the delivery-failure distinctly, and must NOT contain a
+    # 'delivered' line that would read as authorized-and-ran (#241 review).
     journal_text = journal.read_text()
-    assert "APPROVING (delivery pending)" in journal_text, (
-        "the pre-keypress line must be provisional, not a completed-approval record"
-    )
     assert "delivery FAILED" in journal_text, (
         "a failed approval delivery must be journaled distinctly"
     )
@@ -2340,10 +2267,6 @@ def test_taken_answer_journals_a_resolvable_reasoning_ref(
     """
     statedir = tmp_path / "sd"
     statedir.mkdir()
-    fake_bin = tmp_path / "bin"
-    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     env = {
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": (
@@ -2351,8 +2274,6 @@ def test_taken_answer_journals_a_resolvable_reasoning_ref(
             "REVERSIBILITY: reversible\\nANSWER: use Redis'"
         ),
         "AFK_STATE_DIR": str(statedir),
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
         "AFK_JOURNAL_GH_COMMENT": "0",
     }
 
@@ -2378,18 +2299,12 @@ def test_success_answer_journals_warn_and_reversibility(
     # class is recorded for morning review — a loud warned record AND a journal line.
     statedir = tmp_path / "sd"
     statedir.mkdir()
-    fake_bin = tmp_path / "bin"
-    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
-    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     env = {
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": (
             "printf 'REVERSIBILITY: irreversible\\nWARN: double-check the migration\\nANSWER: proceed with Redis'"
         ),
         "AFK_STATE_DIR": str(statedir),
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
         "AFK_JOURNAL_GH_COMMENT": "0",
     }
 
@@ -2409,17 +2324,12 @@ def test_success_answer_routine_journals_file_only(
     statedir = tmp_path / "sd"
     statedir.mkdir()
     fake_bin = tmp_path / "bin"
-    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     gh_log = tmp_path / "gh.log"
     write_stub(fake_bin / "gh", f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{gh_log}"\n')
     env = {
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: reversible\\nANSWER: use Redis'",
         "AFK_STATE_DIR": str(statedir),
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
         # NB: AFK_JOURNAL_GH_COMMENT left ON — the routine path must still not comment.
     }
 
@@ -2434,55 +2344,24 @@ def test_success_answer_routine_journals_file_only(
 
 
 def test_ceiling_mechanical_approve_is_paced_not_every_tick(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # #241 review (regression for the N1 fix): a mechanically-auto-approvable permission that keeps
-    # re-appearing at the SAME (tip, park-signature) — the approve keypress doesn't advance it — is
-    # PACED by the ceiling backoff once exhausted, NOT re-warned + re-approved every tick.
-    statedir = tmp_path / "sd"
-    statedir.mkdir()
-    keylog = tmp_path / "keys.log"
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    (pd / "session.jsonl").write_text(
-        json.dumps(_bash_tool_record("git reset -q; git add tests/x.py")) + "\n"  # classify APPROVE
-    )
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  send-keys) case "$*" in *" 1") printf "1\\n" >> "{keylog}" ;; esac ;;\n'
-        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n",
-    )
-    _agent_ps_stub(fake_bin)
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, "#!/usr/bin/env bash\n:\n")
-    base = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_STATE_DIR": str(statedir),
-        "SPOKE_READY": str(ready_stub),
+    # re-appearing at the SAME (tip, park-signature) — the dialog is still `waiting` after the
+    # approve — is PACED by the ceiling backoff once exhausted, NOT re-warned + re-approved
+    # every tick.
+    env = {
+        **_orca_perm_env(tmp_path, spoke_repo, orca_bin, "git reset -q; git add tests/x.py"),
         "AFK_REANSWER_CEILING": "1",
         "AFK_WARN_BACKOFF_BASE": "60",
-        "AFK_JOURNAL_GH_COMMENT": "0",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
     }
     # Five ticks; the last three are past the 60s backoff window opened at tick 2.
     for now in ("1000", "1000", "1100", "1100", "1100"):
-        _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": now})
+        _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**env, "AFK_NOW": now})
 
-    # Pacing is a per-CALL invariant (<=2 approve() calls across the 5 ticks); each call can
-    # legitimately emit up to 2 keystrokes now (the #299 bounded retry, since this fixture's
-    # pane never advances or changes), so the raw-keystroke ceiling is 2 calls x 2 keys = 4.
-    approves = keylog.read_text().count("1") if keylog.exists() else 0
-    assert approves <= 4, (
+    # Pacing is a per-CALL invariant: at most 2 approve() calls across the 5 ticks.
+    approves = _sent(orca_bin).count("1")
+    assert 1 <= approves <= 2, (
         f"a re-appearing auto-approve must be backoff-paced, not every tick; fired {approves}"
     )
 
@@ -2494,16 +2373,10 @@ def test_success_answer_case_insensitive_reversibility_stays_routine(
     # read as reversible — routine, file-only journal, NO loud warned record.
     statedir = tmp_path / "sd"
     statedir.mkdir()
-    fake_bin = tmp_path / "bin"
-    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     env = {
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: Reversible.\\nANSWER: use Redis'",
         "AFK_STATE_DIR": str(statedir),
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
         "AFK_JOURNAL_GH_COMMENT": "0",
     }
 
@@ -2517,33 +2390,19 @@ def test_success_answer_case_insensitive_reversibility_stays_routine(
 
 
 def test_permission_deny_delivery_failure_journaled_distinctly(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # #241 review (CONFIRMED): the DENY path must NOT swallow the redirect inject rc. When the
-    # decline-and-redirect fails to reach the spoke (dead pane / failed inject), the durable
-    # journal must record the failure DISTINCTLY — never as a clean, delivered denial.
-    destructive = "git reset --hard origin/main"  # irreversible -> reasoner denies
-    env = _perm_env(
+    # decline-and-redirect fails to reach the spoke, the durable journal must record the failure
+    # DISTINCTLY — never as a clean, delivered denial.
+    env = _orca_perm_env(
         tmp_path,
         spoke_repo,
-        destructive,
+        orca_bin,
+        "git reset --hard origin/main",  # irreversible -> reasoner denies
         "printf 'REVERSIBILITY: irreversible\\nANSWER: DENY: create a backup branch first'",
+        extra={"terminal send": _ORCA_REFUSES},
     )
-    fake_bin = Path(env["PATH"].split(":", 1)[0])
-    # Rewrite tmux so send-keys never advances the transcript -> the redirect inject FAILS.
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  send-keys) printf "%s\\n" "$*" >> "{env["_KEYLOG"]}" ;;\n'
-        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n",
-    )
-    _agent_ps_stub(fake_bin)
-    jsonl = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo) / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # no external advance masks the failure
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
     assert result.returncode == 0, result.stderr
@@ -2552,10 +2411,7 @@ def test_permission_deny_delivery_failure_journaled_distinctly(
     assert "redirect delivery FAILED" in journal, (
         "a failed deny-redirect must be journaled distinctly, not as a clean denial"
     )
-    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
-    assert not any(line.split()[-1:] == ["1"] for line in keys.splitlines()), (
-        "an irreversible command must never be auto-approved"
-    )
+    assert "1" not in _sent(orca_bin), "an irreversible command must never be auto-approved"
 
 
 def test_success_answer_quoted_irreversible_stays_flagged(
@@ -2566,16 +2422,10 @@ def test_success_answer_quoted_irreversible_stays_flagged(
     # trailing-strip collapsed it to empty and mis-filed a noteworthy decision as routine.
     statedir = tmp_path / "sd"
     statedir.mkdir()
-    fake_bin = tmp_path / "bin"
-    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     env = {
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: \"irreversible\"\\nANSWER: proceed with care'",
         "AFK_STATE_DIR": str(statedir),
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
         "AFK_JOURNAL_GH_COMMENT": "0",
     }
 
@@ -2643,6 +2493,7 @@ _DIVERGENT_PLAN = (
 def _fastpath_env(
     spoke_repo: Path,
     tmp_path: Path,
+    orca_bin: Path,
     *,
     plan: str,
     body: str,
@@ -2650,19 +2501,15 @@ def _fastpath_env(
     issue: int = 5,
     extra: dict[str, str] | None = None,
     write_artifact: bool = True,
+    park_extra: dict | None = None,
     transcript_plan: str = "transcript fallback plan",
 ) -> dict[str, str]:
-    """A GATE-parked spoke (#175 plan artifact + tag) + a fake gh returning <body> + a fake tmux
-    pane + a recording spoke-ready + a CANARY reasoner that writes <canary> if it ever runs.
+    """A GATE-parked spoke (#175 plan artifact + tag + an Orca inbox question) + a fake gh returning
+    <body> + a recording spoke-ready + a CANARY reasoner that writes <canary> if it ever runs.
 
     write_artifact=False models a bare ``--gate`` park that wrote NO plan artifact, so the only
     plan text is <transcript_plan> (the transcript-extraction fallback)."""
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    jsonl = pd / "session.jsonl"
-    jsonl.write_text(_gate_park_transcript(transcript_plan))
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
-
+    orca_park(orca_bin, spoke_repo, question=transcript_plan, extra=park_extra)
     art = spoke_repo / ".ai-toolkit"
     art.mkdir(exist_ok=True)
     if write_artifact:
@@ -2672,23 +2519,18 @@ def _fastpath_env(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     write_stub(fake_bin / "gh", "#!/usr/bin/env bash\ncat <<'GHBODY'\n" + body + "\nGHBODY\n")
-    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
     write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
 
     env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
         "SPOKE_READY": str(ready_stub),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_STATE_DIR": str(tmp_path / "sd"),
         "AFK_JOURNAL_GH_COMMENT": "0",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
         "AFK_ANSWERER_CMD": f"printf ran > '{canary}'; printf 'REVERSIBILITY: reversible\\nANSWER: Approved'",
         "_READY_LOG": str(ready_log),
-        "_TMUX_LOG": str(tmux_log),
     }
     if extra:
         env.update(extra)
@@ -2725,21 +2567,24 @@ def test_broker_plan_is_restatement_short_plan_falls_through(spoke_repo: Path) -
     assert "|rc=1|" in out.stdout, out.stdout
 
 
-def test_broker_service_gate_fastpaths_a_restating_plan(spoke_repo: Path, tmp_path: Path) -> None:
+def test_broker_service_gate_fastpaths_a_restating_plan(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # AC1 headline: a PLAN-gate park whose posted plan restates the issue body is resolved
     # WITHOUT invoking run_answerer — the canary reasoner never runs, the spoke gets an approve
     # inject, and the waive lands a park:gate journal line naming the coverage.
     canary = tmp_path / "reasoner-ran"
     env = _fastpath_env(
-        spoke_repo, tmp_path, plan=_RESTATING_PLAN, body=_RESTATE_BODY, canary=canary
+        spoke_repo, tmp_path, orca_bin, plan=_RESTATING_PLAN, body=_RESTATE_BODY, canary=canary
     )
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
     assert not canary.exists(), "the reasoner must NOT run when the plan restates the body"
-    tmux_log = Path(env["_TMUX_LOG"]).read_text()
-    assert "proceed to implementation" in tmux_log, f"the approve reply must inject: {tmux_log}"
+    assert any("proceed to implementation" in t for t in _sent(orca_bin)), (
+        f"the approve reply must inject: {_sent(orca_bin)}"
+    )
     ready = Path(env["_READY_LOG"])
     assert "--blocked" not in (ready.read_text() if ready.exists() else ""), (
         "a waive must not block"
@@ -2750,13 +2595,13 @@ def test_broker_service_gate_fastpaths_a_restating_plan(spoke_repo: Path, tmp_pa
 
 
 def test_broker_service_gate_reasoner_runs_on_divergent_plan(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # AC1 contrast: a genuinely DIVERGENT plan is NOT a restatement, so the gate falls through
     # to the full reasoner — the canary runs and its answer path takes over.
     canary = tmp_path / "reasoner-ran"
     env = _fastpath_env(
-        spoke_repo, tmp_path, plan=_DIVERGENT_PLAN, body=_RESTATE_BODY, canary=canary
+        spoke_repo, tmp_path, orca_bin, plan=_DIVERGENT_PLAN, body=_RESTATE_BODY, canary=canary
     )
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
@@ -2766,7 +2611,7 @@ def test_broker_service_gate_reasoner_runs_on_divergent_plan(
 
 
 def test_broker_service_gate_fastpath_ignores_transcript_fallback(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # Regression (#277 review): a bare `--gate` park that wrote NO plan artifact must NEVER be
     # fast-pathed off the transcript-extraction fallback ($orig_question) — that narration is not
@@ -2777,6 +2622,7 @@ def test_broker_service_gate_fastpath_ignores_transcript_fallback(
     env = _fastpath_env(
         spoke_repo,
         tmp_path,
+        orca_bin,
         plan=_RESTATING_PLAN,
         body=_RESTATE_BODY,
         canary=canary,
@@ -2793,13 +2639,14 @@ def test_broker_service_gate_fastpath_ignores_transcript_fallback(
 
 
 def test_broker_service_gate_fastpath_disabled_falls_through(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # AFK_FASTPATH=0 is the documented kill switch: even a restating plan runs the full reasoner.
     canary = tmp_path / "reasoner-ran"
     env = _fastpath_env(
         spoke_repo,
         tmp_path,
+        orca_bin,
         plan=_RESTATING_PLAN,
         body=_RESTATE_BODY,
         canary=canary,
@@ -2813,30 +2660,20 @@ def test_broker_service_gate_fastpath_disabled_falls_through(
 
 
 def test_broker_service_gate_fastpath_inject_failure_falls_through(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # A fast-path whose approve inject cannot be confirmed must NOT swallow the gate — it falls
-    # through to the full reasoner. Model a broken pane: list-panes maps it, but the submitting
-    # Enter never advances the transcript, so inject_and_verify fails.
+    # through to the full reasoner. Model a refused delivery: Orca fails the reply.
     canary = tmp_path / "reasoner-ran"
     env = _fastpath_env(
         spoke_repo,
         tmp_path,
+        orca_bin,
         plan=_RESTATING_PLAN,
         body=_RESTATE_BODY,
         canary=canary,
-        extra={"AFK_INJECT_MENU_PAUSE": "0", "AFK_INJECT_VERIFY_SECONDS": "0"},
+        park_extra={"orchestration reply": _ORCA_REFUSES},
     )
-    fake_bin = tmp_path / "bin"
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n",
-    )
-    _agent_ps_stub(fake_bin)
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
@@ -2844,7 +2681,9 @@ def test_broker_service_gate_fastpath_inject_failure_falls_through(
     assert canary.exists(), "a failed fast-path inject must fall through to the reasoner"
 
 
-def test_broker_service_gate_fastpath_emits_distinct_span(spoke_repo: Path, tmp_path: Path) -> None:
+def test_broker_service_gate_fastpath_emits_distinct_span(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # AC4: the waive emits a DISTINCT afk-answer span variant (status fast-path), never folded
     # into a normal success answer; telemetry-off stays a no-op (no events file at all).
     canary = tmp_path / "reasoner-ran"
@@ -2852,6 +2691,7 @@ def test_broker_service_gate_fastpath_emits_distinct_span(spoke_repo: Path, tmp_
     env = _fastpath_env(
         spoke_repo,
         tmp_path,
+        orca_bin,
         plan=_RESTATING_PLAN,
         body=_RESTATE_BODY,
         canary=canary,
@@ -2876,7 +2716,7 @@ def test_broker_service_gate_fastpath_emits_distinct_span(spoke_repo: Path, tmp_
 
 
 def test_broker_service_gate_fastpath_telemetry_off_is_noop(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # AC4 tail: with telemetry off the fast-path emits no span at all.
     canary = tmp_path / "reasoner-ran"
@@ -2884,6 +2724,7 @@ def test_broker_service_gate_fastpath_telemetry_off_is_noop(
     env = _fastpath_env(
         spoke_repo,
         tmp_path,
+        orca_bin,
         plan=_RESTATING_PLAN,
         body=_RESTATE_BODY,
         canary=canary,

@@ -312,43 +312,35 @@ _afk_mark_conflict_resolved() {
 _afk_clear_conflict_resolved() { rm -f "$(_afk_conflict_resolved_marker "$1")" 2>/dev/null || true; }
 _clear_conflict_resolve_markers() { rm -f "$(_afk_state_dir)"/conflict-resolved-* 2>/dev/null || true; }
 
-# _afk_conflict_resolve_relaunch <wt> <issue> -> DEAD/reaped pane: relaunch the spoke reusing its
-# spoke_run_id (via _afk_continue_command) with the resolve prompt. Resets the reap + idle clocks
-# (the fresh window has not written a transcript yet). rc 1 when the window can't be opened.
+# _afk_conflict_resolve_relaunch <wt> <issue> -> EXITED worker: restart it in place (a retry of its
+# Orca dispatch, same worktree and spoke_run_id) and send the resolve prompt once it is up. Resets
+# the reap + idle clocks (the fresh agent has not written a transcript yet). rc 1 when the restart
+# could not start.
 _afk_conflict_resolve_relaunch() {
   local wt="$1" issue="$2"
-  log "→ conflict-resolve #$issue: relaunching the reaped spoke to merge the base branch + resolve + re-push"
+  log "→ conflict-resolve #$issue: restarting the exited spoke to merge the base branch + resolve + re-push"
   _afk_set_last_action "conflict-resolve #$issue"
-  if ! _afk_open_spoke_window "$wt" "$issue" \
-       "$(_afk_continue_command "$wt" "$(_afk_conflict_resolve_prompt "$issue")")"; then
-    log "  could not open a conflict-resolve window for #$issue"
-    return 1
-  fi
+  local rc=0
+  _afk_retry_worker "$wt" "$issue" "$(_afk_conflict_resolve_prompt "$issue")" || rc=$?
+  # rc 2 = no action on an unknown state: warned, and returned as 2 so the caller neither records
+  # the resolution as dispatched nor warn-parks (a park here could escalate blocked on an unknown).
+  [ "$rc" -ne 2 ] || { _afk_warn_unknown_state "$wt" "$issue" "conflict-resolve restart skipped"; return 2; }
+  [ "$rc" -eq 0 ] || { log "  could not restart the worker for the conflict-resolve of #$issue"; return 1; }
   stamp_progress_epoch "$issue"
   stamp_answer_attempt "$issue"
   broker_journal_decision "$issue" conflict-resolve \
-    "relaunched the reaped spoke to merge the base branch + resolve the land conflict + re-push" reversible
+    "restarted the exited spoke to merge the base branch + resolve the land conflict + re-push" reversible
   _afk_bump_count "$wt" relaunch-count
   _afk_emit_span "$wt" afk-conflict-resolve success
   return 0
 }
-# _afk_conflict_resolve_inject <wt> <issue> -> LIVE pane: inject the resolve prompt into the
-# running session (no relaunch — never kill a working spoke). rc mirrors inject_and_verify.
+# _afk_conflict_resolve_inject <wt> <issue> -> LIVE worker: send the resolve prompt into the running
+# session (no restart — never kill a working spoke). rc mirrors deliver_text.
 _afk_conflict_resolve_inject() {
-  local wt="$1" issue="$2" target rc
-  log "→ conflict-resolve #$issue: injecting merge-base + resolve + re-push into the live session (no relaunch)"
-  _afk_set_last_action "conflict-resolve #$issue"
-  target="$(_spoke_pane_target "$wt")"
-  if [ -z "$target" ]; then
-    log "  no live pane for #$issue — cannot inject"
-    return 1
-  fi
-  stamp_answer_attempt "$issue"
-  inject_and_verify "$wt" "$target" "$(_afk_conflict_resolve_prompt "$issue")"; rc=$?
-  broker_journal_decision "$issue" conflict-resolve \
-    "injected merge the base branch + resolve + re-push into the live session (no relaunch)" reversible
-  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-conflict-resolve success; else _afk_emit_span "$wt" afk-conflict-resolve retry; fi
-  return "$rc"
+  log "→ conflict-resolve #$2: sending merge-base + resolve + re-push into the live session (no restart)"
+  _afk_send_nudge "$1" "$2" conflict-resolve afk-conflict-resolve \
+    "sent merge the base branch + resolve + re-push into the live session (no restart)" \
+    "$(_afk_conflict_resolve_prompt "$2")"
 }
 # _afk_route_conflict_resolution <wt> <issue> -> dispatch ONE resolution per distinct conflict:
 # inject a live pane, relaunch a dead one. On a successful dispatch mark the distinct budget; a
@@ -364,16 +356,19 @@ _afk_route_conflict_resolution() {
     _warn_parked_last "$wt" "$issue" "land conflicts deterministically; resolution already dispatched — waiting for the spoke to merge the base branch + resolve + re-push" land
     return 0
   fi
-  if _spoke_pane_alive "$wt"; then
+  if _spoke_agent_alive "$wt"; then
     if _afk_run_with_heartbeat_fg _afk_conflict_resolve_inject "$wt" "$issue"; then
       _afk_mark_conflict_resolved "$issue" "$tip"
     else
       _warn_parked_last "$wt" "$issue" "land conflicts; live-pane resolve-inject did not register — retrying at low frequency" land
     fi
-  elif _afk_conflict_resolve_relaunch "$wt" "$issue"; then
-    _afk_mark_conflict_resolved "$issue" "$tip"
   else
-    _warn_parked_last "$wt" "$issue" "land conflicts and the resolution relaunch could not start — retrying at low frequency" land
+    _afk_conflict_resolve_relaunch "$wt" "$issue"
+    case $? in
+      0) _afk_mark_conflict_resolved "$issue" "$tip" ;;
+      2) ;;
+      *) _warn_parked_last "$wt" "$issue" "land conflicts and the resolution relaunch could not start — retrying at low frequency" land ;;
+    esac
   fi
 }
 

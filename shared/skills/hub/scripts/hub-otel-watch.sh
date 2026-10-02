@@ -196,7 +196,7 @@ _watch_reexec() {
 # makes a recovery observable); on an idle tick count toward the exit grace (an Orca that
 # did not answer is neither: the count is left alone).
 # Exits 0 after HUB_OTEL_WATCH_IDLE_TICKS consecutive idle ticks (default 3 —
-# grace for transient tmux blips and the spawn race); a live tick resets the
+# grace for transient Orca blips and the spawn race); a live tick resets the
 # counter. Never fatal: ensure failures are best-effort and the loop keeps going.
 _watch_loop() {
   local baseline="${1:-}" cur live

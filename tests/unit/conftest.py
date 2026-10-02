@@ -15,6 +15,7 @@ from _gate_broker_support import (
     _install_fake_claude,
     _project_dir_for,
 )
+from _orca_stub import orca_park
 from _stubs import write_stub
 
 
@@ -87,9 +88,13 @@ def linked_spoke_repo(tmp_path: Path) -> Path:
     return wt
 
 
+_PARKED_QUESTION = "Q: Which store?\n  - Redis: fast"
+
+
 @pytest.fixture
-def waiting_spoke_env(tmp_path: Path, spoke_repo: Path) -> dict[str, str]:
-    """A spoke parked on a question + a recording spoke-ready stub + a fake gh."""
+def waiting_spoke_env(tmp_path: Path, spoke_repo: Path, orca_bin: Path) -> dict[str, str]:
+    """A spoke parked on a question (an Orca inbox `ask`) + a recording spoke-ready stub + a fake gh."""
+    orca_park(orca_bin, spoke_repo, question=_PARKED_QUESTION)
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     (pd / "session.jsonl").write_text(
@@ -113,8 +118,9 @@ def waiting_spoke_env(tmp_path: Path, spoke_repo: Path) -> dict[str, str]:
 
 
 @pytest.fixture
-def reasoner_env(spoke_repo: Path, tmp_path: Path) -> dict[str, str]:
-    """A spoke parked on a question + a fake `claude` reasoner on PATH (default command)."""
+def reasoner_env(spoke_repo: Path, tmp_path: Path, orca_bin: Path) -> dict[str, str]:
+    """A spoke parked on a question (an Orca inbox `ask`) + a fake `claude` reasoner on PATH."""
+    orca_park(orca_bin, spoke_repo, question=_PARKED_QUESTION)
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     spoke_jsonl = pd / "session.jsonl"

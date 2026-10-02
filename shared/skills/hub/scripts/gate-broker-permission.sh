@@ -7,142 +7,38 @@
 set -uo pipefail
 
 # --- permission-dialog detection + handling (issue #149) ----------------------
-# A permission dialog is a pane-only surface — a Claude Code confirmation prompt with no
-# transcript entry of its OWN — but the tool_use it is gating IS flushed to the JSONL as an
-# UNRESOLVED block (no matching tool_result) for the whole park. So the dialog is detected
-# from the pane (the only "a dialog is up" signal) and the command it gates is read from that
-# unresolved tool_use. classify_permission decides it; these helpers see it and deliver the
-# decision. _decide_permission is reached from decide_and_act, which routes a
-# permission-pending spoke here instead of to the answerer.
+# A permission dialog is the agent `waiting` in Orca's state (03 #8): `worktree ps` reports the
+# gated tool's name and input, so there is no pane to scrape and no transcript to re-parse.
+# classify_permission decides it; these helpers see it and deliver the decision.
+# _decide_permission is reached from decide_and_act, which routes a permission-pending spoke here
+# instead of to the answerer.
 
-# _extract_pending_tool_field <wt_path> <field> -> one field of the spoke's trailing UNRESOLVED
-# assistant tool_use — the one a permission dialog is gating. field is `command` or `id`.
-#
-# ONE walk DEFINITION for both fields (#294): a separately-written second walk could drift from
-# this one's resolution rules (#240's skip-the-resolved-blocks scan above all) and name an id from
-# a different block than the command was read from, keying the served marker onto the wrong dialog.
-#
-# What that does NOT buy, since each wrapper is its own python pass: two calls are two independent
-# reads of the transcript, so a park that MOVES between them yields a command and an id from
-# different states. That degrades safely — a mismatched record matches no live park, so the lane
-# fails open to a re-serve rather than suppressing one — but it is why the served id is captured
-# BEFORE a delivery (and before the reasoner's minutes-long step), never re-read after it.
-_extract_pending_tool_field() {
-  local jsonl; jsonl="$(_spoke_jsonl "$1")"
-  [ -n "$jsonl" ] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  _AFK_JSONL="$jsonl" _AFK_FIELD="${2:-command}" python3 2>/dev/null <<'PYEOF'
-import json, os
-
-# Two passes over the transcript: first collect every tool_result's tool_use_id (a
-# tool_result always trails its tool_use in file order, so resolution can only be known
-# after a full read), then pick the LAST tool_use whose id is NOT among them — the one the
-# permission dialog is still gating. Prior, already-resolved calls are skipped (#240).
-tool_uses = []            # ordered (id, name, input) of every assistant tool_use
-resolved = set()          # tool_use_ids that a later tool_result has settled
-try:
-    with open(os.environ["_AFK_JSONL"]) as fh:
-        for raw in fh:
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            content = (obj.get("message") or {}).get("content") or []
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                btype = block.get("type")
-                if btype == "tool_use" and obj.get("type") == "assistant":
-                    tool_uses.append(
-                        (block.get("id"), (block.get("name") or "").strip(), block.get("input") or {})
-                    )
-                elif btype == "tool_result":
-                    tid = block.get("tool_use_id")
-                    if tid:
-                        resolved.add(tid)
-except Exception:
-    tool_uses = []
-
-cmd = ""
-pending_id = ""
-for tid, name, inp in reversed(tool_uses):
-    if tid in resolved:       # a completed call the spoke already ran — never the pending one
-        continue
-    if not isinstance(inp, dict):
-        inp = {}
-    if name == "Bash":
-        cmd = (inp.get("command") or "").strip()
-    elif name == "Read":
-        # Carry the Read TARGET alongside the name (#181) so the classifier can vet the
-        # path — a repo-family read is auto-approvable, a bare name is not.
-        fp = (inp.get("file_path") or "").strip()
-        cmd = f"{name} {fp}" if fp else name
-    elif name:
-        cmd = name
-    # The id of THIS block -- the one cmd was just read from, never a neighbour's (#294).
-    pending_id = (tid or "").strip()
-    break                     # the trailing unresolved tool_use is the pending command
-# NB: NOT truncated since #257 -- this command feeds the default-deny classify_permission and the
-# _reason_permission prompt in the pane path. Truncating a benign prefix off a risky tail could
-# hide the risky segment and mis-approve it, exactly as #253 avoided for afk_permission_hook_decide.
-# The 2000-char DISPLAY cap now lives at the log call sites in _decide_permission via cmd_display,
-# not here. The other consumers tolerate the full command: _permission_pending tests non-emptiness
-# and _broker_park_signature hashes the basis.
-# Plain ASCII, no backticks/parens: bash 3.2 mis-parses those inside a heredoc.
-print(pending_id if os.environ.get("_AFK_FIELD") == "id" else cmd.strip())
-PYEOF
+# extract_pending_command <wt_path> -> the command the waiting agent is gated on (Bash -> its
+# command string; Read -> "Read <file_path>"; any other tool -> the tool name, so the classifier
+# escalates non-Bash tools like browser/computer/mcp), the same string afk_permission_hook_decide
+# builds. Empty when the agent is not waiting, or when Orca's toolInput looks truncated (an ellipsis
+# tail): a clipped command could hide a risky segment behind a benign prefix, so it is read as
+# unreadable and the caller declines it. NOT capped: the classifier is default-deny (#257).
+extract_pending_command() {
+  local wt="$1" name input
+  [ "$(orca_agent_state "$wt" 2>/dev/null)" = waiting ] || return 0
+  name="$(orca_agent_field "$wt" toolName 2>/dev/null)"
+  input="$(orca_agent_field "$wt" toolInput 2>/dev/null)"
+  case "$input" in *"…") return 0 ;; esac
+  case "$name" in
+    Bash) printf '%s\n' "$input" ;;
+    Read) if [ -n "$input" ]; then printf 'Read %s\n' "$input"; else printf 'Read\n'; fi ;;
+    *) printf '%s\n' "$name" ;;
+  esac
 }
 
-# extract_pending_command <wt_path> -> the command of the spoke's trailing UNRESOLVED
-# assistant tool_use — the one a permission dialog is gating (Bash -> its command string;
-# Read -> "Read <file_path>"; any other tool -> the tool name, so the classifier escalates
-# non-Bash tools like browser/computer/mcp). A tool_use is UNRESOLVED when no later
-# tool_result carries its id; the PRIOR calls a parked spoke already completed are resolved
-# and MUST be skipped (#240: returning the last resolved tool surfaced a phantom "Write" and
-# escalated a spoke that needed no human). Empty when nothing is unresolved -> the caller
-# escalates honestly ("unreadable command"), never on a stale resolved tool name.
-extract_pending_command() { _extract_pending_tool_field "$1" command; }
-
-# extract_pending_tool_id <wt_path> -> the tool_use ID of that same pending block (#294): the
-# API-assigned, per-call-unique id of the tool the dialog is gating. It is what separates "the
-# same dialog is STILL on screen" (same id -> an approve already delivered for it must not be
-# delivered twice) from "the spoke re-asked the IDENTICAL command" (a new id at the same tip and
-# signature -> a genuinely new dialog that must still be served). Empty when the gated tool_use is
-# not flushed yet (the #269 dialog-pending window) -> the served marker records nothing and the
-# lane fails OPEN to its pre-#294 behavior.
-extract_pending_tool_id() { _extract_pending_tool_field "$1" id; }
-
-# _permission_pending <wt_path> -> true when the spoke is parked on a permission dialog. #269
-# (#254 option b): DETECTION is decoupled from EXTRACTION. A shown pane dialog IS a park even
-# when extract_pending_command is empty -- the gated tool_use is not flushed while the dialog is
-# pending (the #240/#254 finding), so ANDing a non-empty command made a real park read as FALSE,
-# and the reaper (_reap_or_resume) fell past the park check into "likely hung -> revive",
-# re-raising the identical dialog. The pane is the "a dialog is up" signal -- but the prompt
-# PHRASE alone is not enough: it can appear in a spoke's OWN rendered output (a spoke maintaining
-# the afk subsystem git-shows the file that defines the phrase), a #240/#89-class false park
-# (#269 review). So require BOTH the phrase (_pane_shows_permission_prompt) AND the live dialog's
-# interactive affordance -- a numbered Yes/No option line the real menu draws but a plain text
-# echo does not. The #240 guard holds: NO pane dialog -> false (no phantom park on a stale
-# RESOLVED tool). _decide_permission reads the command separately and handles an unreadable one
-# (decline + warn, never park). Fail-closed on no tmux/pane. The single gate slot_state and
-# decide_and_act share. The pane is captured ONCE and both patterns are grepped from that copy:
-# a second capture-pane doubled the tmux subprocess load and, more importantly, its extra
-# failure surface destabilized the park signature under heavy load (a flaked capture flipped the
-# park verdict, resetting the re-answer ceiling -- #269 final review NIT + a load-flake fix). The
-# phrase default MIRRORS _pane_shows_permission_prompt (hub-inject.sh) and reads the SAME
-# AFK_PERMISSION_PROMPT_RE override, so an operator retune stays consistent across both.
+# _permission_pending <wt_path> -> true when the agent is `waiting` on a permission dialog (any
+# tool but AskUserQuestion, which extract_pending_question reads). DETECTION is decoupled from
+# EXTRACTION (#269): a waiting agent IS a park even when the command is unreadable;
+# _decide_permission handles that (decline + warn, never park).
 _permission_pending() {
-  local wt="$1" target pane
-  command -v tmux >/dev/null 2>&1 || return 1
-  target="$(_spoke_pane_target "$wt")"
-  [ -n "$target" ] || return 1
-  pane="$(tmux capture-pane -p -t "$target" 2>/dev/null)" || return 1
-  printf '%s\n' "$pane" | grep -Eq -- "${AFK_PERMISSION_PROMPT_RE:-Do you want to proceed\?}" || return 1
-  printf '%s\n' "$pane" | grep -Eq -- "${AFK_PERMISSION_AFFORD_RE:-[0-9]+\.[[:space:]]+(Yes|No)}"
+  [ "$(orca_agent_state "$1" 2>/dev/null)" = waiting ] \
+    && [ "$(orca_agent_field "$1" toolName 2>/dev/null)" != AskUserQuestion ]
 }
 
 # _reason_permission_record <wt> <issue> <decision> <rev> -> the post-DELIVERY record for a
@@ -157,16 +53,16 @@ _reason_permission_record() {
   afk_emit_decision "$wt" warn
 }
 
-# _reason_permission <wt> <issue> <cmd> <classify_reason> [park_sig] [tool_id] -> the reasoner
+# _reason_permission <wt> <issue> <cmd> <classify_reason> [park_sig] -> the reasoner
 # decides a permission dialog the fixed rules would NOT auto-approve (#241 §2: the reasoner decides
 # even irreversible asks). It runs in run_answerer's read-only snapshot copy and answers
 # 'ANSWER: APPROVE' or 'ANSWER: DENY: <reversible path>'. APPROVE delivers Yes; DENY (or any
 # unclear reply — the safe default) declines the dialog and injects the reversible-path guidance.
 # Either way the taken decision is warned + journaled with its reversibility class, and the spoke
-# is NEVER parked. park_sig/tool_id identify the park being decided (#294) and are the CALLER's,
-# captured before the minutes-long reason step: only the DELIVERED-approve branch records them.
+# is NEVER parked. park_sig identifies the park being decided and is the CALLER's, captured before
+# the minutes-long reason step.
 _reason_permission() {
-  local wt="$1" issue="$2" cmd="$3" why="$4" sig="${5:-}" tid="${6:-}" q raw rc ans text rev guidance
+  local wt="$1" issue="$2" cmd="$3" why="$4" sig="${5:-}" want="${6:-}" q raw rc ans text rev guidance arc
   q="The spoke is parked on a PERMISSION dialog and wants to run this command:
 
 $cmd
@@ -219,13 +115,16 @@ path to tell the spoke>'."
       _broker_journal_line "$issue" permission "reasoner APPROVING (delivery pending): $cmd" "${rev:-unknown}"
       # Thread the issue + lane + episode so hub-inject's approval_injected delivery event keys on
       # the broker's KNOWN issue (explicit beats the branch-slug fallback) and carries the episode.
-      if AFK_TLOG_ISSUE="$issue" AFK_TLOG_LANE=permission \
-        AFK_TLOG_EPISODE="$(_gb_episode_key "$issue" "$sig")" approve_permission "$wt"; then
-        # #294: this exact park is served — the next tick must not re-approve it if the pane still
-        # shows the same dialog. Only on a CONFIRMED delivery: an unconfirmed one stays retryable.
-        note_permission_served "$wt" "$issue" "$sig" "$tid"
+      arc=0
+      AFK_TLOG_ISSUE="$issue" AFK_TLOG_LANE=permission \
+        AFK_TLOG_EPISODE="$(_gb_episode_key "$issue" "$sig")" approve_permission "$wt" "$want" || arc=$?
+      if [ "$arc" -eq 0 ]; then
         _broker_journal_line "$issue" permission "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
         _reason_permission_record "$wt" "$issue" "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
+      elif [ "$arc" -eq 3 ]; then
+        # The dialog went away (or was replaced) while the reasoner ran: nothing was sent, nothing
+        # failed -- no warn, no backoff arm; the next tick re-reads whatever is waiting.
+        _broker_journal_line "$issue" permission "reasoner APPROVED but the dialog was gone or replaced -- nothing sent: $cmd" "${rev:-unknown}"
       else
         # A delivery failure is distinct on the DURABLE surfaces (a FAILED journal line + gh),
         # so the morning review never reads an undelivered approval as "authorized and ran".
@@ -268,12 +167,13 @@ path to tell the spoke>'."
 # parks the spoke: it routes to the always-answering reasoner (#241) which approves a safe
 # command or declines-and-redirects a risky one, warning + journaling the taken decision.
 #
-# park_sig is the caller's already-captured signature of the park being decided (#294); it keys the
-# served record a delivered APPROVE stamps. Self-derived when absent so a direct caller still works,
-# but broker_service_gate passes its own so the tick's single pane read stays single (#269).
+# park_sig is the caller's already-captured signature of the park being decided; self-derived when
+# absent so a direct caller still works.
 _decide_permission() {
-  local wt="$1" issue="$2" sig="${3:-}" cmd cmd_display decision kind reason tid
+  local wt="$1" issue="$2" sig="${3:-}" cmd cmd_display decision kind reason want arc
   cmd="$(extract_pending_command "$wt")"
+  # The dialog being judged ("<toolName><TAB><toolInput>"): approve only THIS one, whatever replaces it.
+  want="$(orca_agent_field "$wt" toolName 2>/dev/null)"$'\t'"$(orca_agent_field "$wt" toolInput 2>/dev/null)"
   if [ -z "$cmd" ]; then
     # Unreadable command: cannot classify. Decline it (the reversible action) + warn — never
     # park. The spoke gets a denial and keeps going; the backoff paces any retry. Nothing is
@@ -302,11 +202,6 @@ _decide_permission() {
   # -q` APPROVE vs `git reset --hard` ESCALATE, which share the signature git-reset+git-add)
   # correctly read as a CONFLICT, so codify never proposes it as a safe unanimous rule (#155 D).
   log_decision "$issue" permission "$cmd_display" "$kind"
-  # The id of the tool_use this dialog gates, read BEFORE any delivery (#294): it is what the
-  # served record keys on, and after the keypress the trailing unresolved tool_use can already be
-  # a different one. Empty in the #269 unflushed-dialog window → nothing is recorded and the lane
-  # keeps its pre-#294 behavior.
-  tid="$(extract_pending_tool_id "$wt")"
   if [ "$kind" = "APPROVE" ]; then
     log "→ auto-approving safe permission for #$issue: $cmd_display"
     # #300 step 3b: the MECHANICAL auto-approve is a lane decision too — approve_decided with
@@ -317,15 +212,16 @@ _decide_permission() {
     stamp_answer_attempt "$issue"
     # Thread the issue + lane + episode so hub-inject's approval_injected delivery event keys on
     # the broker's KNOWN issue (explicit beats the branch-slug fallback) and carries the episode.
-    if AFK_TLOG_ISSUE="$issue" AFK_TLOG_LANE=permission \
-      AFK_TLOG_EPISODE="$(_gb_episode_key "$issue" "$sig")" approve_permission "$wt"; then
-      # #294: record the park we just served so the next tick does not re-approve the same dialog.
-      # Only a CONFIRMED delivery is served — the failure path below stays retryable.
-      note_permission_served "$wt" "$issue" "$sig" "$tid"
+    arc=0
+    AFK_TLOG_ISSUE="$issue" AFK_TLOG_LANE=permission \
+      AFK_TLOG_EPISODE="$(_gb_episode_key "$issue" "$sig")" approve_permission "$wt" "$want" || arc=$?
+    if [ "$arc" -eq 0 ]; then
       log "  approved permission for #$issue"
       afk_emit_decision "$wt" success
       return 0
     fi
+    # Nothing to approve (the dialog went away or was replaced): not a failure, nothing to retry.
+    [ "$arc" -ne 3 ] || { log "  #$issue: the dialog is gone or was replaced -- nothing approved"; return 0; }
     # Delivery failed — warn + retry on the backoff, never park (#241).
     broker_warn_continue "$wt" "$issue" permission "could not deliver the approval to the spoke — will retry" reversible
     return 0
@@ -333,12 +229,12 @@ _decide_permission() {
   # ESCALATE: the fixed rules will not auto-approve this one. The reasoner decides it (#241) —
   # approve a safe/reversible command, or decline an irreversible one and name the reversible
   # path — and warns + journals the taken decision. Never park.
-  _reason_permission "$wt" "$issue" "$cmd" "$reason" "$sig" "$tid"
+  _reason_permission "$wt" "$issue" "$cmd" "$reason" "$sig" "$want"
 }
 
 # --- programmatic PreToolUse permission decision (issue #253) ------------------
-# The pane-answering path above (extract_pending_command + _pane_shows_permission_prompt +
-# approve_permission) detects and OPERATES a TUI dialog after it appears — the brittle surface
+# The Orca answering path above (extract_pending_command + approve_permission) detects and
+# OPERATES a TUI dialog after it appears — the brittle surface
 # behind the #240/#246/#238 bug family (new dialog shapes, glyphs, and timing windows keep
 # breaking the scraper). afk_permission_hook_decide moves the COMMON case OFF the pane entirely:
 # a spoke-side PreToolUse hook runs classify_permission on the gated tool call BEFORE any dialog

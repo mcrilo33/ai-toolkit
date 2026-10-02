@@ -35,6 +35,13 @@
 #   spoke-ready.sh --accept <issue>      # emit accept/<issue> (built+reviewed; human sign-off)
 #   spoke-ready.sh --blocked <issue>     # emit blocked/<issue> (stuck; answer + re-queue)
 #   spoke-ready.sh --blocked <issue> -m "<reason>"   # stamp a reason into the tag body
+#   spoke-ready.sh --dispatch-capability <token> ...   # remember the preamble's capability token
+#
+# Under Orca (#365) --gate then BLOCKS in `orca orchestration ask` (options approve,revise) until
+# the coordinator replies: exit 0 = approved (the gate tag and plan artifact are consumed here, by
+# their only writer), 3 = amend the plan and re-park, 6 = the ask timed out and is STILL PENDING --
+# re-run the same command to keep waiting, never proceed without an approval. ready / --blocked
+# also send `worker_done` (succeeded / failed), best-effort, after the tag push.
 #
 set -euo pipefail
 
@@ -80,6 +87,7 @@ STATE_FLAG=""
 ISSUE=""
 BODY=""
 PLAN_FILE=""
+CAPABILITY=""   # --dispatch-capability: the Orca preamble token, remembered for later invocations
 QUERY_QUEUE=0   # --queued <N>: print the queued subtasks and exit (read-only, #278)
 NO_WAIT=0       # --no-wait: ready/<N> checks CI once instead of polling (#378)
 LOCAL_GATE=0    # --local-gate: ready/<N> runs the full suite locally instead of waiting for CI (#378)
@@ -107,6 +115,8 @@ while [ "$#" -gt 0 ]; do
     --plan-file)   [ "$#" -ge 2 ] || { echo "spoke-ready: --plan-file needs a value" >&2; usage; }
                    PLAN_FILE="$2"; shift 2 ;;
     --plan-file=*) PLAN_FILE="${1#--plan-file=}"; shift ;;
+    --dispatch-capability) [ "$#" -ge 2 ] || { echo "spoke-ready: --dispatch-capability needs a value" >&2; usage; }
+                   CAPABILITY="$2"; shift 2 ;;
     # --queued <N> (#278): print the subtask issues still queued for this spoke and exit.
     # Read-only — it emits no marker, so merely LOOKING at the queue can never land the spoke.
     --queued)      QUERY_QUEUE=1; shift ;;
@@ -127,6 +137,15 @@ fi
 if [ "$NO_WAIT$LOCAL_GATE" = "11" ]; then
   echo "spoke-ready: --no-wait conflicts with --local-gate (pick one)" >&2
   usage
+fi
+
+# Orca hands a dispatched worker its capability token in the preamble only; ask / worker_done need
+# it. Remember the one the agent passes (0600, under the gitignored .ai-toolkit/) so a later
+# `--ready` finds it. A new dispatch (a restart) has a new token: passing it again overwrites.
+if [ -n "$CAPABILITY" ]; then
+  _cap_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  mkdir -p "$_cap_root/.ai-toolkit"
+  ( umask 077; printf '%s\n' "$CAPABILITY" > "$_cap_root/.ai-toolkit/dispatch-capability" )
 fi
 
 # ── queued-subtask channel (issue #278) ──────────────────────────────────────
@@ -551,7 +570,13 @@ _afk_emit_wake_event() {
   : > "$dir/$(date +%s)-$issue-$kind" 2>/dev/null || return 0
   kill -USR1 "$pid" 2>/dev/null || true
 }
-_afk_emit_wake_event "$ISSUE" "$KIND"
+# An Orca worker's gate question reaches the coordinator's inbox only once the `ask` below is sent,
+# so that wake is deferred a few seconds; every other wake is immediate.
+if [ "$KIND" = gate ] && [ -n "${WT_SPOKE:-}" ] && [ -n "${ORCA_TERMINAL_HANDLE:-}" ]; then
+  ( sleep "${AFK_GATE_WAKE_DELAY:-3}"; _afk_emit_wake_event "$ISSUE" "$KIND" ) >/dev/null 2>&1 &
+else
+  _afk_emit_wake_event "$ISSUE" "$KIND"
+fi
 
 # #300 writer: record the lifecycle transition this marker REPRESENTS. The tag is
 # the transport; this is the record — same actor, same instant, plus the `cause`
@@ -593,4 +618,71 @@ fi
 if command -v telemetry_emit_span >/dev/null 2>&1; then
   telemetry_emit_span --kind script --name spoke-ready \
     --phase "$KIND" --status success --start-ms "$_SR_T0"
+fi
+
+# --- Orca: tell the coordinator (#365) ---------------------------------------
+# ready / --blocked end the worker's task: send worker_done succeeded / failed, AFTER the tag push
+# (the tag is the durable record; this is the notification). Only a spoke session (WT_SPOKE, the
+# role tag) sends it -- the hub emits blocked/<N> over a spoke too -- and only for the PRIMARY
+# issue: a packed subtask's per-issue ready must not complete the whole task. Best-effort.
+if [ -n "${WT_SPOKE:-}" ] && command -v orca_worker_done >/dev/null 2>&1 \
+   && { [ "$KIND" = blocked ] || { [ "$KIND" = ready ] && [ "$ISSUE" = "$(_branch_primary)" ]; }; }; then
+  _done_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  orca_worker_done "$_done_root" "$([ "$KIND" = ready ] && echo succeeded || echo failed)" "$KIND/$ISSUE" \
+    >/dev/null 2>&1 || echo "spoke-ready: note -- could not send worker_done for $TAG (the tag is the record)" >&2
+fi
+
+# --- PLAN gate: block in `ask` until the coordinator replies (#365) -----------
+# The gate/<N> tag and the plan artifact stay the durable git-side record; the question itself
+# travels through Orca, which gives a durable, acknowledged answer. A timeout leaves the question
+# PENDING: the id is kept in .ai-toolkit/gate-<N>.ask so a re-run RESUMES it (never asks twice).
+if [ "$KIND" = gate ]; then
+  _gate_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  _gate_ask="$_gate_root/.ai-toolkit/gate-$ISSUE.ask"
+  if [ -z "${WT_SPOKE:-}" ] || [ -z "${ORCA_TERMINAL_HANDLE:-}" ] || ! command -v orca_ask >/dev/null 2>&1; then
+    echo "spoke-ready: parked $TAG tag-only -- this is not an Orca worker session, so nothing will answer the gate" >&2
+    exit 0
+  fi
+  _gate_out="$(mktemp "${TMPDIR:-/tmp}/spoke-gate.XXXXXX")"
+  _gate_ms="${AFK_GATE_ASK_TIMEOUT_MS:-110000}"
+  _gate_rc=0
+  _gate_disp="$(_orca_identity "$_gate_root" orca_dispatch_id)"
+  # The pending id is bound to the dispatch that asked it: a restarted worker (a new dispatch) owns
+  # a new terminal, so the old question is dead and must be asked afresh.
+  if [ -s "$_gate_ask" ] && [ "$(awk '{print $2}' "$_gate_ask")" != "$_gate_disp" ]; then rm -f "$_gate_ask"; fi
+  if [ -s "$_gate_ask" ]; then
+    _gate_qid="$(awk '{print $1}' "$_gate_ask")"
+    echo "→ resuming the pending PLAN-gate question $_gate_qid (timeout ${_gate_ms}ms)"
+    orca_ask_resume "$_gate_root" "$_gate_qid" "$_gate_ms" >"$_gate_out" || _gate_rc=$?
+  else
+    echo "→ asking the coordinator to approve the PLAN (options approve,revise; timeout ${_gate_ms}ms)"
+    orca_ask "$_gate_root" "PLAN gate for #$ISSUE -- approve or revise the plan below.
+
+${BODY:0:3000}" approve,revise "$_gate_ms" >"$_gate_out" || _gate_rc=$?
+  fi
+  _gate_reply="$(cat "$_gate_out")"; rm -f "$_gate_out"
+  if [ "$_gate_rc" -eq 3 ]; then
+    [ -z "${ORCA_ASK_ID:-}" ] || printf '%s %s\n' "$ORCA_ASK_ID" "$_gate_disp" > "$_gate_ask"
+    echo "spoke-ready: the PLAN-gate question is still PENDING (no reply within ${_gate_ms}ms). Re-run this exact command to keep waiting; do NOT start implementing and do NOT ask again." >&2
+    exit "${WT_GATE_PENDING_EXIT:-6}"
+  fi
+  if [ "$_gate_rc" -ne 0 ]; then
+    rm -f "$_gate_ask"   # a failed ask leaves nothing worth resuming
+    echo "spoke-ready: the PLAN-gate ask failed (${ORCA_ERR:-$ORCA_OUT}) -- if the dispatch capability is missing or stale, re-run with --dispatch-capability <token from your preamble>" >&2
+    exit 1
+  fi
+  rm -f "$_gate_ask"
+  printf '%s\n' "$_gate_reply"
+  case "$(printf '%s' "$_gate_reply" | tr '[:upper:]' '[:lower:]')" in
+    approve*)
+      # Approved: this spoke consumes its own gate tag and artifact (their only writer), so the
+      # plan-gate guard needs no transcript to know the gate is open.
+      git tag -d "$TAG" >/dev/null 2>&1 || true
+      git push origin ":refs/tags/$TAG" >/dev/null 2>&1 || true
+      rm -f "$_gate_root/.ai-toolkit/gate-$ISSUE.md"
+      echo "✓ spoke-ready: PLAN approved -- $TAG consumed; proceed to GREEN" ;;
+    *)
+      echo "spoke-ready: the plan needs changes (reply above). Amend it, then re-park with --gate." >&2
+      exit 3 ;;
+  esac
 fi

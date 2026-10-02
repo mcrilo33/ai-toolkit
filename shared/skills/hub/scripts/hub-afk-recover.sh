@@ -3,7 +3,7 @@
 #
 # The RECOVER lane of the /afk supervisor: reap / revive / nudge / dead-pane / finish-up --
 # the crash-resume + liveness probes, the ledger completion signal, the #255 nudge counter,
-# the resume / nudge / finish-up / pushed-but-unmarked prompts + resume/respawn commands, the
+# the nudge / finish-up / pushed-but-unmarked prompts + the in-place Orca worker retry, the
 # #241 revive-first / warned-parked-last lane, _reap_or_resume,
 # the auth/network reap-prep probes, reap_pass, and recover_dead_panes. A pure function-
 # definition module sourced by the entry lib hub-afk.sh AFTER worktree-lib / gate-broker /
@@ -11,39 +11,17 @@
 # so every cross-module helper resolves at call time. Not run on its own.
 set -uo pipefail
 
-# --- crash ≠ hang: auto-resume-once a pane-dead spoke (issue #109) -------------
-# A reaped spoke is not always hung. The reaper abandoned #103 as "idle, likely hung"
-# when its tmux PANE had crashed but its committed work was intact. So before declaring
-# blocked we distinguish a DEAD pane (session crashed → re-adopt the worktree ONCE,
-# reusing the spoke_run_id) from a LIVE-but-idle pane (truly hung → block).
+# --- crash ≠ hang: auto-resume-once a dead spoke (issue #109) -------------------
+# A reaped spoke is not always hung. The reaper abandoned #103 as "idle, likely hung" when its
+# agent had crashed but its committed work was intact. So before declaring blocked we distinguish
+# a DEAD worker (session crashed -> restart it ONCE in place) from a LIVE-but-idle one (truly
+# hung -> block).
 
-# _spoke_pane_alive <wt> -> true when the spoke's AGENT is running in a tmux pane mapped to
-# the worktree. Two ways to be dead: no pane maps at all (the window crashed / is gone), OR a
-# pane maps but runs a bare shell with no agent beneath it (#301: the spoke is launched as
-# `sh -c "<cmd>; exec zsh"`, so a killed claude — reboot, OOM, a human quitting it — leaves the
-# pane alive running zsh in the worktree). Before #301 only the first was checked, so the second
-# read as a healthy spoke and stranded #296/#299: never revived, and answers typed into the shell.
-#
-# The agent probe fails OPEN here — the OPPOSITE direction from the inject primitives' write-side
-# _pane_agent_ready. A write refuses on an unprovable probe (rc 2) because the cost of guessing
-# wrong is prose executed as a shell command; liveness instead keeps an unobservable pane ALIVE,
-# because the cost of guessing wrong is killing + relaunching a HEALTHY spoke. So only a PROVEN
-# dead agent (rc 1) flips a mapped pane to dead; rc 0 and rc 2 both read alive.
-# The pane target is resolved ONCE per call and reused for the probe: a second _spoke_pane_target
-# would be a second `tmux list-panes` against a loaded server, the shape that flaked #269.
-# UPGRADE: memoize the verdict per (wt, tick) if reap-tick cost becomes a problem — this went from
-# one `tmux list-panes` to list-panes + display-message + a `ps -eo` scan, and a single tick calls
-# it several times per spoke across _reap_or_resume / _afk_finish_up_or_revive / recover_dead_panes
-# (plus slot_state's own _detect_agent_dead). Not cached yet on purpose: a per-tick cache risks a
-# stale ALIVE masking a pane that crashed mid-tick, and one ps scan is cheap next to the hours of
-# stranding a miss costs — revisit only if profiling shows the probe dominating a tick.
-_spoke_pane_alive() {
-  local target rc
-  target="$(_spoke_pane_target "$1")"
-  [ -n "$target" ] || return 1     # no pane maps ⇒ the window crashed / is gone
-  _pane_agent_alive "$target"; rc=$?
-  [ "$rc" -ne 1 ]                  # rc 1 (proven dead) ⇒ dead; rc 0 alive, rc 2 unprovable ⇒ alive
-}
+# _spoke_agent_alive <wt> -> false ONLY when Orca reports the spoke's worker `exited`. Liveness
+# reads fail OPEN: a missing record, a failed read, `live` and `unverifiable` all read alive,
+# because the cost of guessing dead is restarting a HEALTHY spoke (principle #4 / #6). Walks no
+# pane and no process table: Orca owns the worker, so Orca's verdict is the probe.
+_spoke_agent_alive() { ! _spoke_agent_dead "$1"; }
 
 # _afk_default_ref <wt> -> the ref the spoke branched from, so "has commits" measures work
 # ABOVE the branch point. AFK_DEFAULT_BRANCH wins (historical top precedence, kept for
@@ -248,7 +226,7 @@ _clear_redispatch_markers() { rm -f "$(_afk_state_dir)"/redispatched-* 2>/dev/nu
 
 # --- #255: the finished-turn-idle continue-nudge counter ----------------------
 # A spoke that FINISHED its turn and stopped at the input prompt (pane alive, no dialog,
-# transcript ends on a completed assistant turn — _transcript_finished_turn_idle) is NUDGED (a
+# transcript ends on a completed assistant turn — _spoke_turn_done) is NUDGED (a
 # continue message injected into the LIVE session via the shared hardened injector) rather than
 # killed + relaunched. Bounded: after AFK_NUDGE_MAX_ATTEMPTS nudges in one window the reaper
 # falls back to the revive, so a spoke that will not resume is never nudged forever. The count
@@ -286,20 +264,6 @@ _afk_spoke_run_id() {
     id="${branch:-spoke}+$(afk_now)"
   fi
   printf '%s\n' "$id"
-}
-
-# _afk_resume_prompt <issue> -> the plain-English first message for the resumed session.
-# Deliberately NOT a slash command: `/cycle` is not a real command (the skill is
-# solo-cycle), so a seeded `/cycle` would fail and re-strand the spoke.
-_afk_resume_prompt() {
-  local issue="$1"
-  cat <<EOF
-Your session crashed and the AFK supervisor restored this window. Your committed work is
-intact -- do NOT start over. Run /source-task $issue to re-anchor, re-read your task ledger
-and the working tree to see where you left off, then continue the solo flow (RED -> GREEN ->
-REVIEW -> PUSH) from there. Push each subtask and emit the ready marker when the issue's
-acceptance criteria are all met. Do NOT self-land -- the hub lands #$issue.
-EOF
 }
 
 # _afk_nudge_prompt <issue> -> the continue-nudge message for a finished-turn-idle spoke (#255).
@@ -380,119 +344,121 @@ EOF
 }
 
 
-# _afk_continue_command <wt> <prompt> -> the `claude --continue '<prompt>'` launch
-# command for a re-opened spoke window (crash resume, wedge respawn). Pure (returns the
-# string) so it is inspectable in a test. It inline-exports the telemetry the window
-# needs to keep reaching the collector — recovery must not fly blind (#108):
-# AI_TOOLKIT_OTEL=1, the supervisor's OTLP endpoint, the workflow-span sink
-# (AI_TOOLKIT_OTEL_SPAN_ENDPOINT, #126), and the re-pinned spoke_run_id. The
-# auth header stays in the inherited env (never on the command line), exactly as
-# worktree-new.sh does. `claude --continue` resumes the crashed session in the worktree.
-# UPGRADE: replicate worktree-new.sh's full beta-tracing/raw-body env for per-tool parity.
-_afk_continue_command() {
-  local wt="$1" prompt="$2" run_id endpoint span_endpoint
-  run_id="$(_afk_spoke_run_id "$wt")"
-  endpoint="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
-  # Workflow-span sink (#126), resume parity with worktree-new.sh: telemetry.sh's
-  # cycle step:/script/hook spans are gated on this var and POST over OTLP-HTTP,
-  # so it targets the collector's :4318 listener, not the gRPC endpoint above.
-  span_endpoint="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-http://localhost:4318}"
-  printf 'AI_TOOLKIT_OTEL=1 OTEL_EXPORTER_OTLP_ENDPOINT=%s AI_TOOLKIT_OTEL_SPAN_ENDPOINT=%s OTEL_RESOURCE_ATTRIBUTES=%s claude --continue %s\n' \
-    "$(printf '%q' "$endpoint")" "$(printf '%q' "$span_endpoint")" \
-    "$(printf '%q' "spoke_run_id=$run_id")" "$(printf '%q' "$prompt")"
-}
-
-# _afk_resume_command <wt> <issue> -> the launch command for a crash-resumed window:
-# a continue with the plain-English re-anchor prompt.
-_afk_resume_command() { _afk_continue_command "$1" "$(_afk_resume_prompt "$2")"; }
-
-# _afk_wedge_respawn_command <wt> <issue> <answer> -> the launch command for a pane
-# respawned out of a wedged composer (#133): the ANSWER rides verbatim as the
-# continuation prompt — the proven manual recovery, no supervisor preamble — so the
-# respawn itself delivers what the inject could not. <issue> is unused but keeps the
-# (wt, issue, ...) call-site symmetry with _afk_resume_command.
-_afk_wedge_respawn_command() { _afk_continue_command "$1" "$3"; }
-
-# _afk_open_spoke_window <wt> <issue> <cmd> -> open a fresh tmux window in the project
-# session, cd'd into the worktree, running <cmd>. Mirrors worktree-new.sh's
-# project-session window layout. rc 1 when tmux is unavailable or the window can't be
-# opened. Shared by the crash resume and the wedge respawn (#133).
-_afk_open_spoke_window() {
-  local wt="$1" issue="$2" cmd="$3" sess win
-  command -v tmux >/dev/null 2>&1 || return 1
-  sess="$(wt_tmux_session "${MAIN_ROOT:-$(wt_main_root 2>/dev/null)}")"
-  # Name the window with the branch SLUG (the "<issue>-<slug>" worktree-new.sh convention),
-  # NOT the full "feature/<issue>-…" branch: _kill_spoke_window only matches "<issue>-"* /
-  # "<issue>", so a full-branch name would orphan the reopened window on a later reap.
-  win="$(git -C "$wt" branch --show-current 2>/dev/null)"; win="${win##*/}"; win="${win:-$issue}"
-  tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$wt" 2>/dev/null
-  tmux new-window -t "=$sess:" -n "$win" -c "$wt" "$cmd; exec ${SHELL:-zsh}" 2>/dev/null || return 1
-  # Pin the name so the running claude/zsh can't rename the window out of the kill match.
-  tmux set-window-option -t "=$sess:$win" automatic-rename off 2>/dev/null || true
-  return 0
-}
-
-# resume_spoke <wt> <issue> -> re-open the crashed spoke's window running the resume
-# command; stamp the once-per-window marker and a success span. rc 1 when the window
-# can't be opened (the caller then falls back to blocking).
-resume_spoke() {
-  local wt="$1" issue="$2"
-  log "→ resume #$issue: pane crashed with work intact — re-adopting once"
-  _afk_set_last_action "resume #$issue"
-  if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_resume_command "$wt" "$issue")"; then
-    log "  could not open a resume window for #$issue"
-    return 1
+# _afk_agent_command <wt> -> the shell command that launches the spoke's agent in a fresh Orca
+# terminal: the OTel env prefix (real process env -- Claude ignores it from settings, spike (b)),
+# the WT_SPOKE role tag, the resolved model/effort. Mirrors worktree-new.sh so a restarted spoke
+# traces to the same spoke_run_id and runs on the same model as a freshly dispatched one.
+_afk_agent_command() {
+  local wt="$1" tag top="${MAIN_ROOT:-${_AFK_TOPLEVEL:-.}}" sd prefix=""
+  tag="$(_orca_identity "$wt" issue)"; tag="${tag:-spoke}"
+  sd="$(dirname "$(_afk_find_script "${WT_NEW:-}" worktree-new.sh)")"
+  wt_resolve_agent_model "$sd" "${AI_TOOLKIT_CONFIG:-$top/settings/ai-toolkit.yml}"
+  wt_resolve_telemetry_config "${AI_TOOLKIT_CONFIG:-$top/settings/ai-toolkit.yml}"
+  AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"   # the helpers read the literal; like worktree-new.sh
+  if [ "$AI_TOOLKIT_OTEL" = 1 ]; then
+    wt_default_span_endpoint
+    prefix="$(wt_native_otel_prefix "$(_afk_spoke_run_id "$wt")" "$wt/.ai-toolkit/raw-bodies" "$(wt_repo_name "$top")")"
   fi
+  printf '%sWT_SPOKE=%q claude --model %q --effort %q --dangerously-skip-permissions\n'     "$prefix" "$tag" "$WT_AGENT_MODEL" "$WT_AGENT_EFFORT"
+}
+
+# _afk_retry_worker <wt> <issue> [prompt] -> restart the spoke's agent IN PLACE as a retry of its
+# Orca dispatch: stop (a hung `live` worker) or abandon (an `exited` one) the old worker, launch a
+# fresh agent terminal in the SAME worktree, and `worker-start --retry-of` so Orca re-seeds the
+# task. Never a second live dispatch on one worktree: after the fence it re-reads Orca and refuses
+# while ANY OTHER worker there still reads live. [prompt] rides in after the restart (conflict-resolve).
+#   rc 0 started.   rc 1 could not start (the caller warns and retries on its cadence; a terminal
+#   it opened is closed again).   rc 2 NO ACTION: Orca has no readable record, or reports the worker
+#   `unverifiable` -- unknown is never a basis to stop, abandon or restart anything (principle 6),
+#   and callers must treat it as "nothing happened" (no marks, no journal, no counts, no escalation).
+_afk_retry_worker() {
+  local wt="$1" issue="$2" prompt="${3:-}" row rc=0 did task run live cmd h="" new n
+  row="$(_orca_worker_row "$wt")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "  #$issue: Orca has no readable worker record (rc $rc) -- not restarting on an unknown state"
+    return 2
+  fi
+  did="$(printf '%s' "$row" | jq -r '.dispatchId // empty')"; task="$(printf '%s' "$row" | jq -r '.taskId // empty')"
+  run="$(printf '%s' "$row" | jq -r '.runId // empty')"; live="$(printf '%s' "$row" | jq -r '.projection.liveness.verdict // empty')"
+  case "$live" in live | exited) ;; *) log "  #$issue: worker liveness is '${live:-unknown}' -- not restarting on an unverified state"; return 2 ;; esac
+  [ -n "$did" ] && [ -n "$task" ] || { log "  #$issue: the Orca worker record lacks a dispatch/task id -- not restarting"; return 2; }
+  _afk_journal_agent "$issue" "restart: dispatch $did liveness=$live agent=$(orca_agent_state "$wt" 2>/dev/null)"
+  if [ "$live" = exited ]; then orca_worker_abandon "$did"; else orca_worker_stop "$did"; fi \
+    || { log "  #$issue: could not fence dispatch $did"; return 1; }
+  orca_tick_reset
+  n="$(orca_worker_live_count "$wt" "$did")" || n=""
+  [ "$n" = 0 ] || { log "  #$issue: Orca still lists a live worker on $wt after the fence (${n:-unreadable}) -- not starting a second one"; return 1; }
+  cmd="$(_afk_agent_command "$wt")" || return 1
+  orca_json terminal create --worktree "path:$wt" --title "$(basename "$wt")" --command "$cmd" \
+    || { log "  #$issue: terminal create failed: ${ORCA_ERR:-$ORCA_OUT}"; return 1; }
+  h="$(orca_terminal_handle)"
+  if orca_wait_agent "$h" \
+     && _orca_mutate orchestration worker-start --task "$task" --retry-of "$did" --terminal "$h" \
+          --worktree "path:$wt" ${run:+--run "$run"}; then
+    new="$(orca_dispatch_id)"
+    [ -z "$new" ] || _afk_record_dispatch "$wt" "$new"
+    orca_tick_reset
+    [ -z "$prompt" ] || deliver_text "$wt" "$prompt" || true
+    return 0
+  fi
+  log "  #$issue: the restart did not complete in terminal $h (worker-start is never re-issued): ${ORCA_ERR:-agent did not start}"
+  orca_json terminal close --terminal "$h" >/dev/null 2>&1 || true
+  return 1
+}
+
+# _afk_record_dispatch <wt> <dispatch_id> -> point the worktree's identity at the new dispatch, so
+# every later read matches the live worker row, not the fenced one. provision-worktree.sh owns the
+# identity file (its --identity-only mode, which dispatch uses too); best-effort.
+_afk_record_dispatch() {
+  local wt="$1" prov top="${MAIN_ROOT:-${_AFK_TOPLEVEL:-.}}" br tmp f="$1/.ai-toolkit/identity"
+  br="$(git -C "$wt" branch --show-current 2>/dev/null)"
+  if prov="$(_afk_find_script "${PROVISION_WORKTREE:-}" provision-worktree.sh)" \
+     && bash "$prov" --identity-only --worktree "$wt" --repo-root "$top" --issue "$(_orca_identity "$wt" issue)" \
+          ${br:+--branch "$br"} --spoke-run-id "$(_afk_spoke_run_id "$wt")" \
+          --otel-body-dir "$wt/.ai-toolkit/raw-bodies" --repo-name "$(wt_repo_name "$top")" \
+          --orca-worktree-id "$(_orca_identity "$wt" orca_worktree_id)" --run-id "$(_orca_identity "$wt" run_id)" \
+          --orca-dispatch-id "$2" >/dev/null 2>&1; then
+    return 0
+  fi
+  # Loud fallback: a stale dispatch id makes every later read match the FENCED row (deliveries refused,
+  # the new worker's questions invisible). One atomic single-key rewrite beats leaving it stale.
+  log "  WARNING: provision-worktree.sh --identity-only failed for $wt -- rewriting orca_dispatch_id directly"
+  tmp="$(mktemp "$f.XXXXXX" 2>/dev/null)" || return 0
+  { grep -v '^orca_dispatch_id=' "$f" 2>/dev/null; printf 'orca_dispatch_id=%s\n' "$2"; } > "$tmp" && mv "$tmp" "$f" || rm -f "$tmp"
+}
+
+# _afk_journal_agent <issue> <text> -> journal the Orca agent snapshot a recovery acted on.
+_afk_journal_agent() { broker_journal_decision "$1" agent-snapshot "$2" reversible; }
+
+# resume_spoke <wt> <issue> -> restart the crashed spoke's worker in place (a retry of its Orca
+# dispatch, same worktree, same spoke_run_id); stamp the once-per-window marker and a success span.
+# rc 1 when the restart could not start (the caller then falls back to warning); rc 2 = no action
+# on an unknown state (warned, nothing recorded or counted: the caller treats it as handled).
+resume_spoke() {
+  local wt="$1" issue="$2" rc
+  log "→ resume #$issue: worker exited with work intact — restarting it in place once"
+  _afk_set_last_action "resume #$issue"
+  _afk_retry_worker "$wt" "$issue"; rc=$?
+  # rc 2 = no action on an unknown state: warn (rate-limited), record and count NOTHING.
+  [ "$rc" -ne 2 ] || { _afk_warn_unknown_state "$wt" "$issue" "resume skipped"; return 2; }
+  [ "$rc" -eq 0 ] || { log "  could not restart the worker for #$issue"; return 1; }
   _afk_mark_resumed "$issue"
   stamp_progress_epoch "$issue"   # a deliberate revival resets the reap ceiling (#133)
-  # Reset the IDLE clock too (#202 C review): recover_dead_panes resumes then reap_pass runs
-  # in the SAME tick, and _spoke_idle_seconds measures the STALE transcript mtime (the fresh
-  # window has not written yet) — not the progress epoch — so a resumed idle-crashed spoke
-  # would be re-reaped as "live pane, likely hung" and its just-restored work blocked. The
-  # answer-attempt epoch is the idle clock's exclusion, so stamping it reads the revived spoke
-  # busy until its new session writes a transcript.
+  # Reset the IDLE clock too (#202 C review): the restarted agent has not written a transcript yet,
+  # and the answer-attempt epoch is the idle clock's exclusion, so stamping it reads the revived
+  # spoke busy until its new session writes.
   stamp_answer_attempt "$issue"
-  # #300 step 3: re-adopting a crashed-but-intact pane is a revive transition (cause distinct
-  # from _revive_spoke's kill-and-relaunch — this one never kills, the pane was already dead).
   _afk_tlog_transition "$wt" "$issue" revived \
-    "pane crashed with work intact — re-adopted in place once" '{"path":"resume"}'
+    "worker exited with work intact — restarted in place once" '{"path":"resume"}'
   _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
   _afk_clear_park_episode "$wt"          # #231: a fresh run may re-park → count the next block anew
   _afk_emit_span "$wt" afk-resume success
   return 0
 }
 
-# respawn_wedged_spoke <wt> <issue> <answer> -> recover a wedged composer (an
-# unterminated paste no keystroke can submit or clear, #123/#124): kill the spoke's
-# window and reopen it running `claude --continue '<answer>'` under the same
-# spoke_run_id — the respawn itself delivers the answer, so the park is resolved.
-# Delivery is CONFIRMED like an inject: the continued session must start writing its
-# transcript, else a window whose `claude` died instantly (dead auth, PATH) would be
-# scored success and the answer silently lost. rc 1 when the window can't be
-# reopened or never starts writing (the caller escalates).
-respawn_wedged_spoke() {
-  local wt="$1" issue="$2" answer="$3" before
-  log "→ respawn #$issue: composer wedged (unterminated paste) — respawning the pane with the answer"
-  before="$(_transcript_mtime "$wt")"
-  _kill_spoke_window "$issue"
-  if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_wedge_respawn_command "$wt" "$issue" "$answer")"; then
-    log "  could not open a respawn window for #$issue"
-    return 1
-  fi
-  if ! _transcript_advanced "$wt" "$before"; then
-    log "  respawned window never started writing its transcript — escalating"
-    return 1
-  fi
-  stamp_progress_epoch "$issue"   # a deliberate revival resets the reap ceiling (#133)
-  _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
-  _afk_clear_park_episode "$wt"          # #231: a fresh run may re-park → count the next block anew
-  _afk_emit_span "$wt" afk-wedge-respawn success
-  return 0
-}
-
 # --- #241 §7/§8: revive-first, warned-parked-LAST, never abandon -----------------
 # The reaper no longer kills a stuck spoke into blocked/<issue>. Every former reap TAKES a
-# revival first (kill any hung/crashed pane + relaunch `claude --continue`); only a spoke whose
+# revival first (restart any hung/crashed worker in place); only a spoke whose
 # revival was ALREADY tried this window downgrades to warned-and-parked-LAST (warn + journal +
 # arm the warned-retry backoff, retried at low frequency), NEVER killed or abandoned.
 
@@ -560,30 +526,26 @@ _warn_parked_last() {
   _afk_park_terminal "$wt"
 }
 
-# _revive_spoke <wt> <issue> -> kill any hung/crashed window and relaunch the spoke via
-# `claude --continue` under the same spoke_run_id, resetting the reap + idle clocks (#133/#202
-# C: the fresh window hasn't written a transcript yet, so stamp the answer-attempt epoch or the
-# same-tick reap_pass re-reaps it as idle). Marks the once-per-window revival. rc 1 when the
-# window could not be opened (the caller warns + retries next tick).
+# _revive_spoke <wt> <issue> -> stop a hung worker and restart it in place (a retry of its Orca
+# dispatch), resetting the reap + idle clocks (#133/#202 C: the fresh agent has not written a
+# transcript yet, so stamp the answer-attempt epoch or the same-tick reap_pass re-reaps it as
+# idle). Marks the once-per-window revival. rc 1 when the restart could not start (the caller warns
+# + retries next tick).
 _revive_spoke() {
-  local wt="$1" issue="$2"
-  log "→ revive #$issue: killing any hung/crashed pane and relaunching (claude --continue)"
+  local wt="$1" issue="$2" rc
+  log "→ revive #$issue: stopping the hung worker and restarting it in place"
   _afk_set_last_action "revive #$issue"
-  _kill_spoke_window "$issue"
-  if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_resume_command "$wt" "$issue")"; then
-    log "  could not open a revive window for #$issue"
-    return 1
-  fi
+  _afk_retry_worker "$wt" "$issue"; rc=$?
+  [ "$rc" -ne 2 ] || { _afk_warn_unknown_state "$wt" "$issue" "revive skipped"; return 2; }
+  [ "$rc" -eq 0 ] || { log "  could not restart the worker for #$issue"; return 1; }
   _afk_mark_resumed "$issue"
   stamp_progress_epoch "$issue"
   stamp_answer_attempt "$issue"
-  # #241 §10: a revival is a taken decision the morning review sees — journal it (a successful
-  # revival is not a loud warned record, just an auditable journal line + span).
+  # #241 §10: a revival is a taken decision the morning review sees — journal it.
   broker_journal_decision "$issue" revive \
-    "revived a hung/crashed pane (killed + relaunched claude --continue)" reversible
-  # #300 step 3: the drain reviving this spoke is a lifecycle transition — record it.
+    "revived a hung worker (stopped + restarted in place as a retry of its dispatch)" reversible
   _afk_tlog_transition "$wt" "$issue" revived \
-    "killed a hung/crashed pane and relaunched claude --continue" \
+    "stopped a hung worker and restarted it in place" \
     '{"path":"revive"}'
   _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
   _afk_clear_park_episode "$wt"          # #231: a fresh run may re-park → count the next block anew
@@ -591,84 +553,41 @@ _revive_spoke() {
   return 0
 }
 
-# _afk_nudge_spoke <wt> <issue> -> deliver a continue-nudge into the spoke's LIVE session via the
-# shared hardened injector (inject_and_verify: paste-buffer + verified submit — the SAME primitive
-# the answerer uses), then journal the taken decision (#255). Unlike a revive, a nudge does NOT
-# reset the wall-clock reap ceiling (progress epoch): the caller only reaches here UNDER the
-# ceiling, and an answer-attempt-shaped action must not buy a spoke a fresh full ceiling (cf. the
-# #241 §8 "answer attempts must not reset the reap clock" note). It DOES stamp the answer-attempt
-# epoch so the same-tick / next-tick reap does not immediately re-reap the just-nudged spoke off a
-# stale transcript mtime (#202 C). rc 0 when the nudge delivered, else inject_and_verify's rc (the
-# caller has already counted the attempt; a failed delivery just retries next tick until the
-# budget falls back to a revive). Caller wraps this in _afk_run_with_heartbeat_fg because
-# inject_and_verify polls up to AFK_INJECT_VERIFY_SECONDS.
-_afk_nudge_spoke() {
-  local wt="$1" issue="$2" target rc
-  log "→ nudge #$issue: finished-turn-idle — injecting a continue message into the live session (no relaunch)"
-  _afk_set_last_action "nudge #$issue"
-  target="$(_spoke_pane_target "$wt")"
-  if [ -z "$target" ]; then
-    log "  no live pane for #$issue — cannot nudge"
-    return 1
-  fi
+# _afk_send_nudge <wt> <issue> <kind> <span> <journal-text> <prompt> -> the ONE sender of every
+# nudge-shaped message into a LIVE session (continue, finish-up, pushed-unmarked, subtask route,
+# conflict-resolve): deliver_text (Orca proves turn_started; silence is retried next tick, never
+# resent), journal the taken decision under <kind>, emit the span. Stamps only the answer-attempt
+# epoch, never the progress epoch: a nudge must not buy a spoke a fresh full ceiling (#241 §8), but
+# the same-tick reap must not re-reap the just-nudged spoke off a stale transcript mtime (#202 C).
+# rc 0 when delivered; the caller has already counted the attempt. Wrap in
+# _afk_run_with_heartbeat_fg: a send may wait up to AFK_SEND_WAIT seconds.
+_afk_send_nudge() {
+  local wt="$1" issue="$2" kind="$3" span="$4" text="$5" prompt="$6" rc=0
+  _afk_set_last_action "$kind #$issue"
   stamp_answer_attempt "$issue"
-  inject_and_verify "$wt" "$target" "$(_afk_nudge_prompt "$issue")"; rc=$?
-  broker_journal_decision "$issue" nudge \
-    "finished-turn-idle: injected a continue-nudge into the live session (no relaunch)" reversible
-  # #300 step 3: the #255 nudge lane records its event (delivered vs retry via the rc), so a
-  # reader can tell "the drain nudged this spoke" apart from "the spoke is silently idle".
-  _afk_tlog_event "$wt" "$issue" nudge nudge \
+  deliver_text "$wt" "$prompt" || rc=$?
+  broker_journal_decision "$issue" "$kind" "$text" reversible
+  [ "$kind" != nudge ] || _afk_tlog_event "$wt" "$issue" nudge nudge \
     "{\"delivered\":$([ "$rc" -eq 0 ] && printf true || printf false)}"
-  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-nudge success; else _afk_emit_span "$wt" afk-nudge retry; fi
+  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" "$span" success; else _afk_emit_span "$wt" "$span" retry; fi
   return "$rc"
 }
-
-# _afk_finish_up_nudge <wt> <issue> -> #256: an over-ceiling spoke whose ledger is near-complete
-# gets a FINISH-UP nudge (emit ready / final push) injected into its LIVE session, instead of the
-# kill + relaunch a blind ceiling reap would do. Mirrors _afk_nudge_spoke but carries the finish-up
-# prompt and journals a DISTINCT `finish-up` decision + span, so the morning review sees "ceiling
-# hit -> nudged to finish, not reaped" (AC3). Like the #255 nudge it stamps only the answer-attempt
-# epoch, never the progress epoch — a finishing spoke must not buy a fresh full ceiling. rc mirrors
-# inject_and_verify (the caller already counted the attempt; a failed delivery retries next tick
-# until the shared nudge budget falls back to the revive).
+_afk_nudge_spoke() {
+  log "→ nudge #$2: finished-turn-idle — sending a continue message into the live session (no restart)"
+  _afk_send_nudge "$1" "$2" nudge afk-nudge \
+    "finished-turn-idle: sent a continue-nudge into the live session (no restart)" "$(_afk_nudge_prompt "$2")"
+}
 _afk_finish_up_nudge() {
-  local wt="$1" issue="$2" target rc
-  log "→ finish-up #$issue: over the time ceiling but ledger near-complete — nudging it to emit ready / final push (no relaunch)"
-  _afk_set_last_action "finish-up #$issue"
-  target="$(_spoke_pane_target "$wt")"
-  if [ -z "$target" ]; then
-    log "  no live pane for #$issue — cannot nudge"
-    return 1
-  fi
-  stamp_answer_attempt "$issue"
-  inject_and_verify "$wt" "$target" "$(_afk_finish_up_prompt "$issue")"; rc=$?
-  broker_journal_decision "$issue" finish-up \
-    "time ceiling hit but ledger near-complete — nudged to finish (emit ready / final push), not reaped (#256)" reversible
-  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-finish-up success; else _afk_emit_span "$wt" afk-finish-up retry; fi
-  return "$rc"
+  log "→ finish-up #$2: over the time ceiling but ledger near-complete — nudging it to emit ready / final push (no restart)"
+  _afk_send_nudge "$1" "$2" finish-up afk-finish-up \
+    "time ceiling hit but ledger near-complete — nudged to finish (emit ready / final push), not reaped (#256)" \
+    "$(_afk_finish_up_prompt "$2")"
 }
-
-# _afk_pushed_unmarked_nudge <wt> <issue> -> #305: the first rung of the pushed-but-unmarked ACT
-# ladder. Injects the emit-ready / continue nudge (_afk_pushed_unmarked_prompt) into the LIVE
-# session via the shared hardened injector, then journals a `markready` decision. Mirrors
-# _afk_finish_up_nudge: stamps only the answer-attempt epoch (never the progress epoch — a nudge
-# must not buy a fresh full ceiling), and rc mirrors inject_and_verify (the caller counts the
-# attempt against the shared #255 budget). Caller wraps this in _afk_run_with_heartbeat_fg.
 _afk_pushed_unmarked_nudge() {
-  local wt="$1" issue="$2" target rc
-  log "→ pushed-unmarked-nudge #$issue: clean pushed tip, no ready marker — injecting the emit-ready / continue nudge (no relaunch)"
-  _afk_set_last_action "pushed-unmarked-nudge #$issue"
-  target="$(_spoke_pane_target "$wt")"
-  if [ -z "$target" ]; then
-    log "  no live pane for #$issue — cannot nudge"
-    return 1
-  fi
-  stamp_answer_attempt "$issue"
-  inject_and_verify "$wt" "$target" "$(_afk_pushed_unmarked_prompt "$issue")"; rc=$?
-  broker_journal_decision "$issue" markready \
-    "pushed-but-unmarked: nudged the live session to emit ready / continue the cycle (no relaunch, #305)" reversible
-  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-pushed-unmarked-nudge success; else _afk_emit_span "$wt" afk-pushed-unmarked-nudge retry; fi
-  return "$rc"
+  log "→ pushed-unmarked-nudge #$2: clean pushed tip, no ready marker — sending the emit-ready / continue nudge (no restart)"
+  _afk_send_nudge "$1" "$2" markready afk-pushed-unmarked-nudge \
+    "pushed-but-unmarked: nudged the live session to emit ready / continue the cycle (no restart, #305)" \
+    "$(_afk_pushed_unmarked_prompt "$2")"
 }
 
 # _afk_crash_reresume_or_escalate <wt> <issue> <reason> <retry_fn> -> the #310 crash terminus that
@@ -697,13 +616,16 @@ _afk_crash_reresume_or_escalate() {
   attempts="$(_afk_warn_attempt "$issue" "$lane")"
   max="$AFK_WARN_ESCALATE_ATTEMPTS"
   if [ "$attempts" -lt "$max" ]; then
-    local msg="$reason — re-attempting the revival (attempt $(( attempts + 1 ))/$max)"
+    local msg="$reason — re-attempting the revival (attempt $(( attempts + 1 ))/$max)" rrc=0
     log "→ crash-reresume #$issue: $msg"
     _afk_set_last_action "crash-reresume #$issue"
+    "$retry_fn" "$wt" "$issue" || rrc=$?
+    # rc 2: the retry took NO action on an unknown state (and already warned). It was not an attempt:
+    # count, journal and arm NOTHING, so no-ops can never burn the budget toward a blocked escalation.
+    [ "$rrc" -ne 2 ] || return 0
     broker_journal_decision "$issue" reap "$msg" reversible
     _afk_warned_arm "$issue" "$lane"                    # advance the backoff for the next attempt/escalation
-    "$retry_fn" "$wt" "$issue" \
-      || log "  crash-reresume #$issue: revival relaunch could not be started; retrying next cadence"
+    [ "$rrc" -eq 0 ] || log "  crash-reresume #$issue: revival relaunch could not be started; retrying next cadence"
     return 0
   fi
   _afk_crash_escalate_or_park "$wt" "$issue" "$reason — resume budget exhausted (${max} attempts)"
@@ -740,8 +662,8 @@ _afk_revive_or_park_last() {
     _afk_crash_reresume_or_escalate "$wt" "$issue" "$reason — revival already tried this window" _revive_spoke
     return 0
   fi
-  _revive_spoke "$wt" "$issue" \
-    || _warn_parked_last "$wt" "$issue" "$reason — revival launch could not be started; retrying"
+  _revive_spoke "$wt" "$issue"
+  case $? in 0 | 2) ;; *) _warn_parked_last "$wt" "$issue" "$reason — revival launch could not be started; retrying" ;; esac
 }
 
 # _afk_finish_up_or_revive <wt> <issue> <reason> -> #256: the ceiling-hit decision. A spoke over
@@ -757,18 +679,18 @@ _afk_finish_up_or_revive() {
   # Signal 1: a clean pushed-ahead tip with no marker (#200) — surface it actionably (re-run
   # --ready / land by hand), never kill. (In _reap_or_resume the live case is already caught
   # upstream; keeping it here makes the fn self-contained + correct for both call sites.)
-  if _spoke_pane_alive "$wt" && _afk_pushed_but_unmarked "$wt" "$issue"; then
+  if _spoke_agent_alive "$wt" && _afk_pushed_but_unmarked "$wt" "$issue"; then
     _afk_warn_pushed_but_unmarked "$wt" "$issue"
     return 0
   fi
   # Signal 2: a near-complete task ledger on a finished-turn-idle pane — nudge it to finish up
-  # (emit ready / final push) rather than relaunch. Gated on _transcript_finished_turn_idle so the
+  # (emit ready / final push) rather than relaunch. Gated on _spoke_turn_done so the
   # pane is genuinely at the prompt and the nudge can land (a near-complete-but-hung pane falls
   # through to the revive). Bounded by the SHARED per-window nudge budget (#255) so a spoke that
   # will not finish still falls through to the revive.
-  if _spoke_pane_alive "$wt" \
+  if _spoke_agent_alive "$wt" \
      && _afk_ledger_near_complete "$wt" \
-     && _transcript_finished_turn_idle "$wt" \
+     && _spoke_turn_done "$wt" \
      && [ "$(_afk_read_nudge_count "$issue")" -lt "$AFK_NUDGE_MAX_ATTEMPTS" ]; then
     _afk_incr_nudge_count "$issue" >/dev/null
     _afk_run_with_heartbeat_fg _afk_finish_up_nudge "$wt" "$issue"
@@ -808,22 +730,23 @@ _afk_warn_pushed_but_unmarked() {
 #                continue nudge injected into its LIVE session (no relaunch). This is exactly the
 #                lane the pushed-but-unmarked warn short-circuited PAST before #305.
 #   2. relaunch— nudge budget spent (or the pane is hung/dead) and not yet revived this window ->
-#                _revive_spoke (kill + claude --continue; committed work survives, as #299's did).
+#                _revive_spoke (stop + restart in place; committed work survives, as #299's did).
 #   3. decide  — nudge budget spent AND already revived -> _afk_decide_pushed_but_unmarked: a LOUD
 #                terminal blocked/<issue> escalation (never an auto-land of ambiguous work).
 # Because blocked/<issue> at the tip reads terminal (`done`) in slot_state, the decide rung takes the
 # spoke OUT of the reap rotation — the ladder always terminates.
 _afk_act_pushed_but_unmarked() {
   local wt="$1" issue="$2"
-  if _spoke_pane_alive "$wt" \
-     && _transcript_finished_turn_idle "$wt" \
+  if _spoke_agent_alive "$wt" \
+     && _spoke_turn_done "$wt" \
      && [ "$(_afk_read_nudge_count "$issue")" -lt "$AFK_NUDGE_MAX_ATTEMPTS" ]; then
     _afk_incr_nudge_count "$issue" >/dev/null
     _afk_run_with_heartbeat_fg _afk_pushed_unmarked_nudge "$wt" "$issue"
     return 0
   fi
   if ! _afk_already_resumed "$issue"; then
-    _revive_spoke "$wt" "$issue" && return 0
+    _revive_spoke "$wt" "$issue"
+    case $? in 0 | 2) return 0 ;; esac   # rc 2: nothing done on an unknown state, already warned
     # revival launch could not start — fall through to the terminal decision.
   fi
   _afk_decide_pushed_but_unmarked "$wt" "$issue"
@@ -852,7 +775,7 @@ _reap_or_resume() {
   local wt="$1" issue="$2"
   # #246 defense-in-depth: a spoke still parked on an answerable dialog (a permission prompt, a
   # PLAN gate, or an extractable question) must be ANSWERED, not revived — reviving via
-  # `claude --continue` only re-raises the identical dialog (the parked->reaped->revived->parked
+  # a restart only re-raises the identical dialog (the parked->reaped->revived->parked
   # loop). slot_state already keeps a detected park out of `reap`, so this only fires on a
   # same-tick slot_state flicker (answer_pass and reap_pass re-derive state independently) or a
   # future regression. _spoke_still_parked is a POSITIVE signal, so an ambiguous read falls
@@ -866,7 +789,7 @@ _reap_or_resume() {
   fi
   # #200/#241: a live pane at a clean-pushed tip with no marker is warned-and-parked-LAST with an
   # actionable reason (NOT auto-marked/auto-landed — the shape is ambiguous with idle-between-subtasks).
-  if _spoke_pane_alive "$wt" && _afk_pushed_but_unmarked "$wt" "$issue"; then
+  if _spoke_agent_alive "$wt" && _afk_pushed_but_unmarked "$wt" "$issue"; then
     _afk_warn_pushed_but_unmarked "$wt" "$issue"
     return 0
   fi
@@ -874,8 +797,8 @@ _reap_or_resume() {
     # #256: not automatically a runaway — a near-complete ledger / clean pushed-ahead tip is
     # nudged to finish up (or warned), not blind-revived; only a NO-signal spoke revives.
     _afk_finish_up_or_revive "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
-  elif _spoke_pane_alive "$wt" \
-       && _transcript_finished_turn_idle "$wt" \
+  elif _spoke_agent_alive "$wt" \
+       && _spoke_turn_done "$wt" \
        && [ "$(_afk_read_nudge_count "$issue")" -lt "$AFK_NUDGE_MAX_ATTEMPTS" ]; then
     # #255: the FINISHED-TURN-IDLE class — the spoke finished its turn and stopped at the input
     # prompt (transcript ends on a completed assistant turn, no pending tool_use), distinct from a
@@ -885,7 +808,7 @@ _reap_or_resume() {
     # up to AFK_INJECT_VERIFY_SECONDS) like answer_pass's decide_and_act call.
     _afk_incr_nudge_count "$issue" >/dev/null
     _afk_run_with_heartbeat_fg _afk_nudge_spoke "$wt" "$issue"
-  elif _spoke_pane_alive "$wt"; then
+  elif _spoke_agent_alive "$wt"; then
     # #241 §8: a live-but-frozen claude (hung mid-tool_use), or a finished-turn-idle spoke past its
     # nudge budget, is a REVIVAL case (kill the hung pane + relaunch), not a terminal block. answer
     # attempts must not reset the reap clock, so this is a revival, not a re-answer.
@@ -895,8 +818,8 @@ _reap_or_resume() {
   elif _afk_already_resumed "$issue"; then
     _afk_crash_reresume_or_escalate "$wt" "$issue" "pane crashed again after an auto-resume" resume_spoke
   else
-    resume_spoke "$wt" "$issue" \
-      || _warn_parked_last "$wt" "$issue" "pane crashed and the auto-resume could not be launched — retrying"
+    resume_spoke "$wt" "$issue"
+    case $? in 0 | 2) ;; *) _warn_parked_last "$wt" "$issue" "pane crashed and the auto-resume could not be launched — retrying" ;; esac
   fi
 }
 
@@ -1056,31 +979,36 @@ reap_pass() {
 # A live pane and a terminal/parked spoke (done/waiting) are left untouched — reap_pass owns
 # the idle/hung decision, auto_land owns done, the answerer owns waiting.
 
-# _redispatch_dead_pane <wt> <issue> -> tear down a clean, empty crashed worktree so its
-# issue returns to the backlog and re-dispatches next tick. Kills the window, then removes
-# the worktree via worktree-done.sh (--force since the pane is dead). Records the once-per-window
-# stamp on success. AFK_REDISPATCH_CMD overrides the teardown for tests. rc 1 when the teardown
-# can't run (caller escalates).
-_redispatch_dead_pane() {
-  local wt="$1" issue="$2" wt_done run
+# _redispatch_exited_spoke <wt> <issue> -> tear down a clean, empty exited worktree so its issue
+# returns to the backlog and re-dispatches next tick: abandon the exited worker, release its
+# terminal, then worktree-done.sh (#364) removes the worktree through Orca. Records the
+# once-per-window stamp on success. AFK_REDISPATCH_CMD overrides the teardown for tests. rc 1 when
+# the teardown can't run (caller warns); an unreadable Orca record is rc 1 with nothing touched.
+_redispatch_exited_spoke() {
+  local wt="$1" issue="$2" wt_done run did
   # #300 step 3: read the run id BEFORE the teardown — worktree-done.sh removes the worktree,
   # so .ai-toolkit/spoke-run-id is gone by the time we'd record the redispatched transition.
   run="$(_afk_spoke_run_id "$wt")"
-  log "→ redispatch #$issue: pane crashed with no work to preserve — tearing down the empty worktree so it re-dispatches"
-  _kill_spoke_window "$issue"
+  log "→ redispatch #$issue: worker exited with no work to preserve — tearing down the empty worktree so it re-dispatches"
   if [ -n "${AFK_REDISPATCH_CMD:-}" ]; then
     bash -c "$AFK_REDISPATCH_CMD"; _afk_mark_redispatched "$issue"
     AFK_TLOG_RUN="$run" wt_tlog_transition "$issue" redispatched hub-afk.sh \
-      "pane crashed with no work to preserve — tore down the empty worktree to re-dispatch" \
+      "worker exited with no work to preserve — tore down the empty worktree to re-dispatch" \
       '{"path":"redispatch-cmd"}'
     return 0
   fi
+  did="$(orca_worker_field "$wt" '.dispatchId' 2>/dev/null)" && [ -n "$did" ] \
+    || { log "  no readable Orca worker record for #$issue — leaving the worktree in place"; return 1; }
   wt_done="$(_afk_find_script "${WT_DONE:-}" worktree-done.sh)" \
     || { log "  worktree-done.sh not found — cannot re-dispatch #$issue"; return 1; }
+  _afk_journal_agent "$issue" "redispatch: dispatch $did liveness=$(orca_worker_liveness "$wt" 2>/dev/null) agent=$(orca_agent_state "$wt" 2>/dev/null)"
+  _hi_span "$wt" --kind lifecycle --name orca:release --phase teardown   # before the release: the worktree is about to go
+  orca_worker_abandon "$did" && orca_worker_release "$did" \
+    || { log "  could not abandon/release dispatch $did for #$issue — leaving the worktree in place"; return 1; }
   if bash "$wt_done" "$issue" --force >/dev/null 2>&1; then
     _afk_mark_redispatched "$issue"
     AFK_TLOG_RUN="$run" wt_tlog_transition "$issue" redispatched hub-afk.sh \
-      "pane crashed with no work to preserve — tore down the empty worktree to re-dispatch" \
+      "worker exited with no work to preserve — tore down the empty worktree to re-dispatch" \
       '{"path":"worktree-done"}'
     return 0
   fi
@@ -1096,14 +1024,11 @@ recover_dead_panes() {
     # `done` is terminal regardless of liveness (a ready/accept/blocked marker is a human/gate
     # decision — never revive over it).
     case "$state" in done) continue ;; esac
-    # `waiting` means "parked, the answer lane owns it" — but a park is only real if the AGENT is
-    # there to be answered. #301: a dead agent whose pane still renders a stale dialog, or carries
-    # a gate/<issue> tag at the tip (the #296/#299 shape), classifies `waiting` off scrollback / a
-    # git tag that outlived the agent; skipping such a pane here would strand the very crash this
-    # function exists to recover. So honor `waiting` (and hand the live pane to reap_pass) only
-    # when the agent is alive — ST3 also stops slot_state emitting it, this is the belt to that
-    # braces. Probed ONCE (a second _spoke_pane_alive is a second `tmux list-panes` — the #269 flake).
-    if _spoke_pane_alive "$path"; then continue; fi        # live pane — reap_pass / answer lane own it
+    # `waiting` means "parked, the answer lane owns it" — but a park is only real if the worker is
+    # there to be answered. #301: an exited worker whose gate tag lingers at the tip classified
+    # `waiting` off state that outlived it; slot_state no longer emits `waiting` for an exited
+    # worker, and this probe hands only a LIVE (or unknowable) worker to reap_pass / the answer lane.
+    if _spoke_agent_alive "$path"; then continue; fi
     # An over-ceiling runaway always blocks (as reap_pass does) — resume/re-dispatch never
     # applies. Checked first so a crashed-but-over-ceiling spoke is not revived here only to
     # be blocked by reap_pass in the same tick (the hard ceiling ignores fresh progress).
@@ -1116,13 +1041,13 @@ recover_dead_panes() {
       if _afk_already_resumed "$issue"; then
         _afk_crash_reresume_or_escalate "$path" "$issue" "pane crashed again after an auto-resume" resume_spoke
       else
-        resume_spoke "$path" "$issue" \
-          || _warn_parked_last "$path" "$issue" "pane crashed and the auto-resume could not be launched — retrying"
+        resume_spoke "$path" "$issue"
+        case $? in 0 | 2) ;; *) _warn_parked_last "$path" "$issue" "pane crashed and the auto-resume could not be launched — retrying" ;; esac
       fi
     elif _afk_already_redispatched "$issue"; then
       _warn_parked_last "$path" "$issue" "pane crashed clean again after a re-dispatch — parked LAST, retried at low frequency"
     else
-      _redispatch_dead_pane "$path" "$issue" \
+      _redispatch_exited_spoke "$path" "$issue" \
         || _warn_parked_last "$path" "$issue" "pane crashed clean and the worktree teardown failed — retrying"
     fi
   done < <(inflight_worktrees)

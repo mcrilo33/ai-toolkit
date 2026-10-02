@@ -3,7 +3,6 @@
 See shared/skills/hub/scripts/gate-broker-classify.sh.
 """
 
-import json
 from pathlib import Path
 
 import pytest
@@ -12,11 +11,9 @@ from _gate_broker_support import (
     _classify_with_wt,
     _decide,
     _hook_payload,
-    _named_tool_record,
-    _project_dir_for,
-    _read_tool_record,
     _scratchpad_for,
 )
+from _orca_stub import orca_park
 
 
 @pytest.fixture(autouse=True)
@@ -695,35 +692,36 @@ def test_classify_permission_mutation_lane_inert_without_worktree() -> None:
     assert result.stdout.strip() == "ESCALATE"
 
 
-def test_extract_pending_command_carries_read_target(spoke_repo: Path, tmp_path: Path) -> None:
-    # A Read tool_use surfaces as "Read <file_path>" — the name AND its target — so the
+def test_extract_pending_command_carries_read_target(spoke_repo: Path, orca_bin: Path) -> None:
+    # A Read tool surfaces as "Read <file_path>" -- the name AND its target -- so the
     # classifier can vet the path, not just default-deny the bare tool name.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
     target = spoke_repo / "scripts" / "x.sh"
-    (pd / "session.jsonl").write_text(json.dumps(_read_tool_record(str(target))) + "\n")
+    orca_park(orca_bin, spoke_repo, state="waiting", tool="Read", tool_input=str(target))
 
-    result = _call(
-        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
+    result = _call(f"extract_pending_command '{spoke_repo}'")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == f"Read {target}"
 
 
 def test_extract_pending_command_other_tool_stays_bare_name(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, orca_bin: Path
 ) -> None:
-    # A non-Read tool still surfaces as its bare name (no target) — unchanged default-deny.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    (pd / "session.jsonl").write_text(
-        json.dumps(_named_tool_record("Write", {"file_path": "/x", "content": "y"})) + "\n"
-    )
+    # A non-Read tool still surfaces as its bare name (no target) -- unchanged default-deny.
+    orca_park(orca_bin, spoke_repo, state="waiting", tool="Write", tool_input="/x")
 
-    result = _call(
-        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
+    result = _call(f"extract_pending_command '{spoke_repo}'")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "Write"
+
+
+def test_extract_pending_command_is_empty_for_a_truncated_input(
+    spoke_repo: Path, orca_bin: Path
+) -> None:
+    # A clipped command could hide a risky segment behind a benign prefix: read as unreadable.
+    orca_park(orca_bin, spoke_repo, state="waiting", tool="Bash", tool_input="git status \u2026")
+
+    result = _call(f"extract_pending_command '{spoke_repo}'")
+
+    assert result.stdout.strip() == ""

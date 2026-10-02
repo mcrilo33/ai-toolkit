@@ -27,16 +27,10 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
-import _stubs
 import pytest
-from _gate_broker_support import (
-    _DISPLAY_CASE,
-    _PANE_PID,
-    _agent_ps_stub,
-    _fake_tmux_pane,
-)
-from _orca_stub import install_orca_stub
+from _orca_stub import install_forbidden_stubs, install_orca_stub, orca_calls, orca_park
 from _stubs import write_stub
 from bash_session import BashSession, fresh_call
 
@@ -184,6 +178,15 @@ def _call(
 
 def _epoch(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> int:
     return int(datetime.datetime(year, month, day, hour, minute, tzinfo=datetime.UTC).timestamp())
+
+
+def _orca_sent_texts(orca_bin: Path) -> list[str]:
+    """The `--text` of every `orca terminal send` the code under test made, in order."""
+    return [
+        argv[argv.index("--text") + 1]
+        for argv in orca_calls(orca_bin)
+        if argv[:2] == ["terminal", "send"]
+    ]
 
 
 def test_hub_afk_lib_is_sourced_once_per_module() -> None:
@@ -419,94 +422,59 @@ def test_classify_permission_escalate_carries_reason() -> None:
 
 
 # ── permission-dialog detection + handling (issue #149) ───────────────────────
-# A Claude Code PERMISSION dialog is a pane-only surface (no transcript entry); the
-# supervisor detects it from the pane + the trailing tool_use command, classifies it,
-# and either injects "Yes" (safe self-op) or escalates to blocked/<issue> (risky).
+# A Claude Code PERMISSION dialog is the agent `waiting` in Orca (its tool name and input are
+# in `worktree ps`); the supervisor classifies the command and either sends "1" (safe
+# self-op) or has the reasoner decide (risky).
 
 
-def _bash_tool_record(command: str) -> dict:
-    return {
-        "type": "assistant",
-        "message": {
-            "content": [
-                {"type": "tool_use", "name": "Bash", "id": "tu_1", "input": {"command": command}}
-            ]
-        },
-    }
-
-
-def _tool_record(name: str) -> dict:
-    return {
-        "type": "assistant",
-        "message": {"content": [{"type": "tool_use", "name": name, "id": "tu_1", "input": {}}]},
-    }
-
-
-_PROMPT = "Bash command\n  git reset -q\nDo you want to proceed?\n❯ 1. Yes\n  2. No"
-
-
-def test_extract_pending_command_reads_trailing_bash(tmp_path: Path) -> None:
-    projects = tmp_path / "projects"
-    wt = tmp_path / "spoke"
-    pd = _project_dir_for(projects, wt)
-    _write_transcript(pd, [_bash_tool_record("git reset -q; git add tests/x.py")])
-
-    result = _call(f"extract_pending_command '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)})
-
-    assert result.stdout.strip() == "git reset -q; git add tests/x.py"
-
-
-def test_extract_pending_command_returns_tool_name_for_non_bash(tmp_path: Path) -> None:
-    # A non-Bash tool (browser/computer/mcp) yields its NAME, so the classifier escalates it.
-    projects = tmp_path / "projects"
-    wt = tmp_path / "spoke"
-    pd = _project_dir_for(projects, wt)
-    _write_transcript(pd, [_tool_record("mcp__claude-in-chrome__navigate")])
-
-    result = _call(f"extract_pending_command '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)})
-
-    assert result.stdout.strip() == "mcp__claude-in-chrome__navigate"
-
-
-def test_pane_shows_permission_prompt_true(spoke_repo: Path, tmp_path: Path) -> None:
-    fake_bin, _ = _injector_tmux(tmp_path, capture=_PROMPT, pane_path=spoke_repo)
-
-    result = _call(
-        f"_pane_shows_permission_prompt '{spoke_repo}'; echo RC=$?",
-        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
-    )
-
-    assert result.stdout.strip().splitlines()[-1] == "RC=0", result.stdout + result.stderr
-
-
-def test_pane_shows_permission_prompt_false_without_signature(
-    spoke_repo: Path, tmp_path: Path
+@pytest.mark.parametrize(
+    "tool,tool_input,expected",
+    [
+        ("Bash", "git reset -q; git add tests/x.py", "git reset -q; git add tests/x.py"),
+        ("Read", "/a/b.py", "Read /a/b.py"),
+        # A non-Bash tool (browser/computer/mcp) yields its NAME, so the classifier escalates it.
+        ("mcp__claude-in-chrome__navigate", "{}", "mcp__claude-in-chrome__navigate"),
+        # A clipped command could hide a risky segment behind a benign prefix: unreadable.
+        ("Bash", "git reset -q; git add tests/…", ""),
+    ],
+)
+def test_extract_pending_command_reads_the_waiting_tool(
+    spoke_repo: Path, orca_bin: Path, tool: str, tool_input: str, expected: str
 ) -> None:
-    fake_bin, _ = _injector_tmux(tmp_path, capture="just working, no dialog", pane_path=spoke_repo)
+    orca_park(orca_bin, spoke_repo, state="waiting", tool=tool, tool_input=tool_input)
 
-    result = _call(
-        f"_pane_shows_permission_prompt '{spoke_repo}'; echo RC=$?",
-        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
-    )
+    result = _call(f"extract_pending_command '{spoke_repo}'")
 
-    assert result.stdout.strip().splitlines()[-1] == "RC=1", result.stdout + result.stderr
+    assert result.stdout.strip() == expected
 
 
-def test_slot_state_waiting_on_permission_dialog(spoke_repo: Path, tmp_path: Path) -> None:
+def test_extract_pending_command_empty_when_not_waiting(spoke_repo: Path, orca_bin: Path) -> None:
+    orca_park(orca_bin, spoke_repo, state="working", tool="Bash", tool_input="ls")
+
+    result = _call(f"extract_pending_command '{spoke_repo}'")
+
+    assert result.stdout.strip() == ""
+
+
+@pytest.mark.parametrize(
+    "tool,pending",
+    [("Bash", "yes"), ("AskUserQuestion", "no")],
+)
+def test_permission_pending_excludes_ask_user_question(
+    spoke_repo: Path, orca_bin: Path, tool: str, pending: str
+) -> None:
+    orca_park(orca_bin, spoke_repo, state="waiting", tool=tool, tool_input="{}")
+
+    result = _call(f"_permission_pending '{spoke_repo}' && echo yes || echo no")
+
+    assert result.stdout.strip() == pending
+
+
+def test_slot_state_waiting_on_permission_dialog(spoke_repo: Path, orca_bin: Path) -> None:
     # A spoke parked on a permission dialog is 'waiting' (answerable), never reaped as idle.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_bash_tool_record("git reset -q")])
-    fake_bin, _ = _injector_tmux(tmp_path, capture=_PROMPT, pane_path=spoke_repo)
+    orca_park(orca_bin, spoke_repo, state="waiting", tool="Bash", tool_input="git reset -q")
 
-    result = _call(
-        f"slot_state '{spoke_repo}' 5",
-        env={
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_IDLE_MINUTES": "0",  # would reap on idle if not caught as waiting
-        },
-    )
+    result = _call(f"slot_state '{spoke_repo}' 5", env={"AFK_IDLE_MINUTES": "0"})
 
     assert result.stdout.strip() == "waiting", result.stdout + result.stderr
 
@@ -519,60 +487,41 @@ def _blocked_recording_ready(tmp_path: Path) -> tuple[Path, Path]:
     return stub, log
 
 
-def test_decide_and_act_approves_safe_permission(spoke_repo: Path, tmp_path: Path) -> None:
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_bash_tool_record("git reset -q; git add tests/x.py")])
-    jsonl = pd / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    ready_stub, ready_log = _blocked_recording_ready(tmp_path)
-    # capture-pane shows the prompt; the first Enter clears it and touches the transcript
-    # (the spoke resuming), so approve_permission's _transcript_advanced confirms.
-    fake_bin, tmux_log = _injector_tmux(
-        tmp_path, capture=_PROMPT, pane_path=spoke_repo, clear_on_enter=1, touch=jsonl
+def test_decide_and_act_approves_safe_permission(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    orca_park(
+        orca_bin, spoke_repo, state="waiting", tool="Bash", tool_input="git reset -q; git add x.py"
     )
+    ready_stub, ready_log = _blocked_recording_ready(tmp_path)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "SPOKE_READY": str(ready_stub),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-        "AFK_STATE_DIR": str(statedir),
-    }
+    env = {"SPOKE_READY": str(ready_stub), "AFK_STATE_DIR": str(statedir)}
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    calls = tmux_log.read_text()
-    assert "send-keys -t afk:1 1" in calls, calls  # selected option 1 (Yes), not 2
+    assert _orca_sent_texts(orca_bin) == ["1"]  # option 1 (Yes), this once
     assert not ready_log.exists(), f"safe permission must NOT escalate: {ready_log.read_text()}"
 
 
 def test_decide_and_act_risky_permission_reasoner_denies_and_warns(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # #241: a risky permission the mechanical classifier will not auto-approve no longer parks
     # the spoke blocked/<issue>. It routes to the always-answering reasoner (stubbed to DENY),
     # which declines the command and injects the reversible-path guidance — warned, not blocked,
     # and never auto-approved.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_bash_tool_record("git push origin main")])
+    orca_park(orca_bin, spoke_repo, state="waiting", tool="Bash", tool_input="git push origin main")
     ready_stub, ready_log = _blocked_recording_ready(tmp_path)
-    fake_bin, tmux_log = _injector_tmux(tmp_path, capture=_PROMPT, pane_path=spoke_repo)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
         "SPOKE_READY": str(ready_stub),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_STATE_DIR": str(statedir),
         "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: irreversible\\nANSWER: DENY: push a feature branch and open a PR instead'",
         "AFK_JOURNAL_GH_COMMENT": "0",
         "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-        "AFK_INJECT_POLL_SECONDS": "0",
     }
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
@@ -582,9 +531,9 @@ def test_decide_and_act_risky_permission_reasoner_denies_and_warns(
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "a risky permission must warn-and-continue, not escalate to blocked"
     )
-    assert "send-keys -t afk:1 1" not in tmux_log.read_text(), (
-        "must not auto-approve a risky command"
-    )
+    sent = _orca_sent_texts(orca_bin)
+    assert "1" not in sent, "must not auto-approve a risky command"
+    assert any("push a feature branch" in text for text in sent)
     assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned"
     assert "irreversible" in (statedir / "decision-journal.jsonl").read_text()
 
@@ -631,118 +580,49 @@ def _ask_record(question: str, options: list[tuple[str, str]]) -> dict:
     }
 
 
-def _gate_park_records(
-    issue: int, plan: str = "Plan: do X then Y. Reply to approve."
-) -> list[dict]:
-    """Transcript of a PLAN-gate park: an assistant turn that prints the plan prose and
-    runs `spoke-ready.sh --gate <issue>` (no AskUserQuestion), then that Bash's tool_result.
-    """
-    return [
-        {
-            "type": "assistant",
-            "message": {
-                "content": [
-                    {"type": "text", "text": plan},
-                    {
-                        "type": "tool_use",
-                        "name": "Bash",
-                        "id": "tu_gate",
-                        "input": {"command": f"bash scripts/spoke-ready.sh --gate {issue}"},
-                    },
-                ]
-            },
-        },
-        {
-            "type": "user",
-            "message": {
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "tu_gate",
-                        "content": f"emitted gate/{issue}",
-                    }
-                ]
-            },
-        },
-    ]
-
-
-def test_extract_pending_question_reads_open_ask(tmp_path: Path) -> None:
-    projects = tmp_path / "projects"
-    wt = tmp_path / "wt"
-    pd = _project_dir_for(projects, wt)
-    _write_transcript(
-        pd, [_ask_record("Which store?", [("Redis", "fast"), ("Postgres", "durable")])]
+def test_extract_pending_question_reads_stray_ask_user_question(
+    spoke_repo: Path, orca_bin: Path
+) -> None:
+    ask = {
+        "questions": [
+            {
+                "question": "Which store?",
+                "options": [
+                    {"label": "Redis", "description": "fast"},
+                    {"label": "Postgres", "description": "durable"},
+                ],
+            }
+        ]
+    }
+    orca_park(
+        orca_bin, spoke_repo, state="waiting", tool="AskUserQuestion", tool_input=json.dumps(ask)
     )
 
-    result = _call(
-        f"extract_pending_question '{wt}'",
-        env={"CLAUDE_PROJECTS_DIR": str(projects)},
-    )
+    result = _call(f"extract_pending_question '{spoke_repo}'")
 
     assert "Q: Which store?" in result.stdout
     assert "Redis: fast" in result.stdout
     assert "Postgres: durable" in result.stdout
 
 
-def test_extract_pending_question_reads_trailing_notification(tmp_path: Path) -> None:
-    projects = tmp_path / "projects"
-    wt = tmp_path / "wt"
-    pd = _project_dir_for(projects, wt)
-    _write_transcript(
-        pd,
-        [
-            {
-                "type": "assistant",
-                "message": {"content": [{"type": "text", "text": "Plan: do X. Reply to approve."}]},
-            },
-            {"type": "notification", "message": {"content": "waiting"}},
-        ],
-    )
+def test_extract_pending_question_returns_plan_on_gate_park(
+    spoke_repo: Path, orca_bin: Path
+) -> None:
+    # A PLAN-gate park is an inbox question (the agent reads `working` while it blocks on the
+    # ask); the answerer needs the plan to reason about, so extract returns the body.
+    orca_park(orca_bin, spoke_repo, question="Plan: do X then Y. Reply to approve.")
 
-    result = _call(
-        f"extract_pending_question '{wt}'",
-        env={"CLAUDE_PROJECTS_DIR": str(projects)},
-    )
-
-    assert "Plan: do X. Reply to approve." in result.stdout
-
-
-def test_extract_pending_question_empty_when_working(tmp_path: Path) -> None:
-    # A trailing user turn means the session moved on — not waiting.
-    projects = tmp_path / "projects"
-    wt = tmp_path / "wt"
-    pd = _project_dir_for(projects, wt)
-    _write_transcript(
-        pd,
-        [
-            _ask_record("Which store?", [("Redis", "fast")]),
-            {"type": "user", "message": {"content": [{"type": "text", "text": "Redis"}]}},
-        ],
-    )
-
-    result = _call(
-        f"extract_pending_question '{wt}'",
-        env={"CLAUDE_PROJECTS_DIR": str(projects)},
-    )
-
-    assert result.stdout.strip() == ""
-
-
-def test_extract_pending_question_returns_plan_on_gate_park(tmp_path: Path) -> None:
-    # A PLAN-gate park has no AskUserQuestion (prose plan + a `spoke-ready.sh --gate`
-    # Bash). The answerer still needs the plan to reason about, so extract returns it.
-    projects = tmp_path / "projects"
-    wt = tmp_path / "wt"
-    pd = _project_dir_for(projects, wt)
-    _write_transcript(pd, _gate_park_records(5))
-
-    result = _call(
-        f"extract_pending_question '{wt}'",
-        env={"CLAUDE_PROJECTS_DIR": str(projects)},
-    )
+    result = _call(f"extract_pending_question '{spoke_repo}'")
 
     assert "Plan: do X then Y. Reply to approve." in result.stdout
+
+
+def test_extract_pending_question_empty_when_working(spoke_repo: Path, orca_bin: Path) -> None:
+    orca_park(orca_bin, spoke_repo, state="working")
+
+    result = _call(f"extract_pending_question '{spoke_repo}'")
+
+    assert result.stdout.strip() == ""
 
 
 # ── slot_state against a throwaway "spoke" git repo ───────────────────────────
@@ -779,36 +659,23 @@ def test_slot_state_busy_when_no_marker_no_transcript(spoke_repo: Path) -> None:
     assert result.stdout.strip() == "busy"
 
 
-def test_slot_state_waiting_when_parked_on_question(spoke_repo: Path, tmp_path: Path) -> None:
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_ask_record("Which approach?", [("A", "simple")])])
+def test_slot_state_waiting_when_parked_on_question(spoke_repo: Path, orca_bin: Path) -> None:
+    orca_park(orca_bin, spoke_repo, question="Which approach?")
 
-    result = _call(f"slot_state '{spoke_repo}' 5", env={"CLAUDE_PROJECTS_DIR": str(projects)})
+    result = _call(f"slot_state '{spoke_repo}' 5")
 
     assert result.stdout.strip() == "waiting"
 
 
-def test_slot_state_waiting_on_gate_tag_at_tip(spoke_repo: Path, tmp_path: Path) -> None:
-    # A spoke parked at its PLAN gate pushes gate/<issue> at the tip and prints prose (no
-    # AskUserQuestion). The tag, not a pending question, marks it waiting — and that wins
-    # over the idle-reap check even when the spoke has been idle past AFK_IDLE_MINUTES.
+def test_slot_state_gate_tag_alone_is_not_a_park(spoke_repo: Path, orca_bin: Path) -> None:
+    # The gate/<issue> tag is the durable record, not a park signal: with no inbox question and a
+    # working agent, a spoke at a gate tag classifies busy (Orca state alone never marks a park).
     subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    # A plain assistant turn (no question, no notification) so extract_pending_question is
-    # empty — the gate tag is the only waiting signal.
-    _write_transcript(
-        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "parked"}]}}]
-    )
-    os.utime(pd / "session.jsonl", (1_000_000_000, 1_000_000_000))  # idle far past the ceiling
+    orca_park(orca_bin, spoke_repo, state="working")
 
-    result = _call(
-        f"slot_state '{spoke_repo}' 5",
-        env={"CLAUDE_PROJECTS_DIR": str(projects), "AFK_IDLE_MINUTES": "0"},
-    )
+    result = _call(f"slot_state '{spoke_repo}' 5")
 
-    assert result.stdout.strip() == "waiting"
+    assert result.stdout.strip() == "busy"
 
 
 @pytest.mark.parametrize(
@@ -859,8 +726,11 @@ def test_slot_state_busy_when_answer_attempt_fresh(spoke_repo: Path, tmp_path: P
     assert result.stdout.strip() == "busy", result.stderr
 
 
-def test_slot_state_reaps_idle_without_answer_attempt(spoke_repo: Path, tmp_path: Path) -> None:
+def test_slot_state_reaps_idle_without_answer_attempt(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # Control for the exclusion above: same 2h-idle transcript, no delivery attempt.
+    orca_park(orca_bin, spoke_repo)
     now = int(time.time())
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
@@ -949,48 +819,27 @@ def test_slot_state_stamps_progress_on_tip_advance(spoke_repo: Path, tmp_path: P
     assert (statedir / "progress-5.epoch").exists(), "a tip advance between ticks is progress"
 
 
-def test_resume_spoke_stamps_progress(tmp_path: Path) -> None:
+def test_resume_spoke_stamps_progress(tmp_path: Path, orca_bin: Path) -> None:
     # A deliberate revival resets the progress clock — otherwise the >180m ceiling
-    # re-reaps the resumed spoke on the very next tick (#123/#128).
+    # re-reaps the resumed spoke on the very next tick (#123/#128). The restart is Orca-only:
+    # a tmux call would be the retired transport.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _ = _recording_tmux(tmp_path)
+    orca_park(orca_bin, spoke, liveness="exited")
+    bindir = tmp_path / "forbidden-bin"
+    bindir.mkdir()
+    forbidden = install_forbidden_stubs(bindir)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
 
     result = _call(
         f"resume_spoke '{spoke}' 5",
-        env={"PATH": f"{fake_bin}:{os.environ['PATH']}", "AFK_STATE_DIR": str(statedir)},
+        env={"PATH": f"{bindir}:{os.environ['PATH']}", "AFK_STATE_DIR": str(statedir)},
     )
 
     assert result.returncode == 0, result.stderr
     assert (statedir / "progress-5.epoch").exists()
-
-
-def test_respawn_wedged_spoke_stamps_progress(tmp_path: Path) -> None:
-    spoke = _branched_spoke(tmp_path, ahead=True, name="wedge-spoke", branch="feature/5-fix")
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    _write_transcript(
-        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
-    )
-    jsonl = pd / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    fake_bin, _ = _injector_tmux(tmp_path, touch=jsonl, window_line="afk:1 5-fix\n")
-    statedir = tmp_path / "statedir"
-    statedir.mkdir()
-
-    result = _call(
-        f"respawn_wedged_spoke '{spoke}' 5 'use Redis'",
-        env={
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_STATE_DIR": str(statedir),
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "AFK_INJECT_VERIFY_SECONDS": "0",
-        },
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert (statedir / "progress-5.epoch").exists()
+    assert orca_calls_of(orca_bin, "orchestration", "worker-start")
+    assert forbidden.read_text() == "", "the restart must never reach for tmux"
 
 
 def test_clear_stale_blocked_marker_stamps_progress(spoke_repo: Path, tmp_path: Path) -> None:
@@ -1008,40 +857,15 @@ def test_clear_stale_blocked_marker_stamps_progress(spoke_repo: Path, tmp_path: 
     assert (statedir / "progress-5.epoch").exists()
 
 
-def test_decide_and_act_stamps_answer_attempt(spoke_repo: Path, tmp_path: Path) -> None:
+def test_decide_and_act_stamps_answer_attempt(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # The delivery attempt must be stamped so the idle clock excludes the window in
-    # which the answer sits buffered/undelivered (#125 was reaped mid-delivery).
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    jsonl = pd / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, "#!/usr/bin/env bash\nexit 0\n")
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
-        "esac\nexit 0\n",
-    )
-    _agent_ps_stub(fake_bin)
+    # which the answer sits undelivered (#125 was reaped mid-delivery).
+    orca_park(orca_bin, spoke_repo, question="Q: Which store?")
     statedir = tmp_path / "statedir"
     statedir.mkdir()
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "SPOKE_READY": str(ready_stub),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-        "AFK_STATE_DIR": str(statedir),
-    }
+    env = {"AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'", "AFK_STATE_DIR": str(statedir)}
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
@@ -1049,9 +873,12 @@ def test_decide_and_act_stamps_answer_attempt(spoke_repo: Path, tmp_path: Path) 
     assert (statedir / "answer-attempt-5.epoch").exists()
 
 
-def test_slot_state_reaps_when_progress_also_stale(spoke_repo: Path, tmp_path: Path) -> None:
+def test_slot_state_reaps_when_progress_also_stale(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # Progress DEFERS the ceiling, it never cancels it: once the last progress stamp
     # is itself older than the ceiling, the spoke is reaped.
+    orca_park(orca_bin, spoke_repo)
     now = int(time.time())
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
@@ -1077,12 +904,13 @@ def test_slot_state_reaps_when_progress_also_stale(spoke_repo: Path, tmp_path: P
 
 
 def test_slot_state_hard_ceiling_reaps_despite_fresh_progress(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # The absolute backstop: a doom-loop that keeps committing (progress always
     # fresh) is still reaped once dispatch age exceeds
     # AFK_SPOKE_HARD_CEILING_MULT x AFK_SPOKE_MAX_MINUTES — it must not be able to
     # burn a whole drain window (ST3 review).
+    orca_park(orca_bin, spoke_repo)
     now = int(time.time())
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
@@ -1132,471 +960,6 @@ def test_spoke_idle_seconds_prefers_fresher_transcript(spoke_repo: Path, tmp_pat
     (statedir / "answer-attempt-5.epoch").write_text("garbage\n")
     result = _call(f"_spoke_idle_seconds '{spoke_repo}' 5; echo RC=$?", env=env)
     assert "RC=0" in result.stdout and "120" in result.stdout, result.stdout + result.stderr
-
-
-# ── the tmux inject: interactive-gate handling (issue #74, defect 1) ──────────
-# A PLAN gate renders as an interactive AskUserQuestion MENU (tab/arrow/enter) that
-# ignores typed free text, so a bare `send-keys -l <text>` never answers it. The fix
-# is to send Esc FIRST — which cancels the menu, surfaces the questions as text, and
-# opens a free-text prompt — then inject the literal answer and submit with Enter.
-
-
-def _recording_tmux(tmp_path: Path, *, agent_alive: bool = True) -> tuple[Path, Path]:
-    """A tmux stub that appends each invocation's args to a log and exits 0."""
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    log = tmp_path / "tmux.log"
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" >> "{log}"\n'
-        'case "$1" in\n'
-        f"{_DISPLAY_CASE}"
-        "esac\n"
-        "exit 0\n",
-    )
-    _agent_ps_stub(fake_bin, agent_alive=agent_alive)
-    return fake_bin, log
-
-
-def test_inject_answer_sends_escape_before_text_then_enter(tmp_path: Path) -> None:
-    fake_bin, log = _recording_tmux(tmp_path)
-    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}", "AFK_INJECT_MENU_PAUSE": "0"}
-
-    result = _call("inject_answer 'afk:1' 'use Redis'", env=env)
-
-    assert result.returncode == 0, result.stderr
-    lines = log.read_text().splitlines()
-    esc_idx = next(i for i, ln in enumerate(lines) if "Escape" in ln)
-    text_idx = next(i for i, ln in enumerate(lines) if "use Redis" in ln)
-    enter_idx = next(i for i, ln in enumerate(lines) if ln.split() and ln.split()[-1] == "Enter")
-    assert esc_idx < text_idx < enter_idx, f"expected Esc → text → Enter, got: {lines}"
-
-
-# ── inject verification: confirm the answer registered (issue #74, defect 2) ──
-# A send-keys that silently no-ops (wrong target, busy pane, an unhandled menu)
-# leaves the spoke parked indefinitely with no signal. inject_and_verify confirms
-# the spoke's transcript advanced after injecting; if it didn't, it re-injects once
-# and then fails so the caller escalates rather than leaving the spoke stuck.
-
-
-def test_inject_and_verify_succeeds_when_transcript_advances(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    jsonl = pd / "session.jsonl"
-    old = 1_000_000_000
-    os.utime(jsonl, (old, old))  # backdate so the spoke's reaction is strictly newer
-    # inject_answer is stubbed to model the spoke reacting to input: a real submit records
-    # the answer as a user turn. Since #281 that record — not the bare mtime bump this stub
-    # used to write — is what proves delivery, because the injector's own Escape can advance
-    # the transcript while the answer sits unsubmitted (#271).
-    record = json.dumps(
-        {"type": "user", "message": {"content": [{"type": "text", "text": "use Redis"}]}},
-        ensure_ascii=False,
-    )
-    expr = (
-        f"inject_answer() {{ printf '%s\\n' '{record}' >> \"{jsonl}\"; return 0; }}; "
-        f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?"
-    )
-
-    result = _call(
-        expr, env={"CLAUDE_PROJECTS_DIR": str(projects), "AFK_INJECT_VERIFY_SECONDS": "0"}
-    )
-
-    assert "RC=0" in result.stdout, result.stderr
-
-
-def test_inject_and_verify_never_repastes_when_unregistered(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # #133 subtask 1: the "did not register" retry must be Enter ONLY — the old full
-    # re-inject re-pasted the whole answer on top of the buffered one, duplicating it
-    # (#123/#124). Composer unobservable (empty capture) + no transcript advance ⇒ rc 1.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    fake_bin, tmux_log = _injector_tmux(tmp_path)  # capture-pane returns nothing
-    calls = tmp_path / "calls.log"
-    # inject_answer succeeds at the tmux level but the transcript never advances.
-    expr = (
-        f'inject_answer() {{ printf x >> "{calls}"; return 0; }}; '
-        f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?"
-    )
-
-    result = _call(
-        expr,
-        env={
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_INJECT_VERIFY_SECONDS": "0",
-            "AFK_INJECT_POLL_SECONDS": "1",
-        },
-    )
-
-    assert "RC=1" in result.stdout
-    assert calls.read_text() == "x", "an unregistered answer is NEVER re-pasted (Enter-only retry)"
-    nudges = [ln for ln in tmux_log.read_text().splitlines() if ln.split()[-1:] == ["Enter"]]
-    assert len(nudges) == 1, f"the retry must be a single bare Enter, got tmux calls: {nudges}"
-
-
-# ── injector delivery: composer-cleared verify, Enter-only retry, wedge → respawn
-# (issue #133, subtask 1). The 2026-07-04 drain: auto-answers sat unsubmitted in the
-# composer (bracketed paste, Enter lost); the old retry re-pasted the whole answer,
-# and in the worst case the composer wedged in an unterminated-paste state where no
-# keystroke submits — only a pane respawn (kill-window + new-window +
-# `claude --continue '<answer>'` reusing the spoke_run_id) recovers.
-
-
-def _injector_tmux(
-    tmp_path: Path,
-    *,
-    capture: str = "",
-    clear_on_enter: int = 0,
-    touch: Path | None = None,
-    pane_path: Path | None = None,
-    window_line: str = "",
-    fail_new_window: bool = False,
-) -> tuple[Path, Path]:
-    """A programmable tmux stub for the injector paths.
-
-    Logs every call. `capture-pane` serves a mutable capture file seeded with
-    `capture` (the pane BEFORE any paste — chrome, rendered question); a `-l` paste
-    appends its text there, modelling the composer buffering it. On the
-    `clear_on_enter`-th Enter the capture is cleared and `touch` (the spoke's
-    transcript) appended — a submit finally landing. `new-window` also appends to
-    `touch` (the respawned `claude --continue` session writing its first message)
-    unless `fail_new_window`. `list-panes` / `list-windows` answer from fixture
-    lines so decide_and_act can map the pane and a respawn can find its window.
-
-    The landing submit writes the pasted answer as a real type:"user" record, and consumes
-    the buffer as a real submit empties the composer. Since #281 that record is the SOLE
-    proof of delivery (_answer_delivered), so a submit that only bumped the transcript mtime
-    — what this stub did before — no longer reads as delivered, and rightly: that bare-mtime
-    signal is exactly what let an Esc-cancelled QCM score an unsubmitted paste as an
-    "injected answer" in #271. A non-submit transcript write (the respawn's new-window) stays
-    a bare `{}`: it advances the clock without proving the spoke read anything.
-    """
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    log = tmp_path / "tmux.log"
-    capture_file = tmp_path / "capture.txt"
-    capture_file.write_text(capture)
-    panes = tmp_path / "panes.txt"
-    panes.write_text(f"afk:1\t{pane_path}\n" if pane_path is not None else "")
-    windows = tmp_path / "windows.txt"
-    windows.write_text(window_line)
-    counter = tmp_path / "enters.txt"
-    touch_cmd = f'printf "{{}}\\n" >> "{touch}"' if touch is not None else ":"
-    # The landing submit records the pasted answer as a user turn (what Claude Code writes),
-    # encoded exactly as it encodes it — raw UTF-8, no \\u — since _answer_appended matches the
-    # needle byte-wise against its JSON-escaped form.
-    pasted = tmp_path / "pasted.txt"
-    if touch is not None:
-        encode = (
-            "python3 -c 'import json,os;"
-            'print(json.dumps({"type":"user","message":{"content":[{"type":"text",'
-            '"text":open(os.environ[chr(95)+"AFK_PASTE"]).read()}]}},ensure_ascii=False))'
-            "'"
-        )
-        submit_cmd = (
-            f'if [ -s "{pasted}" ]; then _AFK_PASTE="{pasted}" {encode} >> "{touch}"; '
-            f': > "{pasted}"; else {touch_cmd}; fi'
-        )
-    else:
-        submit_cmd = ":"
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" >> "{log}"\n'
-        'case "$1" in\n'
-        f'  capture-pane) cat "{capture_file}" 2>/dev/null ;;\n'
-        f'  list-panes) cat "{panes}" 2>/dev/null ;;\n'
-        f'  list-windows) cat "{windows}" 2>/dev/null ;;\n'
-        f"{_DISPLAY_CASE}"
-        "  new-window)\n"
-        f"    [ {1 if fail_new_window else 0} -eq 1 ] && exit 1\n"
-        f"    {touch_cmd}\n"
-        "    exit 0 ;;\n"
-        "esac\n"
-        'if [ "$1" = "send-keys" ]; then\n'
-        f'  case " $* " in *" -l "*) printf "%s\\n" "${{@: -1}}" >> "{capture_file}"; '
-        f'printf "%s" "${{@: -1}}" > "{pasted}" ;; esac\n'
-        '  if [ "${@: -1}" = "Enter" ]; then\n'
-        f'    n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); printf "%s\\n" "$n" > "{counter}"\n'
-        f'    if [ {clear_on_enter} -gt 0 ] && [ "$n" -ge {clear_on_enter} ]; then\n'
-        f'      : > "{capture_file}"\n'
-        f"      {submit_cmd}\n"
-        "    fi\n"
-        "  fi\n"
-        "fi\n"
-        "exit 0\n",
-    )
-    _agent_ps_stub(fake_bin)
-    return fake_bin, log
-
-
-def test_composer_shows_text_true_while_buffered(tmp_path: Path) -> None:
-    # The needle is the first ~40 chars of the answer's FIRST line: a long multi-line
-    # answer must still be recognized in the composer without matching pane chrome.
-    answer = "Approved: proceed with the plan as posted, containment matching.\nSecond line."
-    fake_bin, _ = _injector_tmux(
-        tmp_path, capture="╭──╮\n│ > Approved: proceed with the plan as posted, cont │\n╰──╯\n"
-    )
-
-    result = _call(
-        f"_composer_shows_text 'afk:1' '{answer}'; echo RC=$?",
-        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
-    )
-
-    assert "RC=0" in result.stdout, result.stderr
-
-
-def test_composer_shows_text_false_once_cleared(tmp_path: Path) -> None:
-    fake_bin, _ = _injector_tmux(tmp_path, capture="╭──╮\n│ > │\n╰──╯\n")
-
-    result = _call(
-        "_composer_shows_text 'afk:1' 'use Redis'; echo RC=$?",
-        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
-    )
-
-    assert result.stdout.strip() == "RC=1", result.stdout + result.stderr
-
-
-def test_composer_shows_text_false_when_capture_fails(tmp_path: Path) -> None:
-    # Fail-open: an unobservable pane (capture-pane errors) must read as "not buffered"
-    # so the caller escalates rather than wedge-respawning a pane it cannot see.
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    write_stub(fake_bin / "tmux", "#!/usr/bin/env bash\nexit 1\n")
-
-    result = _call(
-        "_composer_shows_text 'afk:1' 'use Redis'; echo RC=$?",
-        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
-    )
-
-    assert result.stdout.strip() == "RC=1", result.stdout + result.stderr
-
-
-def test_inject_and_verify_enter_retry_submits_buffered_answer(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # The postmortem's most common failure: the paste buffered but its Enter was lost.
-    # The Enter-only retry submits it (the stub clears the composer and advances the
-    # transcript on the 2nd Enter) — and the answer is pasted exactly ONCE.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    jsonl = pd / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", clear_on_enter=2, touch=jsonl)
-
-    result = _call(
-        f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?",
-        env={
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_INJECT_MENU_PAUSE": "0",
-            "AFK_INJECT_VERIFY_SECONDS": "0",
-        },
-    )
-
-    assert "RC=0" in result.stdout, result.stderr
-    pastes = [ln for ln in tmux_log.read_text().splitlines() if " -l " in f" {ln} "]
-    assert len(pastes) == 1, f"the answer must be pasted exactly once, got: {pastes}"
-
-
-def test_inject_and_verify_wedged_paste_returns_respawn_code(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # The unterminated-paste state: the pane was clean pre-inject, the pasted text
-    # survives the Enter-only retry (capture never clears, transcript never advances)
-    # ⇒ rc 2, the caller's respawn signal — distinct from rc 1 (escalate).
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n")
-
-    result = _call(
-        f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?",
-        env={
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_INJECT_MENU_PAUSE": "0",
-            "AFK_INJECT_VERIFY_SECONDS": "0",
-        },
-    )
-
-    assert "RC=2" in result.stdout, result.stderr
-    pastes = [ln for ln in tmux_log.read_text().splitlines() if " -l " in f" {ln} "]
-    assert len(pastes) == 1, f"a wedged composer must never be re-pasted into, got: {pastes}"
-
-
-def test_inject_and_verify_preexisting_needle_never_wedges(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # Precision guard for the wedge classifier: a short answer that ALREADY shows in
-    # the pane pre-inject (the rendered question/options usually contain the chosen
-    # label) proves nothing post-retry — it must classify rc 1 (safe escalate), never
-    # rc 2 (destructive kill-window of a possibly live pane).
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    fake_bin, _ = _injector_tmux(tmp_path, capture="Q: Which store?\n  1. use Redis — fast\n")
-
-    result = _call(
-        f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?",
-        env={
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_INJECT_MENU_PAUSE": "0",
-            "AFK_INJECT_VERIFY_SECONDS": "0",
-        },
-    )
-
-    assert result.stdout.strip() == "RC=1", result.stdout + result.stderr
-
-
-def test_afk_wedge_respawn_command_reuses_run_id_and_plain_answer(tmp_path: Path) -> None:
-    # The proven manual recipe: `claude --continue '<answer>'` reusing the persisted
-    # spoke_run_id — the answer rides verbatim as the continuation prompt, no
-    # supervisor preamble, and telemetry env is inline-exported like a resume (#108).
-    spoke = _branched_spoke(tmp_path, ahead=True, name="wedge-spoke")
-    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
-    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
-
-    result = _call(f"_afk_wedge_respawn_command '{spoke}' 5 'use Redis'")
-
-    assert result.returncode == 0, result.stderr
-    cmd = result.stdout
-    assert "spoke_run_id=feature/5-x+1700000000" in cmd.replace("\\", "")
-    assert "claude" in cmd and "--continue" in cmd
-    assert "use Redis" in cmd.replace("\\", ""), "the answer IS the continuation prompt"
-    assert "AI_TOOLKIT_OTEL=1" in cmd
-    assert "supervisor" not in cmd, "plain answer, no supervisor preamble (approved default)"
-
-
-def _wedge_env(spoke: Path, tmp_path: Path, fake_bin: Path) -> tuple[dict[str, str], Path]:
-    """Common env for the decide_and_act wedge tests: waiting transcript (backdated so
-    only a stub touch reads as an advance), recording spoke-ready, fake gh, ANSWER
-    answerer. Returns (env, ready_log).
-    """
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    os.utime(pd / "session.jsonl", (1_000_000_000, 1_000_000_000))
-    ready_log = tmp_path / "ready.log"
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "SPOKE_READY": str(ready_stub),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-    }
-    return env, ready_log
-
-
-def test_decide_and_act_wedged_paste_respawns_pane(tmp_path: Path) -> None:
-    # End to end: answerer decides, paste wedges (survives the Enter retry) — the
-    # supervisor respawns the pane (kill-window + new-window --continue) instead of
-    # escalating, the proven manual recovery for #123/#124. The respawned session
-    # writes its transcript (the stub touches it on new-window), so the delivery is
-    # confirmed and the gate tag consumed.
-    spoke = _branched_spoke(tmp_path, ahead=True, name="wedge-spoke", branch="feature/5-fix")
-    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
-    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
-    subprocess.run(["git", "tag", "gate/5"], cwd=spoke, check=True, capture_output=True)
-    projects = tmp_path / "projects"
-    jsonl = _project_dir_for(projects, spoke) / "session.jsonl"
-    fake_bin, tmux_log = _injector_tmux(
-        tmp_path,
-        capture="│ > │\n",
-        touch=jsonl,
-        pane_path=spoke,
-        window_line="afk:1 5-fix\n",
-    )
-    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
-
-    result = _call(f"decide_and_act '{spoke}' 5", env=env)
-
-    assert result.returncode == 0, result.stderr
-    lines = tmux_log.read_text().splitlines()
-    kill_idx = next(i for i, ln in enumerate(lines) if ln.startswith("kill-window"))
-    new_idx = next(i for i, ln in enumerate(lines) if ln.startswith("new-window"))
-    assert kill_idx < new_idx, f"respawn = kill-window THEN new-window, got: {lines}"
-    assert "-n 5-fix " in lines[new_idx], "the respawned window must keep the reapable name"
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
-        "a wedged paste is recovered by respawn, not escalated"
-    )
-    tag = subprocess.run(
-        ["git", "rev-parse", "-q", "--verify", "refs/tags/gate/5"],
-        cwd=spoke,
-        capture_output=True,
-        text=True,
-    )
-    assert tag.returncode != 0, "a confirmed respawn delivers the answer — gate/5 is consumed"
-
-
-def test_decide_and_act_wedge_respawn_failure_escalates(tmp_path: Path) -> None:
-    # If the respawn itself cannot be launched, the spoke must still surface as
-    # blocked/<issue> — a wedge never fails silently — and the blocked reason carries
-    # the head of the undelivered answer (it is persisted nowhere else).
-    spoke = _branched_spoke(tmp_path, ahead=True, name="wedge-spoke", branch="feature/5-fix")
-    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
-    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
-    fake_bin, _ = _injector_tmux(
-        tmp_path,
-        capture="│ > │\n",
-        pane_path=spoke,
-        window_line="afk:1 5-fix\n",
-        fail_new_window=True,
-    )
-    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
-
-    result = _call(f"decide_and_act '{spoke}' 5", env=env)
-
-    assert result.returncode == 0, result.stderr
-    log = ready_log.read_text() if ready_log.exists() else ""
-    # #241: a failed wedge respawn warns-and-continues instead of parking blocked/<issue>.
-    assert "--blocked 5" not in log, log
-    assert "WARNING: #5" in result.stderr, result.stderr
-    assert "respawn" in result.stderr, (
-        f"the warning must name the failed wedge respawn: {result.stderr}"
-    )
-    assert "use Redis" in result.stderr, (
-        f"the warning must carry the undelivered answer's head: {result.stderr}"
-    )
-
-
-def test_decide_and_act_wedge_respawn_unverified_escalates(tmp_path: Path) -> None:
-    # The respawn window opened but the continued session never wrote its transcript
-    # (claude died instantly: dead auth, missing PATH). Scoring that success would
-    # consume the gate tag and lose the answer — it must escalate instead.
-    spoke = _branched_spoke(tmp_path, ahead=True, name="wedge-spoke", branch="feature/5-fix")
-    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
-    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
-    fake_bin, tmux_log = _injector_tmux(
-        tmp_path,
-        capture="│ > │\n",
-        pane_path=spoke,
-        window_line="afk:1 5-fix\n",
-    )
-    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
-
-    result = _call(f"decide_and_act '{spoke}' 5", env=env)
-
-    assert result.returncode == 0, result.stderr
-    assert "new-window" in tmux_log.read_text(), "the respawn was attempted"
-    log = ready_log.read_text() if ready_log.exists() else ""
-    # #241: an unconfirmed respawn warns-and-continues (never reports success), not blocked.
-    assert "--blocked 5" not in log, log
-    assert "WARNING: #5" in result.stderr, result.stderr
 
 
 # ── answerer discipline: seed-replay suppression, gate routing, parked re-check
@@ -1667,48 +1030,63 @@ def test_is_seed_replay_false_for_novel_long_answer(tmp_path: Path) -> None:
     assert result.stdout.strip() == "RC=1", result.stdout + result.stderr
 
 
-def test_decide_and_act_suppresses_seed_replay_answer(tmp_path: Path) -> None:
+def _orca_flip_to(orca_bin: Path, wt: Path, tmp_path: Path, **park: Any) -> str:
+    """A shell prefix that swaps the Orca stub scenario when the answerer runs.
+
+    It models the spoke changing state while the answerer reasons: `park` takes `orca_park`'s
+    keywords for the scenario the spoke has AFTER the flip (the current scenario is untouched).
+    """
+    scenario = orca_bin / ".orca-stub" / "scenario.json"
+    before = scenario.read_text()
+    orca_park(orca_bin, wt, **park)
+    flipped = tmp_path / "flipped-scenario.json"
+    flipped.write_text(scenario.read_text())
+    scenario.write_text(before)
+    return f"cp '{flipped}' '{scenario}'; "
+
+
+def orca_calls_of(orca_bin: Path, noun: str, verb: str) -> list[list[str]]:
+    """Every recorded `orca <noun> <verb> ...` argv."""
+    return [a for a in orca_calls(orca_bin) if a[:2] == [noun, verb]]
+
+
+def test_decide_and_act_suppresses_seed_replay_answer(
+    spoke_repo: Path, stub_env: dict[str, str], tmp_path: Path, orca_bin: Path
+) -> None:
     # #124: the answerer echoed the spoke's own kickoff back at it, six ticks in a row.
-    # A replayed seed must never be injected — escalate with a reason naming the replay.
-    spoke = _branched_spoke(tmp_path, ahead=True, name="replay-spoke", branch="feature/5-fix")
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
-    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
-    # Re-write over _wedge_env's transcript so the FIRST user message is the seed.
+    # A replayed seed must never be delivered — warn with a reason naming the replay.
+    pd = _project_dir_for(tmp_path / "projects", spoke_repo)
     _write_transcript(pd, [_seed_record(), _ask_record("Which store?", [("Redis", "fast")])])
-    env["AFK_ANSWERER_CMD"] = 'printf "ANSWER: %s" "$_AFK_SEED"'
+    env = {**stub_env, "AFK_ANSWERER_CMD": 'printf "ANSWER: %s" "$_AFK_SEED"'}
     env["_AFK_SEED"] = _SEED_PROMPT[:300]
 
-    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
-    assert " -l " not in f" {tmux_calls} ", "a seed replay must never be pasted"
-    log = ready_log.read_text() if ready_log.exists() else ""
+    assert not orca_calls_of(orca_bin, "orchestration", "reply"), "a seed replay must be dropped"
+    log = Path(env["_READY_LOG"])
     # #241: a suppressed seed replay warns-and-continues instead of parking blocked/<issue>.
-    assert "--blocked 5" not in log, log
+    assert not log.exists() or "--blocked 5" not in log.read_text()
     assert "WARNING: #5" in result.stderr, result.stderr
     assert "seed" in result.stderr, f"the warning must name the seed replay: {result.stderr}"
 
 
-def test_decide_and_act_gate_park_routes_plan_to_answerer(tmp_path: Path) -> None:
+def test_decide_and_act_gate_park_routes_plan_to_answerer(
+    spoke_repo: Path, stub_env: dict[str, str], tmp_path: Path, orca_bin: Path
+) -> None:
     # #124's root: a gate park was answered from generic transcript re-extraction. When
     # the park is an emitted gate/<issue>, the answerer must be asked to approve/amend
     # the POSTED PLAN, and the plan prose must ride in its prompt.
-    spoke = _branched_spoke(tmp_path, ahead=True, name="gate-spoke", branch="feature/5-fix")
-    subprocess.run(["git", "tag", "gate/5"], cwd=spoke, check=True, capture_output=True)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    fake_bin, _ = _injector_tmux(tmp_path, capture="│ > │\n")
-    env, _ready_log = _wedge_env(spoke, tmp_path, fake_bin)
-    # Re-write over _wedge_env's ask transcript: the park here is a gate, not an ask.
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
     plan = "Plan: refactor the reaper idle clock, then add the ceiling reset. Reply to approve."
-    _write_transcript(pd, _gate_park_records(5, plan))
+    orca_park(orca_bin, spoke_repo, question=plan)
     prompt_dump = tmp_path / "prompt.txt"
-    env["AFK_ANSWERER_CMD"] = f"cat > \"{prompt_dump}\"; printf 'ANSWER: Approved — proceed.'"
+    env = {
+        **stub_env,
+        "AFK_ANSWERER_CMD": f"cat > \"{prompt_dump}\"; printf 'ANSWER: Approved — proceed.'",
+    }
 
-    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
     dumped = prompt_dump.read_text()
@@ -1718,172 +1096,112 @@ def test_decide_and_act_gate_park_routes_plan_to_answerer(tmp_path: Path) -> Non
     assert "Approve it or state precise amendments" in dumped, (
         "the prompt must route to approve/amend-the-posted-plan"
     )
+    assert "Begin your ANSWER with APPROVE" in dumped, (
+        "the spoke reads the first word of a gate reply: APPROVE or REVISE"
+    )
     assert "restate" in dumped, (
         "the prompt must forbid re-issuing the task (the #124 seed-replay shape)"
     )
 
 
-def test_decide_and_act_gate_park_without_plan_text_still_answers(tmp_path: Path) -> None:
-    # A gate/<issue> tag at the tip whose plan prose cannot be extracted (transcript
-    # rotated, no gate Bash record) must still reach the answerer with the gate framing
-    # — the old code returned silently and left the spoke parked forever.
-    spoke = _branched_spoke(tmp_path, ahead=True, name="gate-spoke", branch="feature/5-fix")
-    subprocess.run(["git", "tag", "gate/5"], cwd=spoke, check=True, capture_output=True)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    fake_bin, _ = _injector_tmux(tmp_path, capture="│ > │\n")
-    env, _ready_log = _wedge_env(spoke, tmp_path, fake_bin)
-    # Re-write over _wedge_env's ask transcript: no ask, no gate Bash record — the
-    # gate/5 tag at the tip is the only park signal.
-    _write_transcript(
-        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}}]
-    )
+def test_decide_and_act_gate_park_without_plan_text_still_answers(
+    spoke_repo: Path, stub_env: dict[str, str], tmp_path: Path, orca_bin: Path
+) -> None:
+    # A gate/<issue> tag at the tip whose plan prose cannot be extracted (no inbox question,
+    # no artifact) must still reach the answerer with the gate framing -- the old code
+    # returned silently and left the spoke parked forever.
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
+    orca_park(orca_bin, spoke_repo, state="working")
     prompt_dump = tmp_path / "prompt.txt"
-    env["AFK_ANSWERER_CMD"] = f"cat > \"{prompt_dump}\"; printf 'ANSWER: Approved — proceed.'"
+    env = {
+        **stub_env,
+        "AFK_ANSWERER_CMD": f"cat > \"{prompt_dump}\"; printf 'ANSWER: Approved — proceed.'",
+    }
 
-    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
     assert prompt_dump.exists(), "the answerer must still be invoked on an unextractable gate park"
     assert "Approve it or state precise amendments" in prompt_dump.read_text()
 
 
-def test_decide_and_act_aborts_when_no_longer_parked(tmp_path: Path) -> None:
-    # #129/#89: the answerer is slow; if the spoke moved on meanwhile (a human replied,
-    # the turn resumed), injecting the stale answer interrupts it mid-tool-call. The
-    # supervisor must re-check the park right before injecting and drop the answer.
-    spoke = _branched_spoke(tmp_path, ahead=True, name="moved-spoke", branch="feature/5-fix")
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
-    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
-    # The answerer's side effect: a human answered while it reasoned (a genuine TYPED reply,
-    # so #241 §4 reads it as moved-on and drops rather than recomputing).
-    human_reply = json.dumps(
-        {
-            "type": "user",
-            "promptSource": "typed",
-            "message": {"content": [{"type": "text", "text": "use Redis"}]},
-        }
-    )
-    env["AFK_ANSWERER_CMD"] = (
-        f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; printf 'ANSWER: use Redis'"
-    )
+def test_decide_and_act_aborts_when_no_longer_parked(
+    spoke_repo: Path, stub_env: dict[str, str], tmp_path: Path, orca_bin: Path
+) -> None:
+    # #129/#89: the answerer is slow; if the spoke moved on meanwhile (the question left the
+    # inbox), delivering the stale answer interrupts it mid-tool-call. The supervisor re-checks
+    # the park right before delivering and drops the answer.
+    flip = _orca_flip_to(orca_bin, spoke_repo, tmp_path, state="working")
+    env = {**stub_env, "AFK_ANSWERER_CMD": f"{flip}printf 'ANSWER: use Redis'"}
 
-    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
-    assert " -l " not in f" {tmux_calls} ", "a stale answer must never be injected"
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
-        "no longer parked is not an escalation — the next tick re-evaluates"
+    assert not orca_calls_of(orca_bin, "orchestration", "reply"), "a stale answer must not land"
+    log = Path(env["_READY_LOG"])
+    assert not log.exists() or "--blocked" not in log.read_text(), (
+        "no longer parked is not an escalation -- the next tick re-evaluates"
     )
 
 
-def test_decide_and_act_recomputes_when_question_changed(tmp_path: Path) -> None:
-    # #241 §4: the spoke is still parked, but on a DIFFERENT question than the one the answerer
-    # reasoned about — and NO user reply landed (a real park change, not a moved-on). Instead of
-    # bare-dropping (pre-#241) and burning a whole tick, the broker RECOMPUTES against the current
-    # park in the same pass (depth-bounded to one re-run). Never blocked.
-    spoke = _branched_spoke(tmp_path, ahead=True, name="moved-spoke", branch="feature/5-fix")
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    # Pin the park mtime OLD so the reasoner's append reads as a deterministic staleness
-    # (the 1s mtime granularity is otherwise a same-second race on the outer detection).
-    os.utime(pd / "session.jsonl", (1_000_000_000, 1_000_000_000))
-    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
-    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+def test_decide_and_act_recomputes_when_question_changed(
+    spoke_repo: Path, stub_env: dict[str, str], tmp_path: Path, orca_bin: Path
+) -> None:
+    # #241 §4: the spoke is still parked, but on a DIFFERENT question (a new inbox id) than the
+    # one the answerer reasoned about. Instead of bare-dropping and burning a whole tick, the
+    # broker RECOMPUTES against the current park in the same pass (depth-bounded to one re-run).
+    flip = _orca_flip_to(orca_bin, spoke_repo, tmp_path, question="Which TTL?", qid="m_q2")
     calls = tmp_path / "answerer.calls"
-    extra = tmp_path / "extra.jsonl"
-    extra.write_text(
-        json.dumps(_ask_record("Which cache TTL?", [("60s", "short"), ("1h", "long")])) + "\n"
-    )
-    # Each reasoning run appends a NEW question (an assistant record — NOT a user reply), so the
-    # park signature keeps changing while the spoke stays parked: exactly the recompute trigger.
-    env["AFK_ANSWERER_CMD"] = (
-        f"printf x >> '{calls}'; cat \"{extra}\" >> \"{pd / 'session.jsonl'}\"; printf 'ANSWER: use Redis'"
-    )
+    env = {**stub_env, "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; {flip}printf 'ANSWER: 60s'"}
 
-    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    # The recompute path is taken (a deterministic stderr signal) rather than a bare drop, and
-    # it re-runs the reasoner against the current park.
     assert "recomputing against the current park" in result.stderr, result.stderr
-    n = calls.read_text().count("x") if calls.exists() else 0
-    assert n >= 2, (
-        f"a changed park while still parked must recompute (re-run), not bare-drop; ran {n}"
-    )
-    # NB: the recompute re-answers the current park; whether its inner inject lands or falls to
-    # the (still-terminal-in-S4) inject-failure escalation is timing-dependent and orthogonal —
-    # S5 converts that escalation to warn-continue. Here we only pin the recompute-not-drop.
+    assert calls.read_text().count("x") >= 2, "a changed park must re-run the reasoner"
+    replies = orca_calls_of(orca_bin, "orchestration", "reply")
+    assert [a[a.index("--id") + 1] for a in replies] == ["m_q2"], "only the CURRENT question"
 
 
-def test_decide_and_act_gate_park_moved_on_aborts(tmp_path: Path) -> None:
-    # The gate tag stays at the tip until the spoke's FIRST COMMIT, so a spoke that
-    # resumed inside that window (a human approved in-pane, or it self-approved and
-    # kept coding, #117) still reads "parked" by the tag alone. The re-check must see
-    # the transcript movement and drop the stale gate answer — the #129 shape.
-    spoke = _branched_spoke(tmp_path, ahead=True, name="gate-spoke", branch="feature/5-fix")
-    subprocess.run(["git", "tag", "gate/5"], cwd=spoke, check=True, capture_output=True)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
-    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
-    _write_transcript(pd, _gate_park_records(5))
-    # The answerer's side effect: a human approved in-pane while it reasoned (a user
-    # text turn lands; no commit, so gate/5 is still at the tip).
-    human_reply = json.dumps(
-        {
-            "type": "user",
-            "promptSource": "typed",
-            "message": {"content": [{"type": "text", "text": "approved, go ahead"}]},
-        }
-    )
-    env["AFK_ANSWERER_CMD"] = (
-        f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; "
-        "printf 'ANSWER: Approved, proceed with the plan.'"
-    )
+def test_decide_and_act_gate_park_moved_on_aborts(
+    spoke_repo: Path, stub_env: dict[str, str], tmp_path: Path, orca_bin: Path
+) -> None:
+    # The gate tag stays at the tip until the spoke's FIRST COMMIT, so a spoke that resumed
+    # inside that window (a human approved in-pane, or it self-approved and kept coding, #117)
+    # still reads "parked" by the tag alone. The re-check reads the inbox, sees the plan question
+    # gone, and drops the stale gate answer -- the #129 shape.
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
+    flip = _orca_flip_to(orca_bin, spoke_repo, tmp_path, state="working")
+    env = {**stub_env, "AFK_ANSWERER_CMD": f"{flip}printf 'ANSWER: Approved, proceed.'"}
 
-    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
-    assert " -l " not in f" {tmux_calls} ", "a stale gate answer must never land mid-turn"
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+    assert not orca_calls_of(orca_bin, "orchestration", "reply"), (
+        "a stale gate answer must not land"
+    )
+    log = Path(env["_READY_LOG"])
+    assert not log.exists() or "--blocked" not in log.read_text()
 
 
-def test_decide_and_act_moved_on_seed_replay_drops_not_blocks(tmp_path: Path) -> None:
-    # Park freshness gates everything: a spoke that moved on while the answerer
-    # reasoned gets a silent drop even when the stale answer is ALSO a seed replay —
-    # escalating would stamp a spurious blocked/<issue> on an actively-working spoke.
-    spoke = _branched_spoke(tmp_path, ahead=True, name="replay-spoke", branch="feature/5-fix")
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
-    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+def test_decide_and_act_moved_on_seed_replay_drops_not_blocks(
+    spoke_repo: Path, stub_env: dict[str, str], tmp_path: Path, orca_bin: Path
+) -> None:
+    # Park freshness gates everything: a spoke that moved on while the answerer reasoned gets a
+    # silent drop even when the stale answer is ALSO a seed replay -- escalating would stamp a
+    # spurious blocked/<issue> on an actively-working spoke.
+    pd = _project_dir_for(tmp_path / "projects", spoke_repo)
     _write_transcript(pd, [_seed_record(), _ask_record("Which store?", [("Redis", "fast")])])
-    human_reply = json.dumps(
-        {
-            "type": "user",
-            "promptSource": "typed",
-            "message": {"content": [{"type": "text", "text": "use Redis"}]},
-        }
-    )
-    env["AFK_ANSWERER_CMD"] = (
-        f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; "
-        'printf "ANSWER: %s" "$_AFK_SEED"'
-    )
+    flip = _orca_flip_to(orca_bin, spoke_repo, tmp_path, state="working")
+    env = {**stub_env, "AFK_ANSWERER_CMD": f'{flip}printf "ANSWER: %s" "$_AFK_SEED"'}
     env["_AFK_SEED"] = _SEED_PROMPT[:300]
 
-    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
-    assert " -l " not in f" {tmux_calls} "
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+    assert not orca_calls_of(orca_bin, "orchestration", "reply")
+    log = Path(env["_READY_LOG"])
+    assert not log.exists() or "--blocked" not in log.read_text(), (
         "moved-on wins over seed-replay: drop, never a spurious blocked marker"
     )
 
@@ -1892,10 +1210,11 @@ def test_decide_and_act_moved_on_seed_replay_drops_not_blocks(tmp_path: Path) ->
 
 
 @pytest.fixture
-def stub_env(tmp_path: Path, spoke_repo: Path) -> dict[str, str]:
-    """A waiting spoke + a recording spoke-ready stub + a fake gh, ready to drive
-    decide_and_act. The answerer command is set per-test via AFK_ANSWERER_CMD.
+def stub_env(tmp_path: Path, spoke_repo: Path, orca_bin: Path) -> dict[str, str]:
+    """A spoke parked on an Orca inbox question + a recording spoke-ready stub + a fake gh,
+    ready to drive decide_and_act. The answerer command is set per-test via AFK_ANSWERER_CMD.
     """
+    orca_park(orca_bin, spoke_repo, question="Q: Which store?\n  - Redis: fast")
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
@@ -1940,51 +1259,15 @@ def test_decide_and_act_no_decision_warns(spoke_repo: Path, stub_env: dict[str, 
     assert "WARNING: #5" in result.stderr and "no decision" in result.stderr, result.stderr
 
 
-def test_decide_and_act_answer_without_pane_warns(
-    spoke_repo: Path, stub_env: dict[str, str]
+def test_decide_and_act_replies_to_the_recorded_question_and_emits_success_span(
+    spoke_repo: Path, stub_env: dict[str, str], tmp_path: Path, orca_bin: Path
 ) -> None:
-    # The answerer decides, but no tmux pane maps to this throwaway path, so injection
-    # fails — #241 warns-and-continues rather than dropping or parking the answer.
-    env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'ANSWER: do the thing'"}
-
-    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
-
-    _rl = Path(env["_READY_LOG"])
-    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
-    assert "WARNING: #5" in result.stderr and "pane" in result.stderr, result.stderr
-
-
-def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_path: Path) -> None:
-    # The happy path: a waiting spoke, an answerer that decides, a pane that maps to the
-    # worktree (fake tmux), so the answer is injected and a `success` span is emitted —
-    # not an escalation. This exercises the feature's single reasoning step end to end.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    jsonl = pd / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # backdate so the reaction is newer
-
-    ready_log = tmp_path / "ready.log"
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    # Fake tmux: list-panes maps a pane to this worktree; the submitting Enter records the
-    # pasted answer as a user turn — the shared stub, so this test drives the same delivery
-    # contract as every other inject test (a bare mtime bump has not proven delivery since
-    # #281, and an inline fake would silently drift from that).
-    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
-
+    # The happy path: a parked spoke, an answerer that decides, the answer sent as the Orca
+    # reply to the recorded question id, and a `success` span emitted -- not an escalation.
     tel_dir = tmp_path / "tel"
     env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "SPOKE_READY": str(ready_stub),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        **stub_env,
         "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
         "AI_TOOLKIT_TELEMETRY": "1",
         "AI_TOOLKIT_TELEMETRY_DIR": str(tel_dir),
     }
@@ -1992,42 +1275,24 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    # Answered, not escalated.
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+    [reply] = orca_calls_of(orca_bin, "orchestration", "reply")
+    assert reply[reply.index("--id") + 1] == "m_q"
+    assert reply[reply.index("--body") + 1] == "use Redis"
+    log = Path(env["_READY_LOG"])
+    assert not log.exists() or "--blocked" not in log.read_text()
     span = json.loads((tel_dir / "events.jsonl").read_text().strip().splitlines()[-1])
     assert span["kind"] == "agent" and span["name"] == "afk-answer"
     assert span["status"] == "success"
 
 
-def test_decide_and_act_consumes_gate_tag_on_inject(spoke_repo: Path, tmp_path: Path) -> None:
-    # When the answerer approves a PLAN-gate park and the answer injects successfully, the
-    # gate/<issue> tag must be consumed — otherwise the next tick re-reads it at the tip
-    # (the spoke has not committed its first RED/GREEN yet) and re-answers the same gate.
+def test_decide_and_act_leaves_the_gate_tag_to_the_spoke(
+    spoke_repo: Path, stub_env: dict[str, str], orca_bin: Path
+) -> None:
+    # The spoke is the single writer of its gate tag (spoke-ready.sh --gate consumes it on an
+    # approve), so a delivered reply -- an approve OR a revise -- never deletes it from the hub:
+    # a revise must keep the plan gate shut while the plan is amended.
     subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, _gate_park_records(5))
-    jsonl = pd / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # backdate so the reaction is newer
-
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, "#!/usr/bin/env bash\nexit 0\n")
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    # The shared stub: the submitting Enter records the answer as a user turn, which is what
-    # proves delivery since #281 (a bare mtime bump no longer does).
-    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
-
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "SPOKE_READY": str(ready_stub),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_ANSWERER_CMD": "printf 'ANSWER: approved, proceed'",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-    }
+    env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'ANSWER: REVISE: split step 2'"}
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
@@ -2038,52 +1303,29 @@ def test_decide_and_act_consumes_gate_tag_on_inject(spoke_repo: Path, tmp_path: 
         capture_output=True,
         text=True,
     )
-    assert tag.returncode != 0, "the gate/5 tag must be consumed after a successful inject"
+    assert tag.returncode == 0, "the hub must not consume the spoke's gate tag"
 
 
-def test_decide_and_act_warns_when_answer_does_not_register(
-    spoke_repo: Path, tmp_path: Path
+def test_decide_and_act_warns_when_answer_is_not_acknowledged(
+    spoke_repo: Path, stub_env: dict[str, str], orca_bin: Path
 ) -> None:
-    # The answerer decides and a pane maps, but the inject never registers (the transcript
-    # does not advance). The supervisor must re-inject and then #241 warn-and-continue —
-    # never leave the spoke silently parked, never park blocked/<issue>.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-
-    ready_log = tmp_path / "ready.log"
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    # Pane maps, send-keys succeeds, but the transcript is never advanced.
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n",
+    # The answerer decides but Orca refuses the reply. #241 warns-and-continues -- never leave
+    # the spoke silently parked, never park blocked/<issue> -- and the gate tag stays.
+    refusal = {"rc": 1, "out": {"ok": False, "error": {"code": "reply_failed"}}, "stderr": "no"}
+    orca_park(
+        orca_bin,
+        spoke_repo,
+        question="Q: Which store?",
+        extra={"orchestration reply": [refusal]},
     )
-    _agent_ps_stub(fake_bin)
-
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "SPOKE_READY": str(ready_stub),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-    }
+    env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'"}
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = ready_log.read_text() if ready_log.exists() else ""
-    assert "--blocked 5" not in log, log
-    assert "WARNING: #5" in result.stderr and "register" in result.stderr, result.stderr
+    log = Path(env["_READY_LOG"])
+    assert not log.exists() or "--blocked 5" not in log.read_text()
+    assert "WARNING: #5" in result.stderr and "not delivered" in result.stderr, result.stderr
 
 
 def test_build_answerer_prompt_includes_rule_and_question(
@@ -2727,16 +1969,19 @@ def _land_stub(tmp_path: Path, exit_code: int) -> tuple[Path, Path]:
 _WT_LAND_CONFLICT_EXIT = 4
 
 
-def test_auto_land_conflict_routes_to_resolution(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_conflict_routes_to_resolution(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # A conflict (exit 4) records the fingerprint AND dispatches the resolution lane —
     # it does NOT treat the failure as a generic push-rejection warn-park.
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     _seed_clean_review(spoke_repo)
+    orca_park(orca_bin, spoke_repo, liveness="exited")
     wt_land, _ = _land_stub(tmp_path, _WT_LAND_CONFLICT_EXIT)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     dispatch_log = tmp_path / "dispatch.log"
-    # Seam the dead-pane relaunch so no real tmux is needed; it stands in for the revive.
+    # Seam the exited-worker relaunch so no worker is restarted; it stands in for the revive.
     expr = (
         f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; '
         f'_afk_conflict_resolve_relaunch() {{ printf "relaunch %s\\n" "$2" >> "{dispatch_log}"; return 0; }}; '
@@ -3116,13 +2361,14 @@ def test_auto_land_unstashable_dirty_hub_escalates(spoke_repo: Path, tmp_path: P
 
 
 def test_auto_land_conflict_budget_distinct_from_crash_resume(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # The conflict-resolution budget must be its own per-window marker (conflict-resolved-<issue>),
     # NOT the crash-resume stamp (resumed-<issue>) — so a conflict revive neither consumes nor is
     # starved by the once-per-window crash-resume budget.
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     _seed_clean_review(spoke_repo)
+    orca_park(orca_bin, spoke_repo, liveness="exited")
     wt_land, _ = _land_stub(tmp_path, _WT_LAND_CONFLICT_EXIT)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
@@ -3151,11 +2397,12 @@ def test_auto_land_conflict_budget_distinct_from_crash_resume(
 
 
 def test_conflict_resolution_no_redispatch_while_spoke_tip_unchanged(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # #285 review: the budget is keyed on the SPOKE branch tip, so a re-land triggered by a
     # sibling advancing main (fingerprint moves, spoke tip does NOT) must NOT re-inject the
     # resolve prompt into a spoke already resolving. Two route calls at the same tip dispatch once.
+    orca_park(orca_bin, spoke_repo, liveness="exited")
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     dispatch_log = tmp_path / "dispatch.log"
@@ -4558,7 +3805,7 @@ def _run_preflight(
     )
     expr = f'{otel_line}; {auth_line}; {prelude}; afk_telemetry_preflight /repo; echo "RC=$?"{tail}'
     # Fast re-probe knobs so a "won't bind" launch gives up instantly instead of the
-    # production 10×1s wait.
+    # production 10x1s wait.
     return _call(
         expr,
         env={
@@ -4941,34 +4188,6 @@ def _branched_spoke(
     return wt
 
 
-def _reaper_tmux(
-    tmp_path: Path, *, pane_path: Path | None, agent_alive: bool = True
-) -> tuple[Path, Path]:
-    """A tmux stub that records every call and answers `list-panes` with one line
-    pointing at `pane_path` (pane alive) or nothing (pane dead). Everything else exits 0.
-
-    `agent_alive` is the #301 axis, and it is INDEPENDENT of `pane_path`: the incident's
-    shape is a pane that very much exists (list-panes maps it) whose agent is gone, leaving
-    a bare shell in the worktree. `pane_path=None` remains the older shape — the window
-    itself is gone. Default True: every pre-#301 test here means "a healthy live spoke".
-    """
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    log = tmp_path / "tmux.log"
-    panes = tmp_path / "panes.txt"
-    panes.write_text(f"afk:1\t{pane_path}\n" if pane_path is not None else "")
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" >> "{log}"\n'
-        f'if [ "$1" = "list-panes" ]; then cat "{panes}"; fi\n'
-        f'if [ "$1" = "display-message" ]; then printf "{_PANE_PID}\\n"; fi\n'
-        "exit 0\n",
-    )
-    _agent_ps_stub(fake_bin, agent_alive=agent_alive)
-    return fake_bin, log
-
-
 def _reaper_env(
     spoke: Path,
     tmp_path: Path,
@@ -5018,138 +4237,64 @@ def _reaper_env(
         # #241: the revive/warn-park paths journal a decision — keep the gh issue comment OFF so
         # the reaper tests never fire a real `gh issue comment` at the live repo.
         "AFK_JOURNAL_GH_COMMENT": "0",
-        # #330: zero the injector verify poll for the whole reaper cluster. A reap that reaches
-        # the finished-turn-idle nudge (or any inject_and_verify path) otherwise polls
-        # _transcript_advanced up to AFK_INJECT_VERIFY_SECONDS (60s) plus a bounded retry
-        # (~122s) against the stub tmux, which NEVER advances the transcript — so the poll can
-        # only ever time out. Both vars are read at call time, so zeroing them here is a pure
-        # clock injection: _transcript_advanced returns on its first check without sleeping and
-        # no reap-path outcome changes. A test that needs a real budget overrides BOTH on its
-        # returned env AFTER this call — raise VERIFY_SECONDS *and* POLL_SECONDS together, since
-        # _transcript_advanced only escapes its loop via `waited += poll`; a nonzero budget with
-        # POLL still 0 would spin forever.
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-        "AFK_INJECT_POLL_SECONDS": "0",
     }
     return expr, env, ready_log, statedir
 
 
-def test_reaper_stubs_are_warmed_before_the_reap_runs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # #375: reap_pass execs the tmux and `ps` stubs dozens of times, and a freshly written
-    # script's FIRST exec can take seconds under xdist (macOS vets each new executable). Both
-    # are warmed via tests/_stubs when built, so the pass only ever pays ~10ms re-execs.
-    warmed: list[str] = []
-    real_warm = _stubs.warm_stubs
-    monkeypatch.setattr(
-        _stubs, "warm_stubs", lambda paths: (warmed.extend(p.name for p in paths), real_warm(paths))
-    )
-
-    _, tmux_log = _reaper_tmux(tmp_path, pane_path=tmp_path)
-
-    assert {"tmux", "ps"} <= set(warmed), "the tmux and ps stubs must be warmed up front"
-    assert not tmux_log.exists(), "the warm-up exec must not look like a tmux call"
-
-
-def test_afk_resume_command_reuses_run_id_and_plain_prompt(tmp_path: Path) -> None:
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
-    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
-
-    result = _call(f"_afk_resume_command '{spoke}' 5")
-
-    assert result.returncode == 0, result.stderr
-    cmd = result.stdout
-    assert "feature/5-x+1700000000" in cmd, "the resume must reuse the persisted spoke_run_id"
-    assert "claude" in cmd and "--continue" in cmd, "resume in place: continue the crashed session"
-    assert "/cycle" not in cmd, (
-        "a plain-English continuation prompt, never the unknown /cycle command"
-    )
-
-
-def test_afk_resume_command_inline_exports_otel_for_collector(tmp_path: Path) -> None:
-    # Q1: the resumed window must still reach the collector or recovery flies blind and
-    # defeats #108 — inline-export AI_TOOLKIT_OTEL=1 + the OTLP endpoint + the run id.
+def test_afk_agent_command_carries_run_id_and_telemetry_env(tmp_path: Path) -> None:
+    # The restarted agent must still reach the collector or recovery flies blind (#108): the
+    # launch command inline-exports AI_TOOLKIT_OTEL=1, the OTLP endpoint, the workflow-span
+    # endpoint (default: the collector's OTLP-HTTP :4318, not the gRPC :4317 the native stream
+    # uses) and the persisted spoke_run_id -- and starts a fresh agent (worker-start re-seeds it).
     spoke = _branched_spoke(tmp_path, ahead=True)
     (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
     (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
 
     result = _call(
-        f"_afk_resume_command '{spoke}' 5",
-        env={"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317"},
+        f"_afk_agent_command '{spoke}'",
+        env={"AI_TOOLKIT_OTEL": "1", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317"},
     )
 
     cmd = result.stdout
-    assert "AI_TOOLKIT_OTEL=1" in cmd
+    assert result.returncode == 0, result.stderr
+    assert "CLAUDE_CODE_ENABLE_TELEMETRY=1" in cmd
     assert "OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317" in cmd
+    assert "AI_TOOLKIT_OTEL_SPAN_ENDPOINT=http://localhost:4318" in cmd
     assert "spoke_run_id=feature/5-x+1700000000" in cmd
+    assert "claude" in cmd and "--continue" not in cmd
 
 
-def test_afk_resume_command_inline_exports_workflow_span_endpoint(tmp_path: Path) -> None:
-    # #126 resume parity: telemetry.sh's workflow-span family (cycle step:/script/
-    # hook spans) is gated on AI_TOOLKIT_OTEL_SPAN_ENDPOINT, which worktree-new.sh
-    # exports at spawn — but a resumed window rebuilds its env from scratch, so the
-    # resume command must re-export it too or the revived spoke's workflow spans
-    # silently stop. Default: the collector's OTLP-HTTP listener (:4318, not the
-    # gRPC :4317 the native stream uses).
+def test_afk_agent_command_preserves_span_endpoint_override(tmp_path: Path) -> None:
+    # An operator-set AI_TOOLKIT_OTEL_SPAN_ENDPOINT rides through verbatim.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
-    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
-
-    result = _call(f"_afk_resume_command '{spoke}' 5")
-
-    assert result.returncode == 0, result.stderr
-    assert "AI_TOOLKIT_OTEL_SPAN_ENDPOINT=http://localhost:4318" in result.stdout
-
-
-def test_afk_resume_command_preserves_span_endpoint_override(tmp_path: Path) -> None:
-    # An operator-set AI_TOOLKIT_OTEL_SPAN_ENDPOINT rides through verbatim, same
-    # override-preserved contract as the sibling OTLP endpoint above.
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
-    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
 
     result = _call(
-        f"_afk_resume_command '{spoke}' 5",
-        env={"AI_TOOLKIT_OTEL_SPAN_ENDPOINT": "http://collector.internal:4318"},
+        f"_afk_agent_command '{spoke}'",
+        env={
+            "AI_TOOLKIT_OTEL": "1",
+            "AI_TOOLKIT_OTEL_SPAN_ENDPOINT": "http://collector.internal:4318",
+        },
     )
 
     assert result.returncode == 0, result.stderr
     assert "AI_TOOLKIT_OTEL_SPAN_ENDPOINT=http://collector.internal:4318" in result.stdout
 
 
-def test_reap_pass_resumes_pane_dead_spoke_with_commits(tmp_path: Path) -> None:
+def test_reap_pass_resumes_exited_spoke_with_commits(tmp_path: Path, orca_bin: Path) -> None:
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke, liveness="exited")
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
 
     result = _call(expr, env=env)
 
     assert result.returncode == 0, result.stderr
-    assert "new-window" in tmux_log.read_text(), (
-        "a crashed-pane spoke with commits is resumed in place"
+    assert orca_calls_of(orca_bin, "orchestration", "worker-start"), (
+        "an exited spoke with commits is restarted in place"
     )
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
         "resume must happen BEFORE any blocked is emitted"
     )
     assert (statedir / "resumed-5").exists(), "the once-per-window resume must be recorded"
-
-
-def test_resume_window_name_is_reapable_by_kill_pattern(tmp_path: Path) -> None:
-    # The resumed window must follow the "<issue>-<slug>" convention so a LATER reap's
-    # _kill_spoke_window (which matches "<issue>-"* / "<issue>") can find it — a full
-    # "feature/5-…" branch name would orphan the resumed window.
-    spoke = _branched_spoke(tmp_path, ahead=True, branch="feature/5-fix")
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
-
-    _call(expr, env=env)
-
-    new_window_line = next(ln for ln in tmux_log.read_text().splitlines() if "new-window" in ln)
-    assert "-n 5-fix " in new_window_line, (
-        f"resumed window must be named with the <issue>-<slug> tail, got: {new_window_line}"
-    )
 
 
 # ── reliable escalation: retry + durable local fallback (issue #109, AC2) ──────
@@ -5337,13 +4482,13 @@ def test_slot_state_ignores_ready_behind_tip(spoke_repo: Path) -> None:
 # (#241 §8): a hung live pane is REVIVED, not blocked — the inverse of the old "block" test.
 
 
-def test_reap_pass_attended_re_crash_warns_not_reresumes(tmp_path: Path) -> None:
+def test_reap_pass_attended_re_crash_warns_not_reresumes(tmp_path: Path, orca_bin: Path) -> None:
     # AC5 (integration pin): a NON-afk (attended / mode-less) spoke that crashes again after a resume
     # keeps today's warn-and-parked-LAST — NO auto relaunch, NO escalation. The #310 crash ladder is
     # an unattended-drain behavior only; the human is the wall here.
     spoke = _branched_spoke(tmp_path, ahead=True)  # no .ai-toolkit/mode => non-afk
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke, liveness="exited")  # exited again
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     (statedir / "resumed-5").write_text("1700000000\n")  # already resumed once this window
 
     _call(expr, env=env)
@@ -5351,31 +4496,31 @@ def test_reap_pass_attended_re_crash_warns_not_reresumes(tmp_path: Path) -> None
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "attended re-crash warns-and-parks-LAST, never blocks"
     )
-    assert "new-window" not in tmux_log.read_text(), (
+    assert not orca_calls_of(orca_bin, "orchestration", "worker-start"), (
         "attended stays warn-and-wait — no auto relaunch"
     )
     assert (statedir / "warned-5.txt").exists()
 
 
-def test_reap_pass_revives_pane_dead_spoke_without_commits(tmp_path: Path) -> None:
-    # #241 §7: a dead pane with nothing committed is REVIVED (relaunched) — the crash may
+def test_reap_pass_revives_exited_spoke_without_commits(tmp_path: Path, orca_bin: Path) -> None:
+    # #241 §7: an exited worker with nothing committed is REVIVED (restarted) — the crash may
     # un-stick — not blocked. (Only a twice-failed revival parks LAST.)
     spoke = _branched_spoke(tmp_path, ahead=False)  # nothing to preserve
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke, liveness="exited")
+    expr, env, ready_log, _statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
 
     _call(expr, env=env)
 
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), "revive, not block"
-    assert "new-window" in tmux_log.read_text(), "a crashed pane is revived (relaunched)"
+    assert orca_calls_of(orca_bin, "orchestration", "worker-start"), "the worker is restarted"
 
 
-def test_reap_pass_over_ceiling_revives_not_blocks(tmp_path: Path) -> None:
+def test_reap_pass_over_ceiling_revives_not_blocks(tmp_path: Path, orca_bin: Path) -> None:
     # #241 §7: a runaway over the wall-clock ceiling is REVIVED first (a hang may un-stick on
-    # relaunch) then parked LAST — never blocked.
+    # restart) then parked LAST — never blocked.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=False)
+    orca_park(orca_bin, spoke, liveness="exited")
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=False)
     (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over ceiling
 
     _call(expr, env=env)
@@ -5383,7 +4528,7 @@ def test_reap_pass_over_ceiling_revives_not_blocks(tmp_path: Path) -> None:
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "an over-ceiling runaway is revived + parked LAST, never blocked"
     )
-    assert "new-window" in tmux_log.read_text(), "the runaway is revived (relaunched)"
+    assert orca_calls_of(orca_bin, "orchestration", "worker-start"), "the runaway is restarted"
 
 
 # ── dead-pane recovery each tick (issue #202 C) ───────────────────────────────
@@ -5436,190 +4581,142 @@ def _recover_env(
     return expr, env, ready_log, statedir
 
 
-def test_recover_dead_panes_resumes_dead_pane_with_commits_when_not_idle(tmp_path: Path) -> None:
-    # The core of C: a dead pane with committed work is revived THIS tick, even though the
-    # transcript is fresh (reap_pass would read it `busy` and leave it stranded).
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
-    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
-
-    result = _call(expr, env=env)
-
-    assert result.returncode == 0, result.stderr
-    assert "new-window" in tmux_log.read_text(), "a crashed pane with commits is resumed in place"
-    assert (statedir / "resumed-5").exists(), "the once-per-window resume must be recorded"
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
-        "work is never reaped"
-    )
-
-
-def test_recover_dead_panes_resumes_dead_pane_with_dirty_wip(tmp_path: Path) -> None:
-    # WIP counts as work: a dead pane with an uncommitted (dirty) tree is revived, not reaped.
-    spoke = _branched_spoke(tmp_path, ahead=False)  # no commits above base…
-    (spoke / "wip.txt").write_text("half-done\n")  # …but a dirty tree to preserve
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
-    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
-
-    _call(expr, env=env)
-
-    assert "new-window" in tmux_log.read_text(), "dirty WIP is work — the crashed pane is revived"
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
-
-
-def test_recover_dead_panes_skips_live_pane(tmp_path: Path) -> None:
-    # A live pane is left to reap_pass's idle/hung logic — recover_dead_panes only handles crashes.
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE
-    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
-
-    _call(expr, env=env)
-
-    assert "new-window" not in tmux_log.read_text(), (
-        "a live pane is not a crash — never resumed here"
-    )
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
-
-
-# ── #301: a pane whose AGENT is dead is a crash, however alive the pane looks ──
-#
-# The 2026-07-15 incident. A reboot killed both spokes' claude processes; the terminal
-# restored their tmux panes, which came back running a bare zsh in the worktree (the spoke
-# is launched as `sh -c "<cmd>; exec zsh"`, so the window is DESIGNED to outlive the agent).
-# _spoke_pane_alive only ever asked "does a pane map to this worktree?", so a bare shell
-# read as a healthy spoke: #296 and #299 were never revived and sat stranded for hours with
-# committed, unpushed work, while the answerer typed into their shells.
-
-
-def test_spoke_pane_alive_is_false_when_the_pane_runs_a_bare_shell(tmp_path: Path) -> None:
-    """AC4(a): a pane with no agent must not read as a live spoke."""
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _ = _reaper_tmux(tmp_path, pane_path=spoke, agent_alive=False)
-    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
-
-    result = _call(f"_spoke_pane_alive '{spoke}' && echo ALIVE || echo DEAD", env=env)
-
-    assert result.stdout.strip() == "DEAD", (
-        "a pane running a bare shell is a CRASHED spoke, not a live one — reading it as "
-        f"alive is what stranded #296/#299: {result.stdout}{result.stderr}"
-    )
-
-
-def test_spoke_pane_alive_is_true_when_the_agent_runs_below_the_pane_shell(
-    tmp_path: Path,
+def test_recover_dead_panes_resumes_exited_worker_with_dirty_wip(
+    tmp_path: Path, orca_bin: Path
 ) -> None:
-    """The other half of AC4(a): a REAL live spoke must keep reading as alive.
-
-    Its pane also reports `pane_current_command=zsh` — the agent is a child of the pane's
-    launcher shell — so this is the pin that would fail if liveness were ever re-derived
-    from the pane's own command.
-    """
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _ = _reaper_tmux(tmp_path, pane_path=spoke, agent_alive=True)
-    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
-
-    result = _call(f"_spoke_pane_alive '{spoke}' && echo ALIVE || echo DEAD", env=env)
-
-    assert result.stdout.strip() == "ALIVE", (
-        f"a pane with claude running under its shell is a LIVE spoke: {result.stderr}"
-    )
-
-
-def test_spoke_pane_alive_reads_an_unprovable_probe_as_alive(tmp_path: Path) -> None:
-    """Liveness fails OPEN — the OPPOSITE direction from the write side, deliberately.
-
-    A write refuses when it cannot prove an agent is there, because the cost of guessing
-    wrong is prose executed as shell. Here the cost of guessing wrong is killing and
-    relaunching a HEALTHY spoke, so an unobservable pane keeps its old benefit of the doubt.
-    """
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    # list-panes maps the pane, but nothing answers the pane-pid probe: rc 2, unprovable.
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        f'if [ "$1" = "list-panes" ]; then printf "afk:1\\t%s\\n" "{spoke}"; fi\n'
-        "exit 0\n",
-    )
-    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
-
-    result = _call(f"_spoke_pane_alive '{spoke}' && echo ALIVE || echo DEAD", env=env)
-
-    assert result.stdout.strip() == "ALIVE", (
-        "an unprovable probe must never kill a spoke we merely cannot observe"
-    )
-
-
-def test_recover_dead_panes_resumes_a_pane_whose_agent_died(tmp_path: Path) -> None:
-    """AC2 + AC4(c): the agent-dead pane is revived IN PLACE — worktree and commits intact.
-
-    This is the whole point of the issue: the ONE condition tier-1 recovery exists to fix
-    was invisible to it.
-    """
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke, agent_alive=False)
-    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+    # WIP counts as work: an exited worker with an uncommitted (dirty) tree is restarted, not reaped.
+    spoke = _branched_spoke(tmp_path, ahead=False)  # no commits above base...
+    (spoke / "wip.txt").write_text("half-done\n")  # ...but a dirty tree to preserve
+    orca_park(orca_bin, spoke, liveness="exited")
+    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
 
     _call(expr, env=env)
 
-    assert "new-window" in tmux_log.read_text(), (
-        "a pane whose agent is gone must route to resume_spoke — the commits are intact, so "
-        f"it is re-adopted in place, never abandoned: {tmux_log.read_text()}"
-    )
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
-        "a crashed agent is revived, never blocked"
-    )
+    assert orca_calls_of(orca_bin, "orchestration", "worker-start"), "dirty WIP is work"
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
 
 
-def test_recover_dead_panes_revives_a_phantom_waiting_dead_pane(tmp_path: Path) -> None:
+def test_recover_dead_panes_skips_live_worker(tmp_path: Path, orca_bin: Path) -> None:
+    # A live worker is left to reap_pass's idle/hung logic — recover_dead_panes only handles crashes.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    orca_park(orca_bin, spoke, liveness="live")
+    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    _call(expr, env=env)
+
+    assert not orca_calls_of(orca_bin, "orchestration", "worker-start"), "a live worker is no crash"
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+
+
+# ── #301: a worker whose AGENT is gone is a crash, however alive its terminal looks ──
+# Liveness is Orca's verdict on the worker, never a pane or process-table proxy. It fails OPEN:
+# only `exited` reads dead -- guessing dead restarts a HEALTHY spoke, and a missing or unreadable
+# record is "unknown", never a basis to restart anything.
+
+
+@pytest.mark.parametrize(
+    "liveness,verdict",
+    [("exited", "DEAD"), ("live", "ALIVE"), ("unverifiable", "ALIVE")],
+)
+def test_spoke_agent_alive_follows_the_orca_verdict(
+    tmp_path: Path, orca_bin: Path, liveness: str, verdict: str
+) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    orca_park(orca_bin, spoke, liveness=liveness)
+
+    result = _call(f"_spoke_agent_alive '{spoke}' && echo ALIVE || echo DEAD")
+
+    assert result.stdout.strip() == verdict
+
+
+def test_spoke_agent_alive_reads_a_missing_record_as_alive(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)  # the stub's worker-list is empty
+
+    result = _call(f"_spoke_agent_alive '{spoke}' && echo ALIVE || echo DEAD")
+
+    assert result.stdout.strip() == "ALIVE", "unknown must never kill a spoke we cannot observe"
+
+
+def test_recover_dead_panes_revives_a_phantom_waiting_exited_worker(
+    tmp_path: Path, orca_bin: Path
+) -> None:
     """The #296/#299 stranding, pinned at the recover_dead_panes belt.
 
-    A dead agent's pane keeps a gate/<issue> tag at the tip (a git tag outlives the process)
-    or a stale dialog in its scrollback, so slot_state classifies it `waiting`. Before #301
-    recover_dead_panes skipped every `waiting` state outright — so the crash it exists to fix
-    was invisible and the spoke sat stranded. slot_state is forced to `waiting` here so the
-    belt is proven in isolation: a dead-agent `waiting` pane is revived, not skipped, whatever
-    ST3's slot_state gating does upstream.
+    A dead agent keeps a gate/<issue> tag at the tip (a git tag outlives the process), so
+    slot_state can classify it `waiting`. recover_dead_panes must revive an exited worker
+    whatever slot_state says, not skip it as if the answer lane owned it. slot_state is forced
+    to `waiting` so the belt is proven in isolation.
     """
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke, agent_alive=False)
-    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+    orca_park(orca_bin, spoke, liveness="exited")
+    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
     expr = f'slot_state() {{ printf "waiting\\n"; }}; {expr}'
 
     _call(expr, env=env)
 
-    assert "new-window" in tmux_log.read_text(), (
-        "a `waiting` classification on a DEAD agent is a phantom park (stale scrollback / a "
-        f"gate tag) — it must be revived, not skipped as if the answer lane owned it: "
-        f"{tmux_log.read_text()}"
-    )
+    assert orca_calls_of(orca_bin, "orchestration", "worker-start"), "a phantom park is revived"
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
 
 
-def test_recover_dead_panes_skips_a_live_waiting_pane(tmp_path: Path) -> None:
-    """The other side of the belt: a `waiting` pane whose agent IS alive is left to the answer
-    lane — reviving a genuinely parked live spoke would kill the agent mid-park (#246)."""
+def orca_scenario_workers(orca_bin: Path, extra_rows: list[dict]) -> str:
+    """Append rows to the scripted worker-list reply (keeps the rest of the parked scenario)."""
+    f = orca_bin / ".orca-stub" / "scenario.json"
+    sc = json.loads(f.read_text())
+    sc["orchestration worker-list"][0]["out"]["result"]["workers"] += extra_rows
+    f.write_text(json.dumps(sc))
+    return "workers: " + ", ".join(
+        r["dispatchId"] for r in sc["orchestration worker-list"][0]["out"]["result"]["workers"]
+    )
+
+
+def _recovery_trail(orca_bin: Path, upto: int | None = None) -> list[str]:
+    """The Orca write verbs the drain issued (first `upto` calls), in order, as `<noun> <verb>`."""
+    names = [" ".join(argv[:2]) for argv in orca_calls(orca_bin)[:upto]]
+    writes = ("terminal create", "terminal send")
+    return [n for n in names if n in writes or ("worker-" in n and not n.endswith("-list"))]
+
+
+def test_recover_dead_panes_skips_a_live_waiting_pane(tmp_path: Path, orca_bin: Path) -> None:
+    """A `waiting` spoke whose worker IS live is left to the answer lane — restarting a
+    genuinely parked live spoke would kill the agent mid-park (#246)."""
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke, agent_alive=True)
-    expr, env, _ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+    orca_park(orca_bin, spoke, liveness="live")
+    expr, env, _ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
     expr = f'slot_state() {{ printf "waiting\\n"; }}; {expr}'
 
     _call(expr, env=env)
 
-    assert "new-window" not in tmux_log.read_text(), (
-        "a live parked pane is the answer lane's job — recover_dead_panes must not revive it"
-    )
+    assert _recovery_trail(orca_bin) == [], "a live parked worker is the answer lane's job"
 
 
-def test_recover_dead_panes_reresumes_after_one_resume(tmp_path: Path) -> None:
-    # #310: a second crash after an auto-resume no longer dead-ends in an eternal warn-park. On the
-    # first DUE warned-lane cadence (no prior backoff -> due, attempt 0 < AFK_WARN_ESCALATE_ATTEMPTS)
-    # it genuinely RE-ATTEMPTS the resume — a transient crash self-heals mid-window — rather than
-    # warn-parking forever. It still never blocks on this first re-crash. mode=afk: the ladder is
-    # unattended-only (attended is pinned by test_reap_pass_attended_re_crash_warns_not_reresumes).
+def test_recover_dead_panes_missing_worker_record_takes_no_action(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # An absent or unreadable worker record is "unknown", and unknown is never a basis to
+    # restart, tear down or block anything (AFK principle 6).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+    empty = {"out": {"ok": True, "result": {"workers": []}}}
+    for reply in (empty, {"rc": 1, "out": {"ok": False}}):
+        orca_park(orca_bin, spoke, extra={"orchestration worker-list": [reply]}, liveness="exited")
+
+        result = _call(expr, env=env)
+        retry = _call(f"_afk_retry_worker '{spoke}' 5", env=env)
+
+        assert result.returncode == 0, result.stderr
+        assert retry.returncode == 2, "an unreadable record is rc 2: no action, nothing touched"
+        assert _recovery_trail(orca_bin) == [], f"no recovery on an unknown record: {reply}"
+        assert not ready_log.exists(), "unknown is never a blocked escalation"
+        assert not (statedir / "resumed-5").exists()
+
+
+def test_recover_dead_panes_reresumes_after_one_resume(tmp_path: Path, orca_bin: Path) -> None:
+    # #310: a second crash after an auto-resume re-attempts the resume on the first DUE
+    # warned-lane cadence (attempt 0 < AFK_WARN_ESCALATE_ATTEMPTS) instead of warn-parking
+    # forever, and never blocks on this first re-crash. mode=afk: the ladder is unattended-only.
     spoke = _afk_mode_spoke(tmp_path, "afk")
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
-    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
+    orca_park(orca_bin, spoke, liveness="exited")
+    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
     (statedir / "resumed-5").write_text("1700000000\n")  # already resumed once this window
 
     _call(expr, env=env)
@@ -5627,27 +4724,247 @@ def test_recover_dead_panes_reresumes_after_one_resume(tmp_path: Path) -> None:
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "the first re-crash re-attempts the resume, it does not block"
     )
-    assert "new-window" in tmux_log.read_text(), (
+    assert "orchestration worker-start" in _recovery_trail(orca_bin), (
         "a due re-crash re-attempts the resume (the #310 bounded retry), not a once-per-window dead end"
     )
     attempt, _next = (statedir / "warned-state-5").read_text().split("\t")
     assert attempt == "1", "the crash backoff advanced for the next cadence (attempt 0 -> 1)"
 
 
-def test_recover_dead_panes_redispatches_clean_dead_pane(tmp_path: Path) -> None:
-    # A clean, empty crashed worktree (no commits, nothing dirty) is torn down so the issue
-    # re-dispatches — NOT escalated to a human (the manual ~4x-overnight step).
-    spoke = _branched_spoke(tmp_path, ahead=False)  # no commits, clean tree
-    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
-    redispatch = tmp_path / "redispatched"
-    expr, env, ready_log, statedir = _recover_env(
-        spoke, tmp_path, fake_bin, redispatch_marker=redispatch
-    )
+def test_recover_dead_panes_retries_an_exited_worker_with_work_in_place(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # An exited worker WITH work is retried in place: its dispatch is abandoned (already
+    # exited), a fresh terminal is created, and worker-start --retry-of re-seeds the SAME
+    # worktree. Never a second live dispatch: worker-start comes only after the fence.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    orca_park(orca_bin, spoke, liveness="exited", dispatch="ctx_old", handle="term_old")
+    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
 
     result = _call(expr, env=env)
 
     assert result.returncode == 0, result.stderr
-    assert redispatch.exists(), "a clean crashed worktree is torn down to re-dispatch the issue"
+    assert _recovery_trail(orca_bin) == [
+        "orchestration worker-abandon",
+        "terminal create",
+        "orchestration worker-start",
+    ]
+    (start,) = [a for a in orca_calls(orca_bin) if a[:2] == ["orchestration", "worker-start"]]
+    assert start[start.index("--retry-of") + 1] == "ctx_old"
+    assert start[start.index("--terminal") + 1] == "term_stub"
+    assert start[start.index("--worktree") + 1] == f"path:{spoke}"
+    assert (statedir / "resumed-5").exists(), "the once-per-window resume is recorded"
+    assert not ready_log.exists(), "work is retried, never blocked"
+
+
+def test_afk_retry_worker_stops_a_live_worker_before_restarting(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # A live (hung) worker is worker-stop'd first: the retry never issues worker-start while the
+    # old dispatch is unfenced (no two live dispatches on one worktree).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    orca_park(orca_bin, spoke, liveness="live")
+    _expr, env, _ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    result = _call(f"_afk_retry_worker '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert _recovery_trail(orca_bin)[:2] == ["orchestration worker-stop", "terminal create"]
+    assert _recovery_trail(orca_bin)[-1] == "orchestration worker-start"
+
+
+def test_afk_retry_worker_takes_no_action_on_an_unverifiable_worker(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # Orca's own recovery guide: an unverifiable worker is never stopped, abandoned or retried.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    orca_park(orca_bin, spoke, liveness="unverifiable")
+    _expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    retry = _call(f"_afk_retry_worker '{spoke}' 5", env=env)
+    revive = _call(f"_revive_spoke '{spoke}' 5", env=env)
+
+    assert retry.returncode == 2, "rc 2 is 'no action on an unknown state'"
+    assert revive.returncode == 2, "a skipped revive says so; callers treat 2 as handled"
+    assert _recovery_trail(orca_bin) == []
+    assert not (statedir / "resumed-5").exists(), "a no-op revive records nothing"
+    assert not ready_log.exists()
+
+
+def test_the_crash_ladder_never_counts_or_escalates_on_an_unverifiable_worker(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # No-op "attempts" must not burn the resume budget toward a blocked escalation (principle 6):
+    # five cadences on an unverifiable worker leave no warned-lane count, no marker, no blocked.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="unverifiable")
+    _expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+    env = {**env, "AFK_WARN_BACKOFF_BASE": "0"}
+
+    for _ in range(5):
+        _call(f"_afk_crash_reresume_or_escalate '{spoke}' 5 'crashed again' _revive_spoke", env=env)
+
+    assert _recovery_trail(orca_bin) == []
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+    assert not (statedir / "warned-state-5").exists(), "a skipped retry advances no backoff/count"
+    assert (statedir / "unknown-5").exists(), "but the unknown state is WARNED about, not silent"
+
+
+def test_a_skipped_revive_warns_once_per_window_of_time_not_every_tick(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    orca_park(orca_bin, spoke, liveness="unverifiable")
+    _expr, env, _ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    first = _call(f"_revive_spoke '{spoke}' 5", env=env)
+    stamp = (statedir / "unknown-5").read_text()
+    second = _call(f"_revive_spoke '{spoke}' 5", env=env)
+
+    assert first.returncode == 2 and second.returncode == 2
+    assert (statedir / "unknown-5").read_text() == stamp, (
+        "rate-limited: not re-stamped inside the gap"
+    )
+
+
+def test_the_crash_ladder_counts_nothing_when_the_row_lacks_a_task_id(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # The third reason a retry takes no action: an exited row with no taskId. The ladder must not keep
+    # its own copy of the no-action rules -- it asks the retry, which says rc 2 -- so this no-op
+    # cannot burn the budget toward blocked either.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
+    f = orca_bin / ".orca-stub" / "scenario.json"
+    sc = json.loads(f.read_text())
+    del sc["orchestration worker-list"][0]["out"]["result"]["workers"][0]["taskId"]
+    f.write_text(json.dumps(sc))
+    _expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+    env = {**env, "AFK_WARN_BACKOFF_BASE": "0"}
+
+    for _ in range(5):
+        _call(f"_afk_crash_reresume_or_escalate '{spoke}' 5 'crashed again' resume_spoke", env=env)
+
+    assert _recovery_trail(orca_bin) == []
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+    assert not (statedir / "warned-state-5").exists()
+
+
+def test_a_skipped_conflict_resolve_restart_neither_records_nor_warn_parks(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
+    f = orca_bin / ".orca-stub" / "scenario.json"
+    sc = json.loads(f.read_text())
+    del sc["orchestration worker-list"][0]["out"]["result"]["workers"][0]["taskId"]  # -> rc 2
+    f.write_text(json.dumps(sc))
+    _expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    result = _call(f"_afk_route_conflict_resolution '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not (statedir / "conflict-resolved-5").exists(), "nothing was dispatched"
+    assert not (statedir / "warned-state-5").exists(), "and nothing was warn-parked"
+    assert not ready_log.exists()
+
+
+def test_afk_record_dispatch_falls_back_to_a_loud_single_key_rewrite(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    identity = spoke / ".ai-toolkit" / "identity"
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_text("issue=5\norca_dispatch_id=ctx_old\n")
+    broken = tmp_path / "provision-worktree.sh"
+    broken.write_text("#!/bin/sh\nexit 1\n")
+
+    result = _call(
+        f"_afk_record_dispatch '{spoke}' ctx_new", env={"PROVISION_WORKTREE": str(broken)}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "WARNING" in result.stderr
+    assert identity.read_text().splitlines() == ["issue=5", "orca_dispatch_id=ctx_new"]
+
+
+def test_afk_retry_worker_refuses_a_second_live_dispatch_on_the_worktree(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # After the fence Orca still lists ANOTHER live worker there (an unsettled earlier restart that
+    # did take effect): starting a third would put two live dispatches on one worktree.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    other = {
+        "dispatchId": "ctx_other",
+        "taskId": "task_1",
+        "agentTerminalHandle": "term_other",
+        "resource": {"worktreeId": f"stub-repo::{spoke}"},
+        "projection": {"liveness": {"verdict": "live"}},
+    }
+    orca_park(orca_bin, spoke, liveness="live", dispatch="ctx_old")
+    mine = orca_scenario_workers(orca_bin, [other])
+    _expr, env, _ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    result = _call(f"_afk_retry_worker '{spoke}' 5", env=env)
+
+    assert result.returncode == 1, mine
+    assert "orchestration worker-start" not in _recovery_trail(orca_bin)
+    assert "terminal create" not in _recovery_trail(orca_bin)
+
+
+def test_afk_retry_worker_never_starts_while_the_old_dispatch_is_unfenced(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    stop_fails = {"rc": 1, "out": {"ok": False}, "stderr": "boom"}
+    orca_park(orca_bin, spoke, liveness="live", extra={"orchestration worker-stop": [stop_fails]})
+    _expr, env, _ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    result = _call(f"_afk_retry_worker '{spoke}' 5", env=env)
+
+    assert result.returncode == 1, "an unfenced dispatch is a failed retry the caller warns on"
+    assert "orchestration worker-start" not in _recovery_trail(orca_bin)
+    assert "terminal create" not in _recovery_trail(orca_bin)
+
+
+def test_afk_retry_worker_records_the_new_dispatch_in_the_identity(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    identity = spoke / ".ai-toolkit" / "identity"
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_text("issue=5\norca_dispatch_id=ctx_old\n")
+    orca_park(orca_bin, spoke, liveness="exited", dispatch="ctx_old")
+    _expr, env, _ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    result = _call(f"_afk_retry_worker '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    lines = identity.read_text().splitlines()
+    assert "orca_dispatch_id=ctx_stub" in lines, "later reads must match the NEW row"
+    assert "orca_dispatch_id=ctx_old" not in lines
+
+
+def test_recover_dead_panes_redispatches_clean_dead_pane(tmp_path: Path, orca_bin: Path) -> None:
+    # A clean, empty exited worktree (no commits, nothing dirty) is torn down so the issue
+    # re-dispatches — NOT escalated to a human: abandon -> release -> worktree-done.sh, in
+    # that order (the teardown only runs once the dispatch is fenced and its terminal freed).
+    spoke = _branched_spoke(tmp_path, ahead=False)  # no commits, clean tree
+    orca_park(orca_bin, spoke, liveness="exited")
+    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+    done_at = tmp_path / "done-at"
+    wt_done = tmp_path / "worktree-done.sh"
+    calls_log = orca_bin / ".orca-stub" / "calls.jsonl"
+    write_stub(wt_done, f'#!/usr/bin/env bash\nwc -l < "{calls_log}" > "{done_at}"\n')
+    env["WT_DONE"] = str(wt_done)
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert done_at.exists(), "a clean exited worktree is torn down to re-dispatch the issue"
+    fenced_and_freed = ["orchestration worker-abandon", "orchestration worker-release"]
+    assert _recovery_trail(orca_bin, int(done_at.read_text())) == fenced_and_freed, (
+        "the dispatch is fenced and released BEFORE worktree-done.sh runs"
+    )
+    assert _recovery_trail(orca_bin) == fenced_and_freed
     assert (statedir / "redispatched-5").exists(), (
         "the once-per-window re-dispatch must be recorded"
     )
@@ -5656,14 +4973,16 @@ def test_recover_dead_panes_redispatches_clean_dead_pane(tmp_path: Path) -> None
     )
 
 
-def test_recover_dead_panes_warns_clean_dead_pane_after_one_redispatch(tmp_path: Path) -> None:
+def test_recover_dead_panes_warns_clean_dead_pane_after_one_redispatch(
+    tmp_path: Path, orca_bin: Path
+) -> None:
     # #241 §7: a clean pane that crashes AGAIN after a re-dispatch warns-and-parks-LAST
     # (retried at low frequency), never blocks. Re-dispatch stays bounded once per window.
     spoke = _branched_spoke(tmp_path, ahead=False)
-    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
+    orca_park(orca_bin, spoke, liveness="exited")
     redispatch = tmp_path / "redispatched"
     expr, env, ready_log, statedir = _recover_env(
-        spoke, tmp_path, fake_bin, redispatch_marker=redispatch
+        spoke, tmp_path, orca_bin, redispatch_marker=redispatch
     )
     (statedir / "redispatched-5").write_text("1700000000\n")  # already re-dispatched once
 
@@ -5676,85 +4995,25 @@ def test_recover_dead_panes_warns_clean_dead_pane_after_one_redispatch(tmp_path:
     assert (statedir / "warned-5.txt").exists()
 
 
-def _stateful_reaper_tmux(tmp_path: Path) -> tuple[Path, Path]:
-    """A tmux stub whose pane starts DEAD (list-panes empty) and goes ALIVE when a resume opens
-    a window: `new-window -c <path>` records <path> as the live pane. Models the exact
-    crash->resume transition the #202 C review flagged (recover resumes, reap_pass runs next)."""
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    log = tmp_path / "tmux.log"
-    panes = tmp_path / "panes.txt"
-    panes.write_text("")  # pane dead initially
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" >> "{log}"\n'
-        f'if [ "$1" = list-panes ]; then cat "{panes}"; fi\n'
-        'if [ "$1" = new-window ]; then p=""; while [ "$#" -gt 0 ]; do '
-        f'if [ "$1" = -c ]; then p="$2"; fi; shift; done; printf "afk:1\\t%s\\n" "$p" > "{panes}"; fi\n'
-        "exit 0\n",
-    )
-    return fake_bin, log
-
-
-def test_recover_then_reap_does_not_block_a_just_resumed_idle_spoke(tmp_path: Path) -> None:
-    # #202 C review regression: recover_dead_panes resumes a dead-pane spoke whose transcript is
-    # IDLE-stale, then reap_pass runs the SAME tick with the pane now alive. Without resetting the
-    # idle clock on resume, reap_pass reads "idle + live pane" and BLOCKS the just-restored work.
+def test_recover_then_reap_does_not_reap_a_just_resumed_idle_spoke(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # #202 C review regression: recover_dead_panes restarts an exited spoke whose transcript is
+    # IDLE-stale, then reap_pass runs the SAME tick. Without resetting the idle clock on resume
+    # the stale transcript reads `reap` and the just-restored work is warn-parked / blocked.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _stateful_reaper_tmux(tmp_path)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    _write_transcript(
-        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
-    )
-    os.utime(pd / "session.jsonl", (1_000_000, 1_000_000))  # ancient ⇒ idle
-    ready_log = tmp_path / "ready.log"
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    statedir = tmp_path / "statedir"
-    statedir.mkdir()
-    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
-    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+    orca_park(orca_bin, spoke, liveness="exited")
+    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+    pd = _project_dir_for(tmp_path / "projects", spoke)
+    os.utime(pd / "session.jsonl", (1_000_000, 1_000_000))  # ancient => idle
+    env |= {"AFK_IDLE_MINUTES": "0", "AFK_AUTH_PROBE_CMD": "true"}  # any idle reads reap
 
-    expr = f'inflight_worktrees() {{ printf "{spoke}\\t5\\n"; }}; recover_dead_panes; reap_pass'
-    result = _call(
-        expr,
-        env={
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "SPOKE_READY": str(ready_stub),
-            "AFK_STATE_DIR": str(statedir),
-            "AFK_DEFAULT_BRANCH": "main",
-            "AFK_IDLE_MINUTES": "0",  # any idle reads reap — proves the resume reset the clock
-            "AFK_NOW": "1700000000",
-            "AFK_AUTH_PROBE_CMD": "true",
-        },
-    )
+    result = _call(f"{expr}; reap_pass", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert "new-window" in tmux_log.read_text(), (
-        "the crashed spoke is resumed by recover_dead_panes"
-    )
-    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
-        "the same tick's reap_pass must NOT block a just-resumed spoke (#202 C review)"
-    )
-
-
-def test_recover_dead_panes_over_ceiling_revives_not_blocks(tmp_path: Path) -> None:
-    # #241 §7: an over-ceiling runaway is REVIVED first (a hang may un-stick on relaunch) then
-    # parked LAST — never blocked. recover_dead_panes and reap_pass both revive-first now.
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD, with commits
-    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
-    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over ceiling
-
-    _call(expr, env=env)
-
-    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
-        "an over-ceiling runaway is revived + parked LAST, never blocked"
-    )
-    assert "new-window" in tmux_log.read_text(), "the runaway is revived (relaunched)"
+    assert "orchestration worker-start" in _recovery_trail(orca_bin), "the worker is restarted"
+    assert not (statedir / "warned-5.txt").exists(), "the same tick's reap must leave it alone"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text()
 
 
 # ── J: pushed-but-unmarked detection (issue #202 J / #200) ────────────────────
@@ -5835,20 +5094,18 @@ def test_pushed_but_unmarked_false_when_unpushed_work(tmp_path: Path) -> None:
     assert "NO" in result.stdout, "unpushed work is mid-task, not a pushed-but-unmarked finish"
 
 
-def test_recover_dead_panes_skips_done_spoke(tmp_path: Path) -> None:
+def test_recover_dead_panes_skips_done_spoke(tmp_path: Path, orca_bin: Path) -> None:
     # A finished spoke (ready/<N> at the tip) with a dead pane is left for auto_land — never
     # revived or torn down by the dead-pane pass.
     spoke = _branched_spoke(tmp_path, ahead=True)
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke, check=True, capture_output=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
-    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+    orca_park(orca_bin, spoke, liveness="exited")
+    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
 
     _call(expr, env=env)
 
-    # A done spoke is skipped before the pane check, so tmux is never even consulted.
-    assert not tmux_log.exists() or "new-window" not in tmux_log.read_text(), (
-        "a done spoke is not revived"
-    )
+    # A done spoke is skipped before the liveness check: no worker is restarted for it.
+    assert not any(c[:2] == ["orchestration", "worker-start"] for c in orca_calls(orca_bin))
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
 
 
@@ -6014,7 +5271,7 @@ def test_self_copy_temp_launch_loads_transitive_helpers(tmp_path: Path) -> None:
         [
             "bash",
             "-c",
-            f'source "{copy}"; for fn in _pane_shows_permission_prompt _transcript_mtime '
+            f'source "{copy}"; for fn in deliver_text _transcript_mtime '
             '_spoke_jsonl _transcript_sizes; do command -v "$fn" >/dev/null || '
             '{ echo "missing: $fn"; exit 1; }; done; echo OK',
         ],
@@ -6963,24 +6220,28 @@ def _gh_auth_stub(tmp_path: Path, *, exit_code: int) -> Path:
     return fake_bin
 
 
-def test_arm_preconditions_reach_the_interim_orca_guard_when_all_else_is_ok(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("handle", "rc"), [("term_hub", 0), ("", 1)], ids=["coordinator-terminal", "no-terminal"]
+)
+def test_arm_preconditions_need_a_coordinator_terminal_with_a_run(
+    tmp_path: Path, handle: str, rc: int
 ) -> None:
-    # Every static precondition passes, so the ONLY refusal left is the interim #365 guard
-    # (dispatch is Orca-only since #363, but the supervisor still watches tmux panes).
+    # Every static precondition passes, so the ONLY thing left is the Orca guard: the drain
+    # arms from a coordinator terminal that has a bound Run, and refuses anywhere else.
     repo = _clean_hub(tmp_path)
     fake_bin = _gh_auth_stub(tmp_path, exit_code=0)
     env = {
         **install_orca_stub(fake_bin),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_STATE": str(tmp_path / "no-state"),  # off ⇒ no live supervisor
+        "AFK_STATE": str(tmp_path / "no-state"),  # off => no live supervisor
         "AFK_DEFAULT_BRANCH": "main",
+        "ORCA_TERMINAL_HANDLE": handle,
     }
 
     result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
 
-    assert "RC=1" in result.stdout, result.stdout + result.stderr
-    assert "#365" in result.stderr
+    assert f"RC={rc}" in result.stdout, result.stdout + result.stderr
+    assert ("bound Run" in result.stderr) == (rc == 1)
     assert "uncommitted" not in result.stderr and "gh auth" not in result.stderr
 
 
@@ -7032,12 +6293,12 @@ def test_arm_preconditions_tolerates_untracked_files(tmp_path: Path) -> None:
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_STATE": str(tmp_path / "no-state"),
         "AFK_DEFAULT_BRANCH": "main",
+        "ORCA_TERMINAL_HANDLE": "term_hub",
     }
 
     result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
 
-    # Reaching the interim guard (not the dirty-tree refusal) proves untracked files pass.
-    assert "#365" in result.stderr and "uncommitted" not in result.stderr, result.stderr
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
 
 
 def test_arm_preconditions_refuses_off_base_branch(tmp_path: Path) -> None:
@@ -7758,12 +7019,12 @@ def test_afk_auth_is_dead_predicate(probe_cmd: str, expected: int) -> None:
     assert f"RC={expected}" in result.stdout, result.stdout + result.stderr
 
 
-def test_reap_pass_halts_on_dead_auth_instead_of_reaping(tmp_path: Path) -> None:
+def test_reap_pass_halts_on_dead_auth_instead_of_reaping(tmp_path: Path, orca_bin: Path) -> None:
     # An idle reap candidate with a DEAD subscription token: reap_pass must probe once, raise
     # the global stop flag, and NOT reap the spoke (blocking it into dead auth one-by-one).
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
-    expr, env, ready_log, _statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke)
+    expr, env, ready_log, _statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     env["AFK_AUTH_PROBE_CMD"] = "echo authentication_error; exit 1"  # dead auth
     expr = expr + '; echo "FLAG=$_AFK_AUTH_FAILED"'
 
@@ -7848,14 +7109,16 @@ def test_afk_probe_state_tristate(net_cmd: str, auth_cmd: str, expected: str) ->
     assert result.stdout.strip() == expected, result.stdout + result.stderr
 
 
-def test_reap_pass_skips_reap_and_refreshes_clocks_when_network_down(tmp_path: Path) -> None:
+def test_reap_pass_skips_reap_and_refreshes_clocks_when_network_down(
+    tmp_path: Path, orca_bin: Path
+) -> None:
     # The core #249 fix: an idle reap candidate during a network blackout. reap_pass must probe
     # reachability, find the network DOWN, and skip the reap — never raising the auth-halt flag,
     # never blocking the spoke — while recording the outage and refreshing the idle/ceiling clocks
     # so the blackout does not accumulate into a reap the instant the network returns.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke)
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     env["AFK_NET_PROBE_CMD"] = "false"  # network down
     expr = expr + '; echo "FLAG=$_AFK_AUTH_FAILED"'
 
@@ -7869,38 +7132,23 @@ def test_reap_pass_skips_reap_and_refreshes_clocks_when_network_down(tmp_path: P
     assert (statedir / "answer-attempt-5.epoch").exists(), "the idle clock is refreshed"
 
 
-def test_reap_pass_clears_offline_marker_when_network_recovers(tmp_path: Path) -> None:
+def test_reap_pass_clears_offline_marker_when_network_recovers(
+    tmp_path: Path, orca_bin: Path
+) -> None:
     # A prior outage left an offline marker; this tick the network is back and auth is healthy,
     # so reap_pass proceeds normally AND clears the stale outage marker (consecutive-offline reset).
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
-    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke, state="done")  # finished-turn-idle: reap_pass nudges it
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1"})
     env["AFK_NET_PROBE_CMD"] = "true"  # network back up (auth stub in _reaper_env is healthy)
 
-    # #330: the marker clear happens at the TOP of reap_pass (clear_offline_since), before
-    # _reap_or_resume's nudge path enters inject_and_verify -> _transcript_advanced, which
-    # polls up to AFK_INJECT_VERIFY_SECONDS (60s) plus a bounded retry (~122s total against
-    # the stub tmux that never advances the transcript). The fix zeroes the inject-verify
-    # budget in _reaper_env's returned env. #375: witness the skipped poll directly instead of
-    # a wall-clock budget (cold stub execs made any bound flaky under xdist). The poll's step
-    # is `sleep <AFK_INJECT_POLL_SECONDS>`; a `sleep` shim records every call and no-ops the
-    # 2s default step, so a regressed pass loops instantly and leaves its trace in the log.
-    sleep_log = tmp_path / "sleep.log"
-    shim = (
-        f'sleep() {{ printf "%s\\n" "$*" >> "{sleep_log}"; [ "$1" = 2 ] || command sleep "$@"; }}; '
-    )
-    _call(shim + expr, env=env)
+    _call(expr, env=env)
 
     assert not (statedir / "offline-since.epoch").exists(), (
         "network recovery must clear the outage marker so --status stops reporting OFFLINE"
     )
-    assert "send-keys" in tmux_log.read_text(), "the pass must reach the inject path it bounds"
-    polled = sleep_log.read_text().split() if sleep_log.exists() else []
-    assert "2" not in polled, (
-        "reap_pass entered the injector verify poll (default 2s step); with the budget zeroed "
-        f"it is skipped, so a poll step means the ~122s pre-fix wait is back (sleeps: {polled})"
-    )
+    assert len(_orca_sent_texts(orca_bin)) == 1, "the pass must go on to service the idle spoke"
 
 
 def test_service_auth_halt_stays_halted_and_records_outage_when_network_down(
@@ -8482,122 +7730,105 @@ def test_afk_sync_labels_ignores_lifecycle_labels(tmp_path: Path) -> None:
 
 
 # ── issue #241 S6: reap becomes revive-first + warned-parked-LAST, never abandon ──
-# The reaper no longer kills a stuck spoke into blocked/<issue>. A live-but-frozen claude or a
-# crashed pane is REVIVED (kill + relaunch); only a twice-failed revival downgrades to
-# warned-and-parked-LAST (retried at low frequency), never abandoned. A finished-but-unmarked
-# spoke (#200) is auto-marked ready, not reaped.
+# The reaper no longer kills a stuck spoke into blocked/<issue>. A live-but-frozen or exited
+# worker is REVIVED (restarted in place); only a twice-failed revival downgrades to
+# warned-and-parked-LAST (retried at low frequency), never abandoned.
 
 
-def test_reap_pass_revives_pane_alive_idle_spoke(tmp_path: Path) -> None:
-    # #241 §8: a live-but-frozen claude is a REVIVAL case (kill the hung pane + relaunch),
-    # NOT a terminal block. It warns + revives (opens a fresh window), never parks blocked.
-    # #255: "hung" here means genuinely frozen MID-TOOL_USE — a trailing unresolved tool_use,
-    # distinct from the finished-turn-idle shape (which is nudged, not relaunched).
+def test_reap_pass_revives_pane_alive_idle_spoke(tmp_path: Path, orca_bin: Path) -> None:
+    # #241 §8: a live-but-frozen claude is a REVIVAL case (stop the hung worker + restart it in
+    # place as a retry of its dispatch), NOT a terminal block. #255: "hung" means the agent is
+    # still `working` (frozen mid-tool), distinct from the finished-turn-idle shape (`done`),
+    # which is nudged, not restarted.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE (frozen)
-    expr, env, ready_log, statedir = _reaper_env(
-        spoke, tmp_path, fake_bin, idle=True, transcript=[_bash_tool_record("pytest -x")]
-    )
+    orca_park(orca_bin, spoke, state="working", liveness="live")
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
 
     _call(expr, env=env)
 
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
-        "a hung live pane must be revived, never blocked"
+        "a hung live worker must be revived, never blocked"
     )
-    assert "new-window" in tmux_log.read_text(), "a hung live pane is REVIVED (relaunched)"
+    assert _recovery_trail(orca_bin) == [
+        "orchestration worker-stop",
+        "terminal create",
+        "orchestration worker-start",
+    ], "a hung live worker is fenced, then restarted in place"
     # A successful revival journals the taken decision for morning post-review (§10).
     assert "revive" in (statedir / "decision-journal.jsonl").read_text()
 
 
 def test_reap_or_resume_permission_park_routes_to_answerer(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
-    # #246 defense-in-depth: even over the ceiling with a live pane, a spoke STILL parked on a
+    # #246 defense-in-depth: even over the ceiling with a live worker, a spoke STILL parked on a
     # permission dialog must be ANSWERED (routed to decide_and_act), NOT revived — reviving only
     # re-raises the same dialog. slot_state already keeps a park out of `reap`; this backstops a
-    # same-tick slot_state flicker. Pre-fix _reap_or_resume revived the over-ceiling/live pane.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    # A safe self-op the mechanical classifier auto-approves → the answerer presses "1".
-    _write_transcript(pd, [_bash_tool_record("git reset -q; git add tests/x.py")])
-    jsonl = pd / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    ready_stub, ready_log = _blocked_recording_ready(tmp_path)
-    # Live pane (list-panes maps afk:1) + capture-pane shows the permission prompt; the first
-    # Enter clears it and touches the transcript so approve_permission confirms the resume.
-    fake_bin, tmux_log = _injector_tmux(
-        tmp_path, capture=_PROMPT, pane_path=spoke_repo, clear_on_enter=1, touch=jsonl
+    # same-tick slot_state flicker. Pre-fix _reap_or_resume revived the over-ceiling spoke.
+    # A safe self-op the mechanical classifier auto-approves -> the answerer presses "1".
+    orca_park(
+        orca_bin,
+        spoke_repo,
+        state="waiting",
+        tool="Bash",
+        tool_input="git reset -q; git add tests/x.py",
     )
+    ready_stub, ready_log = _blocked_recording_ready(tmp_path)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
-    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over the ceiling
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago => over the ceiling
 
     result = _call(
         f"_reap_or_resume '{spoke_repo}' 5",
         env={
-            "CLAUDE_PROJECTS_DIR": str(projects),
             "SPOKE_READY": str(ready_stub),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "AFK_STATE_DIR": str(statedir),
             "AFK_NOW": "1000000000",  # well over AFK_SPOKE_MAX_MINUTES since dispatch
-            "AFK_INJECT_VERIFY_SECONDS": "0",
             "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
     assert result.returncode == 0, result.stderr
-    calls = tmux_log.read_text()
-    assert "send-keys -t afk:1 1" in calls, f"the park must be ANSWERED (option 1): {calls}"
-    assert "new-window" not in calls, f"a live park must NOT be revived: {calls}"
-    assert "revive #5" not in result.stderr, f"a live park must NOT be revived: {result.stderr}"
+    assert _orca_sent_texts(orca_bin) == ["1"], "the park must be ANSWERED (option 1)"
+    assert "worker-stop" not in str(orca_calls(orca_bin)), "a live park must NOT be revived"
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "a safe park is answered, not escalated to blocked"
     )
 
 
 # ── issue #255: the finished-turn-idle spoke gets a continue-nudge, not a relaunch ──
-# A spoke that FINISHED its turn and stopped at the input prompt (pane alive, no dialog,
-# transcript ends on a completed assistant turn) is nudged — a "continue the cycle" message
-# injected into the LIVE session via the shared hardened injector — instead of the heavier
-# kill + `claude --continue` relaunch. Bounded to AFK_NUDGE_MAX_ATTEMPTS (2) per window, after
-# which it falls back to the existing revive.
+# A spoke that FINISHED its turn (agent `done`, no dialog) is nudged — a "continue the cycle"
+# message sent into the LIVE session — instead of a worker restart. Bounded to
+# AFK_NUDGE_MAX_ATTEMPTS (2) per window, after which it falls back to the revive.
 
 
-def test_reap_pass_finished_turn_idle_nudges_not_revives(tmp_path: Path) -> None:
-    # AC1/AC2: a finished-turn-idle live pane is NUDGED via the shared inject_and_verify
-    # (send-keys -l into the pane + a submitting Enter), never killed + relaunched.
+def test_reap_pass_finished_turn_idle_nudges_not_revives(tmp_path: Path, orca_bin: Path) -> None:
+    # AC1/AC2: a finished-turn-idle live worker (agent `done`) is NUDGED with a terminal send
+    # into its live session, never stopped + restarted.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    projects = tmp_path / "projects"
-    jsonl = _project_dir_for(projects, spoke) / "session.jsonl"
-    # The injector tmux: capture-pane serves the composer; the first Enter clears it and
-    # touches the transcript, so inject_and_verify confirms the nudge registered.
-    fake_bin, tmux_log = _injector_tmux(
-        tmp_path, capture="│ > │\n", pane_path=spoke, clear_on_enter=1, touch=jsonl
-    )
-    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
-    env["AFK_INJECT_VERIFY_SECONDS"] = "5"
-    env["AFK_INJECT_POLL_SECONDS"] = "1"
+    orca_park(orca_bin, spoke, state="done")
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
 
     _call(expr, env=env)
 
-    calls = tmux_log.read_text()
-    assert "send-keys -t afk:1 -l" in calls, f"a finished-turn-idle spoke is NUDGED: {calls}"
-    assert "new-window" not in calls, f"a nudge must NOT relaunch the pane: {calls}"
+    assert _recovery_trail(orca_bin) == ["terminal send"], "a finished-turn-idle spoke is NUDGED"
     assert "nudge" in (statedir / "decision-journal.jsonl").read_text()
     assert (statedir / "nudge-5.count").read_text().strip() == "1", "the nudge attempt is counted"
 
 
-def test_reap_pass_finished_turn_idle_revives_after_max_nudges(tmp_path: Path) -> None:
+def test_reap_pass_finished_turn_idle_revives_after_max_nudges(
+    tmp_path: Path, orca_bin: Path
+) -> None:
     # AC3: after AFK_NUDGE_MAX_ATTEMPTS (2) nudges this window, a still-idle finished-turn spoke
-    # falls back to the revive (kill + relaunch), never nudged forever.
+    # falls back to the revive (stop + restart in place), never nudged forever.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE
-    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke, state="done")
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     (statedir / "nudge-5.count").write_text("2\n")  # the nudge budget is already spent
 
     _call(expr, env=env)
 
-    assert "new-window" in tmux_log.read_text(), (
+    assert "orchestration worker-start" in _recovery_trail(orca_bin), (
         "past the nudge budget, a finished-turn spoke revives"
     )
     assert "revive" in (statedir / "decision-journal.jsonl").read_text()
@@ -8616,15 +7847,15 @@ def test_clear_nudge_counts_removes_per_window_stamps(tmp_path: Path) -> None:
     assert not (statedir / "nudge-7.count").exists()
 
 
-def test_reap_pass_revival_exhausted_escalates_under_afk(tmp_path: Path) -> None:
+def test_reap_pass_revival_exhausted_escalates_under_afk(tmp_path: Path, orca_bin: Path) -> None:
     # #310 (end-to-end through reap_pass, the #302 replay): once the resume budget is spent
     # (warned attempt >= AFK_WARN_ESCALATE_ATTEMPTS), a mode=afk crashed-again spoke escalates
     # blocked/<issue> — flipping slot_state terminal and silencing the watchdog's dead-pane race —
     # instead of an eternal warn-park. (The attended terminus stays warn-and-wait, pinned by
     # test_crash_escalate_or_park_attended_never_escalates.)
     spoke = _afk_mode_spoke(tmp_path, "afk")
-    fake_bin, _ = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke, liveness="exited")  # exited again
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     (statedir / "resumed-5").write_text("1700000000\n")  # a revival already happened this window
     (statedir / "warned-state-5").write_text(
         "3\t1\n"
@@ -8637,13 +7868,13 @@ def test_reap_pass_revival_exhausted_escalates_under_afk(tmp_path: Path) -> None
     )
 
 
-def test_reap_pass_pushed_but_unmarked_warns_not_reaps(tmp_path: Path) -> None:
+def test_reap_pass_pushed_but_unmarked_warns_not_reaps(tmp_path: Path, orca_bin: Path) -> None:
     # #200/#241: a clean-pushed tip with no completion marker is warned-and-parked-LAST with an
     # actionable reason, NOT reaped and NOT auto-landed — the shape is ambiguous with a spoke idle
     # BETWEEN subtasks, so auto-emitting ready/<issue> could land incomplete work onto main.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _ = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke)
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     push_log = tmp_path / "push.log"
     push_stub = tmp_path / "spoke-push.sh"
     write_stub(push_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{push_log}"\n')
@@ -8791,84 +8022,76 @@ def test_afk_ledger_near_complete_respects_done_pct_override(tmp_path: Path) -> 
     assert "NO" in stricter.stdout, "a 95% threshold is respected"
 
 
-def test_reap_pass_over_ceiling_near_complete_nudges_not_revives(tmp_path: Path) -> None:
-    # AC1/AC3: an over-ceiling spoke whose ledger is near-complete and whose pane is at the
-    # input prompt is NUDGED to finish up (emit ready / final push) via the live-session
-    # injector — never killed + relaunched — and the taken decision is journaled as finish-up.
+def test_reap_pass_over_ceiling_near_complete_nudges_not_revives(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # AC1/AC3: an over-ceiling spoke whose ledger is near-complete and whose agent is at the
+    # input prompt (`done`) is NUDGED to finish up (emit ready / final push) with a terminal
+    # send — never stopped + restarted — and the taken decision is journaled as finish-up.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    projects = tmp_path / "projects"
-    jsonl = _project_dir_for(projects, spoke) / "session.jsonl"
-    fake_bin, tmux_log = _injector_tmux(
-        tmp_path, capture="│ > │\n", pane_path=spoke, clear_on_enter=1, touch=jsonl
-    )
+    orca_park(orca_bin, spoke, state="done")
     expr, env, _ready_log, statedir = _reaper_env(
-        spoke, tmp_path, fake_bin, idle=True, transcript=_ledger_records(done=33, total=33)
+        spoke, tmp_path, orca_bin, idle=True, transcript=_ledger_records(done=33, total=33)
     )
-    env["AFK_INJECT_VERIFY_SECONDS"] = "5"
-    env["AFK_INJECT_POLL_SECONDS"] = "1"
-    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over ceiling
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago => over ceiling
 
     _call(expr, env=env)
 
-    calls = tmux_log.read_text()
-    assert "send-keys -t afk:1 -l" in calls, (
-        f"a near-complete over-ceiling spoke is nudged: {calls}"
-    )
-    assert "new-window" not in calls, f"a finish-up nudge must NOT relaunch the pane: {calls}"
+    assert _recovery_trail(orca_bin) == ["terminal send"], "a near-complete spoke is nudged"
     journal = (statedir / "decision-journal.jsonl").read_text()
     assert "finish-up" in journal, f"the finish-up decision is journaled (AC3): {journal}"
 
 
-def test_reap_pass_over_ceiling_low_progress_still_revives(tmp_path: Path) -> None:
+def test_reap_pass_over_ceiling_low_progress_still_revives(tmp_path: Path, orca_bin: Path) -> None:
     # AC2: an over-ceiling spoke with a barely-started ledger and no pushed work is a genuine
-    # runaway — it still REVIVES (kill + relaunch), no finish-up shortcut.
+    # runaway — it still REVIVES (stop + restart in place), no finish-up shortcut.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
+    orca_park(orca_bin, spoke, state="done")
     expr, env, _ready_log, statedir = _reaper_env(
-        spoke, tmp_path, fake_bin, idle=True, transcript=_ledger_records(done=2, total=33)
+        spoke, tmp_path, orca_bin, idle=True, transcript=_ledger_records(done=2, total=33)
     )
     (statedir / "dispatch-5.epoch").write_text("1000\n")  # over ceiling
 
     _call(expr, env=env)
 
-    assert "new-window" in tmux_log.read_text(), "a low-progress runaway still revives"
+    assert "orchestration worker-start" in _recovery_trail(orca_bin), "a runaway still revives"
     assert "revive" in (statedir / "decision-journal.jsonl").read_text()
 
 
-def test_reap_pass_over_ceiling_near_complete_revives_after_max_nudges(tmp_path: Path) -> None:
+def test_reap_pass_over_ceiling_near_complete_revives_after_max_nudges(
+    tmp_path: Path, orca_bin: Path
+) -> None:
     # The finish-up nudge is bounded by the shared per-window budget: once spent, a still-
     # over-ceiling near-complete spoke falls through to the revive rather than nudged forever.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
+    orca_park(orca_bin, spoke, state="done")
     expr, env, _ready_log, statedir = _reaper_env(
-        spoke, tmp_path, fake_bin, idle=True, transcript=_ledger_records(done=33, total=33)
+        spoke, tmp_path, orca_bin, idle=True, transcript=_ledger_records(done=33, total=33)
     )
     (statedir / "dispatch-5.epoch").write_text("1000\n")  # over ceiling
     (statedir / "nudge-5.count").write_text("2\n")  # the shared nudge budget is already spent
 
     _call(expr, env=env)
 
-    calls = tmux_log.read_text()
-    assert "new-window" in calls, (
-        "past the nudge budget, an over-ceiling near-complete spoke revives"
-    )
-    assert "send-keys" not in calls, "past the budget it must revive, NOT nudge again"
+    trail = _recovery_trail(orca_bin)
+    assert "orchestration worker-start" in trail, "past the budget an over-ceiling spoke revives"
+    assert "terminal send" not in trail, "past the budget it must revive, NOT nudge again"
     assert "finish-up" not in (statedir / "decision-journal.jsonl").read_text(), (
         "no finish-up decision once the nudge budget is spent"
     )
 
 
-def test_recover_dead_panes_over_ceiling_near_complete_still_revives(tmp_path: Path) -> None:
+def test_recover_dead_panes_over_ceiling_near_complete_still_revives(
+    tmp_path: Path, orca_bin: Path
+) -> None:
     # The second wiring: recover_dead_panes routes its ceiling branch through the same
-    # _afk_finish_up_or_revive, but it only runs for a DEAD pane. A near-complete ledger must NOT
-    # divert a crashed spoke to the (live-session) finish-up nudge — the pane-alive gate holds and
-    # it REVIVES, exactly as before #256. Guards against a future drop of that gate silently
-    # leaving a crashed near-done spoke un-revived (finish-up returns 1 on the empty pane target,
-    # but _afk_finish_up_or_revive would still return 0 as if handled).
+    # _afk_finish_up_or_revive, but it only runs for an EXITED worker. A near-complete ledger must
+    # NOT divert a crashed spoke to the (live-session) finish-up nudge — the liveness gate holds
+    # and it REVIVES, exactly as before #256.
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD, with commits
-    expr, env, _ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
-    # A near-complete ledger on the (dead) pane — the signal that WOULD nudge a live pane.
+    orca_park(orca_bin, spoke, liveness="exited", state="done")
+    expr, env, _ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+    # A near-complete ledger on the exited worker: the signal that WOULD nudge a live one.
     _write_transcript(
         _project_dir_for(tmp_path / "projects", spoke), _ledger_records(done=33, total=33)
     )
@@ -8876,10 +8099,10 @@ def test_recover_dead_panes_over_ceiling_near_complete_still_revives(tmp_path: P
 
     _call(expr, env=env)
 
-    calls = tmux_log.read_text()
-    assert "new-window" in calls, "a crashed near-complete spoke still revives (pane-alive gate)"
+    assert "orchestration worker-start" in _recovery_trail(orca_bin), "an exited worker revives"
+    assert "terminal send" not in _recovery_trail(orca_bin)
     assert "finish-up" not in (statedir / "decision-journal.jsonl").read_text(), (
-        "a dead pane is never diverted to the live-session finish-up nudge"
+        "an exited worker is never diverted to the live-session finish-up nudge"
     )
 
 
@@ -9286,10 +8509,11 @@ def test_service_auth_halt_resumes_when_auth_recovers(tmp_path: Path) -> None:
 
 
 def test_decide_and_act_auth_failure_warns_not_blocks(
-    spoke_repo: Path, stub_env: dict[str, str]
+    spoke_repo: Path, stub_env: dict[str, str], orca_bin: Path
 ) -> None:
     # #241 §9: an answerer auth failure warns the spoke (not blocks it — it's not the spoke's
     # fault) and still raises the global halt flag so dispatch pauses.
+    orca_park(orca_bin, spoke_repo, question="Q: Which store?\n  - Redis: fast")
     env = {
         **stub_env,
         "AFK_ANSWERER_CMD": "printf 'authentication_error: OAuth token expired' >&2; exit 1",
@@ -10597,12 +9821,12 @@ _HOLDS_BACK_5 = (
 )
 
 
-def test_pushed_but_unmarked_attended_still_warns(tmp_path: Path) -> None:
+def test_pushed_but_unmarked_attended_still_warns(tmp_path: Path, orca_bin: Path) -> None:
     # AC2 regression pin: an ATTENDED pushed-but-unmarked spoke keeps today's warn-and-parked-LAST
     # behavior — the human is the wall. No nudge, no relaunch, no blocked escalation.
     spoke = _afk_mode_spoke(tmp_path, "attended")
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke, state="done")
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     expr = "_afk_pushed_but_unmarked() { return 0; }; " + expr
 
     _call(expr, env=env)
@@ -10611,54 +9835,50 @@ def test_pushed_but_unmarked_attended_still_warns(tmp_path: Path) -> None:
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "attended must NOT escalate blocked"
     )
-    assert "new-window" not in tmux_log.read_text(), "attended must NOT relaunch"
+    assert _recovery_trail(orca_bin) == [], "attended must neither nudge nor restart"
 
 
-def test_pushed_but_unmarked_afk_nudges_first(tmp_path: Path) -> None:
+def test_pushed_but_unmarked_afk_nudges_first(tmp_path: Path, orca_bin: Path) -> None:
     # AC1 rung 1: an afk pushed-but-unmarked finished-turn-idle spoke is NUDGED (emit-ready /
-    # continue) into its LIVE session — never warn-parked, never relaunched — and journaled.
+    # continue) into its LIVE session — never warn-parked, never restarted — and journaled.
     spoke = _afk_mode_spoke(tmp_path, "afk")
-    projects = tmp_path / "projects"
-    jsonl = _project_dir_for(projects, spoke) / "session.jsonl"
-    fake_bin, tmux_log = _injector_tmux(
-        tmp_path, capture="│ > │\n", pane_path=spoke, clear_on_enter=1, touch=jsonl
-    )
-    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
-    env["AFK_INJECT_VERIFY_SECONDS"] = "5"
-    env["AFK_INJECT_POLL_SECONDS"] = "1"
+    orca_park(orca_bin, spoke, state="done")
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     expr = "_afk_pushed_but_unmarked() { return 0; }; " + expr
 
     _call(expr, env=env)
 
-    calls = tmux_log.read_text()
-    assert "send-keys -t afk:1 -l" in calls, f"afk pushed-but-unmarked is nudged: {calls}"
-    assert "new-window" not in calls, f"the nudge must NOT relaunch: {calls}"
+    assert _recovery_trail(orca_bin) == ["terminal send"], "afk pushed-but-unmarked is nudged"
     assert "markready" in (statedir / "decision-journal.jsonl").read_text()
     assert (statedir / "nudge-5.count").read_text().strip() == "1", "the nudge is counted"
     assert not (statedir / "warned-5.txt").exists(), "afk acts — it does not warn-park"
 
 
-def test_pushed_but_unmarked_afk_revives_after_nudge_budget(tmp_path: Path) -> None:
-    # AC1 rung 2: past the shared #255 nudge budget, an afk pushed-but-unmarked spoke relaunches
-    # (kill + claude --continue) — the worktree + commits survive, as #299's did.
+def test_pushed_but_unmarked_afk_revives_after_nudge_budget(tmp_path: Path, orca_bin: Path) -> None:
+    # AC1 rung 2: past the shared #255 nudge budget, an afk pushed-but-unmarked spoke is restarted
+    # in place — the worktree + commits survive, as #299's did.
     spoke = _afk_mode_spoke(tmp_path, "afk")
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
-    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke, state="done")
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     (statedir / "nudge-5.count").write_text("2\n")  # budget spent
     expr = "_afk_pushed_but_unmarked() { return 0; }; " + expr
 
     _call(expr, env=env)
 
-    assert "new-window" in tmux_log.read_text(), "past the nudge budget, afk relaunches"
+    assert "orchestration worker-start" in _recovery_trail(orca_bin), (
+        "past the budget, afk restarts"
+    )
     assert "revive" in (statedir / "decision-journal.jsonl").read_text()
 
 
-def test_pushed_but_unmarked_afk_escalates_after_nudge_and_relaunch(tmp_path: Path) -> None:
+def test_pushed_but_unmarked_afk_escalates_after_nudge_and_relaunch(
+    tmp_path: Path, orca_bin: Path
+) -> None:
     # AC1 rung 3 + AC4 replay: nudge budget spent AND a relaunch already tried this window ->
     # the ladder's terminal LOUD escalation: blocked/5, naming the scope-blocked dependents.
     spoke = _afk_mode_spoke(tmp_path, "afk")
-    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    orca_park(orca_bin, spoke, state="done")
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, orca_bin, idle=True)
     (statedir / "nudge-5.count").write_text("2\n")  # budget spent
     (statedir / "resumed-5").write_text("1700000000\n")  # a revival already happened this window
     env["BATCH_PLAN"] = str(_planner_stub(tmp_path, exit_code=0, out=_HOLDS_BACK_5))
@@ -10815,11 +10035,12 @@ def _crash_ready_env(tmp_path: Path, spoke: Path, statedir: Path) -> dict[str, s
     }
 
 
-def test_crash_reresume_retries_within_budget(tmp_path: Path) -> None:
+def test_crash_reresume_retries_within_budget(tmp_path: Path, orca_bin: Path) -> None:
     # AC1: while the warned-retry attempt count is under AFK_WARN_ESCALATE_ATTEMPTS and the backoff
     # is due, the crash terminus genuinely RE-ATTEMPTS the revival (a transient crash self-heals)
     # and advances the backoff — it does not warn-park-forever.
     spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     (statedir / "warned-state-5").write_text("1\t1\n")  # attempt 1 (< bound 3), next-due long past
@@ -10858,11 +10079,14 @@ def test_crash_reresume_silent_inside_backoff(tmp_path: Path) -> None:
     assert not retry_log.exists(), "inside the backoff -> parked LAST silently, no retry"
 
 
-def test_crash_reresume_escalates_past_budget_without_dependents(tmp_path: Path) -> None:
+def test_crash_reresume_escalates_past_budget_without_dependents(
+    tmp_path: Path, orca_bin: Path
+) -> None:
     # AC2 (the #302 replay): once the resume budget is spent, a mode=afk crash park escalates
     # blocked/<issue> + notification EVEN WITH ZERO scope-blocked dependents — the parked issue is
     # itself the stalled work. This is what #302 never did.
     spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
     statedir = tmp_path / "statedir"
     env = _crash_ready_env(tmp_path, spoke, statedir)
     (statedir / "warned-state-5").write_text("3\t1\n")  # attempt 3 (>= bound), due
@@ -10937,10 +10161,11 @@ def test_crash_escalate_journals_the_decision(tmp_path: Path) -> None:
     assert "resume budget exhausted" in journal, "the escalation decision is journaled"
 
 
-def test_crash_reresume_message_names_the_scheduled_action(tmp_path: Path) -> None:
+def test_crash_reresume_message_names_the_scheduled_action(tmp_path: Path, orca_bin: Path) -> None:
     # AC4 message honesty: while retrying, the reason names the scheduled retry (attempt k/N), not a
     # bare "retried at low frequency" that may never happen.
     spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     (statedir / "warned-state-5").write_text("0\t1\n")
@@ -10957,20 +10182,21 @@ def test_crash_reresume_message_names_the_scheduled_action(tmp_path: Path) -> No
     )
 
 
-def test_reap_or_resume_302_replay_reaches_terminal(tmp_path: Path) -> None:
+def test_reap_or_resume_302_replay_reaches_terminal(tmp_path: Path, orca_bin: Path) -> None:
     # AC3 replay pin: #302's exact state — a crashed pane that was ALREADY resumed this window, with
     # its resume budget spent and NO dependents — reaches a terminal blocked/<issue> (silencing the
     # watchdog's dead-pane race) instead of an eternal warn-park.
     spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
     statedir = tmp_path / "statedir"
     env = _crash_ready_env(tmp_path, spoke, statedir)
     (statedir / "resumed-5").write_text("1\n")  # already resumed this window (#302)
     (statedir / "warned-state-5").write_text("3\t1\n")  # budget spent, due
 
     _call(
-        # Drive the crashed-again-with-commits branch of _reap_or_resume directly: no live pane, has
-        # commits, already resumed. Stub the liveness probes so the branch is deterministic.
-        "_spoke_still_parked() { return 1; }; _spoke_pane_alive() { return 1; }; "
+        # Drive the crashed-again-with-commits branch of _reap_or_resume directly: exited worker,
+        # has commits, already resumed. Stub the liveness probes so the branch is deterministic.
+        "_spoke_still_parked() { return 1; }; _spoke_agent_alive() { return 1; }; "
         "_spoke_over_any_ceiling() { return 1; }; _spoke_has_commits() { return 0; }; "
         '_reap_or_resume "$WT" 5',
         env=env,
@@ -11045,14 +10271,14 @@ def test_afk_tlog_no_ops_on_an_adhoc_slug(tmp_path: Path) -> None:
 
 
 def test_redispatch_records_redispatched_with_the_run(tmp_path: Path) -> None:
-    # The full redispatch path (test-override lane): _redispatch_dead_pane tears the worktree
+    # The full redispatch path (test-override lane): _redispatch_exited_spoke tears the worktree
     # down, then records `redispatched`. The run id must survive that teardown — it is read
     # from .ai-toolkit/spoke-run-id BEFORE the teardown, so the record still carries it.
     wt = _spoke_wt_with_run(tmp_path, "run-redispatch")
     state = tmp_path / "sd"
 
     _call(
-        f'_redispatch_dead_pane "{wt}" 302',
+        f'_redispatch_exited_spoke "{wt}" 302',
         env={"AFK_STATE_DIR": str(state), "AFK_REDISPATCH_CMD": "true"},
     )
 
@@ -11062,17 +10288,17 @@ def test_redispatch_records_redispatched_with_the_run(tmp_path: Path) -> None:
 
 
 def test_redispatch_reads_run_before_teardown() -> None:
-    # Source guard for the property above: the run-id read must PRECEDE _kill_spoke_window /
-    # worktree-done — otherwise the record keys by a synthesized fallback, not the real run.
-    # _redispatch_dead_pane now lives in hub-afk-recover.sh (the #307 split).
+    # Source guard for the property above: the run-id read must PRECEDE worktree-done.sh —
+    # otherwise the record keys by a synthesized fallback, not the real run.
+    # _redispatch_exited_spoke lives in hub-afk-recover.sh (the #307 split).
     src = (HUB_AFK.parent / "hub-afk-recover.sh").read_text()
-    body = src[src.index("_redispatch_dead_pane()") :]
+    body = src[src.index("_redispatch_exited_spoke()") :]
     body = body[: body.index("\nrecover_dead_panes")]
     read_at = body.find('run="$(_afk_spoke_run_id')
-    kill_at = body.find("_kill_spoke_window")
+    teardown_at = body.find('bash "$wt_done"')
 
-    assert read_at != -1, "_redispatch_dead_pane must capture the run id"
-    assert read_at < kill_at, "the run id must be read BEFORE the teardown removes the worktree"
+    assert read_at != -1, "_redispatch_exited_spoke must capture the run id"
+    assert 0 <= read_at < teardown_at, "the run id must be read BEFORE worktree-done.sh runs"
 
 
 def test_reap_reads_run_before_the_land() -> None:

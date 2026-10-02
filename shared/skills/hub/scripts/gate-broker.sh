@@ -15,9 +15,9 @@
 #               evidence + the decisions-digest seed.)
 #   4. CLASSIFY obvious, safe scoped self-ops decided by a fixed rules table
 #               (classify_permission); a genuine judgment call routes out to the adapter.
-#   5. INJECT   the ONE hardened injector (inject_and_verify): Esc-first menu cancel,
-#               send-keys -l, a SEPARATE Enter, a bare-Enter retry that never re-pastes,
-#               wedge -> pane respawn. Shared by both modes so the paste bugs are fixed once.
+#   5. DELIVER  the ONE delivery module (hub-inject.sh): deliver_reply answers a worker's `ask`
+#               by message id (the ack is the proof); deliver_text types into the agent's
+#               terminal (the observed stage is the proof). Never resent within a tick.
 #   6. LOG      an auto-answer decision span (afk_emit_decision). (Subtask D adds the
 #               automatable-decisions log + codification pass.)
 #
@@ -25,8 +25,7 @@
 # is _broker_on_human_decision (unattended -> escalate blocked/<N>; attended -> QCM).
 #
 # Sourceable on its own (the tests do): it pulls worktree-lib.sh and defines every helper it
-# needs. respawn_wedged_spoke (a supervisor-lifecycle recovery) is the one outward call,
-# reached by a runtime existence-check so a standalone/attended broker degrades to escalate.
+# needs; every read and write of a spoke goes through orca-lib.sh (sourced by worktree-lib).
 set -uo pipefail
 
 SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -67,10 +66,9 @@ unset _cand
 
 log() { printf '%s\n' "$*" >&2; }
 
-# --- source hub-inject.sh (the ONE hardened tmux-inject + delivery-proof unit) -
-# The spoke-pane injection + transcript-delivery primitives (issue #251) live in
-# hub-inject.sh so the /afk answerer (us) and the tier-2 hub-watchdog share one tested
-# helper. Always a co-located sibling — in the checkout AND a synced .ai-toolkit/scripts/
+# --- source hub-inject.sh (the ONE Orca delivery module) ----------------------
+# The delivery primitives (deliver_reply / deliver_text / approve_permission) and the transcript
+# locators live in hub-inject.sh so every lane shares one tested helper. Always a co-located sibling — in the checkout AND a synced .ai-toolkit/scripts/
 # target — so it resolves from $_GB_DIR (OUR own dir) regardless of the inherited SCRIPT_DIR.
 # The _AFK_TOPLEVEL fallbacks mirror the worktree-lib block; without them a self-copy
 # supervisor (SCRIPT_DIR = a temp dir with only hub-afk.sh) left every moved helper undefined
@@ -125,7 +123,7 @@ done
 unset _mod _gbm _cand _GB_DIR
 
 
-# --- tmux injection + telemetry -----------------------------------------------
+# --- transcript activity scans + telemetry -----------------------------------
 
 # _scan_appended_turns <wt_path> <sizes> <mode> -> scan the transcript bytes APPENDED after the
 # <sizes> snapshot for a matching record. <mode> selects the filter:
@@ -164,7 +162,7 @@ def matches(record):
     if mode == "any":
         return True
     kind = record.get("type")
-    # A genuine typed human/self reply — shared by both modes (mirrors _gate_answer_landed).
+    # A genuine typed human/self reply — shared by both modes.
     if kind == "user" and record.get("promptSource") == "typed" and not record.get("isMeta"):
         return True
     if mode == "typed":
@@ -213,12 +211,6 @@ sys.exit(3)
 PYEOF
   case $? in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
 }
-
-# _user_turn_appended <wt_path> <sizes> -> did a GENUINE typed reply land in transcript bytes
-# appended after the <sizes> snapshot? The "the spoke MOVED ON" signal (#241 §4). The staleness
-# recompute gates on the DEFINITE "no genuine reply" (rc 1); rc 0 (a typed reply landed) or rc 2
-# (cannot tell) both fall to the #89-safe drop. rc 0 found, rc 1 none, rc 2 unavailable.
-_user_turn_appended() { _scan_appended_turns "$1" "$2" typed; }
 
 # _spoke_activity_appended <wt_path> <sizes> -> did a GENUINE spoke turn (a typed reply OR the
 # spoke's OWN assistant work) land in appended transcript bytes? The read-only void's #244
@@ -403,8 +395,8 @@ $advice
 
 ## Your decision
 
-Reply with the option you want (the spoke listed its own options above, recommended
-first), or type any freeform instruction — it is injected verbatim into the spoke. An
+For a PLAN gate begin with APPROVE to approve it, or REVISE: <changes>. Otherwise reply with the option
+you want (the spoke listed its own options above, recommended first), or type any freeform instruction — it is injected verbatim into the spoke. An
 empty reply defers the gate (escalated as blocked/$issue for later).
 EOF
 }
@@ -416,7 +408,7 @@ EOF
 # here. UPGRADE: offer the spoke's discrete options as numbered one-key picks (parse them
 # out of the summary) once the extract carries structured option labels.
 _broker_present_qcm() {
-  local wt="$1" issue="$2" advice="$3" summary reply target
+  local wt="$1" issue="$2" advice="$3" summary reply
   summary="$(extract_pending_question "$wt")"
   [ -n "$summary" ] || summary="(the spoke's parked prompt could not be extracted; decide from the advice + the issue contract)"
   build_qcm "$issue" "$summary" "$advice"
@@ -436,10 +428,8 @@ _broker_present_qcm() {
     _broker_qcm_clear "$issue"
     return 0
   fi
-  target="$(_spoke_pane_target "$wt")"
-  if [ -n "$target" ] && inject_and_verify "$wt" "$target" "$reply"; then
+  if deliver_answer "$wt" "$issue" "$(_pending_question_id "$wt")" "$reply"; then
     log "  injected the reviewer's reply into #$issue"
-    _consume_gate_tag "$wt" "$issue"
     afk_emit_decision "$wt" success
     _broker_qcm_clear "$issue"
   else
@@ -483,22 +473,19 @@ _broker_present_qcm() {
 # coverage check), so the minutes-long staleness the reasoner path guards against does not apply —
 # no _still_parked_same recompute needed.
 _broker_try_fastpath_gate() {
-  local wt="$1" issue="$2" mode="$3" plan body cov target
+  local wt="$1" issue="$2" mode="$3" plan body cov
   [ "$mode" = unattended ] || return 1
   [ "${AFK_FASTPATH:-1}" != 0 ] || return 1
   plan="$(_read_gate_artifact "$wt" "$issue")"
   [ -n "$plan" ] || return 1   # no real posted artifact -> never fast-path the transcript fallback
   body="$(_broker_issue_body "$issue")"
   cov="$(_broker_plan_is_restatement "$plan" "$body")" || return 1   # rc 1 -> not a restatement
-  target="$(_spoke_pane_target "$wt")"
-  [ -n "$target" ] || return 1
-  # Deliver the approval through the SAME hardened path the reasoned-ANSWER branch uses.
+  # Deliver the approval through the SAME path the reasoned-ANSWER branch uses.
   stamp_answer_attempt "$issue"
-  inject_and_verify "$wt" "$target" \
+  deliver_answer "$wt" "$issue" "$(_pending_question_id "$wt")" \
     "Approved — the posted plan restates the issue contract; proceed to implementation." \
     || return 1
   log "  fast-path auto-approved #$issue (plan restates issue body, coverage ${cov:-?})"
-  _consume_gate_tag "$wt" "$issue"
   _afk_clear_warned "$issue"   # a waive is genuine progress → drop any warned-retry backoff
   clear_answer_drop "$issue"   # #288: a waive is a delivery — any prior drop record is moot
   # broker_journal_decision (not the file-only _broker_journal_line): it ALSO posts a best-effort
@@ -510,63 +497,11 @@ _broker_try_fastpath_gate() {
   return 0
 }
 
-# _retire_abandoned_gate_park <wt> <issue> -> retire a PLAN-gate episode the spoke coded past
-# without a reply (#117/#312). The same teardown the #204 self-heal runs (top of
-# broker_service_gate), plus a journal line: consume the stale gate/<issue> tag (so the next tick
-# reads the spoke as busy, not a re-serviceable gate park — this is what stops the reasoner-run-
-# per-tick loop), credit + clear the park onset, drop the answer-lane warned-retry backoff, and
-# clear the answer-drop ledger for the now-resolved episode. Journaled under park kind
-# `gate-abandoned` (NOT `gate`) so it is auditable (#241) yet never mistaken for the #277
-# fast-path waive, which the `gate` kind emits as a `waived` lane event. Best-effort throughout.
-_retire_abandoned_gate_park() {
-  local wt="$1" issue="$2"
-  _consume_gate_tag "$wt" "$issue"
-  clear_park_onset_epoch "$issue"
-  _afk_clear_warned "$issue"
-  clear_answer_drop "$issue"
-  broker_journal_decision "$issue" gate-abandoned \
-    "spoke coded past its PLAN gate without a reply (#117) — retired the abandoned gate episode" reversible
-}
-
-# _broker_retire_if_coded_past_gate <wt> <issue> <was_gate> -> rc 0 (retired — the caller must
-# then return) when this is a PLAN-gate park the spoke coded PAST without a reply (#117/#312); rc 1
-# otherwise (the caller falls through to its plain moved-on drop, unchanged). Shared by BOTH
-# moved-on drop sites — the ANSWER pre-inject drop and the ESCALATE/no-decision drop — so an
-# abandoned gate is retired whatever the reasoner returned, not only on an ANSWER.
-_broker_retire_if_coded_past_gate() {
-  local wt="$1" issue="$2" was_gate="$3"
-  [ "$was_gate" -eq 1 ] || return 1
-  _gate_spoke_coded_past "$wt" || return 1
-  log "  #$issue coded past its PLAN gate without a reply (#117) — retiring the abandoned gate episode"
-  _retire_abandoned_gate_park "$wt" "$issue"
-}
-
 # decide_and_act <wt_path> <issue> -> reason about a parked spoke and act: inject the
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
 broker_service_gate() {
-  local wt="$1" issue="$2" mode="${3:-unattended}" depth="${4:-0}" question orig_question raw rc decision kind text target was_gate=0 inject_diagnosed=0
-  # Self-heal a stale gate tag (issue #204): if gate/<issue> is at the tip but the spoke
-  # already resumed past its PLAN gate (a late / external / attended approval that never ran
-  # the confirmed-inject path), consume the stale tag and stop — do NOT re-answer, and do NOT
-  # count it against the re-answer ceiling (checked BEFORE it, so a resumed spoke heals even
-  # once exhausted). The plan-gate-guard self-heals the same signal from the spoke side.
-  #
-  # #288 AC1/AC4: this is the exact moment the broker PROVES the park episode ended — end it
-  # right here rather than waiting for a later slot_state tick to happen to observe "not
-  # parked" (the #277 gap: the watchdog fired off a park-onset that outlived the episode it was
-  # stamped for). Clear the onset, the answer-lane warned-retry backoff, AND any answer-drop
-  # record (review: a re-park on the SAME tip/signature would otherwise inherit a stale drop
-  # count from the now-resolved episode), so a later re-park gets a fresh ceiling instead of
-  # inheriting one exhausted by the resolved episode's own retries.
-  if _gate_parked "$wt" "$issue" && _gate_answer_landed "$wt"; then
-    log "  #$issue resumed past its PLAN gate outside the broker — consuming the stale gate/$issue tag"
-    _consume_gate_tag "$wt" "$issue"
-    clear_park_onset_epoch "$issue"
-    _afk_clear_warned "$issue"
-    clear_answer_drop "$issue"
-    return 0
-  fi
+  local wt="$1" issue="$2" mode="${3:-unattended}" depth="${4:-0}" question orig_question orig_qid raw rc decision kind text was_gate=0
   # A prior tick found the reasoner mutated the live tree for this gate (#237). The mutation
   # perturbs the (tip, sig) ceiling every tick (a tree write flips the pending command), so a
   # DURABLE void marker — not the ceiling — is what throttles the mutating reasoner. #241 §5: the
@@ -584,27 +519,6 @@ broker_service_gate() {
   # tip from the prior escalation — until the prompt changes or the tip moves. Checked before
   # BOTH the permission path (#203 finding 4's compound dialog) and the answerer path.
   local park_sig; park_sig="$(_broker_park_signature "$wt" "$issue")"
-  # An APPROVE already DELIVERED for this exact park (#294): the same (tip, sig) AND the same gated
-  # tool_use is still pending, so the dialog on the pane is the one we just answered — not a new
-  # ask. Without this the ceiling below recomputed the same key, found the counter still under
-  # AFK_REANSWER_CEILING, and re-approved the identical command a second time (the #135/#188
-  # two-concurrent-gates shape). Keyed on the tool_use id too, so a repeatable safe command the
-  # spoke re-issues VERBATIM at the same tip is a NEW dialog and is still served.
-  #
-  # Checked BEFORE the ceiling, like the void marker above and for the same reason: a skipped tick
-  # must not burn ceiling budget, or a stale pane would exhaust it and warn + arm the #241 backoff
-  # over a spoke that never failed at anything. It needs no extra _permission_pending call either —
-  # only a perm: signature can match a served record, so an answer/gate park never does (the tick's
-  # single pane read stays single, #269).
-  #
-  # NEVER terminal (the void block's shape): approve_permission verifies only that the transcript
-  # mtime advanced, not that the dialog was consumed, so an approve whose keypress never landed
-  # leaves the identical park pending — a permanent skip would strand it. Inside the window: skip.
-  # Once it elapses: drop the marker for ONE supervised re-serve, and the ceiling paces from there.
-  if _broker_permission_served "$wt" "$issue" "$park_sig"; then
-    _broker_served_skip_due "$issue" || return 0                  # inside the window → already served
-    clear_permission_served "$issue"                              # elapsed → one supervised re-serve
-  fi
   if _broker_reanswer_exhausted "$wt" "$issue" "$park_sig"; then
     # #241 §5: the ceiling is no longer TERMINAL — it warns and retries on an exponential
     # backoff, so a doom-loop is throttled by the growing curve, not abandoned. On the FIRST
@@ -640,11 +554,13 @@ broker_service_gate() {
   # served, and re-deriving the signature after the delivery could name a DIFFERENT park (the #288
   # note_answer_drop lesson).
   if _permission_pending "$wt"; then _decide_permission "$wt" "$issue" "$park_sig"; return; fi
-  # Snapshot the transcript clock BEFORE the park checks: a write landing between
-  # this and the pre-inject re-check must count as movement (review nit, ST2).
-  local parked_mtime; parked_mtime="$(_transcript_mtime "$wt")"
-  local parked_sizes; parked_sizes="$(_transcript_sizes "$wt")"   # #241 §4: detect a real reply vs a non-turn write
+  # Snapshot the park BEFORE the reason step: the recorded question id is what the reply answers
+  # and what the freshness re-checks compare against; the transcript sizes bound the read-only
+  # void's spoke-activity scan.
+  local parked_sizes; parked_sizes="$(_transcript_sizes "$wt")"
   _gate_parked "$wt" "$issue" && was_gate=1
+  orig_qid="$(_pending_question_id "$wt")"
+  local orig_asked; orig_asked="$(orca_inbox_question "$wt" created 2>/dev/null)" || orig_asked=""
   orig_question="$(extract_pending_question "$wt")"
   question="$orig_question"
   if [ "$was_gate" -eq 1 ]; then
@@ -660,7 +576,7 @@ broker_service_gate() {
     if _broker_try_fastpath_gate "$wt" "$issue" "$mode"; then return 0; fi
     local plan; plan="$(_read_gate_artifact "$wt" "$issue")"
     [ -n "$plan" ] || plan="$orig_question"
-    question="The spoke is parked at its PLAN gate; below is the plan it posted. Approve it or state precise amendments to it. Do NOT restate or re-issue the task itself.
+    question="The spoke is parked at its PLAN gate; below is the plan it posted. Approve it or state precise amendments to it. Begin your ANSWER with APPROVE if the plan stands as written, or with REVISE: followed by the precise amendments (the spoke reads that first word). Do NOT restate or re-issue the task itself.
 
 ${plan:-(the plan prose could not be extracted — approve or amend from the issue contract above)}"
   elif [ -z "$question" ]; then
@@ -762,26 +678,16 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     # reasoned, nothing happens regardless of the answer's content — injecting would
     # land mid-turn (#129/#89) and even a seed-replay escalation would stamp a
     # spurious blocked/<issue> on an actively-working spoke.
-    if ! _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question" "$parked_mtime"; then
-      # #241 §4: the park may have CHANGED (a new prompt), or a non-turn write may have bumped
-      # the transcript mtime while the spoke is STILL parked (the recurring-false-staleness that
-      # stranded #240). Recompute against the CURRENT park in the same pass (depth-bounded to one
-      # re-run) ONLY when the spoke is still parked AND no USER TURN landed since the park — a
-      # DEFINITE no-reply (rc 1). Preserve #89/#129: a reply landing (rc 0) or an unreadable
-      # transcript (rc 2) means the spoke may have moved on, so drop rather than inject mid-turn.
-      _user_turn_appended "$wt" "$parked_sizes"; local _ut_rc=$?
-      if [ "$depth" -lt 1 ] && [ "$_ut_rc" -eq 1 ] && _spoke_still_parked "$wt" "$issue"; then
-        log "  #$issue still parked on a refreshed prompt (no reply landed) — recomputing against the current park (#241)"
+    if ! _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question" "$orig_qid"; then
+      # #241 §4: the park may have CHANGED (a new question id). Recompute against the CURRENT park in
+      # the same pass (depth-bounded to one re-run) when the spoke is still parked on something;
+      # otherwise it moved on (the question left the inbox) and the answer is dropped, preserving
+      # #89/#129 (never answer a spoke that is no longer asking).
+      if [ "$depth" -lt 1 ] && _spoke_still_parked "$wt" "$issue"; then
+        log "  #$issue still parked on a refreshed prompt — recomputing against the current park (#241)"
         broker_service_gate "$wt" "$issue" "$mode" "$(( depth + 1 ))"
         return $?
       fi
-      # #312: a PLAN-gate park the spoke coded PAST (#117 keeps-coding shape) is ABANDONED, not
-      # merely stale — this moved-on drop has just PROVEN the episode is over. Retire it here, by
-      # the actor that proved it (principle #1), so the gate/<n> tag + park onset do not linger and
-      # age into a watchdog park-undeliverable fire (and a reasoner run) every tick. Extends the
-      # #204 self-heal (top of this function) to the shape its typed-reply detector can't see; an
-      # ambiguous / non-coded-past read falls through to the plain drop below, unchanged.
-      if _broker_retire_if_coded_past_gate "$wt" "$issue" "$was_gate"; then return 0; fi
       log "  #$issue is no longer parked on that prompt — dropping the stale answer (spoke moved on)"
       note_answer_drop "$wt" "$issue" "$park_sig" "no longer parked on that prompt (spoke moved on)"
       return 0
@@ -789,66 +695,44 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
       log "  answer to #$issue replays the spoke's own seed prompt — suppressing (#124)"
       text="answerer replayed the spoke's seed prompt — suppressed; needs a human"
     else
-      target="$(_spoke_pane_target "$wt")"
-      if [ -z "$target" ]; then
-        text="could not locate spoke pane to inject the answer"
-      else
-        # Stamp the delivery attempt FIRST: from here until the answer registers the
-        # spoke may sit on a buffered answer, and that window must not read as idle.
-        stamp_answer_attempt "$issue"
-        inject_and_verify "$wt" "$target" "$text"; rc=$?
-        if [ "$rc" -eq 0 ]; then
-          log "  injected answer into #$issue"
-          _consume_gate_tag "$wt" "$issue"
-          _afk_clear_warned "$issue"   # #241: genuine progress → drop this issue's warned-retry backoff
-          clear_answer_drop "$issue"   # #288: a delivery landed — any prior drop record is moot
-          # #241 review B2: record the taken answer for morning review. Read the reasoner's own
-          # 'WARN:' note and 'REVERSIBILITY:' class off the reply. A WARN or a non-reversible class
-          # is a NOTEWORTHY decision → a loud warned record + a journal line WITH a gh comment. A
-          # routine reversible answer is a cheap FILE-ONLY journal line (no per-answer gh spam).
-          local ans_rev_raw ans_rev ans_warn ans_ref
-          # Persist the reasoner's own output and journal a ref to it (#281): the record says
-          # WHAT was decided, the ref says WHY. Empty when the save failed — the pre-#281
-          # behavior — so a lost audit trail never costs the delivered answer.
-          ans_ref="$(_broker_save_reasoning "$issue" "$raw_text")"
-          ans_rev_raw="$(parse_decision_field "$raw_text" REVERSIBILITY)"
-          # Normalize to the first ALPHABETIC RUN (portable lowercasing, tolerant of quotes,
-          # parens, or a trailing period around the class word) so 'Reversible', 'reversible.',
-          # and '"irreversible"' all classify correctly. Gate the warn on the RAW presence, not
-          # the normalized value: a present-but-non-reversible class (even one that normalizes to
-          # empty, e.g. all-punctuation noise) must fail SAFE to a loud warned record, never
-          # silently collapse to routine the way a bare trailing-strip did (#241 review).
-          ans_rev="$(printf '%s' "$ans_rev_raw" | tr '[:upper:]' '[:lower:]' | grep -oE '[a-z]+' | head -n1 || true)"
-          ans_warn="$(parse_decision_field "$raw_text" WARN)"
-          if [ -n "$ans_warn" ] || { [ -n "$ans_rev_raw" ] && [ "$ans_rev" != reversible ]; }; then
-            # The clear above dropped the retry BACKOFF (progress); this warned record is the
-            # DELIBERATE loud review flag for the noteworthy decision — not a stale leftover.
-            broker_warn "$issue" "answered [${ans_rev:-unknown}]${ans_warn:+ — WARN: $ans_warn}"
-            broker_journal_decision "$issue" answer "injected answer${ans_warn:+ (WARN: $ans_warn)}" "${ans_rev:-unknown}" "$ans_ref"
-          else
-            _broker_journal_line "$issue" answer "injected answer (routine)" "${ans_rev:-reversible}" "$ans_ref"
-          fi
-          afk_emit_decision "$wt" success
-          return 0
-        elif [ "$rc" -eq 2 ] && command -v respawn_wedged_spoke >/dev/null 2>&1 && respawn_wedged_spoke "$wt" "$issue" "$text"; then
-          # The wedged composer was recovered by a pane respawn that carries the answer
-          # as its --continue prompt — delivered, same success contract as an inject.
-          _consume_gate_tag "$wt" "$issue"
-          afk_emit_decision "$wt" success
-          return 0
-        elif [ "$rc" -eq 2 ]; then
-          # The old window is dead and the answer text lives nowhere else — carry its
-          # head in the blocked reason so the returning human need not re-derive it.
-          text="composer wedged and the pane respawn could not be confirmed — needs a human; the undelivered answer began: $(printf '%.120s' "${text%%$'\n'*}")"
-          inject_diagnosed=1
-        elif [ "$rc" -eq 3 ]; then
-          log "  answer to #$issue never left the composer (delivery refuted) — escalating"
-          text="answer never left the composer (delivery refuted, #201) — needs a human"
-          inject_diagnosed=1
+      # Stamp the delivery attempt FIRST: from here until the answer registers the spoke may sit
+      # on an undelivered answer, and that window must not read as idle.
+      stamp_answer_attempt "$issue"
+      if deliver_answer "$wt" "$issue" "$orig_qid" "$text" "$orig_asked"; then
+        log "  injected answer into #$issue"
+        _afk_clear_warned "$issue"   # #241: genuine progress → drop this issue's warned-retry backoff
+        clear_answer_drop "$issue"   # #288: a delivery landed — any prior drop record is moot
+        # #241 review B2: record the taken answer for morning review. Read the reasoner's own
+        # 'WARN:' note and 'REVERSIBILITY:' class off the reply. A WARN or a non-reversible class
+        # is a NOTEWORTHY decision → a loud warned record + a journal line WITH a gh comment. A
+        # routine reversible answer is a cheap FILE-ONLY journal line (no per-answer gh spam).
+        local ans_rev_raw ans_rev ans_warn ans_ref
+        # Persist the reasoner's own output and journal a ref to it (#281): the record says
+        # WHAT was decided, the ref says WHY. Empty when the save failed — the pre-#281
+        # behavior — so a lost audit trail never costs the delivered answer.
+        ans_ref="$(_broker_save_reasoning "$issue" "$raw_text")"
+        ans_rev_raw="$(parse_decision_field "$raw_text" REVERSIBILITY)"
+        # Normalize to the first ALPHABETIC RUN (portable lowercasing, tolerant of quotes,
+        # parens, or a trailing period around the class word) so 'Reversible', 'reversible.',
+        # and '"irreversible"' all classify correctly. Gate the warn on the RAW presence, not
+        # the normalized value: a present-but-non-reversible class (even one that normalizes to
+        # empty, e.g. all-punctuation noise) must fail SAFE to a loud warned record, never
+        # silently collapse to routine the way a bare trailing-strip did (#241 review).
+        ans_rev="$(printf '%s' "$ans_rev_raw" | tr '[:upper:]' '[:lower:]' | grep -oE '[a-z]+' | head -n1 || true)"
+        ans_warn="$(parse_decision_field "$raw_text" WARN)"
+        if [ -n "$ans_warn" ] || { [ -n "$ans_rev_raw" ] && [ "$ans_rev" != reversible ]; }; then
+          # The clear above dropped the retry BACKOFF (progress); this warned record is the
+          # DELIBERATE loud review flag for the noteworthy decision — not a stale leftover.
+          broker_warn "$issue" "answered [${ans_rev:-unknown}]${ans_warn:+ — WARN: $ans_warn}"
+          broker_journal_decision "$issue" answer "injected answer${ans_warn:+ (WARN: $ans_warn)}" "${ans_rev:-unknown}" "$ans_ref"
         else
-          log "  answer to #$issue did not register — escalating"
-          text="answer did not register in the spoke (inject not confirmed) — needs a human"
+          _broker_journal_line "$issue" answer "injected answer (routine)" "${ans_rev:-reversible}" "$ans_ref"
         fi
+        afk_emit_decision "$wt" success
+        return 0
+      else
+        log "  answer to #$issue was not delivered — escalating"
+        text="answer was not delivered to the spoke (no acknowledgement) — needs a human"
       fi
     fi
   elif [ "$kind" = "ESCALATE" ]; then
@@ -856,31 +740,16 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   else
     text="answerer returned no decision — escalating for human review"
   fi
-  # Park freshness gates the ESCALATE / no-decision / inject-failure escalation too, not just
-  # the ANSWER inject (#171-subtask-2): the answerer takes minutes (or timed out), and if the
-  # spoke moved on meanwhile (a human replied, the turn resumed) stamping blocked/<N> would
-  # strand an actively-working spoke — worse now that a blocked-at-tip park is re-answerable
-  # (#171-subtask-3). A late-registered inject also drops here rather than double-escalating.
-  # Uses _spoke_moved_on (a POSITIVE transcript-advanced signal), NOT !_still_parked_same:
-  # an ambiguous probe must NOT drop a real escalation (review) — only demonstrated activity
-  # does. (The ANSWER branch's own pre-inject re-check stays _still_parked_same: there,
-  # dropping on uncertainty is the safe direction — it just skips a possibly-stale inject.)
-  # EXCEPT when the injector itself diagnosed a wedge/refuted delivery (rc 2/3): there the
-  # advance is EXPLAINED by the very non-turn write that triggered the diagnosis, so reading
-  # it as "moved on" would drop every #201 escalation and re-paste onto the wedged composer
-  # forever, with no blocked/<issue> ever stamped (#201 review, CONFIRMED).
-  if [ "$inject_diagnosed" -eq 0 ] && _spoke_moved_on "$wt" "$parked_mtime"; then
-    # #312: same as the ANSWER-branch drop — a gate the spoke coded past is retired here too, so an
-    # ESCALATE/no-decision outcome on an abandoned gate stops re-running the reasoner every tick.
-    if _broker_retire_if_coded_past_gate "$wt" "$issue" "$was_gate"; then return 0; fi
-    log "  #$issue transcript advanced while reasoning — dropping the escalation (spoke moved on)"
+  # Park freshness gates the ESCALATE / no-decision / delivery-failure escalation too, not just
+  # the ANSWER delivery (#171-subtask-2): the answerer takes minutes (or timed out), and if the
+  # spoke moved on meanwhile (a reply landed, the turn resumed) stamping blocked/<N> would strand an
+  # actively-working spoke. Uses _spoke_moved_on (a POSITIVE Orca signal that the recorded question
+  # is gone), NOT !_still_parked_same: an ambiguous probe must NOT drop a real escalation.
+  if _spoke_moved_on "$wt" "$orig_question" "$orig_qid"; then
+    log "  #$issue is no longer parked while reasoning — dropping the escalation (spoke moved on)"
     return 0
   fi
-  # A diagnosed wedge/refuted inject (rc 2/3) is genuinely UNCERTAIN — the paste may have
-  # partially landed — so journal it 'unknown' for triage; an ESCALATE/no-decision is reversible.
-  local decision_rev=reversible
-  [ "$inject_diagnosed" -eq 1 ] && decision_rev=unknown
-  _broker_on_human_decision "$mode" "$wt" "$issue" "$text" "$decision_rev"
+  _broker_on_human_decision "$mode" "$wt" "$issue" "$text" reversible
 }
 
 decide_and_act() { broker_service_gate "$1" "$2" unattended; }

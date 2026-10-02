@@ -10,29 +10,18 @@ from pathlib import Path
 
 import pytest
 from _gate_broker_support import (
-    _DISPLAY_CASE,
-    _PERMISSION_PROMPT,
     _SMOKE_COMPOUND,
     AFK_PERMISSION_HOOK,
     DANGER_GUARD_HOOK,
     REPO_ROOT,
-    _agent_ps_stub,
-    _bash_tool_record,
     _call,
     _classify_with_wt,
     _decide,
-    _fake_tmux_capture,
     _hook_payload,
-    _named_tool_record,
     _perm,
-    _perm_env,
-    _project_dir_for,
-    _read_tool_record,
-    _resolved_only_transcript,
     _run_hook,
-    _tool_result_record,
 )
-from _stubs import write_stub
+from _orca_stub import orca_calls, orca_park
 
 
 @pytest.fixture(autouse=True)
@@ -69,206 +58,157 @@ def test_permission_module_surface_loads() -> None:
     assert result.stdout.strip().splitlines()[-1] == "OK"
 
 
-def test_extract_pending_command_ignores_resolved_trailing_tool(
-    spoke_repo: Path, tmp_path: Path
+_AUTO_APPROVABLE = "git reset -q; git add tests/x.py"  # classify_permission APPROVEs a self-stage
+_PUSH_MAIN = "git push origin main"  # a main-touching command classify_permission ESCALATEs
+_TRUNCATED = "git add x.py; git push origin main…"  # Orca clips a long toolInput with an ellipsis
+
+
+def _park_perm(orca_bin: Path, wt: Path, command: str, *, tool: str = "Bash", **kw) -> None:
+    """Park `wt` on a permission dialog: the agent `waiting` on `tool` with `command` as its input."""
+    orca_park(orca_bin, wt, state="waiting", tool=tool, tool_input=command, **kw)
+
+
+def _gate_env(tmp_path: Path, answerer: str) -> dict[str, str]:
+    statedir = tmp_path / "sd"
+    statedir.mkdir(exist_ok=True)
+    return {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_ANSWERER_CMD": answerer,
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+    }
+
+
+def _sent_texts(orca_bin: Path) -> list[str]:
+    """Every `--text` typed into a terminal, in order (the Escape key included)."""
+    return [c[c.index("--text") + 1] for c in orca_calls(orca_bin) if c[:2] == ["terminal", "send"]]
+
+
+def _classify_pending(wt: Path, tmp_path: Path) -> tuple[str, str]:
+    """(extract_pending_command, classify_permission's verdict on it) for the parked spoke."""
+    extracted = _call(f"extract_pending_command '{wt}'").stdout.strip()
+    verdict = _call(
+        'classify_permission "$CMD" "$WT" | cut -f1',
+        env={"CMD": extracted, "WT": str(wt), "AFK_TASKS_ROOT": str(tmp_path / "tasks")},
+    ).stdout.strip()
+    return extracted, verdict
+
+
+def test_extract_pending_command_empty_unless_the_agent_is_waiting(
+    spoke_repo: Path, orca_bin: Path
 ) -> None:
-    # The exact #238 repro: the last tool_use is a COMPLETED Write (with a matching
-    # tool_result) and there is NO unresolved tool_use. extract_pending_command must NOT
-    # return the resolved "Write" — with nothing pending it returns empty, so the caller
-    # escalates honestly ("unreadable command") instead of on a phantom tool name.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    records = [
-        _read_tool_record(str(spoke_repo / "task.md")),
-        _tool_result_record("tu_r"),
-        _bash_tool_record("ls -la scripts/dev/"),
-        _tool_result_record("tu_1"),
-        _named_tool_record("Write", {"file_path": "scripts/dev/x.sh", "content": "y"}),
-        _tool_result_record("tu_n"),
-    ]
-    (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+    # A working agent has no dialog open: a stale tool name must never surface as a command (the
+    # #238 phantom-park shape), so the caller never classifies something nothing is gating.
+    orca_park(orca_bin, spoke_repo, state="working", tool="Bash", tool_input=_SMOKE_COMPOUND)
 
-    result = _call(
-        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "", (
-        f"a resolved trailing tool must not surface: {result.stdout!r}"
-    )
-
-
-def test_extract_pending_command_returns_unresolved_pending_command(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # The live-park case: prior Read+Write are RESOLVED, and the pending Bash compound the
-    # dialog is gating sits UNRESOLVED (no tool_result) for the length of the park. That
-    # real command — not the resolved Write — is what surfaces, so the classifier can decide
-    # it. This is the command the drain recovers to auto-service #238.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    records = [
-        _read_tool_record(str(spoke_repo / "task.md")),
-        _tool_result_record("tu_r"),
-        _named_tool_record("Write", {"file_path": "scripts/dev/afk-gate-smoke.sh", "content": "#"}),
-        _tool_result_record("tu_n"),
-        _bash_tool_record(_SMOKE_COMPOUND),  # tu_1, no tool_result → the pending dialog
-    ]
-    (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
-
-    result = _call(
-        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == _SMOKE_COMPOUND
-
-
-def test_extract_pending_tool_id_returns_the_unresolved_blocks_id(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # #294 keys the served marker on this id, so #240's rule binds it exactly as it binds the
-    # command: the RESOLVED trailing calls are ones the spoke already ran, and keying on one of
-    # their ids would mark a dialog served that was never approved. Only the trailing UNRESOLVED
-    # block's id may surface — and it must be the id of the block the command came from (tu_1),
-    # never the resolved Read (tu_r) or Write (tu_n) before it.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    records = [
-        _read_tool_record(str(spoke_repo / "task.md")),
-        _tool_result_record("tu_r"),
-        _named_tool_record("Write", {"file_path": "scripts/x.sh", "content": "y"}),
-        _tool_result_record("tu_n"),
-        _bash_tool_record(_SMOKE_COMPOUND),  # tu_1, no tool_result → the pending dialog
-    ]
-    (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
-    env = {"CLAUDE_PROJECTS_DIR": str(projects)}
-
-    result = _call(f"extract_pending_tool_id '{spoke_repo}'", env=env)
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "tu_1"
-    # The id and the command must name the SAME block — the pairing the served key depends on.
-    cmd = _call(f"extract_pending_command '{spoke_repo}'", env=env)
-    assert cmd.stdout.strip() == _SMOKE_COMPOUND
-
-
-def test_extract_pending_tool_id_empty_when_nothing_is_unresolved(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # No pending tool_use → no id → note_permission_served records nothing and the approve lane
-    # fails OPEN to its pre-#294 behavior, rather than keying on a stale resolved call.
-    projects = tmp_path / "projects"
-    _resolved_only_transcript(_project_dir_for(projects, spoke_repo))
-
-    result = _call(
-        f"extract_pending_tool_id '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
+    result = _call(f"extract_pending_command '{spoke_repo}'")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == ""
 
 
-def test_permission_pending_true_on_pane_prompt_with_empty_command(
-    spoke_repo: Path, tmp_path: Path
+@pytest.mark.parametrize(
+    ("tool", "tool_input", "expected"),
+    [
+        ("Bash", _SMOKE_COMPOUND, _SMOKE_COMPOUND),
+        ("Read", "/repo/a.txt", "Read /repo/a.txt"),
+        ("Write", "scripts/x.sh", "Write"),
+    ],
+)
+def test_extract_pending_command_reads_the_waiting_tools_input(
+    spoke_repo: Path, orca_bin: Path, tool: str, tool_input: str, expected: str
 ) -> None:
-    # The #238/#254 state: the pane shows the 3-option dialog but the gated command is
-    # absent from the transcript. Pre-fix _permission_pending ANDed a non-empty command,
-    # so it read FALSE and the reaper revived; it must now read TRUE (park detected).
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _resolved_only_transcript(pd)
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    _fake_tmux_capture(fake_bin, spoke_repo, _PERMISSION_PROMPT)
-    env = {"CLAUDE_PROJECTS_DIR": str(projects), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    # The dialog's gated call is the agent's waiting toolName/toolInput: Bash -> its command,
+    # Read -> "Read <path>", any other tool -> its bare name (so the classifier escalates it).
+    _park_perm(orca_bin, spoke_repo, tool_input, tool=tool)
 
-    # sanity: the command really is unreadable, so the OLD AND-predicate would be false
-    cmd = _call(f"extract_pending_command '{spoke_repo}'", env=env)
-    assert cmd.stdout.strip() == "", cmd.stdout
+    result = _call(f"extract_pending_command '{spoke_repo}'")
 
-    result = _call(f"_permission_pending '{spoke_repo}' && echo PARKED || echo FREE", env=env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+def test_extract_pending_command_reads_a_truncated_input_as_unreadable(
+    spoke_repo: Path, orca_bin: Path
+) -> None:
+    # A clipped command could hide a risky segment behind a benign prefix. An ellipsis tail is
+    # read as UNREADABLE (empty), never handed to the classifier as if it were the whole command.
+    _park_perm(orca_bin, spoke_repo, _TRUNCATED)
+
+    result = _call(f"extract_pending_command '{spoke_repo}'")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ""
+
+
+def test_decide_permission_declines_a_truncated_command_without_classifying(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
+    # The unreadable command is declined (Escape + guidance, the reversible action), never
+    # classified, never approved (no "1"), and never routed to the reasoner.
+    _park_perm(orca_bin, spoke_repo, _TRUNCATED)
+    reasoner_ran = tmp_path / "reasoner-ran"
+    env = _gate_env(tmp_path, f"touch '{reasoner_ran}'")
+
+    result = _call(f"_decide_permission '{spoke_repo}' 5 sigA", env=env)
+
+    assert result.returncode == 0, result.stderr
+    texts = _sent_texts(orca_bin)
+    assert "1" not in texts, "a truncated command must never be approved"
+    assert any("Declined an unreadable permission command" in t for t in texts), texts
+    assert not (Path(env["AFK_STATE_DIR"]) / "decisions.log").exists(), "it was classified"
+    assert not reasoner_ran.exists(), "the reasoner must not see a clipped command"
+
+
+def test_permission_pending_true_on_a_waiting_agent_with_an_empty_command(
+    spoke_repo: Path, orca_bin: Path
+) -> None:
+    # The #238/#254 state: the agent waits but its tool input is empty. Detection is decoupled from
+    # extraction (#269): a waiting agent IS a park, so the reaper must not revive it.
+    _park_perm(orca_bin, spoke_repo, "")
+    assert _call(f"extract_pending_command '{spoke_repo}'").stdout.strip() == ""
+
+    result = _call(f"_permission_pending '{spoke_repo}' && echo PARKED || echo FREE")
+
     assert result.stdout.strip().splitlines()[-1] == "PARKED", result.stdout + result.stderr
 
 
-def test_spoke_still_parked_true_on_pane_prompt_with_empty_command(
-    spoke_repo: Path, tmp_path: Path
+def test_spoke_still_parked_true_on_a_waiting_agent_with_an_empty_command(
+    spoke_repo: Path, orca_bin: Path
 ) -> None:
-    # _spoke_still_parked delegates to _permission_pending first, so the reaper
-    # (_reap_or_resume checks it before the idle-hung branch) now sees the park.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _resolved_only_transcript(pd)
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    _fake_tmux_capture(fake_bin, spoke_repo, _PERMISSION_PROMPT)
-    env = {"CLAUDE_PROJECTS_DIR": str(projects), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    # _spoke_still_parked delegates to _permission_pending, so the reaper sees the park.
+    _park_perm(orca_bin, spoke_repo, "")
 
-    result = _call(f"_spoke_still_parked '{spoke_repo}' 5 && echo PARKED || echo FREE", env=env)
+    result = _call(f"_spoke_still_parked '{spoke_repo}' 5 && echo PARKED || echo FREE")
+
     assert result.stdout.strip().splitlines()[-1] == "PARKED", result.stdout + result.stderr
 
 
-def test_permission_pending_false_on_resolved_tool_without_pane_prompt(
-    spoke_repo: Path, tmp_path: Path
+@pytest.mark.parametrize(
+    ("state", "tool"), [("working", "Bash"), ("waiting", "AskUserQuestion")], ids=["working", "ask"]
+)
+def test_permission_pending_false_without_a_permission_dialog(
+    spoke_repo: Path, orca_bin: Path, state: str, tool: str
 ) -> None:
-    # The #240 guard, preserved: a resolved trailing tool with NO pane prompt must stay
-    # FALSE — decoupling detection from extraction must not resurrect a phantom park when
-    # the pane is not actually showing a dialog.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _resolved_only_transcript(pd)
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    _fake_tmux_capture(fake_bin, spoke_repo, "esc to interrupt\n> working...")
-    env = {"CLAUDE_PROJECTS_DIR": str(projects), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    # The #240 guard, preserved: a working agent is not parked, and a waiting AskUserQuestion is
+    # a question (extract_pending_question's), not a permission dialog.
+    orca_park(orca_bin, spoke_repo, state=state, tool=tool, tool_input="x")
 
-    pend = _call(f"_permission_pending '{spoke_repo}' && echo PARKED || echo FREE", env=env)
-    assert pend.stdout.strip().splitlines()[-1] == "FREE", pend.stdout + pend.stderr
+    pend = _call(f"_permission_pending '{spoke_repo}' && echo PARKED || echo FREE")
 
-    still = _call(f"_spoke_still_parked '{spoke_repo}' 5 && echo PARKED || echo FREE", env=env)
-    assert still.stdout.strip().splitlines()[-1] == "FREE", still.stdout + still.stderr
-
-
-def test_permission_pending_false_on_prompt_phrase_echo_without_affordance(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # #269 review WARNING: the prompt PHRASE alone (no numbered Yes/No option line) is NOT a
-    # park -- it can appear in a spoke's OWN rendered output (a spoke editing the afk subsystem
-    # git-shows the file that literally contains "Do you want to proceed?"). Without the live
-    # dialog's interactive affordance, _permission_pending must stay FALSE, or that echo would
-    # trigger a spurious mid-turn decline injection (#89 class).
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _resolved_only_transcript(pd)
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    # The phrase is on the pane, but NO "1. Yes"/"2. No" option line (a plain echo, not a menu).
-    _fake_tmux_capture(
-        fake_bin, spoke_repo, "Do you want to proceed? (from a git show of the source)"
-    )
-    env = {"CLAUDE_PROJECTS_DIR": str(projects), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
-
-    pend = _call(f"_permission_pending '{spoke_repo}' && echo PARKED || echo FREE", env=env)
     assert pend.stdout.strip().splitlines()[-1] == "FREE", pend.stdout + pend.stderr
 
 
-def test_park_signature_nonempty_for_pane_prompt_with_empty_command(
-    spoke_repo: Path, tmp_path: Path
+def test_park_signature_nonempty_for_a_waiting_agent_with_an_empty_command(
+    spoke_repo: Path, orca_bin: Path
 ) -> None:
-    # #269 review WARNING: an empty-command permission park must carry a STABLE non-empty
-    # signature so the re-answer ceiling can bound per-tick declines (an empty signature
-    # fail-opens and re-declines every tick). The full dialog is shown (affordance present) but
-    # the gated command is unflushed (empty), so the signature falls to the "perm:unreadable"
-    # stable basis and hashes to a non-empty value.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    _resolved_only_transcript(pd)
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    _fake_tmux_capture(fake_bin, spoke_repo, _PERMISSION_PROMPT)
-    env = {"CLAUDE_PROJECTS_DIR": str(projects), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    # #269: an empty-command permission park must carry a STABLE non-empty signature so the
+    # re-answer ceiling can bound per-tick declines (an empty signature fail-opens and re-declines
+    # every tick). It falls to the "perm:unreadable" basis and hashes to a non-empty value.
+    _park_perm(orca_bin, spoke_repo, "")
 
-    result = _call(f"_broker_park_signature '{spoke_repo}' 5", env=env)
+    result = _call(f"_broker_park_signature '{spoke_repo}' 5")
+
     assert result.stdout.strip(), "an empty-command park must still yield a throttleable signature"
 
 
@@ -366,143 +306,78 @@ def test_classify_permission_read_prefixed_bash_never_bypasses_gate(
         assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE", cmd
 
 
-def test_read_prefixed_bash_tooluse_end_to_end_escalates(spoke_repo: Path, tmp_path: Path) -> None:
-    # End-to-end: a real Bash tool_use whose command TEXT starts with "Read " flows through
+def test_read_prefixed_bash_tooluse_end_to_end_escalates(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
+    # End-to-end: a real Bash call whose command TEXT starts with "Read " flows through
     # extract_pending_command (which emits it raw) into classify_permission, and must escalate —
     # binding both halves of the chain, not just the decision point.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    (pd / "session.jsonl").write_text(
-        json.dumps(_bash_tool_record(f"Read {spoke_repo}/a.txt; rm -rf /tmp/PWNED")) + "\n"
-    )
+    _park_perm(orca_bin, spoke_repo, f"Read {spoke_repo}/a.txt; rm -rf /tmp/PWNED")
 
-    extracted = _call(
-        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    ).stdout.strip()
-    verdict = _call(
-        'classify_permission "$CMD" "$WT" | cut -f1',
-        env={"CMD": extracted, "WT": str(spoke_repo), "AFK_TASKS_ROOT": str(tmp_path / "tasks")},
-    ).stdout.strip()
+    _, verdict = _classify_pending(spoke_repo, tmp_path)
 
     assert verdict == "ESCALATE"
 
 
-def test_smoke_compound_end_to_end_auto_approves(spoke_repo: Path, tmp_path: Path) -> None:
-    # The #238 acceptance in miniature: a spoke parked after a completed Write, with the
-    # smoke compound sitting UNRESOLVED, must flow through extract_pending_command (which now
-    # recovers the real compound, not the resolved "Write") into classify_permission and
-    # AUTO-APPROVE — binding both halves of the fix (extraction + exec policy).
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    records = [
-        _named_tool_record("Write", {"file_path": "scripts/dev/afk-gate-smoke.sh", "content": "#"}),
-        _tool_result_record("tu_n"),
-        _bash_tool_record(_SMOKE_COMPOUND),  # tu_1, unresolved → the pending dialog
-    ]
-    (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+def test_smoke_compound_end_to_end_auto_approves(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
+    # The #238 acceptance in miniature: the waiting agent's Bash input is the smoke compound; it
+    # flows through extract_pending_command into classify_permission and AUTO-APPROVEs.
+    _park_perm(orca_bin, spoke_repo, _SMOKE_COMPOUND)
 
-    extracted = _call(
-        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    ).stdout.strip()
+    extracted, verdict = _classify_pending(spoke_repo, tmp_path)
+
     assert extracted == _SMOKE_COMPOUND
-    verdict = _call(
-        'classify_permission "$CMD" "$WT" | cut -f1',
-        env={"CMD": extracted, "WT": str(spoke_repo), "AFK_TASKS_ROOT": str(tmp_path / "tasks")},
-    ).stdout.strip()
-
     assert verdict == "APPROVE"
 
 
-# ── issue #257: the pane path must classify the WHOLE gated command, not a 2000-char cut ──
+# ── issue #257: the permission path must classify the WHOLE gated command, not a 2000-char cut ──
 #
-# extract_pending_command used to end its embedded python with `print(cmd[:2000].strip())`,
-# truncating the gated command to 2000 chars. In the pane path _decide_permission fed that
-# truncated string to the default-deny classify_permission (and the _reason_permission prompt),
-# so a >2KB compound whose risky segment lived past char 2000 was classified on its benign
-# prefix only and auto-approved — the exact hazard #253 fixed for afk_permission_hook_decide
-# (test_afk_permission_hook_classifies_the_whole_long_command). These bind the pane-path fix.
+# extract_pending_command used to truncate the gated command to 2000 chars, so a >2KB compound
+# whose risky segment lived past char 2000 was classified on its benign prefix only and
+# auto-approved — the exact hazard #253 fixed for afk_permission_hook_decide
+# (test_afk_permission_hook_classifies_the_whole_long_command). These bind the fix.
+
+_LONG_PUSH = "git add x.py; " * 200 + "git push origin main"  # ~2820 chars, past the old cap
 
 
 def test_extract_pending_command_returns_untruncated_long_command(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, orca_bin: Path
 ) -> None:
     # The gated command feeds the default-deny classifier, so it must NOT be truncated: a risky
-    # tail past the old 2000-char cap would otherwise be hidden from classify_permission and
-    # mis-approved. extract_pending_command returns the FULL command (uncapped basis is fine for
-    # its other consumers — _permission_pending tests non-emptiness, _broker_park_signature hashes
-    # it). RED pre-fix: the old [:2000] cut returned a 2000-char prefix, not the full command.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    cmd = "git add x.py; " * 200 + "git push origin main"  # ~2820 chars, well past 2000
-    (pd / "session.jsonl").write_text(json.dumps(_bash_tool_record(cmd)) + "\n")
+    # tail past 2000 chars would otherwise be hidden from classify_permission and mis-approved.
+    _park_perm(orca_bin, spoke_repo, _LONG_PUSH)
 
-    extracted = _call(
-        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    ).stdout.strip()
+    extracted = _call(f"extract_pending_command '{spoke_repo}'").stdout.strip()
 
-    assert extracted == cmd
+    assert extracted == _LONG_PUSH
     assert len(extracted) > 2000, "the classifier must see the whole command, not a 2000-char cut"
 
 
 def test_decide_permission_classifies_the_whole_long_command(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
 ) -> None:
-    # Pane-path analogue of test_afk_permission_hook_classifies_the_whole_long_command (#253):
+    # Permission-path analogue of test_afk_permission_hook_classifies_the_whole_long_command (#253):
     # a benign `git add x.py` prefix padded well past the old 2000-char cap with a risky
-    # `git push origin main` tail. extract_pending_command must NOT truncate, so classify sees the
-    # main-touching push and ESCALATEs (routes to the reasoner) instead of mis-approving the
-    # visible prefix. approve_permission is never invoked — no bare `1` is auto-typed — and the
-    # reasoner prompt carries the untruncated command (acceptance bullet 3).
-    #
-    # The prefix is sized so cmd[:2000] lands on a clean segment boundary: "git add x.py; " is 14
-    # chars, 142 whole units = 1988 chars, +12 = "git add x.py" (chars 1988..1999), so the 2000-
-    # char cut is exactly 143 complete `git add x.py` segments — all APPROVE pre-fix (genuinely RED).
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    cmd = "git add x.py; " * 200 + "git push origin main"
-    (pd / "session.jsonl").write_text(json.dumps(_bash_tool_record(cmd)) + "\n")
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    tmux_log = fake_bin / "tmux.log"
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" >> "{tmux_log}"\n'
-        'case "$1" in\n'
-        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n",
-    )
-    _agent_ps_stub(fake_bin)
-    statedir = tmp_path / "sd"
-    statedir.mkdir()
+    # `git push origin main` tail. classify sees the main-touching push and ESCALATEs (routes to
+    # the reasoner) instead of mis-approving the visible prefix. No "1" is ever typed, and the
+    # reasoner prompt carries the untruncated command.
+    _park_perm(orca_bin, spoke_repo, _LONG_PUSH)
     answerer_log = tmp_path / "answerer.log"
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_STATE_DIR": str(statedir),
-        # The reasoner sees the pending command in its prompt (delivered on stdin); capture it and
-        # DENY, so the escalate path declines rather than auto-approving.
-        "AFK_ANSWERER_CMD": f"cat >> '{answerer_log}'; printf 'ANSWER: DENY: push your own branch, not main'",
-        "AFK_JOURNAL_GH_COMMENT": "0",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-        "AFK_INJECT_POLL_SECONDS": "0",
-    }
+    # The reasoner sees the pending command on stdin; capture it and DENY, so the escalate path
+    # declines rather than auto-approving.
+    env = _gate_env(
+        tmp_path,
+        f"cat >> '{answerer_log}'; printf 'ANSWER: DENY: push your own branch, not main'",
+    )
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    # The whole command was classified: the main-touching push tail forces ESCALATE, not APPROVE.
-    fields = (statedir / "decisions.log").read_text().strip().split("\t")
+    fields = (Path(env["AFK_STATE_DIR"]) / "decisions.log").read_text().strip().split("\t")
     assert fields[4] == "ESCALATE", fields
-    # approve_permission types a BARE `1` then Enter; the escalate→deny path must never do that.
-    assert "send-keys -t afk:1 1\n" not in tmux_log.read_text(), (
-        "no auto-approve keypress on ESCALATE"
-    )
-    # Acceptance bullet 3: the reasoner prompt carries the untruncated command, tail and all.
+    assert "1" not in _sent_texts(orca_bin), "no auto-approve keypress on ESCALATE"
     assert "git push origin main" in answerer_log.read_text(), "reasoner got a truncated command"
 
 
@@ -897,113 +772,48 @@ def test_danger_guard_registered_like_permission_hook() -> None:
     assert perm is not None, "afk-permission-hook baseline missing"
 
 
-# ── issue #294 AC1: an APPROVE is delivered ONCE per pending dialog ────────────────────────────
-# _decide_permission called approve_permission and returned success without recording that THIS
-# park was served, so an unchanged dialog — a pane that has not redrawn, or an approved
-# `nohup ... &` whose gate keeps the gated tool_use unresolved — was re-approved on the very next
-# tick: the (tip, sig) re-answer ceiling computed the SAME key, found the counter still under
-# AFK_REANSWER_CEILING, and fell through to a second keypress. At the default ceiling of 2 that is
-# exactly one duplicate delivery — the #135/#188 two-concurrent-gates shape.
-
-_AUTO_APPROVABLE = "git reset -q; git add tests/x.py"  # classify_permission APPROVEs a self-stage
+# ── the approve counts only Orca's input_accepted, once per tick (#365) ────────────────────────
+# A permission dialog is the agent `waiting` with toolName/toolInput. The approve types "1" and
+# counts ONLY when Orca reports the input_accepted stage; silence (no stage) is retried on the next
+# tick, never resent within this one. Consumption is provable, so there is no served marker.
 
 
-def _served_marker(env: dict[str, str]) -> Path:
-    return Path(env["_STATEDIR"]) / "served-5"
-
-
-def _yes_keystrokes(env: dict[str, str]) -> list[str]:
-    """Every "Yes" (option 1) keypress the broker sent to the dialog — approve_permission's own
-    delivery, so counting these counts real approvals, not intentions."""
-    keylog = Path(env["_KEYLOG"])
-    keys = keylog.read_text() if keylog.exists() else ""
-    return [line for line in keys.splitlines() if line.split()[-1] == "1"]
-
-
-def _age_transcript(spoke_repo: Path, env: dict[str, str]) -> None:
-    """Backdate the spoke's transcript so approve_permission's _transcript_advanced check has an
-    mtime to advance PAST (BSD stat is whole-second, so a same-second append would not register
-    and the approve would read as undelivered)."""
-    jsonl = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo) / "session.jsonl"
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-
-
-def test_two_ticks_on_an_unchanged_dialog_approve_exactly_once(
-    spoke_repo: Path, tmp_path: Path
+@pytest.mark.parametrize("resumes", [True, False], ids=["agent-leaves-waiting", "dialog-stays-up"])
+def test_approve_counts_only_when_the_agent_leaves_waiting_and_sends_once(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path, resumes: bool
 ) -> None:
-    # _perm_env's fake tmux keeps showing the SAME dialog, and its Enter appends a non-turn record
-    # that never resolves the gated tool_use — i.e. the identical (tip, sig, tool_use) is still
-    # pending on tick 2, exactly the state the duplicate needs.
-    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
-    _age_transcript(spoke_repo, env)
+    _park_perm(orca_bin, spoke_repo, _AUTO_APPROVABLE, resumes=resumes)
+    env = _gate_env(tmp_path, "printf 'ANSWER: APPROVE'")
+    state = Path(env["AFK_STATE_DIR"])
 
-    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
-    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
-    assert len(_yes_keystrokes(env)) == 1, (
-        "an unchanged dialog must be approved ONCE — a second keypress lands in whatever the pane "
-        "shows next (the #89 stale-inject class) and re-runs the command it authorized"
-    )
-
-
-def test_a_delivered_approve_records_the_served_park(spoke_repo: Path, tmp_path: Path) -> None:
-    # The mechanism behind the exactly-once guarantee: the mechanical auto-approve stamps the park
-    # it served, naming the id of the tool_use it actually approved.
-    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
-    _age_transcript(spoke_repo, env)
-
-    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
-
-    assert len(_yes_keystrokes(env)) == 1, "sanity: the first tick really did approve"
-    record = _served_marker(env).read_text().strip().split("\t")
-    assert record[2] == "tu_1", f"the served record must name the approved tool_use: {record}"
+    assert result.returncode == 0, result.stderr
+    assert _sent_texts(orca_bin) == ["1"], "exactly ONE terminal send, never resent in the tick"
+    injected = _events_named(state, 5, "approval_injected")
+    assert [e["evidence"]["delivered"] for e in injected] == [resumes], injected
+    # An unconfirmed delivery warns and stays retryable (never parks, never reads as served).
+    assert bool(_events_named(state, 5, "escalated")) is not resumes
 
 
-def _break_the_keypress(spoke_repo: Path, tmp_path: Path, env: dict[str, str]) -> None:
-    """Replace _perm_env's tmux with one that still shows the dialog and still records the
-    keystroke, but whose Enter never advances the transcript — approve_permission's exact
-    "sent it, could not confirm it landed" failure (it verifies the mtime moved, nothing more)."""
-    tmux = tmp_path / "bin" / "tmux"
-    write_stub(
-        tmux,
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  send-keys) printf "%s\\n" "$*" >> "{env["_KEYLOG"]}" ;;\n'
-        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n",
-    )
-    _agent_ps_stub(tmux.parent)
+def test_decide_permission_leaves_no_served_marker(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
+    # D2: consumption is provable from Orca, so nothing records "this park was served".
+    _park_perm(orca_bin, spoke_repo, _AUTO_APPROVABLE)
+    env = _gate_env(tmp_path, "printf 'ANSWER: APPROVE'")
 
+    result = _call(f"_decide_permission '{spoke_repo}' 5 sigA", env=env)
 
-def test_a_failed_approve_delivery_records_no_served_park(spoke_repo: Path, tmp_path: Path) -> None:
-    # Only a CONFIRMED delivery is served — this is what keeps the marker from becoming the strand
-    # it exists to prevent. The keypress goes out but the transcript never moves, so
-    # approve_permission returns failure and this park must stay retryable on the next tick rather
-    # than reading as already-answered. (The mtime is frozen by the stub, NOT by racing the
-    # whole-second clock — a delivery must fail here by construction, not by luck.)
-    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
-    _break_the_keypress(spoke_repo, tmp_path, env)
-
-    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
-
-    # TWO since #299: this stub's pane keeps rendering the SAME dialog byte-for-byte, which is
-    # exactly the lost-keypress shape approve_permission now retries once (re-asserting "1" before
-    # its Enter, never a bare Enter). The retry changes nothing about what this test pins — an
-    # unconfirmed delivery still records no served park — only how many attempts it takes to fail.
-    assert len(_yes_keystrokes(env)) == 2, "sanity: the approve was attempted, then retried once"
-    assert not _served_marker(env).exists(), (
-        "a delivery the broker could not confirm must never read as served"
-    )
+    assert result.returncode == 0, result.stderr
+    assert _sent_texts(orca_bin) == ["1"], "sanity: the approve really was delivered"
+    assert list(Path(env["AFK_STATE_DIR"]).glob("served-*")) == []
 
 
 # ── #300 step 3b: permission lane transition-log events ───────────────────────
 # The permission lane records its per-episode decision (approve_decided, kind=reasoned|mechanical)
 # and threads the issue+lane+episode so hub-inject's approval_injected delivery event keys on the
 # broker's KNOWN issue. Shadow-only: these assert the RECORD, not a behavior change.
-
-_PUSH_MAIN = "git push origin main"  # a main-touching command classify_permission ESCALATEs
 
 
 def _events(state_dir: Path, issue: int) -> list[dict]:
@@ -1017,16 +827,20 @@ def _events_named(state_dir: Path, issue: int, name: str) -> list[dict]:
     return [e for e in _events(state_dir, issue) if e.get("event") == name]
 
 
+def _service(spoke_repo: Path, orca_bin: Path, tmp_path: Path, command: str, answerer: str) -> Path:
+    """Park on `command`, run one broker tick with `answerer`, and return the state dir."""
+    _park_perm(orca_bin, spoke_repo, command)
+    env = _gate_env(tmp_path, answerer)
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    return Path(env["AFK_STATE_DIR"])
+
+
 def test_decide_permission_records_mechanical_approve_decided(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
 ) -> None:
     # The fixed-rule fast path records approve_decided with kind=mechanical, and threads the
     # lane onto hub-inject's approval_injected delivery event.
-    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
-    _age_transcript(spoke_repo, env)
-    state = Path(env["_STATEDIR"])
-
-    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    state = _service(spoke_repo, orca_bin, tmp_path, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
 
     decided = _events_named(state, 5, "approve_decided")
     assert any(e["evidence"]["kind"] == "mechanical" for e in decided), decided
@@ -1035,43 +849,38 @@ def test_decide_permission_records_mechanical_approve_decided(
     assert injected and all(e["lane"] == "permission" for e in injected), injected
 
 
-def test_reason_permission_records_reasoned_approve(spoke_repo: Path, tmp_path: Path) -> None:
+def test_reason_permission_records_reasoned_approve(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
     # An ESCALATE command routes to the reasoner; an ANSWER: APPROVE records approve_decided with
     # kind=reasoned and decision=approve, and the reasoner's own answer_computed is labelled on
     # the permission lane (run_answerer defaults to the answer lane).
-    env = _perm_env(tmp_path, spoke_repo, _PUSH_MAIN, "printf 'ANSWER: APPROVE'")
-    _age_transcript(spoke_repo, env)
-    state = Path(env["_STATEDIR"])
-
-    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    state = _service(spoke_repo, orca_bin, tmp_path, _PUSH_MAIN, "printf 'ANSWER: APPROVE'")
 
     decided = _events_named(state, 5, "approve_decided")
     assert decided, "the reasoned verdict must record approve_decided"
-    ev = decided[-1]["evidence"]
-    assert ev == {"decision": "approve", "kind": "reasoned"}
+    assert decided[-1]["evidence"] == {"decision": "approve", "kind": "reasoned"}
     computed = _events_named(state, 5, "answer_computed")
     assert computed and computed[-1]["lane"] == "permission", computed
 
 
-def test_reason_permission_records_reasoned_deny(spoke_repo: Path, tmp_path: Path) -> None:
-    env = _perm_env(tmp_path, spoke_repo, _PUSH_MAIN, "printf 'ANSWER: DENY: use your own branch'")
-    _age_transcript(spoke_repo, env)
-    state = Path(env["_STATEDIR"])
-
-    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+def test_reason_permission_records_reasoned_deny(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
+    state = _service(
+        spoke_repo, orca_bin, tmp_path, _PUSH_MAIN, "printf 'ANSWER: DENY: use your own branch'"
+    )
 
     decided = _events_named(state, 5, "approve_decided")
     assert decided and decided[-1]["evidence"]["decision"] == "deny", decided
 
 
-def test_permission_lane_events_carry_the_episode(spoke_repo: Path, tmp_path: Path) -> None:
+def test_permission_lane_events_carry_the_episode(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
     # The episode key is <sig>:<onset>; the sig is _broker_park_signature's hash, so the recorded
-    # episode is non-empty and matches the broker's own re-answer/served signature.
-    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
-    _age_transcript(spoke_repo, env)
-    state = Path(env["_STATEDIR"])
-
-    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    # episode is non-empty and matches the broker's own re-answer signature.
+    state = _service(spoke_repo, orca_bin, tmp_path, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
 
     decided = _events_named(state, 5, "approve_decided")
     assert decided, "sanity: a decision was recorded"
@@ -1217,3 +1026,59 @@ def test_danger_wall_journals_under_the_record_issue_not_the_branch_slug(
 
     assert _perm(result.stdout) == "deny", result.stdout + result.stderr
     assert _journal_issues(env) == {"361"}
+
+
+# -- rc 3 at both broker call sites: the dialog went away while we decided (#365) ----------------
+
+
+def _gone_scenario(orca_bin: Path, wt: Path) -> Path:
+    """A scenario file the answerer/classifier swaps in mid-decision: the agent is `working` again."""
+    alt = orca_bin / "alt-scenario.json"
+    orca_park(orca_bin, wt, state="working")
+    alt.write_text((orca_bin / ".orca-stub" / "scenario.json").read_text())
+    return alt
+
+
+def _no_failure_record(state: Path) -> None:
+    assert not (state / "warned-state-5").exists(), "a vanished dialog arms no retry backoff"
+    assert _events_named(state, 5, "escalated") == [], "and is not a failed delivery"
+
+
+def test_a_dialog_that_vanishes_before_a_mechanical_approve_is_a_noop(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
+    alt = _gone_scenario(orca_bin, spoke_repo)
+    _park_perm(orca_bin, spoke_repo, _AUTO_APPROVABLE)
+    env = _gate_env(tmp_path, "false")
+    state = Path(env["AFK_STATE_DIR"])
+    scenario = orca_bin / ".orca-stub" / "scenario.json"
+
+    # the dialog is answered elsewhere between classifying it and approving it
+    result = _call(
+        f'classify_permission() {{ cp "{alt}" "{scenario}"; printf "APPROVE\\tok\\n"; }}; '
+        f"_decide_permission '{spoke_repo}' 5",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _sent_texts(orca_bin) == [], "no key goes to a dialog that is gone"
+    _no_failure_record(state)
+
+
+def test_a_dialog_that_vanishes_while_the_reasoner_runs_is_journaled_not_failed(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
+    alt = _gone_scenario(orca_bin, spoke_repo)
+    _park_perm(orca_bin, spoke_repo, _PUSH_MAIN)
+    scenario = orca_bin / ".orca-stub" / "scenario.json"
+    env = _gate_env(tmp_path, f"cp '{alt}' '{scenario}'; printf 'ANSWER: APPROVE'")
+    state = Path(env["AFK_STATE_DIR"])
+
+    result = _call(f"_decide_permission '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert _sent_texts(orca_bin) == []
+    journal = (state / "decision-journal.jsonl").read_text()
+    assert "dialog was gone or replaced" in journal
+    assert "delivery FAILED" not in journal
+    _no_failure_record(state)

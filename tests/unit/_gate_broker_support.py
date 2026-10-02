@@ -8,7 +8,6 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from shlex import quote as shlex_quote
 
 import pytest
 from _stubs import write_stub
@@ -126,74 +125,12 @@ def _ask_record(question: str, options: list[tuple[str, str]]) -> dict:
 # ── the hardened injector submits (no stranded paste) ─────────────────────────
 
 
-def _write_fake_tmux(
-    tmp_path: Path,
-    *,
-    on_paste: str = ":",
-    on_enter: str = ":",
-    on_capture: str = ":",
-    pane_path: Path | None = None,
-    agent_alive: bool = True,
-) -> Path:
-    """Fake tmux encoding inject_answer's key contract (Escape, `send-keys -l --`
-    paste, separate Enter): one single-line bash snippet runs per event, capture-pane
-    runs on_capture. One builder so every inject test drives the SAME contract —
-    divergent inline fakes would let the suite stay green against a stale contract.
-    pane_path additionally makes list-panes advertise an afk:1 pane at that path
-    (for callers that locate the pane via _spoke_pane_target). Returns the bin dir
-    to prepend to PATH.
-
-    Since #301 every keystroke primitive first proves an agent is RUNNING in the pane, so
-    the builder answers that probe too — `agent_alive=True` by default, because these tests
-    exercise delivery into a healthy spoke. Without it every inject here would refuse and
-    the suite would go green on refusals rather than on the contract it means to pin.
-    """
-    list_panes = f'printf "afk:1\\t%s\\n" "{pane_path}"' if pane_path else ":"
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        "  send-keys)\n"
-        '    case "$*" in\n'
-        f'      *" -l "*) {on_paste} ;;\n'
-        f"      *Enter*) {on_enter} ;;\n"
-        "    esac ;;\n"
-        f"  capture-pane) {on_capture} ;;\n"
-        f"  list-panes) {list_panes} ;;\n"
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n",
-    )
-    _agent_ps_stub(fake_bin, agent_alive=agent_alive)
-    return fake_bin
-
-
-def _inject_env(projects: Path, fake_bin: Path, **extra: str) -> dict[str, str]:
-    return {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-        "AFK_INJECT_POLL_SECONDS": "0",
-        **extra,
-    }
-
-
 def _seed_transcript(projects: Path, spoke_repo: Path, content: str = "{}\n") -> Path:
     """A spoke session transcript pinned to a stale mtime (any write reads as advance)."""
     jsonl = _project_dir_for(projects, spoke_repo) / "session.jsonl"
     jsonl.write_text(content)
     os.utime(jsonl, (1_000_000_000, 1_000_000_000))
     return jsonl
-
-
-def _user_record(answer: str) -> str:
-    """What Claude Code appends on submit: the user turn, JSON-encoded raw-UTF-8."""
-    return json.dumps(
-        {"type": "user", "message": {"content": [{"type": "text", "text": answer}]}},
-        ensure_ascii=False,
-    )
 
 
 # ── option (c): the reasoner tool-call audit (#247) ───────────────────────────
@@ -222,116 +159,7 @@ def _result_event(text: str) -> str:
 # ── subtask C: attended QCM surface + interactive per-gate resolver ────────────
 
 
-# ── #301: the agent-liveness probe's two stubbed halves ───────────────────────
-#
-# The probe reads the pane's pid from tmux, then looks for the agent among that pid's
-# DESCENDANTS in a `ps` snapshot. The pane pid is ALWAYS a bare shell — that is the point of
-# the incident: a LIVE spoke's pane reports `pane_current_command=zsh` exactly like a dead
-# one, because the launcher shell is the process-group leader and claude runs beneath it. So
-# the ONLY thing separating the two shapes is whether a `claude` descendant exists.
-_PANE_PID = 4242
-_AGENT_PID = 4243
-_DISPLAY_CASE = f'  display-message) printf "{_PANE_PID}\\n" ;;\n'
-
-
-def _agent_ps_stub(fake_bin: Path, *, agent_alive: bool = True, pane_pid: int = _PANE_PID) -> None:
-    """PATH-stub `ps` for the #301 agent probe. Default ALIVE: a stub that silently reported
-    every pane's agent as dead would disable the inject lane across the whole suite, and the
-    tests that pin delivery would pass for the wrong reason.
-
-    `pane_pid` is the shell pid the tmux stub advertises via display-message; the stubbed
-    agent hangs off it so the probe's ancestor-walk resolves. It defaults to _PANE_PID (what
-    the shared tmux stubs report) but a fixture that advertises a different pid — the
-    forensics builder reports the live pytest pid so the real process-tree capture has
-    descendants — passes its own.
-
-    Only the probe's exact `-eo pid=,ppid=,comm=` form is answered; every other `ps` call
-    execs the REAL ps — hub-afk reads `-o comm= -p`, `-o command= -p` and a
-    `-o pid,stat,etime,wchan` hang snapshot through the same PATH, and a blanket stub would
-    silently corrupt them.
-    """
-    table = f"{pane_pid} 1 -zsh\n"
-    if agent_alive:
-        table += f"{_AGENT_PID} {pane_pid} claude\n"
-    # A foreign claude OUTSIDE this pane's tree: it must never vouch for this pane.
-    table += "999 1 /Applications/Other.app/Contents/MacOS/claude\n"
-    tbl = fake_bin / "ps_table.txt"
-    tbl.write_text(table)
-    write_stub(
-        fake_bin / "ps",
-        "#!/usr/bin/env bash\n"
-        'case "$*" in\n'
-        f'  "-eo pid=,ppid=,comm=") cat "{tbl}" ;;\n'
-        '  *) exec /bin/ps "$@" ;;\n'
-        "esac\n",
-    )
-
-
-def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path, *, agent_alive: bool = True) -> Path:
-    """A tmux stub: list-panes maps a pane to <wt>; the submitting Enter records the pasted
-    answer as a type:"user" turn (what Claude Code really writes on submit); send-keys logged.
-
-    The Enter used to append a bare `{}` — enough to bump the mtime, but NOT the user record a
-    real submit writes. Since #281 the appended user record is the SOLE proof of delivery
-    (_answer_delivered), so a stub that only bumped the clock would score every inject in this
-    suite as non-delivered — and, worse, would have kept passing against the pre-#281 fail-open
-    that let an unsubmitted paste read as delivered. The paste is remembered on the literal
-    `send-keys -l --` and replayed into the record on the following Enter, mirroring the real
-    two-keystroke contract; an Enter with nothing pasted still writes a bare `{}` (a non-turn
-    write that advances the transcript without proving delivery).
-
-    The submitting Enter CONSUMES the buffer, exactly as a real submit empties the composer.
-    Without that, the bare-Enter retry (#133) would re-emit the same answer as a second user
-    record and manufacture a "delivered" verdict against an injector that never submitted
-    anything — the stub would pass while the real code was broken, which is the whole failure
-    mode #281 is about.
-    """
-    log = fake_bin / "tmux.log"
-    paste = fake_bin / "pasted.txt"
-    # json.dumps in the stub: the needle is matched byte-wise against its JSON-ESCAPED form,
-    # so the record has to be encoded exactly as Claude Code encodes it (raw UTF-8, no \\u).
-    encode = (
-        "python3 -c 'import json,os,sys;"
-        'print(json.dumps({"type":"user","message":{"content":[{"type":"text",'
-        '"text":open(os.environ[chr(95)+"AFK_PASTE"]).read()}]}},ensure_ascii=False))'
-        "'"
-    )
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" >> "{log}"\n'
-        'case "$1" in\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{wt}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "  send-keys)\n"
-        '    case "$*" in\n'
-        f'      *" -l "*) printf "%s" "${{@: -1}}" > "{paste}" ;;\n'
-        f'      *Enter*)  if [ -s "{paste}" ]; then\n'
-        f'                  _AFK_PASTE="{paste}" {encode} >> "{jsonl}"\n'
-        f'                  : > "{paste}"\n'
-        f'                else printf "{{}}\\n" >> "{jsonl}"; fi ;;\n'
-        "    esac ;;\n"
-        "esac\nexit 0\n",
-    )
-    _agent_ps_stub(fake_bin, agent_alive=agent_alive)
-    return log
-
-
 # ── subtask D: automatable-decisions log + codification pass ───────────────────
-
-
-def _bash_tool_record(command: str) -> dict:
-    return {
-        "type": "assistant",
-        "message": {
-            "content": [
-                {"type": "tool_use", "name": "Bash", "id": "tu_1", "input": {"command": command}}
-            ]
-        },
-    }
-
-
-_PERMISSION_PROMPT = "Bash command\n  git reset -q\nDo you want to proceed?\n❯ 1. Yes\n  2. No"  # noqa: RUF001 (real Claude Code dialog cursor glyph)
 
 
 # ── issue #164: the reasoner transcript must not pollute the spoke's session ────
@@ -394,86 +222,6 @@ def _install_fake_claude(fake_bin: Path, decision: str) -> None:
 # tool_result: an is_error result un-latches it.
 
 
-def _gate_bash_turn(plan: str, tool_id: str = "tu_gate", issue: int = 5) -> dict:
-    """An assistant turn: a prose plan + a `spoke-ready.sh --gate` Bash carrying a tool_use id."""
-    return {
-        "type": "assistant",
-        "message": {
-            "content": [
-                {"type": "text", "text": plan},
-                {
-                    "type": "tool_use",
-                    "name": "Bash",
-                    "id": tool_id,
-                    "input": {
-                        "command": (
-                            f"bash .ai-toolkit/scripts/spoke-ready.sh --gate {issue} "
-                            "--plan-file .ai-toolkit/gate-plan.md"
-                        )
-                    },
-                },
-            ]
-        },
-    }
-
-
-def _gate_tool_result(tool_id: str = "tu_gate", *, is_error: bool) -> dict:
-    """The user turn Claude Code appends for the gate Bash's result (a hook deny → is_error)."""
-    block: dict = {"type": "tool_result", "tool_use_id": tool_id, "content": "result"}
-    if is_error:
-        block["is_error"] = True
-    return {"type": "user", "message": {"content": [block]}}
-
-
-def _spoke_activity_turn() -> dict:
-    """The spoke's OWN work after a failed emission — an assistant tool_use, no park."""
-    return {
-        "type": "assistant",
-        "message": {
-            "content": [
-                {"type": "text", "text": "That was denied — investigating the guard instead."},
-                {"type": "tool_use", "name": "Read", "id": "tu_r", "input": {"file_path": "x.sh"}},
-            ]
-        },
-    }
-
-
-def _spoke_await_review_turn() -> dict:
-    """A COMPLIANT parked spoke's trailing turn: the agent loop's text-only reply to the gate
-    Bash's tool_result — 'plan posted, awaiting review' — then it idles. No mutation past the gate,
-    so this must NOT read as coded-past (the #312 review's false-positive case)."""
-    return {
-        "type": "assistant",
-        "message": {
-            "content": [
-                {
-                    "type": "text",
-                    "text": "I've posted my plan and am waiting for review before I proceed.",
-                }
-            ]
-        },
-    }
-
-
-def _spoke_coded_past_turn() -> dict:
-    """The #117 keeps-coding shape: the spoke WROTE to the worktree past the gate (an Edit) — the
-    operation the PLAN gate exists to block. This is what proves it coded past, not a text turn."""
-    return {
-        "type": "assistant",
-        "message": {
-            "content": [
-                {"type": "text", "text": "Starting the implementation."},
-                {
-                    "type": "tool_use",
-                    "name": "Edit",
-                    "id": "tu_e",
-                    "input": {"file_path": "hub-afk.sh", "old_string": "a", "new_string": "b"},
-                },
-            ]
-        },
-    }
-
-
 def _write_transcript(projects: Path, wt: Path, records: list[dict]) -> None:
     pd = _project_dir_for(projects, wt)
     (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
@@ -502,7 +250,7 @@ def _seed_task_output(tasks_root: Path, wt_path: Path, mtime: int) -> Path:
 # The gate park hands its plan to the broker through a scripted artifact
 # (<wt>/.ai-toolkit/gate-<N>.md, written by spoke-ready.sh --gate) rather than the
 # transcript heuristic. The gate route PREFERS the artifact when present (transcript
-# fallback intact); _consume_gate_tag removes it alongside the tag.
+# fallback intact); spoke-ready.sh --gate removes it alongside the tag on an approve.
 
 
 def _gate_park_transcript(plan: str) -> str:
@@ -573,23 +321,12 @@ def _gate_broker_env(spoke_repo: Path, tmp_path: Path, *, prompt_log: Path) -> d
 
 
 # ── issue #204: consume a stale gate tag when the answer already landed ─────────
-# _consume_gate_tag ran ONLY on the broker's confirmed-inject path. An answer that
+# The hub no longer consumes the gate tag (the spoke does, on an approve). An answer that
 # registered late, a wedge respawn started outside the broker, or an attended/manual
 # reply in the pane left gate/<N> at the tip — re-read as "waiting" and re-answered,
 # and (with the #204 guard) wedging the resumed spoke. The broker now self-heals: when
 # the transcript shows a genuine user reply AFTER the PLAN-gate park, it consumes the
 # stale tag instead of re-answering.
-
-
-def _resumed_gate_transcript(plan: str) -> str:
-    """A gate-park transcript where a TYPED reply already landed after the park."""
-    reply = (
-        json.dumps(
-            {"type": "user", "promptSource": "typed", "message": {"content": "Approved — proceed."}}
-        )
-        + "\n"
-    )
-    return _gate_park_transcript(plan) + reply
 
 
 # ── issue #203 finding 4: compound-command decomposition + in-worktree lane ────
@@ -628,47 +365,11 @@ def _classify_with_wt(cmd: str, wt: Path, tasks_root: Path) -> str:
 # secret-like or out-of-family one. Every OTHER non-Bash tool stays default-deny.
 
 
-def _read_tool_record(file_path: str) -> dict:
-    return {
-        "type": "assistant",
-        "message": {
-            "content": [
-                {
-                    "type": "tool_use",
-                    "name": "Read",
-                    "id": "tu_r",
-                    "input": {"file_path": file_path},
-                }
-            ]
-        },
-    }
-
-
-def _named_tool_record(name: str, tool_input: dict | None = None) -> dict:
-    return {
-        "type": "assistant",
-        "message": {
-            "content": [{"type": "tool_use", "name": name, "id": "tu_n", "input": tool_input or {}}]
-        },
-    }
-
-
 # ── issue #240: extract_pending_command must return the PENDING (unresolved) tool_use ──
 # The permission dialog flushes the pending tool_use to the JSONL as an UNRESOLVED block
 # (no matching tool_result) for the whole park, while the PRIOR calls are already resolved.
 # The old walk kept the last tool_use in file order regardless of resolution, so a spoke
 # that parked right after a completed Write surfaced a phantom "Write" and escalated on it.
-
-
-def _tool_result_record(tool_use_id: str) -> dict:
-    # The user turn Claude Code appends when a tool_use completes — its tool_result carries
-    # the matching tool_use_id, which is what marks the tool_use RESOLVED.
-    return {
-        "type": "user",
-        "message": {
-            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": "ok"}]
-        },
-    }
 
 
 _SMOKE_COMPOUND = "chmod +x scripts/dev/afk-gate-smoke.sh && ./scripts/dev/afk-gate-smoke.sh"
@@ -681,29 +382,6 @@ _SMOKE_COMPOUND = "chmod +x scripts/dev/afk-gate-smoke.sh && ./scripts/dev/afk-g
 # is empty. _permission_pending must DECOUPLE detection (the pane) from extraction (the
 # command): a shown pane prompt IS a park even with an empty command. The #240 guard still
 # holds: a resolved tool with NO pane prompt yields false (no phantom escalation).
-
-
-def _fake_tmux_capture(fake_bin: Path, wt: Path, pane_text: str) -> None:
-    """A tmux stub whose capture-pane prints <pane_text> and whose list-panes maps the
-    pane to <wt>, so _pane_shows_permission_prompt observes exactly that pane content."""
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  capture-pane) printf "%s\\n" {shlex_quote(pane_text)} ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" {shlex_quote(str(wt))} ;;\n'
-        "esac\nexit 0\n",
-    )
-
-
-def _resolved_only_transcript(pd: Path) -> None:
-    # A completed Write with its matching tool_result -> NO unresolved tool_use, so
-    # extract_pending_command returns empty (the dialog-pending #240/#254 shape).
-    records = [
-        _named_tool_record("Write", {"file_path": "scripts/x.sh", "content": "y"}),
-        _tool_result_record("tu_n"),
-    ]
-    (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
 
 
 # ── issue #241 S2: the reasoner ALWAYS answers (rule <-> fallback policy binding) ──
@@ -722,53 +400,6 @@ RULE_FILE = REPO_ROOT / "shared" / "rules" / "afk-answering.md"
 # reversible, in-scope command; DENY an irreversible/destructive one (Esc-cancel the dialog
 # and inject the reversible-path guidance) — never auto-approve a destructive command. Either
 # way the taken decision is warned + journaled, and the spoke stays serviced (never blocked).
-
-
-def _perm_env(tmp_path: Path, spoke_repo: Path, command: str, answerer: str) -> dict[str, str]:
-    """Park spoke #5 on a permission dialog for <command>, stub the reasoner with <answerer>,
-    and record any blocked escalation. A fake tmux logs every send-keys to _KEYLOG and, on an
-    Enter, advances the transcript so approve/inject verification can register."""
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    jsonl = pd / "session.jsonl"
-    jsonl.write_text(json.dumps(_bash_tool_record(command)) + "\n")
-    keylog = tmp_path / "keys.log"
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    write_stub(
-        fake_bin / "tmux",
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        "  send-keys)\n"
-        f'    printf "%s\\n" "$*" >> "{keylog}"\n'
-        f'    case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
-        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n",
-    )
-    _agent_ps_stub(fake_bin)
-    statedir = tmp_path / "sd"
-    statedir.mkdir(exist_ok=True)
-    ready_log = tmp_path / "ready.log"
-    ready_stub = tmp_path / "spoke-ready.sh"
-    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    gh = fake_bin / "gh"
-    write_stub(gh, '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    return {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_STATE_DIR": str(statedir),
-        "SPOKE_READY": str(ready_stub),
-        "AFK_ANSWERER_CMD": answerer,
-        "AFK_JOURNAL_GH_COMMENT": "0",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-        "AFK_INJECT_POLL_SECONDS": "0",
-        "_KEYLOG": str(keylog),
-        "_READY_LOG": str(ready_log),
-        "_STATEDIR": str(statedir),
-    }
 
 
 # ── issue #253: programmatic PreToolUse permission decision ───────────────────

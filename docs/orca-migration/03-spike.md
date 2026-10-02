@@ -136,3 +136,18 @@ issue's `-250` target; the net is still negative and tests shrink by far more.
 | `hub-afk-arm.sh` (Orca guard) | 531 | 546 | +15 |
 | `hub-otel-watch.sh` | 270 | 268 | -2 |
 | **Net code** | 2987 | 2959 | **-28** |
+
+## Round 5 — S6/S7 (#365, 2026-10-02)
+
+Orca 1.4.218. Run by the #365 worker: read-only calls against the live runtime plus the CLI sources
+(`app.asar.unpacked/out/cli/handlers/`). A depth-1 worker cannot dispatch (`nested_worker_depth_exceeded`),
+so nothing below mutated Orca state.
+
+| Spike | Outcome | Evidence |
+|---|---|---|
+| D3 — `worker-start --task <t> --retry-of <d> --terminal <h> --worktree path:<wt>` re-seeds the task's original spec and the agent resumes from its ledger | **NOT VERIFIED — needs the coordinator.** `_afk_retry_worker` is built so it does not depend on it: after the restart the finished-turn-idle nudge lane (`_spoke_turn_done` → `_afk_nudge_spoke`) sends a continue prompt if the agent sits idle, and the conflict-resolve lane sends its prompt after the restart. To close it: on a disposable worktree run `worker-start --spec <s> … --terminal <h1>`, then `worker-stop`, a new `terminal create`, and `worker-start --task <task> --retry-of <dispatch> --terminal <h2>`; record whether the new agent received the spec, and whether `--task` + `--retry-of` is accepted without `--spec`. | `worker-start --help`: `(--task \| --spec)`, `--retry-of`; fenced for a depth-1 worker. |
+| `ask` needs the dispatch capability | **A spoke script cannot read it.** `orchestration ask` from an active Dispatch fails `dispatch_capability_invalid` ("pass --dispatch-capability <token> from your dispatch preamble"); no env var carries it and `worker-show` omits it. `spoke-ready.sh` therefore takes `--dispatch-capability <token>` (the agent passes it once from its preamble), remembers it in `.ai-toolkit/dispatch-capability` (0600) and passes it to `ask` / `worker_done`. | CLI source `question-handler.js`; live `ask` probe without the flag. |
+| `ask` receipt and timeout | `result.{messageId, answer, timedOut, cancelled, timeoutMs}`. A timeout exits 1 with `timedOut: true` and the **message id**, the question stays pending and `ask --resume <id>` waits again (`--options` is invalid on resume). | `question-handler.js`. |
+| `terminal send` receipt | `result.send.{accepted, prompt.{requestId, stages[]}}`; `--wait-submit` and `--retry-request` are **only valid with `--text` + `--enter`** (a bare Escape goes without them). Stages: `input_accepted`, `turn_started`. `accepted: false` exits 1. | `terminal-send.js`. |
+| `worktree ps` agent fields | `agents[].{state, toolName, toolInput, stateStartedAt, updatedAt, paneKey, prompt, lastAssistantMessage}`; for a Bash call `toolInput` is the **command string**. Whether Orca clips a long `toolInput` is unverified, so an ellipsis tail is read as an unreadable command (declined, never classified). | live `worktree ps --json`. |
+| Inbox: does an answered `question` leave `check --peek`? | **Unverified.** The slot_state gate read assumes a replied question stops showing as unread. If it does not, a gate would re-park forever: confirm with one real `reply` on a disposable run, and if needed ack with `check --ack`. | — |

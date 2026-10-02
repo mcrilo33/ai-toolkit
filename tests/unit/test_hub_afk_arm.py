@@ -67,30 +67,50 @@ def test_arm_claude_check_default_probe_runs_on_haiku() -> None:
     assert "claude-opus-4-8" not in src
 
 
-# --- Orca arm guard (#363) ------------------------------------------------------
-# Dispatch is Orca-only since #363, but the drain still supervises tmux panes:
-# recover_dead_panes would treat a pane-less Orca spoke as crashed and tear it down or
-# relaunch it in tmux. So arming is refused, naming #365 (S6), until the supervisor moves to Orca.
+# --- Orca arm guard (#363/#365) ------------------------------------------------
+# The drain reads and writes spokes only through Orca, so arming needs a usable Orca AND a
+# coordinator terminal with a bound Run (reply / worker-start / check are fenced to it).
 
 
-def _orca_env(tmp_path: Path, **kw: Any) -> dict[str, str]:
+def _orca_env(tmp_path: Path, handle: str | None = "term_hub", **kw: Any) -> dict[str, str]:
     bindir = tmp_path / "bin"
     bindir.mkdir()
     env = install_orca_stub(bindir, **kw)
-    return {**env, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    env = {**env, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    if handle:
+        env["ORCA_TERMINAL_HANDLE"] = handle
+    return env
 
 
-def test_arm_refuses_with_a_message_naming_365_even_with_a_healthy_orca(tmp_path: Path) -> None:
+def test_arm_passes_with_a_usable_orca_a_terminal_handle_and_a_run(tmp_path: Path) -> None:
     result = _call("afk_arm_orca_guard; echo RC=$?", env=_orca_env(tmp_path))
 
+    assert "RC=0" in result.stdout
+
+
+def test_arm_refuses_without_an_orca_terminal_handle(tmp_path: Path) -> None:
+    result = _call(
+        "unset ORCA_TERMINAL_HANDLE; afk_arm_orca_guard; echo RC=$?",
+        env=_orca_env(tmp_path, handle=None),
+    )
+
     assert "RC=1" in result.stdout
-    assert "#365" in result.stderr
+    assert "bound Run" in result.stderr
+
+
+def test_arm_refuses_when_the_terminal_has_no_bound_run(tmp_path: Path) -> None:
+    scenario = {
+        "orchestration run-current": [{"rc": 1, "out": {"ok": False, "error": {"code": "no_run"}}}]
+    }
+
+    result = _call("afk_arm_orca_guard; echo RC=$?", env=_orca_env(tmp_path, scenario=scenario))
+
+    assert "RC=1" in result.stdout
+    assert "bound Run" in result.stderr
 
 
 @pytest.mark.parametrize("version", ["1.4.217", "0.9.0"])
-def test_arm_refuses_on_an_orca_below_the_floor_before_the_interim_guard(
-    tmp_path: Path, version: str
-) -> None:
+def test_arm_refuses_on_an_orca_below_the_floor(tmp_path: Path, version: str) -> None:
     result = _call("afk_arm_orca_guard; echo RC=$?", env=_orca_env(tmp_path, version=version))
 
     assert "RC=1" in result.stdout
@@ -106,12 +126,12 @@ def test_arm_refuses_when_the_orca_runtime_does_not_answer(tmp_path: Path) -> No
 
     assert "RC=1" in result.stdout
     assert "not usable" in result.stderr
-    assert "#365" not in result.stderr, "an unusable Orca refuses before the interim guard speaks"
 
 
 def test_arm_guard_honours_the_precheck_opt_out(tmp_path: Path) -> None:
     result = _call(
-        "afk_arm_orca_guard; echo RC=$?", env={**_orca_env(tmp_path), "AFK_ARM_PRECHECK": "0"}
+        "afk_arm_orca_guard; echo RC=$?",
+        env={**_orca_env(tmp_path, handle=None), "AFK_ARM_PRECHECK": "0"},
     )
 
     assert "RC=0" in result.stdout

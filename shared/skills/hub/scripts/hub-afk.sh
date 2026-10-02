@@ -12,7 +12,7 @@
 #   2. AUTO-ANSWER every spoke parked on a question / gate (⚠ WAITING ON INPUT): extract
 #      the prompt from its transcript, hand it to an ANSWERER (a headless `claude -p` with
 #      a thinking budget) that follows the `afk-answering` rule, and inject the returned
-#      answer into the spoke's tmux pane. This single reasoning step is the sanctioned
+#      answer to the spoke through Orca. This single reasoning step is the sanctioned
 #      exception to the scripted control plane; everything else stays scripted. Each
 #      decision is emitted as a telemetry span so it surfaces on the #35 dashboard.
 #   3. AUTO-LAND every ready/<issue> via worktree-land.sh (suite + merge + push + teardown
@@ -282,15 +282,6 @@ _afk_with_timeout() {
   return "$rc"
 }
 
-# --- reaping ------------------------------------------------------------------
-_kill_spoke_window() {
-  local issue="$1" target name
-  command -v tmux >/dev/null 2>&1 || return 0
-  tmux list-windows -a -F '#{session_name}:#{window_index} #{window_name}' 2>/dev/null \
-  | while read -r target name; do
-      case "$name" in "${issue}-"* | "$issue") tmux kill-window -t "$target" 2>/dev/null || true ;; esac
-    done
-}
 # --- #231 terminal-outcome + failure-economics counts -------------------------
 # The supervisor knows a spoke's terminal state (parked = blocked) and its relaunch history —
 # state a landed spoke's clean trace can't distinguish. Post-#241 the reaper never abandons; a
@@ -441,6 +432,7 @@ reconcile_markers() {
 # labels (#223). Each pass re-surveys the in-flight set, so a spoke that changed state
 # earlier in the tick is seen fresh.
 supervise_tick() {
+  orca_tick_reset   # one Orca read cache per tick (orca-lib.sh)
   reconcile_markers
   dispatch_batch
   answer_pass
@@ -490,6 +482,7 @@ afk_interruptible_sleep() {
 # already self-limit to waiting / ready spokes, so re-deriving over the whole in-flight set
 # is a safe superset of "service only the named spokes" (slot_state is authoritative).
 service_event_wake() {
+  orca_tick_reset
   local issues; issues="$(afk_drain_event_issues)"
   [ -n "$issues" ] && log "/afk: event wake — servicing $(printf '%s' "$issues" | tr '\n' ' ')"
   answer_pass

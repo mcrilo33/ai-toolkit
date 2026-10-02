@@ -25,18 +25,12 @@
 #   • a non-commit git write like `git add` (only `commit` lands code).
 #
 # SELF-CLEARING — THREE UN-BLOCK PATHS
-#   1. The broker's gate-answer path deletes the tag (_consume_gate_tag).
+#   1. spoke-ready.sh --gate consumes its own gate tag when the coordinator approves (#365): the
+#      spoke is the tag's only writer.
 #   2. The tip advances past the gate commit (the tag is no longer at the tip).
-#   3. SELF-HEAL (issue #204): the tag can OUTLIVE the approval — a broker inject
-#      that registered late, a wedge respawn started outside the broker, or ANY
-#      attended / manual reply typed in the pane, none of which run the broker's
-#      _consume_gate_tag. So before denying, the guard checks for a POSITIVE sign
-#      the approval already arrived — the session transcript shows a genuine user
-#      turn after the PLAN-gate park, or the AI_TOOLKIT_PLAN_GATE_OVERRIDE
-#      break-glass is set — and, if so, ALLOWS and best-effort drops the stale
-#      LOCAL tag (which is what this guard reads) so later calls are a no-op. This
-#      only ADDS allow-cases on evidence approval landed; absent that evidence the
-#      deny stands, so a genuinely-parked spoke is never loosened.
+#   3. BREAK-GLASS: AI_TOOLKIT_PLAN_GATE_OVERRIDE is set — the guard ALLOWS and best-effort drops
+#      the stale LOCAL tag so later calls are a no-op. There is no transcript heuristic: absent
+#      this, the deny stands, so a genuinely-parked spoke is never loosened.
 #
 # DISCIPLINE — deny-or-silent, fail-open: anything this hook cannot prove is a
 #   parked write degrades to SILENT (exit 0). A deny guard must never false-block
@@ -61,64 +55,11 @@ is_gated_commit() {
   printf '%s' "$1" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[cC][[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+commit\b'
 }
 
-# approval_in_transcript <input> — rc 0 when the session transcript (payload
-# .transcript_path) shows a GENUINE human/hub reply AFTER the assistant turn that ran
-# `spoke-ready.sh --gate` — i.e. the PLAN-gate approval reply already landed. A (re-)park
-# supersedes an earlier approval. "Genuine" is a TYPED prompt submission
-# (promptSource == "typed"): a human typing in the pane, or the broker's tmux inject,
-# both land as "typed". Every synthetic user turn the harness injects — tool_results,
-# <task-notification>/<system-reminder>, skill/meta turns (isMeta), SDK/system prompts —
-# carries a different promptSource (or none), so it can NOT masquerade as approval and
-# tear the gate down (a #117-class hole this guard exists to close). Fail-CLOSED (rc 1):
-# no transcript_path, no python3, an unreadable transcript, a CC build that omits
-# promptSource, or no typed post-park turn all keep the deny — only a PROVEN typed reply
-# un-blocks. Mirrors the broker's _gate_answer_landed so both sides read the same signal.
-approval_in_transcript() {
-  local input="$1" tp
-  tp=$(json_field "$input" "transcript_path")
-  [ -n "$tp" ] || return 1
-  [ -f "$tp" ] || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
-  _PGG_JSONL="$tp" python3 2>/dev/null <<'PYEOF'
-import json, os, sys
-
-parked = False
-approved = False
-try:
-    with open(os.environ["_PGG_JSONL"], encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            ttype = obj.get("type")
-            content = (obj.get("message") or {}).get("content")
-            if ttype == "assistant":
-                for block in content if isinstance(content, list) else []:
-                    if (isinstance(block, dict)
-                            and block.get("type") == "tool_use"
-                            and block.get("name") == "Bash"
-                            and "spoke-ready.sh --gate" in ((block.get("input") or {}).get("command") or "")):
-                        parked = True       # a (re-)park supersedes any earlier approval
-                        approved = False
-            elif ttype == "user" and parked:
-                # ONLY a typed prompt submission is a genuine reply — harness-injected user
-                # turns (tool_results, notifications, skill/meta, SDK/system) are not.
-                if obj.get("promptSource") == "typed" and not obj.get("isMeta"):
-                    approved = True
-except Exception:
-    sys.exit(1)
-sys.exit(0 if approved else 1)
-PYEOF
-}
-
-# self_heal_approved <input> — rc 0 when a POSITIVE approval signal is present: the
-# break-glass env override, or a genuine post-park user turn in the transcript.
+# self_heal_approved — rc 0 only for the break-glass env override. The approval itself is recorded
+# where it happens (#365): spoke-ready.sh --gate blocks in `orca orchestration ask`, and on an
+# approve consumes its OWN gate tag, so the guard never reads a transcript to learn the gate opened.
 self_heal_approved() {
-  [ -n "${AI_TOOLKIT_PLAN_GATE_OVERRIDE:-}" ] && return 0
-  approval_in_transcript "$1"
+  [ -n "${AI_TOOLKIT_PLAN_GATE_OVERRIDE:-}" ]
 }
 
 INPUT=$(read_stdin)
@@ -160,8 +101,7 @@ fi
 
 deny "You are parked at your PLAN gate (gate/${ISSUE} at the branch tip) awaiting review. \
 Edits (Edit/Write/NotebookEdit) and git commit are blocked until the gate is answered. \
-Present your plan as a message and WAIT — this un-blocks the moment the approval lands: the \
-broker (or the reviewer replying in your pane) answers the gate, the guard sees that reply \
-and self-heals, or your tip advances past the gate commit. Reads, searches, git status/diff, \
-and spoke-ready.sh stay allowed. (Stuck after a real approval? export \
+Present your plan and WAIT — spoke-ready.sh --gate blocks until the coordinator replies, and \
+this un-blocks the moment it approves (the tag is consumed), or your tip advances past the gate \
+commit. Reads, searches, git status/diff, and spoke-ready.sh stay allowed. (Stuck after a real approval? export \
 AI_TOOLKIT_PLAN_GATE_OVERRIDE=1 to break glass.)"

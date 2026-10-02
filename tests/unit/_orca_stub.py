@@ -111,6 +111,15 @@ def remove(row, repo, rm):
                        capture_output=True)
 
 
+if key == "terminal send":
+    state["sent"] = True  # persisted by emit(); flips `worktree ps` to scenario["_after_send"]
+if key == "worktree ps" and state.get("sent") and "worktree ps" in scenario.get("_after_send", {}):
+    _seq = scenario["_after_send"]["worktree ps"]
+    _i = state["n"].get("ps-after", 0)
+    state["n"]["ps-after"] = _i + 1
+    _r = _seq[min(_i, len(_seq) - 1)]
+    emit(_r.get("rc", 0), _r.get("out", {}), _r.get("stderr", ""))
+
 for snap in scenario.get("_snapshot", []):
     if snap["key"] == key:
         f = Path(snap["path"])
@@ -157,6 +166,19 @@ if key == "worktree set":
     emit(0, ok({}))
 if key == "worktree ps":
     emit(0, ok({"worktrees": []}))
+if key == "orchestration worker-list":
+    emit(0, ok({"workers": []}))
+if key == "orchestration check":
+    emit(0, ok({"messages": []}))
+if key == "terminal send":
+    emit(0, ok({"send": {"accepted": True,
+                         "prompt": {"stages": ["input_accepted", "turn_started"]}}}))
+if key == "orchestration ask":
+    emit(0, ok({"messageId": "msg_ask", "answer": "approve", "timedOut": False,
+                "cancelled": False}))
+if key in ("orchestration reply", "orchestration send", "orchestration worker-stop",
+           "orchestration worker-abandon"):
+    emit(0, ok({}))
 if key == "orchestration run-current":
     emit(0, ok({"run": {"id": "run_stub"}}))
 if key == "terminal create":
@@ -309,3 +331,77 @@ def stub_env(bindir: Path, base: dict[str, str] | None = None) -> dict[str, str]
     env = dict(base if base is not None else os.environ)
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     return env
+
+
+def orca_park(
+    bindir: Path,
+    wt: Path,
+    *,
+    question: str | None = None,
+    qid: str = "m_q",
+    state: str = "working",
+    tool: str | None = None,
+    tool_input: str | None = None,
+    liveness: str = "live",
+    handle: str = "term_w",
+    dispatch: str = "ctx_1",
+    resumes: bool = True,
+    extra: dict | None = None,
+) -> None:
+    """Script the Orca replies the drain reads for ONE spoke at `wt` (replaces the scenario).
+
+    `state` is the agent state in `worktree ps` (`waiting` + `tool`/`tool_input` is a permission
+    dialog); `question` is an unread inbox `question` from the spoke's terminal (a PLAN gate or any
+    worker `ask`; the agent reads `working` meanwhile); `liveness` is the worker-list verdict.
+    A `waiting` agent RESUMES (reads `working`) once anything is typed into a terminal, like a real
+    dialog consumed by a keypress; `resumes=False` keeps it waiting (an approval that never lands).
+    `extra` merges more canned replies keyed like `install_orca_stub`'s scenario.
+    """
+    agent: dict = {"state": state, "stateStartedAt": 1_000}
+    if tool:
+        agent.update(toolName=tool, toolInput=tool_input or "")
+    messages = (
+        [
+            {
+                "id": qid,
+                "type": "question",
+                "from_handle": handle,
+                "body": question,
+                "created_at": 1_000,
+            }
+        ]
+        if question
+        else []
+    )
+    worker = {
+        "dispatchId": dispatch,
+        "taskId": "task_1",
+        "agentTerminalHandle": handle,
+        "resource": {"worktreeId": f"stub-repo::{wt}"},
+        "projection": {"liveness": {"verdict": liveness}},
+    }
+    after: dict = {}
+    if state == "waiting" and resumes:
+        moved = {"state": "working", "stateStartedAt": 2_000}
+        after = {
+            "worktree ps": [
+                {"out": ok_reply({"worktrees": [{"path": str(wt), "agents": [moved]}]})}
+            ]
+        }
+    orca_scenario(
+        bindir,
+        {
+            **({"_after_send": after} if after else {}),
+            "worktree ps": [
+                {"out": ok_reply({"worktrees": [{"path": str(wt), "agents": [agent]}]})}
+            ],
+            "orchestration worker-list": [{"out": ok_reply({"workers": [worker]})}],
+            "orchestration check": [{"out": ok_reply({"messages": messages})}],
+            **(extra or {}),
+        },
+    )
+
+
+def ok_reply(result: dict) -> dict:
+    """The `{ok: true, result}` envelope every `orca ... --json` success carries."""
+    return {"ok": True, "result": result}

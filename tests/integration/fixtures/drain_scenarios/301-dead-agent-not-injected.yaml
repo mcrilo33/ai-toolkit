@@ -10,18 +10,17 @@ spokes:
       agent: dead
       recovers: true
 timeline:
-  # The spoke parks on a question, then its agent (claude) dies — but the launcher
-  # zsh keeps the pane alive, so the dialog lingers in scrollback (the #301 shape).
+  # The spoke parks on a question, then its agent dies: the worker-list row reports
+  # `exited` while the inbox question is still unread (the #301 shape).
   - { t: 0, spoke: 301, do: park }
   - { t: 10, spoke: 301, do: kill_agent }
-  # The drain must read the DEAD agent (a claude descendant absent from the pane pid's
-  # tree), never inject into the surviving zsh, and recover it instead.
+  # The drain must read the exited worker, never inject into its terminal, and recover
+  # it instead.
   - { t: 20, run: [drain] }
 expect:
   violations: []
 mutation:
-  # Reintroduce the pre-#301 pane_current_command=zsh proxy: the liveness probe LIES
-  # and reports the dead agent alive, so the drain injects into a dead pane.
-  env:
-    AFK_SIM_PS_FORCE_ALIVE: "1"
+  # The stub reports a live worker for an exited one (the liveness probe LIES), so the
+  # drain treats the dead agent as parked-and-alive and never recovers it.
+  report_live: true
   expect_violation: I5

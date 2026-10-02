@@ -101,6 +101,18 @@ for _var in _LEAKED_GIT_HOOK_VARS:
 for _var in [_k for _k in os.environ if _k.startswith("GIT_CONFIG_")]:
     os.environ.pop(_var, None)
 
+# A spoke session exports its own role and Orca identity (WT_SPOKE, ORCA_TERMINAL_HANDLE,
+# ORCA_DISPATCH_CAPABILITY), and the pre-push gate runs the suite inside that session. The scripts
+# under test branch on them (spoke-ready.sh blocks in `ask` for a WT_SPOKE session with a terminal
+# handle), so inheriting them would run every test as the real spoke. A test that wants them sets
+# them in its own child env.
+for _var in ("WT_SPOKE", "ORCA_TERMINAL_HANDLE", "ORCA_DISPATCH_CAPABILITY"):
+    os.environ.pop(_var, None)
+
+# approve_permission polls Orca for the agent leaving `waiting`; tests script that transition
+# (orca_park resumes), so a silent approve must fail on the first check, not after the 10 s budget.
+os.environ["AFK_APPROVE_SETTLE_SECONDS"] = "0"
+
 # Hermetic commit identity (issue #295, the third CI-red-on-main incident). Many tests
 # `git commit` inside a throwaway repo. Once the isolation above scrubs GIT_CONFIG_*, git
 # falls back to ~/.gitconfig for the committer identity — PRESENT on the dev machine, ABSENT
