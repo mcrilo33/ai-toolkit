@@ -88,11 +88,15 @@ _hi_span() {
   ( cd "$wt" && telemetry_emit_span "$@" ) >/dev/null 2>&1 || true
 }
 
-# _hi_wait_ms <since-epoch-ms> -> ms elapsed since an Orca timestamp; empty when unusable.
+# _hi_wait_ms <since> -> ms elapsed since an Orca timestamp: epoch milliseconds (an agent's
+# stateStartedAt) or ISO-8601 UTC (a message's created_at). Empty when unusable.
 _hi_wait_ms() {
-  local d
-  case "${1:-}" in '' | *[!0-9]*) return 0 ;; esac
-  d=$(( ${AFK_NOW:-$(date +%s)} * 1000 - $1 ))
+  local t="${1:-}" d
+  case "$t" in
+    '' | *[!0-9]*) t="$(LC_ALL=C date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$t" +%s 2>/dev/null)" || return 0
+                   [ -n "$t" ] && t=$(( t * 1000 )) || return 0 ;;
+  esac
+  d=$(( ${AFK_NOW:-$(date +%s)} * 1000 - t ))
   [ "$d" -ge 0 ] && printf '%s\n' "$d"
   return 0
 }
@@ -169,6 +173,8 @@ deliver_reply() {
 # asks for input_accepted); the text is sent ONCE, whatever the outcome.
 deliver_text() {
   local wt="$1" text="$2" proof="${3:-turn_started}" esc="${4:-0}" h stages rc=1
+  # Never type into a worker Orca reports exited: its terminal may have fallen back to a shell (#301).
+  [ "$(orca_worker_liveness "$wt" 2>/dev/null)" != exited ] || { log "  worker of $wt has exited -- not typing into its terminal"; return 1; }
   h="$(_hi_terminal "$wt")" || return 1
   [ "$esc" = 1 ] && { orca_send_text "$h" $'\e' 0 0 >/dev/null || true; sleep "${AFK_INJECT_MENU_PAUSE:-0.3}"; }
   if stages="$(orca_send_text "$h" "$text" "${AFK_SEND_WAIT:-15}" 1)"; then

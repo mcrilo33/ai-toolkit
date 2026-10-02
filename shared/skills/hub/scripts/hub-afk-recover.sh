@@ -363,43 +363,60 @@ _afk_agent_command() {
 }
 
 # _afk_retry_worker <wt> <issue> [prompt] -> restart the spoke's agent IN PLACE as a retry of its
-# Orca dispatch: stop (or abandon, when already exited) the old worker, launch a fresh agent
-# terminal in the SAME worktree, and `worker-start --retry-of` so Orca re-seeds the task. Never a
-# second live dispatch on one worktree. rc 0 started, rc 1 could not start (the caller warns and
-# retries on its cadence). A missing or unreadable Orca record is rc 0 with NO action: unknown is
-# never a basis to restart anything (principle #6). [prompt] rides in after the restart, for the
-# conflict-resolve lane. The new dispatch id is recorded in the worktree's identity.
+# Orca dispatch: stop (a hung `live` worker) or abandon (an `exited` one) the old worker, launch a
+# fresh agent terminal in the SAME worktree, and `worker-start --retry-of` so Orca re-seeds the
+# task. Never a second live dispatch on one worktree: after the fence it re-reads Orca and refuses
+# while ANY OTHER worker there still reads live. [prompt] rides in after the restart (conflict-resolve).
+#   rc 0 started.   rc 1 could not start (the caller warns and retries on its cadence; a terminal
+#   it opened is closed again).   rc 2 NO ACTION: Orca has no readable record, or reports the worker
+#   `unverifiable` -- unknown is never a basis to stop, abandon or restart anything (principle 6),
+#   and callers must treat it as "nothing happened" (no marks, no journal, no counts, no escalation).
 _afk_retry_worker() {
-  local wt="$1" issue="$2" prompt="${3:-}" row rc=0 did task run live cmd h new
+  local wt="$1" issue="$2" prompt="${3:-}" row rc=0 did task run live cmd h="" new n
   row="$(_orca_worker_row "$wt")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     log "  #$issue: Orca has no readable worker record (rc $rc) -- not restarting on an unknown state"
-    return 0
+    return 2
   fi
   did="$(printf '%s' "$row" | jq -r '.dispatchId // empty')"; task="$(printf '%s' "$row" | jq -r '.taskId // empty')"
   run="$(printf '%s' "$row" | jq -r '.runId // empty')"; live="$(printf '%s' "$row" | jq -r '.projection.liveness.verdict // empty')"
-  [ -n "$did" ] && [ -n "$task" ] || { log "  #$issue: the Orca worker record lacks a dispatch/task id -- not restarting"; return 0; }
-  _afk_journal_agent "$issue" "restart: dispatch $did liveness=${live:-?} agent=$(orca_agent_state "$wt" 2>/dev/null)"
-  if [ "$live" = exited ]; then orca_worker_abandon "$did"; else orca_worker_stop "$did"; fi     || { log "  #$issue: could not fence dispatch $did"; return 1; }
-  cmd="$(_afk_agent_command "$wt")" || return 1
-  orca_json terminal create --worktree "path:$wt" --title "$(basename "$wt")" --command "$cmd"     || { log "  #$issue: terminal create failed: ${ORCA_ERR:-$ORCA_OUT}"; return 1; }
-  h="$(orca_terminal_handle)"
-  orca_wait_agent "$h" || { log "  #$issue: claude did not start in Orca terminal $h"; return 1; }
-  _orca_mutate orchestration worker-start --task "$task" --retry-of "$did" --terminal "$h" \
-    --worktree "path:$wt" ${run:+--run "$run"}     || { log "  #$issue: worker-start --retry-of failed (never re-issued): ${ORCA_ERR:-$ORCA_OUT}"; return 1; }
-  new="$(orca_dispatch_id)"
-  [ -n "$new" ] && _afk_record_dispatch "$wt" "$new"
+  case "$live" in live | exited) ;; *) log "  #$issue: worker liveness is '${live:-unknown}' -- not restarting on an unverified state"; return 2 ;; esac
+  [ -n "$did" ] && [ -n "$task" ] || { log "  #$issue: the Orca worker record lacks a dispatch/task id -- not restarting"; return 2; }
+  _afk_journal_agent "$issue" "restart: dispatch $did liveness=$live agent=$(orca_agent_state "$wt" 2>/dev/null)"
+  if [ "$live" = exited ]; then orca_worker_abandon "$did"; else orca_worker_stop "$did"; fi \
+    || { log "  #$issue: could not fence dispatch $did"; return 1; }
   orca_tick_reset
-  [ -z "$prompt" ] || deliver_text "$wt" "$prompt" || true
-  return 0
+  n="$(orca_worker_live_count "$wt" "$did")" || n=""
+  [ "$n" = 0 ] || { log "  #$issue: Orca still lists a live worker on $wt after the fence (${n:-unreadable}) -- not starting a second one"; return 1; }
+  cmd="$(_afk_agent_command "$wt")" || return 1
+  orca_json terminal create --worktree "path:$wt" --title "$(basename "$wt")" --command "$cmd" \
+    || { log "  #$issue: terminal create failed: ${ORCA_ERR:-$ORCA_OUT}"; return 1; }
+  h="$(orca_terminal_handle)"
+  if orca_wait_agent "$h" \
+     && _orca_mutate orchestration worker-start --task "$task" --retry-of "$did" --terminal "$h" \
+          --worktree "path:$wt" ${run:+--run "$run"}; then
+    new="$(orca_dispatch_id)"
+    [ -z "$new" ] || _afk_record_dispatch "$wt" "$new"
+    orca_tick_reset
+    [ -z "$prompt" ] || deliver_text "$wt" "$prompt" || true
+    return 0
+  fi
+  log "  #$issue: the restart did not complete in terminal $h (worker-start is never re-issued): ${ORCA_ERR:-agent did not start}"
+  orca_json terminal close --terminal "$h" >/dev/null 2>&1 || true
+  return 1
 }
 
 # _afk_record_dispatch <wt> <dispatch_id> -> point the worktree's identity at the new dispatch, so
-# every later read matches the live worker row, not the fenced one. Best-effort.
+# every later read matches the live worker row, not the fenced one. provision-worktree.sh owns the
+# identity file (its --identity-only mode, which dispatch uses too); best-effort.
 _afk_record_dispatch() {
-  local f="$1/.ai-toolkit/identity"
-  [ -f "$f" ] || return 0
-  { grep -v '^orca_dispatch_id=' "$f"; printf 'orca_dispatch_id=%s\n' "$2"; } >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" || true
+  local wt="$1" prov top="${MAIN_ROOT:-${_AFK_TOPLEVEL:-.}}"
+  prov="$(_afk_find_script "${PROVISION_WORKTREE:-}" provision-worktree.sh)" || return 0
+  bash "$prov" --identity-only --worktree "$wt" --repo-root "$top" --issue "$(_orca_identity "$wt" issue)" \
+    --branch "$(git -C "$wt" branch --show-current 2>/dev/null)" --spoke-run-id "$(_afk_spoke_run_id "$wt")" \
+    --otel-body-dir "$wt/.ai-toolkit/raw-bodies" --repo-name "$(wt_repo_name "$top")" \
+    --orca-worktree-id "$(_orca_identity "$wt" orca_worktree_id)" --run-id "$(_orca_identity "$wt" run_id)" \
+    --orca-dispatch-id "$2" >/dev/null 2>&1 || log "  could not record dispatch $2 in the identity of $wt"
 }
 
 # _afk_journal_agent <issue> <text> -> journal the Orca agent snapshot a recovery acted on.
@@ -409,10 +426,12 @@ _afk_journal_agent() { broker_journal_decision "$1" agent-snapshot "$2" reversib
 # dispatch, same worktree, same spoke_run_id); stamp the once-per-window marker and a success span.
 # rc 1 when the restart could not start (the caller then falls back to warning).
 resume_spoke() {
-  local wt="$1" issue="$2"
+  local wt="$1" issue="$2" rc
   log "→ resume #$issue: worker exited with work intact — restarting it in place once"
   _afk_set_last_action "resume #$issue"
-  _afk_retry_worker "$wt" "$issue" || { log "  could not restart the worker for #$issue"; return 1; }
+  _afk_retry_worker "$wt" "$issue"; rc=$?
+  [ "$rc" -ne 2 ] || return 0   # no action on an unknown state: nothing happened, nothing to record
+  [ "$rc" -eq 0 ] || { log "  could not restart the worker for #$issue"; return 1; }
   _afk_mark_resumed "$issue"
   stamp_progress_epoch "$issue"   # a deliberate revival resets the reap ceiling (#133)
   # Reset the IDLE clock too (#202 C review): the restarted agent has not written a transcript yet,
@@ -503,10 +522,12 @@ _warn_parked_last() {
 # idle). Marks the once-per-window revival. rc 1 when the restart could not start (the caller warns
 # + retries next tick).
 _revive_spoke() {
-  local wt="$1" issue="$2"
+  local wt="$1" issue="$2" rc
   log "→ revive #$issue: stopping the hung worker and restarting it in place"
   _afk_set_last_action "revive #$issue"
-  _afk_retry_worker "$wt" "$issue" || { log "  could not restart the worker for #$issue"; return 1; }
+  _afk_retry_worker "$wt" "$issue"; rc=$?
+  [ "$rc" -ne 2 ] || return 0   # no action on an unknown state: nothing happened, nothing to record
+  [ "$rc" -eq 0 ] || { log "  could not restart the worker for #$issue"; return 1; }
   _afk_mark_resumed "$issue"
   stamp_progress_epoch "$issue"
   stamp_answer_attempt "$issue"

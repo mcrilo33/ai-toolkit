@@ -320,8 +320,11 @@ _afk_conflict_resolve_relaunch() {
   local wt="$1" issue="$2"
   log "→ conflict-resolve #$issue: restarting the exited spoke to merge the base branch + resolve + re-push"
   _afk_set_last_action "conflict-resolve #$issue"
-  _afk_retry_worker "$wt" "$issue" "$(_afk_conflict_resolve_prompt "$issue")" \
-    || { log "  could not restart the worker for the conflict-resolve of #$issue"; return 1; }
+  local rc=0
+  _afk_retry_worker "$wt" "$issue" "$(_afk_conflict_resolve_prompt "$issue")" || rc=$?
+  # rc 2 (no action on an unknown state) is a failure HERE: the caller must not record the
+  # resolution as dispatched, and instead warn-parks on the land lane.
+  [ "$rc" -eq 0 ] || { log "  could not restart the worker for the conflict-resolve of #$issue"; return 1; }
   stamp_progress_epoch "$issue"
   stamp_answer_attempt "$issue"
   broker_journal_decision "$issue" conflict-resolve \

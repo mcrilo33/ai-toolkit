@@ -711,20 +711,8 @@ inflight_issues() {
 }
 
 
-# _consume_gate_tag <wt_path> <issue> -> drop the gate/<issue> marker once a PLAN-gate
-# answer has been injected. slot_state reads the LOCAL tag at the tip, so deleting the local
-# tag is what closes the window between "answered" and the spoke committing its first code
-# (the tip still equals the gate commit until then, and an untouched tag would re-read as
-# waiting and re-answer the same gate). The remote delete is cosmetic (dashboard /
-# hub-status) and best-effort. Never aborts the loop.
-_consume_gate_tag() {
-  local wt="$1" issue="$2"
-  git -C "$wt" tag -d "gate/$issue" >/dev/null 2>&1 || true
-  git -C "$wt" push origin ":refs/tags/gate/$issue" >/dev/null 2>&1 || true
-  # Drop the scripted plan artifact too (issue #175): once the gate is answered the plan
-  # handoff is spent, and a lingering gate-<N>.md would feed a stale plan to a later re-park.
-  rm -f "$(_gate_artifact_path "$wt" "$issue")" 2>/dev/null || true
-}
+# (The PLAN-gate tag and plan artifact are consumed by the spoke itself, in spoke-ready.sh --gate, on
+# an approve: their only writer. The hub never deletes them -- a revise reply must keep the gate shut.)
 
 # --- durable local block record (issue #109, AC2) -----------------------------
 # spoke-ready.sh emits blocked/<issue> by `git tag` + `git push -f origin blocked/<issue>`;

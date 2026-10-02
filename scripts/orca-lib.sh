@@ -126,7 +126,7 @@ _orca_cached() {
 }
 
 _orca_rp() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
-_orca_identity() { sed -n "s/^$2=//p" "$1/.ai-toolkit/identity" 2>/dev/null | head -n1; }
+_orca_identity() { { sed -n "s/^$2=//p" "$1/.ai-toolkit/identity" 2>/dev/null | head -n1; } || true; }
 
 # orca_agent_state <wt> -> working|waiting|done|none (rc 0), or unknown (rc 2) when ps failed or
 # does not list the worktree. Several agents: waiting beats working beats done.
@@ -153,14 +153,15 @@ orca_agent_field() {
 }
 
 # _orca_worker_row <wt> -> the worker-list row for the worktree as one JSON line: the identity's
-# dispatch id when recorded, else the newest row on that worktree. rc 1 no row, rc 2 unknown.
+# dispatch id when recorded, else the newest row on that worktree (worker-list is newest first).
+# rc 1 no row, rc 2 unknown.
 _orca_worker_row() {
   local run did out row
   run="$(_orca_identity "$1" run_id)"; did="$(_orca_identity "$1" orca_dispatch_id)"
   out="$(_orca_cached "wl-${run:-bound}" orchestration worker-list ${run:+--run "$run"})" || return 2
   row="$(printf '%s' "$out" | jq -c --arg d "$did" --arg p "::$(_orca_rp "$1")" '
     [.result.workers[]?] | (map(select($d != "" and .dispatchId == $d))[0]
-      // map(select((.resource.worktreeId // "") | endswith($p)))[-1]) // empty' 2>/dev/null)" || return 2
+      // map(select((.resource.worktreeId // "") | endswith($p)))[0]) // empty' 2>/dev/null)" || return 2
   [ -n "$row" ] && printf '%s\n' "$row"
 }
 
@@ -168,6 +169,18 @@ _orca_worker_row() {
 orca_worker_field() {
   local row; row="$(_orca_worker_row "$1")" || return $?
   printf '%s' "$row" | jq -r "$2 // empty" 2>/dev/null
+}
+
+# orca_worker_live_count <wt> [exclude-dispatch] -> how many `live` workers Orca lists on the worktree
+# besides <exclude-dispatch> (the one just fenced); rc 2 when the list is unreadable. The guard that
+# keeps a restart from ever making a second live dispatch on one worktree.
+orca_worker_live_count() {
+  local run out
+  run="$(_orca_identity "$1" run_id)"
+  out="$(_orca_cached "wl-${run:-bound}" orchestration worker-list ${run:+--run "$run"})" || return 2
+  printf '%s' "$out" | jq -r --arg p "::$(_orca_rp "$1")" --arg x "${2:-}" '[.result.workers[]?
+    | select(((.resource.worktreeId // "") | endswith($p)) and .dispatchId != $x
+        and .projection.liveness.verdict == "live")] | length' 2>/dev/null
 }
 
 # orca_worker_liveness <wt> -> live|unverifiable|exited (rc 0); unknown with rc 1 (no row) or 2.

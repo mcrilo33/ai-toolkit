@@ -162,7 +162,7 @@ def matches(record):
     if mode == "any":
         return True
     kind = record.get("type")
-    # A genuine typed human/self reply — shared by both modes (mirrors _gate_answer_landed).
+    # A genuine typed human/self reply — shared by both modes.
     if kind == "user" and record.get("promptSource") == "typed" and not record.get("isMeta"):
         return True
     if mode == "typed":
@@ -395,8 +395,8 @@ $advice
 
 ## Your decision
 
-Reply with the option you want (the spoke listed its own options above, recommended
-first), or type any freeform instruction — it is injected verbatim into the spoke. An
+For a PLAN gate begin with APPROVE to approve it, or REVISE: <changes>. Otherwise reply with the option
+you want (the spoke listed its own options above, recommended first), or type any freeform instruction — it is injected verbatim into the spoke. An
 empty reply defers the gate (escalated as blocked/$issue for later).
 EOF
 }
@@ -430,7 +430,6 @@ _broker_present_qcm() {
   fi
   if deliver_answer "$wt" "$issue" "$(_pending_question_id "$wt")" "$reply"; then
     log "  injected the reviewer's reply into #$issue"
-    _consume_gate_tag "$wt" "$issue"
     afk_emit_decision "$wt" success
     _broker_qcm_clear "$issue"
   else
@@ -487,7 +486,6 @@ _broker_try_fastpath_gate() {
     "Approved — the posted plan restates the issue contract; proceed to implementation." \
     || return 1
   log "  fast-path auto-approved #$issue (plan restates issue body, coverage ${cov:-?})"
-  _consume_gate_tag "$wt" "$issue"
   _afk_clear_warned "$issue"   # a waive is genuine progress → drop any warned-retry backoff
   clear_answer_drop "$issue"   # #288: a waive is a delivery — any prior drop record is moot
   # broker_journal_decision (not the file-only _broker_journal_line): it ALSO posts a best-effort
@@ -578,7 +576,7 @@ broker_service_gate() {
     if _broker_try_fastpath_gate "$wt" "$issue" "$mode"; then return 0; fi
     local plan; plan="$(_read_gate_artifact "$wt" "$issue")"
     [ -n "$plan" ] || plan="$orig_question"
-    question="The spoke is parked at its PLAN gate; below is the plan it posted. Approve it or state precise amendments to it. Do NOT restate or re-issue the task itself.
+    question="The spoke is parked at its PLAN gate; below is the plan it posted. Approve it or state precise amendments to it. Begin your ANSWER with APPROVE if the plan stands as written, or with REVISE: followed by the precise amendments (the spoke reads that first word). Do NOT restate or re-issue the task itself.
 
 ${plan:-(the plan prose could not be extracted — approve or amend from the issue contract above)}"
   elif [ -z "$question" ]; then
@@ -702,7 +700,6 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
       stamp_answer_attempt "$issue"
       if deliver_answer "$wt" "$issue" "$orig_qid" "$text" "$orig_asked"; then
         log "  injected answer into #$issue"
-        _consume_gate_tag "$wt" "$issue"
         _afk_clear_warned "$issue"   # #241: genuine progress → drop this issue's warned-retry backoff
         clear_answer_drop "$issue"   # #288: a delivery landed — any prior drop record is moot
         # #241 review B2: record the taken answer for morning review. Read the reasoner's own

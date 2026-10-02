@@ -545,9 +545,14 @@ if [ "$KIND" = gate ]; then
   _gate_out="$(mktemp "${TMPDIR:-/tmp}/spoke-gate.XXXXXX")"
   _gate_ms="${AFK_GATE_ASK_TIMEOUT_MS:-110000}"
   _gate_rc=0
+  _gate_disp="$(_orca_identity "$_gate_root" orca_dispatch_id)"
+  # The pending id is bound to the dispatch that asked it: a restarted worker (a new dispatch) owns
+  # a new terminal, so the old question is dead and must be asked afresh.
+  if [ -s "$_gate_ask" ] && [ "$(awk '{print $2}' "$_gate_ask")" != "$_gate_disp" ]; then rm -f "$_gate_ask"; fi
   if [ -s "$_gate_ask" ]; then
-    echo "→ resuming the pending PLAN-gate question $(cat "$_gate_ask") (timeout ${_gate_ms}ms)"
-    orca_ask_resume "$_gate_root" "$(head -n1 "$_gate_ask")" "$_gate_ms" >"$_gate_out" || _gate_rc=$?
+    _gate_qid="$(awk '{print $1}' "$_gate_ask")"
+    echo "→ resuming the pending PLAN-gate question $_gate_qid (timeout ${_gate_ms}ms)"
+    orca_ask_resume "$_gate_root" "$_gate_qid" "$_gate_ms" >"$_gate_out" || _gate_rc=$?
   else
     echo "→ asking the coordinator to approve the PLAN (options approve,revise; timeout ${_gate_ms}ms)"
     orca_ask "$_gate_root" "PLAN gate for #$ISSUE -- approve or revise the plan below.
@@ -556,11 +561,12 @@ ${BODY:0:3000}" approve,revise "$_gate_ms" >"$_gate_out" || _gate_rc=$?
   fi
   _gate_reply="$(cat "$_gate_out")"; rm -f "$_gate_out"
   if [ "$_gate_rc" -eq 3 ]; then
-    [ -z "${ORCA_ASK_ID:-}" ] || printf '%s\n' "$ORCA_ASK_ID" > "$_gate_ask"
+    [ -z "${ORCA_ASK_ID:-}" ] || printf '%s %s\n' "$ORCA_ASK_ID" "$_gate_disp" > "$_gate_ask"
     echo "spoke-ready: the PLAN-gate question is still PENDING (no reply within ${_gate_ms}ms). Re-run this exact command to keep waiting; do NOT start implementing and do NOT ask again." >&2
     exit "${WT_GATE_PENDING_EXIT:-6}"
   fi
   if [ "$_gate_rc" -ne 0 ]; then
+    rm -f "$_gate_ask"   # a failed ask leaves nothing worth resuming
     echo "spoke-ready: the PLAN-gate ask failed (${ORCA_ERR:-$ORCA_OUT}) -- if the dispatch capability is missing or stale, re-run with --dispatch-capability <token from your preamble>" >&2
     exit 1
   fi

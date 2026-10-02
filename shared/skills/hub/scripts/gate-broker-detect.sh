@@ -328,6 +328,12 @@ slot_state() {
   if _permission_pending "$wt_path" && ! _spoke_agent_dead "$wt_path"; then
     _afk_reconcile_park "$wt_path" "$issue"; printf 'waiting\n'; return
   fi
+  # Orca could not say (a failed read, no worker record): unknown is never a basis to drop a park
+  # clock or reap a spoke (principle 6) -- hold it busy until Orca answers.
+  if [ "$(orca_agent_state "$wt_path" 2>/dev/null)" = unknown ] \
+     || { orca_inbox_question "$wt_path" id >/dev/null 2>&1; [ "$?" -eq 2 ]; }; then
+    printf 'busy\n'; return
+  fi
   # Past every park check ⇒ the spoke is NOT parked (busy/reap). Reset its park-onset clock so a
   # later re-park measures the watchdog's park-unanswered ceiling from the NEW onset, not a stale
   # one (#265). Placed here, not in _afk_note_tip_progress above: that runs BEFORE the two waiting
@@ -360,8 +366,8 @@ _gate_parked() {
 }
 
 # _gate_artifact_path <wt> <issue> -> the gate plan artifact path (<wt>/.ai-toolkit/
-# gate-<issue>.md). The single owner of that layout, shared by _read_gate_artifact and
-# _consume_gate_tag (spoke-ready.sh writes the same path from the spoke side, #175). Falls
+# gate-<issue>.md). The single owner of that layout, read by _read_gate_artifact; spoke-ready.sh --gate
+# writes it and, on an approve, removes it, from the spoke side (#175). Falls
 # back to <wt> as the root when rev-parse can't resolve a toplevel (a non-git path in a test).
 _gate_artifact_path() {
   local wt="$1" issue="$2" root
