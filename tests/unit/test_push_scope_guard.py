@@ -77,7 +77,9 @@ def _hook_env() -> dict[str, str]:
     return env
 
 
-def run_guard(payload: str, cwd: Path) -> subprocess.CompletedProcess:
+def run_guard(
+    payload: str, cwd: Path, *, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     """Run push-scope-guard with an explicit payload; return the process."""
     return subprocess.run(
         ["bash", str(HOOK)],
@@ -85,7 +87,7 @@ def run_guard(payload: str, cwd: Path) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         cwd=str(cwd),
-        env=_hook_env(),
+        env={**_hook_env(), **(extra_env or {})},
     )
 
 
@@ -782,3 +784,48 @@ def test_spoke_star_scope_suppresses_advisory(spoke: Path) -> None:
 
     assert result.returncode == ALLOW, result.stderr
     assert "work.txt" not in result.stderr, result.stderr
+
+
+# ── Identity record (#360): the record wins; the git-dir pattern is the only fallback ──
+
+
+def _write_identity(root: Path, text: str) -> None:
+    (root / ".ai-toolkit").mkdir(exist_ok=True)
+    (root / ".ai-toolkit" / "identity").write_text(text)
+
+
+def test_identity_record_makes_a_plain_checkout_a_spoke(hub: Path) -> None:
+    # Orca "half spoke": not a linked worktree by git-dir, but provisioned with a record.
+    _write_identity(hub, "issue=360\n")
+    payload = _cursor_shell_payload("git push origin main", root=hub)
+
+    result = run_guard(payload, cwd=hub)
+
+    assert result.returncode == BLOCK
+
+
+def test_empty_identity_issue_leaves_a_plain_checkout_a_hub(hub: Path) -> None:
+    _write_identity(hub, "issue=\nlane=spoke\n")
+    payload = _cursor_shell_payload("git push origin main", root=hub)
+
+    result = run_guard(payload, cwd=hub)
+
+    assert result.returncode == ALLOW
+
+
+def test_wt_spoke_env_alone_does_not_make_a_hub_a_spoke(hub: Path) -> None:
+    # This guard's fallback is the git-dir pattern ONLY — never the env marker.
+    payload = _cursor_shell_payload("git push origin main", root=hub)
+
+    result = run_guard(payload, cwd=hub, extra_env={"WT_SPOKE": "1"})
+
+    assert result.returncode == ALLOW
+
+
+def test_linked_worktree_without_a_record_is_still_a_spoke(spoke: Path) -> None:
+    assert not (spoke / ".ai-toolkit" / "identity").exists()
+    payload = _cursor_shell_payload("git push origin main", root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == BLOCK

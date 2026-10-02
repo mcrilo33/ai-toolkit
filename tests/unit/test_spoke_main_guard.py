@@ -324,3 +324,43 @@ def test_allows_checkout_of_main_when_base_configured(spoke: Path) -> None:
     result = run_guard(_payload("git checkout main"), spoke, spoke=True)
 
     assert result.returncode == ALLOW
+
+
+# ── Identity record (#360): record, else WT_SPOKE or the git-dir pattern ──
+
+
+def _write_identity(root: Path, text: str) -> None:
+    (root / ".ai-toolkit").mkdir(exist_ok=True)
+    (root / ".ai-toolkit" / "identity").write_text(text)
+
+
+def test_identity_record_makes_a_plain_checkout_a_spoke(hub: Path) -> None:
+    # Orca "half spoke": no WT_SPOKE, not a linked worktree, but a provisioned record.
+    _git(hub, "checkout", "-q", "-b", "orca-migration")
+    _write_identity(hub, "issue=360\n")
+
+    result = run_guard(_payload("git checkout main"), hub, spoke=False)
+
+    assert result.returncode == BLOCK, result.stdout + result.stderr
+
+
+def test_empty_identity_issue_leaves_a_plain_checkout_a_hub(hub: Path) -> None:
+    _write_identity(hub, "issue=\nlane=spoke\n")
+
+    result = run_guard(_payload("git checkout main"), hub, spoke=False)
+
+    assert result.returncode == ALLOW, result.stdout + result.stderr
+
+
+def test_no_record_wt_spoke_env_still_makes_a_spoke(hub: Path) -> None:
+    result = run_guard(_payload("git checkout main"), hub, spoke=True)
+
+    assert result.returncode == BLOCK, result.stdout + result.stderr
+
+
+def test_no_record_linked_worktree_without_env_is_still_a_spoke(spoke: Path) -> None:
+    assert not (spoke / ".ai-toolkit" / "identity").exists()
+
+    result = run_guard(_payload("git checkout main"), spoke, spoke=False)
+
+    assert result.returncode == BLOCK, result.stdout + result.stderr

@@ -1944,8 +1944,15 @@ def _ledger_payload(subject: str | None, *, tool: str = "TaskCreate") -> str:
     return json.dumps({"tool_name": tool, "tool_input": tool_input})
 
 
-def run_ledger(subject: str | None, *, tool: str = "TaskCreate", spoke: bool = True) -> int:
+def run_ledger(
+    subject: str | None,
+    *,
+    tool: str = "TaskCreate",
+    spoke: bool = True,
+    cwd: Path | None = None,
+) -> int:
     env = {**os.environ}
+    env.pop("CURSOR_PROJECT_DIR", None)
     if spoke:
         env["WT_SPOKE"] = "1"
     else:
@@ -1956,6 +1963,7 @@ def run_ledger(subject: str | None, *, tool: str = "TaskCreate", spoke: bool = T
         capture_output=True,
         text=True,
         env=env,
+        cwd=str(cwd) if cwd else None,
     ).returncode
 
 
@@ -1964,6 +1972,12 @@ def _entry(keyword: str, *, sub: str = "#235.main", label: str = "pin the failin
 
 
 class TestLedgerSchemaGuard:
+    @pytest.fixture(autouse=True)
+    def _outside_any_worktree(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The guard reads the cwd's identity record; run from a neutral dir so a
+        # provisioned spoke running this suite cannot turn the no-op cases into spokes.
+        monkeypatch.chdir(tmp_path)
+
     def test_allows_a_conforming_step_entry(self) -> None:
         assert run_ledger(_entry("RED")) == ALLOW
 
@@ -2014,6 +2028,47 @@ class TestLedgerSchemaGuard:
             env=env,
         ).returncode
         assert rc == ALLOW
+
+
+class TestLedgerIdentity:
+    """#360: the identity record wins; the fallback is WT_SPOKE ONLY (not the git-dir)."""
+
+    def test_record_makes_a_plain_checkout_a_spoke(self, git_repo: Path) -> None:
+        (git_repo / ".ai-toolkit").mkdir()
+        (git_repo / ".ai-toolkit" / "identity").write_text("issue=360\n")
+
+        assert run_ledger("free form nonsense", spoke=False, cwd=git_repo) == BLOCK
+
+    def test_record_wins_on_a_branch_that_names_no_issue(
+        self, on_branch: Callable[[str], Path]
+    ) -> None:
+        repo = on_branch("orca-migration")
+        (repo / ".ai-toolkit").mkdir()
+        (repo / ".ai-toolkit" / "identity").write_text("issue=360\n")
+
+        assert run_ledger("free form nonsense", spoke=False, cwd=repo) == BLOCK
+
+    def test_empty_record_issue_leaves_a_non_spoke_alone(self, git_repo: Path) -> None:
+        (git_repo / ".ai-toolkit").mkdir()
+        (git_repo / ".ai-toolkit" / "identity").write_text("issue=\n")
+
+        assert run_ledger("free form nonsense", spoke=False, cwd=git_repo) == ALLOW
+
+    def test_linked_worktree_without_record_or_env_is_still_not_a_spoke(
+        self, git_repo: Path, tmp_path: Path
+    ) -> None:
+        linked = tmp_path / "linked"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "feature/9-x", str(linked)],
+            cwd=str(git_repo),
+            check=True,
+            capture_output=True,
+        )
+
+        assert run_ledger("free form nonsense", spoke=False, cwd=linked) == ALLOW
+
+    def test_wt_spoke_env_without_record_is_still_a_spoke(self, git_repo: Path) -> None:
+        assert run_ledger("free form nonsense", spoke=True, cwd=git_repo) == BLOCK
 
 
 # ── #334: per-project commit-quality configuration ──────────────────

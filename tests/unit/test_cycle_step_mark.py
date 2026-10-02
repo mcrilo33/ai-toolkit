@@ -441,3 +441,62 @@ class TestInvisibleAndGated:
 
         assert result.returncode == 0
         assert result.stdout == ""
+
+
+class TestIdentityRecord:
+    """#360: the identity record wins; the fallback is WT_SPOKE ONLY (not the git-dir)."""
+
+    @staticmethod
+    def _no_env_marker(telemetry_dir: Path) -> dict:
+        env = _env(telemetry_dir)
+        env.pop("WT_SPOKE", None)
+        return env
+
+    @staticmethod
+    def _record(root: Path, text: str) -> None:
+        (root / ".ai-toolkit").mkdir(exist_ok=True)
+        (root / ".ai-toolkit" / "identity").write_text(text)
+
+    def test_record_marks_steps_without_wt_spoke(self, repo: Path, telemetry_dir: Path) -> None:
+        env = self._no_env_marker(telemetry_dir)
+        self._record(repo, "issue=360\n")
+        _commit(repo, env, "feat: implement thing")
+
+        _run(_bash_payload("git commit -m 'feat: implement thing'"), env, repo)
+
+        assert [s["phase"] for s in _steps(telemetry_dir)] == ["green"]
+
+    def test_record_wins_on_a_branch_that_names_no_issue(
+        self, repo: Path, telemetry_dir: Path
+    ) -> None:
+        env = self._no_env_marker(telemetry_dir)
+        _git(repo, env, "checkout", "-q", "-b", "orca-migration")
+        self._record(repo, "issue=360\n")
+        _commit(repo, env, "feat: implement thing")
+
+        _run(_bash_payload("git commit -m 'feat: implement thing'"), env, repo)
+
+        assert [s["phase"] for s in _steps(telemetry_dir)] == ["green"]
+
+    def test_empty_record_issue_without_wt_spoke_is_a_noop(
+        self, repo: Path, telemetry_dir: Path
+    ) -> None:
+        env = self._no_env_marker(telemetry_dir)
+        self._record(repo, "issue=\n")
+        _commit(repo, env, "feat: implement thing")
+
+        _run(_bash_payload("git commit -m 'feat: implement thing'"), env, repo)
+
+        assert _events(telemetry_dir) == []
+
+    def test_linked_worktree_without_record_or_env_is_still_a_noop(
+        self, repo: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        env = self._no_env_marker(telemetry_dir)
+        linked = tmp_path / "linked"
+        _git(repo, env, "worktree", "add", "-q", "-b", "feature/9-x", str(linked))
+        _commit(linked, env, "feat: implement thing")
+
+        _run(_bash_payload("git commit -m 'feat: implement thing'"), env, linked)
+
+        assert _events(telemetry_dir) == []
