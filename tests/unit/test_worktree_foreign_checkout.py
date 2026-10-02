@@ -36,8 +36,9 @@ WORKTREE_SCRIPTS = (
     "provision-worktree.sh",
 )
 # Co-located next to the scripts by sync-to-repo.sh (like telemetry.sh) so
-# worktree-lib.sh finds it as a sibling in a synced target (issue #117).
-COLOCATED_LIBS = ("base-branch.sh",)
+# worktree-lib.sh finds it as a sibling in a synced target (issue #117); identity.sh
+# likewise feeds the issue column of the Orca-backed worktree lookup (#364).
+COLOCATED_LIBS = ("base-branch.sh", "identity.sh")
 
 # Isolate from the host's git config (this repo ships installable git hooks).
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
@@ -117,7 +118,7 @@ def test_worktree_done_resolves_sibling_lib(synced_repo: Path) -> None:
     """worktree-done.sh sources worktree-lib.sh from its own dir and tears down."""
     _run(synced_repo, "worktree-new.sh", "42", "demo", env=_dispatch_env(synced_repo))
 
-    proc = _run(synced_repo, "worktree-done.sh", "42", "--no-code", "--force")
+    proc = _run(synced_repo, "worktree-done.sh", "42", "--force")
 
     assert proc.returncode == 0, proc.stderr
     wt_dir = synced_repo.parent / "orca-ws" / "42-demo"

@@ -2,14 +2,14 @@
 
 Landing is hub-owned: verify the spoke pushed → merge into the default branch →
 push main (the pre-push hook is the single test gate, issue #19) → tear down the
-worktree (worktree-done.sh) → close the issue → kill the stranded tmux window.
+worktree through Orca (worker-release, then worktree-done.sh) → close the issue.
 Every guard must abort with a precise reason BEFORE the merge; landing no longer
 runs the suite itself, and a pre-push rejection (the gate failing) must roll main
 back.
 
 Hermetic like test_worktree_done.py: git runs against a local bare `origin`, and
-`gh`, `tmux`, `code`, and `pytest` are logging stubs on PATH — no network, no
-real issue closes, no real tmux server, and no land-side pytest (a stub proves
+`gh` and `pytest` are logging stubs and `orca` is the PATH stub (conftest) — no network, no
+real issue closes, no real Orca, and no land-side pytest (a stub proves
 landing never invokes it). A stub hub pre-push hook stands in for the real gate
 when a test needs to assert env threading or rollback.
 """
@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from _orca_stub import orca_calls, orca_link, orca_scenario
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKTREE_LAND = _REPO_ROOT / "scripts" / "worktree-land.sh"
@@ -123,7 +124,6 @@ def _run_land(
     tmp_path: Path,
     *args: str,
     gh_exit: int = 0,
-    tmux_windows: str = "",
     spoke_marker: str | None = None,
     extra_env: dict[str, str] | None = None,
     stub_python312: bool = False,
@@ -134,7 +134,7 @@ def _run_land(
 ) -> tuple[subprocess.CompletedProcess, dict[str, Path]]:
     """Run worktree-land.sh from the hub with logging stubs on PATH.
 
-    Stubs `gh`, `tmux`, and `code` (one log line per invocation each), plus a
+    Stubs `gh` (one log line per invocation), plus a
     `pytest` stub logging every call (exiting `pytest_exit`, default 0) — landing
     runs pytest itself ONLY for the diverged --skip-tests merge-sanity check
     (issue #174); otherwise the suite runs once via the pre-push hook on the main
@@ -142,7 +142,6 @@ def _run_land(
     `pytest_side_effect` is a shell snippet the pytest stub runs before exiting —
     used to model a concurrent sibling ref move (or an escape) DURING the
     merge-sanity tripwire window (issue #205).
-    `tmux_windows` is the line(s) the tmux stub prints for `list-windows`.
     Returns the completed process and the stub logs by name.
 
     Telemetry isolation (issue #127): the land script now resolves Langfuse auth
@@ -156,13 +155,7 @@ def _run_land(
     the OTLP span payload) so span POSTs are captured, never sent."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
-    logs = {
-        name: tmp_path / f"{name}-calls.log"
-        for name in ("gh", "tmux", "code", "pytest", "python3.12", "curl")
-    }
-    code_stub = bindir / "code"
-    code_stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["code"]}"\nexit 0\n')
-    code_stub.chmod(0o755)
+    logs = {name: tmp_path / f"{name}-calls.log" for name in ("gh", "pytest", "python3.12", "curl")}
     # `gh` logs every call AND answers `issue view --json state` with `issue_state`,
     # so the resume finalize's OPEN-check (issue #151) can be steered per test.
     gh_stub = bindir / "gh"
@@ -173,12 +166,6 @@ def _run_land(
         f"exit {gh_exit}\n"
     )
     gh_stub.chmod(0o755)
-    tmux = bindir / "tmux"
-    tmux.write_text(
-        f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["tmux"]}"\n'
-        f'case "$1" in list-windows) printf "%s\\n" "{tmux_windows}" ;; esac\nexit 0\n'
-    )
-    tmux.chmod(0o755)
     pytest_stub = bindir / "pytest"
     pytest_stub.write_text(
         f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["pytest"]}"\n'
@@ -192,6 +179,8 @@ def _run_land(
             "#!/bin/sh\n"
             f'printf "CALL %s\\n" "$*" >> "{logs["python3.12"]}"\n'
             f'env | grep -E "^LANGFUSE_" >> "{logs["python3.12"]}" || true\n'
+            # With ORCA_CALLS_LOG set, the ingest also leaves its place in the orca call order.
+            '[ -z "$ORCA_CALLS_LOG" ] || printf \'["INGEST"]\\n\' >> "$ORCA_CALLS_LOG"\n'
             "exit 0\n"
         )
         py_stub.chmod(0o755)
@@ -353,15 +342,6 @@ def test_worktree_removed_and_branch_pruned(hub: Path, tmp_path: Path) -> None:
     assert not wt.exists()
     assert "feature/1-pruned" not in _local_branches(hub)
     assert _remote_sha(hub, "feature/1-pruned") == ""
-
-
-def test_keep_branch_flag_keeps_branch(hub: Path, tmp_path: Path) -> None:
-    _make_spoke(hub, tmp_path, "feature/1-kept", push=True)
-
-    proc, _ = _run_land(hub, tmp_path, "1", "--keep-branch")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "feature/1-kept" in _local_branches(hub)
 
 
 # --- spoke-session guard (issue #26) --------------------------------------------
@@ -1400,71 +1380,6 @@ def test_adhoc_branch_skips_issue_close(hub: Path, tmp_path: Path) -> None:
     assert "issue close" not in _log_text(logs["gh"])
 
 
-# --- tmux window cleanup (per-project session, issue #39) -------------------------
-
-
-def test_cleanup_lists_windows_in_project_session(hub: Path, tmp_path: Path) -> None:
-    # The land-side cleanup must enumerate the project session that
-    # worktree-new.sh spawned spokes into — not the retired hardcoded session 0,
-    # or stranded windows would never be found and would accumulate.
-    _make_spoke(hub, tmp_path, "feature/1-stranded", push=True)
-
-    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows="@3\t1-stranded\t/gone/path")
-
-    assert proc.returncode == 0, proc.stderr
-    lw = next(ln for ln in _log_text(logs["tmux"]).splitlines() if ln.startswith("list-windows"))
-    assert "-t 0" not in lw, "cleanup still targets the retired session 0"
-    assert "-t =" in lw, "the '=' exact-match guard must be preserved"
-    assert "hub" in lw, "the session must be named after the project (repo basename)"
-
-
-def test_stranded_tmux_window_is_killed(hub: Path, tmp_path: Path) -> None:
-    _make_spoke(hub, tmp_path, "feature/1-stranded", push=True)
-
-    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows="@3\t1-stranded\t/gone/path")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "kill-window" in _log_text(logs["tmux"])
-
-
-def test_landed_issue_window_killed_even_with_live_pane_dir(hub: Path, tmp_path: Path) -> None:
-    # The landed spoke is finished by definition (guards proved it pushed + carries
-    # the ready marker), so its window is reaped UNCONDITIONALLY — even when the
-    # pane's cwd still fully exists — before worktree-done.sh removes the worktree,
-    # so a still-live exporter can't recreate <wt>/.ai-toolkit and strand it (#273).
-    _make_spoke(hub, tmp_path, "feature/1-alive", push=True)
-
-    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows=f"@3\t1-alive\t{tmp_path}")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "kill-window" in _log_text(logs["tmux"])
-
-
-def test_recreated_ai_toolkit_only_pane_dir_window_is_killed(hub: Path, tmp_path: Path) -> None:
-    # The recreated-dir case (#273): the spoke's OTel exporter rewrote
-    # <wt>/.ai-toolkit/raw-bodies by absolute path after teardown, so the pane's cwd
-    # re-exists holding ONLY the gitignored scratch dir. The pre-#273 `[ ! -d ]`
-    # sweep saw a live dir and KEPT the window, stranding the zombie; teardown must
-    # now kill it.
-    _make_spoke(hub, tmp_path, "feature/1-recreated", push=True)
-    pane = tmp_path / "recreated-wt"
-    (pane / ".ai-toolkit" / "raw-bodies").mkdir(parents=True)
-
-    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows=f"@3\t1-recreated\t{pane}")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "kill-window" in _log_text(logs["tmux"])
-
-
-def test_unrelated_tmux_window_is_kept(hub: Path, tmp_path: Path) -> None:
-    _make_spoke(hub, tmp_path, "feature/1-mine", push=True)
-
-    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows="@4\t2-other\t/gone/path")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "kill-window" not in _log_text(logs["tmux"])
-
-
 # --- --local: micro-spoke landing (issue #10) ---
 
 
@@ -1573,18 +1488,6 @@ def test_local_refuses_default_branch(hub: Path, tmp_path: Path) -> None:
     assert proc.returncode != 0
     assert "default branch" in proc.stderr  # the dedicated guard, not the upstream one
     assert _remote_sha(hub, "main") == pre
-
-
-def test_local_keep_branch_keeps_bare_branch(hub: Path, tmp_path: Path) -> None:
-    # --keep-branch must survive bare-branch mode: the merged local branch is
-    # kept for follow-up work instead of being deleted after the push.
-    wt = _make_spoke(hub, tmp_path, "claude/micro-keep", push=False)
-    _git(hub, "worktree", "remove", str(wt))
-
-    proc, _ = _run_land(hub, tmp_path, "claude/micro-keep", "--local", "--keep-branch")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "claude/micro-keep" in _local_branches(hub)
 
 
 def test_local_refuses_bare_branch_with_upstream(hub: Path, tmp_path: Path) -> None:
@@ -2109,22 +2012,6 @@ def test_reland_after_worktree_removed_finalizes_from_marker(hub: Path, tmp_path
     assert "ready/1" not in _local_tags(hub), "the completion marker is consumed"
 
 
-def test_reland_finalize_kills_scratch_only_stranded_window(hub: Path, tmp_path: Path) -> None:
-    # The resume-finalize path (:169-176) never reaches the primary pre-teardown
-    # kill, so it carries the SAME recreated-dir hole (#273): its sweep must treat a
-    # pane cwd holding only the gitignored .ai-toolkit scratch as stranded, not live.
-    wt = _make_spoke(hub, tmp_path, "feature/1-wtgone", push=True, ready=True)
-    _complete_ship(hub, "feature/1-wtgone")
-    _git(hub, "worktree", "remove", str(wt))
-    pane = tmp_path / "wtgone-recreated"
-    (pane / ".ai-toolkit" / "raw-bodies").mkdir(parents=True)
-
-    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows=f"@3\t1-wtgone\t{pane}")
-
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "kill-window" in _log_text(logs["tmux"]), "the scratch-only stranded window is reaped"
-
-
 def test_reland_refuses_issue_without_ready_marker(hub: Path, tmp_path: Path) -> None:
     # Safety: no resume signal at all (no worktree, no ready tag) ⇒ still abort. The
     # finalize must never close an issue it cannot prove shipped.
@@ -2566,9 +2453,9 @@ def test_pre_merge_heal_when_hub_behind_origin(hub: Path, tmp_path: Path) -> Non
 
 
 def _stub_bindir(bindir: Path, sandbox: Path) -> dict[str, str]:
-    """gh/tmux/code/pytest logging stubs in `bindir`; returns the land env (shared by threads)."""
+    """gh/pytest logging stubs in `bindir`; returns the land env (shared by threads)."""
     bindir.mkdir(parents=True, exist_ok=True)
-    for name in ("gh", "tmux", "code", "pytest"):
+    for name in ("gh", "pytest"):
         body = "#!/bin/sh\n"
         if name == "gh":
             body += 'case "$*" in *"issue view"*state*) printf "OPEN\\n" ;; esac\n'
@@ -2666,3 +2553,125 @@ def test_nonff_push_rejection_recovers_and_reruns_gate(hub: Path, tmp_path: Path
     head = _git(hub, "rev-parse", "HEAD").strip()
     assert _remote_sha(hub, "main") == head, "the hub must end at origin, not behind it"
     assert (hub / "feature-1-racy.txt").exists(), "the spoke's work landed after recovery"
+
+
+# --- teardown through Orca (issue #364) -----------------------------------------
+
+
+def _land_after_ingest(
+    orca_bin: Path, hub: Path, tmp_path: Path, branch: str, *args: str, dispatch: str = "ctx_1"
+) -> tuple[subprocess.CompletedProcess, Path]:
+    """Land a seeded OTel spoke (so the ingest really runs) with an identity record."""
+    wt = _make_spoke(hub, tmp_path, branch, push=True)
+    _seed_otel_spoke(hub, wt, raw_bodies=True)
+    (wt / ".ai-toolkit" / "identity").write_text(f"orca_dispatch_id={dispatch}\n")
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_BASIC_AUTH="Basic-test-364"\n')
+    proc, _ = _run_land(
+        hub,
+        tmp_path,
+        _issue_of(branch),
+        *args,
+        stub_python312=True,
+        stub_curl=True,
+        extra_env={
+            "AFK_TELEMETRY_CONF": str(conf),
+            "AI_TOOLKIT_INGEST_FLUSH_WAIT": "0",
+            "ORCA_CALLS_LOG": str(orca_bin / ".orca-stub" / "calls.jsonl"),
+            "ORCA_SETTLE_SLEEP": "0",
+        },
+    )
+    return proc, wt
+
+
+def _order(orca_bin: Path) -> list[str]:
+    return [" ".join(c[:2]) if c[0] != "INGEST" else "INGEST" for c in orca_calls(orca_bin)]
+
+
+def test_land_runs_ingest_then_worker_release_then_removal_without_hooks(
+    orca_bin: Path, hub: Path, tmp_path: Path
+) -> None:
+    proc, wt = _land_after_ingest(orca_bin, hub, tmp_path, "feature/1-order")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    order = _order(orca_bin)
+    release = order.index("orchestration worker-release")
+    removal = order.index("worktree rm")
+    assert max(i for i, name in enumerate(order) if name == "INGEST") < release < removal
+    calls = orca_calls(orca_bin)
+    assert calls[release][2:4] == ["--dispatch", "ctx_1"]
+    assert "--run-hooks" not in calls[removal], "land ingested already; the archive hook must not"
+    assert not wt.exists()
+
+
+def test_land_with_no_recorded_dispatch_skips_the_release_and_still_lands(
+    orca_bin: Path, hub: Path, tmp_path: Path
+) -> None:
+    proc, wt = _land_after_ingest(orca_bin, hub, tmp_path, "feature/1-nodispatch", dispatch="")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "orchestration worker-release" not in _order(orca_bin)
+    assert "worktree rm" in _order(orca_bin)
+    assert not wt.exists()
+
+
+def test_land_continues_when_the_worker_release_fails(
+    orca_bin: Path, hub: Path, tmp_path: Path
+) -> None:
+    orca_scenario(
+        orca_bin, {"orchestration worker-release": [{"rc": 1, "stderr": "release_unknown"}]}
+    )
+
+    proc, wt = _land_after_ingest(orca_bin, hub, tmp_path, "feature/1-relfail")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "worker-release failed" in proc.stderr
+    assert not wt.exists()
+
+
+def test_land_exits_3_not_1_when_orca_refuses_the_removal(
+    orca_bin: Path, hub: Path, tmp_path: Path
+) -> None:
+    orca_scenario(orca_bin, {"_rm": {"refuse": True}})
+    wt = _make_spoke(hub, tmp_path, "feature/1-refused", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 3, proc.stderr + proc.stdout
+    assert "INCOMPLETE" in proc.stdout
+    assert wt.exists()
+    assert _git(hub, "rev-parse", "main").strip() == _remote_sha(hub, "main")
+
+
+def test_land_treats_a_cli_drop_after_the_removal_as_success(
+    orca_bin: Path, hub: Path, tmp_path: Path
+) -> None:
+    orca_scenario(orca_bin, {"_rm": {"drop": "after"}})
+    wt = _make_spoke(hub, tmp_path, "feature/1-dropped", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1", extra_env={"ORCA_SETTLE_SLEEP": "0"})
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert not wt.exists()
+
+
+def test_land_rejects_an_unknown_flag_before_touching_anything(hub: Path, tmp_path: Path) -> None:
+    wt = _make_spoke(hub, tmp_path, "feature/1-flag", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--bogus")
+
+    assert proc.returncode != 0
+    assert "--bogus" in proc.stderr
+    assert wt.exists()
+
+
+def test_land_of_a_bare_branch_worktree_resolves_it_by_orca_issue(
+    orca_bin: Path, hub: Path, tmp_path: Path
+) -> None:
+    wt = _make_spoke(hub, tmp_path, "361-bare", push=True, ready=False)
+    orca_link(orca_bin, wt, issue=361)
+
+    proc, _ = _run_land(hub, tmp_path, "361", "--force-land")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert not wt.exists()

@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _orca_stub import orca_link, orca_scenario
 
 HUB_STATUS = (
     Path(__file__).resolve().parents[2] / "shared" / "skills" / "hub" / "scripts" / "hub-status.sh"
@@ -1394,3 +1395,32 @@ def test_waived_gates_negative_limit_never_hides_a_waive(
     section = out[out.index("Waived gates") :]
     assert "+4 older waives" not in section, f"must not overcount the remainder: {section}"
     assert "+3 older waives" in section, f"3 waives exist, so all 3 must be accounted: {section}"
+
+
+# --- the Worktrees table reads Orca's issue column (#364) ---------------------------
+
+
+def test_worktree_row_shows_the_orca_issue_of_a_bare_branch(
+    hub_with_spokes: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    bare = tmp_path / "bare"
+    _git(hub_with_spokes, "worktree", "add", "-q", "-b", "scratch-lane", str(bare))
+    orca_link(orca_bin, bare, issue=361)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, issue_state="OPEN")
+
+    line = next(ln for ln in out.splitlines() if "scratch-lane" in ln)
+    assert "#361 OPEN" in line
+    hub_line = next(ln for ln in out.splitlines() if "(hub)" in ln)
+    assert "main" in hub_line
+
+
+def test_worktrees_table_says_so_loudly_when_orca_cannot_list(
+    hub_with_spokes: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    orca_scenario(orca_bin, {"worktree list": [{"rc": 1, "stderr": "runtime down"}]})
+
+    proc = _run_hub_status_proc(hub_with_spokes, tmp_path)
+
+    assert "could not list task worktrees" in proc.stdout
+    assert "feature/1-pushed" not in proc.stdout.split("Open issues")[0]

@@ -240,7 +240,7 @@ class TestWorktreeDoneSpoke:
         wt = _make_spoke(hub, tmp_path, "7", "beta")
         srid = (wt / ".ai-toolkit" / "spoke-run-id").read_text().strip()
 
-        res = _run(WORKTREE_DONE, hub, _tele_env(telemetry_dir), "7", "--no-code", "--force")
+        res = _run(WORKTREE_DONE, hub, _tele_env(telemetry_dir), "7", "--force")
 
         assert res.returncode == 0, res.stderr
         spans = _spans(telemetry_dir, name="worktree-done", kind="lifecycle")
@@ -286,7 +286,7 @@ class TestWorktreeDoneSpoke:
         )
         assert new.returncode == 0, new.stderr
 
-        done = _run(WORKTREE_DONE, hub, _tele_env(None, enabled=False), "5", "--no-code")
+        done = _run(WORKTREE_DONE, hub, _tele_env(None, enabled=False), "5")
         assert done.returncode == 0, done.stderr
 
 
@@ -356,7 +356,7 @@ class TestWorktreeScriptSpans:
     ) -> None:
         _make_spoke(hub, tmp_path, "7", "beta")
 
-        res = _run(WORKTREE_DONE, hub, _tele_env(telemetry_dir), "7", "--no-code", "--force")
+        res = _run(WORKTREE_DONE, hub, _tele_env(telemetry_dir), "7", "--force")
 
         assert res.returncode == 0, res.stderr
         spans = _spans(telemetry_dir, name="worktree-done", kind="script")
