@@ -58,6 +58,7 @@ def _run_quick(
     extra_env: dict[str, str] | None = None,
     stub_curl: bool = False,
     version: str = "1.4.218",
+    scenario: dict | None = None,
 ) -> subprocess.CompletedProcess:
     """Run worktree-quick.sh from the hub against the stubbed `orca`.
 
@@ -79,7 +80,7 @@ def _run_quick(
             "exit 0\n"
         )
         curl.chmod(0o755)
-    env = {**_GIT_ENV, **install_orca_stub(bindir, version=version)}
+    env = {**_GIT_ENV, **install_orca_stub(bindir, version=version, scenario=scenario)}
     for var in (
         "TMUX",
         "WT_SPOKE",
@@ -261,3 +262,30 @@ def test_quick_emits_no_span_when_auth_unresolvable(hub: Path, tmp_path: Path) -
     assert proc.returncode == 0, proc.stderr
     curl_log = tmp_path / "curl-calls.log"
     assert not curl_log.exists() or curl_log.read_text() == ""
+
+
+def test_a_lost_create_reply_settles_through_a_repo_scoped_listing(
+    hub: Path, tmp_path: Path
+) -> None:
+    # The create really happens (the stub materialises it) but its reply is lost; another repo
+    # may own a worktree of the same name, so the probe must list THIS repo only.
+    wt = _wt(tmp_path, "fix-typo")
+    _git(hub, "worktree", "add", "-q", "-b", "fix-typo", str(wt))
+    listing = {
+        "ok": True,
+        "result": {
+            "worktrees": [{"id": "stub-repo::x", "path": str(wt), "displayName": "fix-typo"}]
+        },
+    }
+    scenario = {
+        "worktree create": [
+            {"rc": 1, "out": {"ok": False, "error": {"code": "runtime_unavailable"}}}
+        ],
+        "worktree list": [{"out": listing}],
+    }
+
+    proc = _run_quick(hub, tmp_path, "fix-typo", scenario=scenario)
+
+    assert proc.returncode == 0, proc.stderr
+    lists = [c for c in orca_calls(tmp_path / "bin") if c[:2] == ["worktree", "list"]]
+    assert lists[0][lists[0].index("--repo") + 1] == f"path:{hub}"

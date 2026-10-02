@@ -116,7 +116,8 @@ def test_arm_refuses_when_the_orca_runtime_does_not_answer(tmp_path: Path) -> No
     result = _call("afk_arm_orca_guard; echo RC=$?", env=_orca_env(tmp_path, scenario=scenario))
 
     assert "RC=1" in result.stdout
-    assert "Orca" in result.stderr
+    assert "not usable" in result.stderr
+    assert "#365" not in result.stderr, "an unusable Orca refuses before the interim guard speaks"
 
 
 def test_arm_guard_honours_the_precheck_opt_out(tmp_path: Path) -> None:

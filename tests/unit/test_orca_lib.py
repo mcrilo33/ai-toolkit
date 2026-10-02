@@ -334,3 +334,23 @@ def test_with_no_request_id_and_no_probe_an_unsettled_call_is_unknown_at_once(
 
     assert proc.returncode == 1
     assert [c[:2] for c in orca_calls(bindir)] == [["orchestration", "worker-start"]]
+
+
+def test_the_worktree_probe_is_scoped_to_the_given_repo(tmp_path: Path) -> None:
+    scenario = {
+        "worktree list": [
+            {
+                "out": {
+                    "ok": True,
+                    "result": {"worktrees": [{"id": "r::/w", "path": "/w", "displayName": "n1"}]},
+                }
+            }
+        ]
+    }
+
+    proc, bindir = _run(
+        tmp_path, "orca_worktree_by_name n1 path:/the/repo && orca_wt_path", scenario=scenario
+    )
+
+    assert proc.stdout.strip() == "/w"
+    assert orca_calls(bindir) == [["worktree", "list", "--repo", "path:/the/repo", "--json"]]

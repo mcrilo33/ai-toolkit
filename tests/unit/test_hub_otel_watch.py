@@ -303,7 +303,7 @@ _LOOP_ENV = "; ".join(
 
 
 def _pane_pattern_stub(tmp_path: Path, pattern: str) -> str:
-    """A spoke_agent_live stub scripted per tick: 'L' = live, anything else = idle.
+    """A spoke_agent_live stub scripted per tick: 'L' = live, 'U' = unknown (rc 2), else idle.
 
     Ticks beyond the pattern read as idle, so every loop terminates. The tick
     count persists in a file the test can assert on.
@@ -313,7 +313,7 @@ def _pane_pattern_stub(tmp_path: Path, pattern: str) -> str:
         f'TICKS="{ticks}"; PATTERN="{pattern}"; '
         "spoke_agent_live() { "
         'n=$(( $(cat "$TICKS" 2>/dev/null || echo 0) + 1 )); printf "%s" "$n" > "$TICKS"; '
-        'c="${PATTERN:$((n-1)):1}"; [ "$c" = "L" ]; }'
+        'c="${PATTERN:$((n-1)):1}"; [ "$c" = "L" ] && return 0; [ "$c" = "U" ] && return 2; return 1; }'
     )
 
 
@@ -773,3 +773,48 @@ def test_worktree_new_arms_watchdog_after_preflights() -> None:
     text = WORKTREE_NEW.read_text()
     assert 'wt_otel_watch_arm "$REPO_ROOT"' in text
     assert text.index("wt_otel_watch_arm") > text.index('wt_otel_bridge_preflight "$REPO_ROOT"')
+
+
+# ── Orca unreachable is "unknown", never "idle" (AFK principle 6) ─────────────
+
+
+def test_agent_paths_reports_unknown_when_orca_fails(tmp_path: Path) -> None:
+    ps = {"ok": False, "error": {"code": "runtime_unavailable"}}
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    env = {
+        **os.environ,
+        **install_orca_stub(bindir, scenario={"worktree ps": [{"rc": 1, "out": ps}]}),
+    }
+
+    result = subprocess.run(
+        ["bash", "-c", f'source "{HUB_OTEL_WATCH}"; _agent_paths; echo RC=$?'],
+        capture_output=True,
+        text=True,
+        env=stub_env(bindir, env),
+    )
+
+    assert "RC=2" in result.stdout
+
+
+def test_spoke_agent_live_is_unknown_not_idle_when_orca_does_not_answer() -> None:
+    parts = [
+        "MAIN_ROOT=/repo",
+        '_spoke_worktree_paths() { printf "%s\\n" /repo/wt-115; }',
+        "_agent_paths() { return 2; }",
+        "spoke_agent_live; echo RC=$?",
+    ]
+
+    result = _call("; ".join(parts))
+
+    assert "RC=2" in result.stdout
+
+
+def test_watch_loop_does_not_count_unknown_ticks_toward_the_idle_exit(tmp_path: Path) -> None:
+    # Orca restarting for four ticks must not tear the watch down: only three consecutive IDLE
+    # ticks (after the pattern runs out) exit, so the loop reaches tick 7, not tick 3.
+    result = _call(f"{_pane_pattern_stub(tmp_path, 'UUUU')}; {_LOOP_ENV}; _watch_loop")
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "ticks").read_text() == "7"
+    assert "COLLECTOR" not in result.stdout

@@ -488,6 +488,8 @@ def test_a_runtime_unavailable_worktree_create_settles_through_the_listing(
 
     assert proc.returncode == 0, proc.stderr
     assert len(_calls(tmp_path, "worktree create")) == 1
+    listing = _calls(tmp_path, "worktree list")[0]
+    assert _arg(listing, "--repo") == f"path:{hub}"
 
 
 # ── identity, provisioning, spoke env ──
