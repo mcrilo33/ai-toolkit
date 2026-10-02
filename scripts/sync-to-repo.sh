@@ -565,6 +565,40 @@ sync_mcp_servers() {
 # The telemetry python PACKAGE the land-time ingest imports rides along too, via
 # copy_telemetry_package (issue #319) — a package, not a flat file, so it takes its
 # own recursive step rather than the name loop.
+# Is $1 (a path relative to $TARGET) listed under ANY tool in the target's sync manifest?
+# True only for files an earlier sync wrote; a host-authored file is never listed.
+manifest_owns() {
+    python3 - "$TARGET/.ai-toolkit-manifest.json" "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    tools = json.load(open(sys.argv[1])).get("tools", {})
+except (OSError, ValueError):
+    sys.exit(1)
+sys.exit(0 if any(sys.argv[2] in (files or []) for files in tools.values()) else 1)
+PY
+}
+
+# Generate <target>/orca.yaml from the toolkit's own orca.yaml (issue #362): synced scripts
+# live at .ai-toolkit/scripts/, so ./scripts/ is rewritten to ./.ai-toolkit/scripts/. A host
+# orca.yaml the manifest does not own is never touched (warn and skip, and left unrecorded so
+# it never becomes toolkit-owned). The host's LOCAL Orca hookSettings.scripts must stay empty:
+# a non-empty local script silently overrides orca.yaml.
+generate_orca_yaml() {
+    local src="$REPO_DIR/orca.yaml"
+    [ -f "$src" ] || { warn "toolkit orca.yaml not found at $src — target orca.yaml not generated"; return 0; }
+    if [ -e "$TARGET/orca.yaml" ] && ! manifest_owns "orca.yaml"; then
+        warn "orca.yaml already exists in target and is not toolkit-owned — skipped (point its scripts at .ai-toolkit/scripts/{provision,archive}-worktree.sh manually)"
+        return 0
+    fi
+    record_file "orca.yaml"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "[dry-run] would write orca.yaml"
+        return 0
+    fi
+    sed 's#\./scripts/#./.ai-toolkit/scripts/#g' "$src" > "$TARGET/orca.yaml"
+    info "orca.yaml"
+}
+
 sync_workflow_scripts() {
     section "Workflow scripts (hub/spoke/land)"
     local dst_dir="$TARGET/.ai-toolkit/scripts"
@@ -574,7 +608,7 @@ sync_workflow_scripts() {
     # hooks/lib/) so the worktree scripts can source them as siblings — see
     # worktree-lib.sh's telemetry and base-branch blocks.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-otel-lib.sh worktree-gh-lib.sh worktree-quick.sh ensure-test-venv.sh provision-worktree.sh spoke-push.sh spoke-ready.sh spoke-relaunch.sh gate-sweep.sh travel-local.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh hub-afk-land.sh hub-afk-dispatch.sh hub-afk-arm.sh hub-afk-supervise.sh hub-afk-recover.sh hub-afk-state.sh hub-agent.sh gate-broker.sh gate-broker-markers.sh gate-broker-detect.sh gate-broker-classify.sh gate-broker-danger.sh gate-broker-answerer.sh gate-broker-permission.sh transition-log.sh hub-inject.sh hub-watchdog.sh hub-watchdog-detect.sh hub-watchdog-intervene.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-otel-lib.sh worktree-gh-lib.sh worktree-quick.sh ensure-test-venv.sh provision-worktree.sh archive-worktree.sh spoke-push.sh spoke-ready.sh spoke-relaunch.sh gate-sweep.sh travel-local.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh hub-afk-land.sh hub-afk-dispatch.sh hub-afk-arm.sh hub-afk-supervise.sh hub-afk-recover.sh hub-afk-state.sh hub-agent.sh gate-broker.sh gate-broker-markers.sh gate-broker-detect.sh gate-broker-classify.sh gate-broker-danger.sh gate-broker-answerer.sh gate-broker-permission.sh transition-log.sh hub-inject.sh hub-watchdog.sh hub-watchdog-detect.sh hub-watchdog-intervene.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh; do
         case "$name" in
             hub-status.sh|hub-ready-watch.sh|hub-notify.sh|hub-otel-watch.sh|hub-afk.sh|hub-afk-land.sh|hub-afk-dispatch.sh|hub-afk-arm.sh|hub-afk-supervise.sh|hub-afk-recover.sh|hub-afk-state.sh|hub-agent.sh|gate-broker.sh|gate-broker-markers.sh|gate-broker-detect.sh|gate-broker-classify.sh|gate-broker-danger.sh|gate-broker-answerer.sh|gate-broker-permission.sh|transition-log.sh|hub-inject.sh|hub-watchdog.sh|hub-watchdog-detect.sh|hub-watchdog-intervene.sh|batch-plan.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
             telemetry.sh|base-branch.sh|enabled.sh)      src="$SHARED_DIR/hooks/lib/$name" ;;
@@ -587,6 +621,9 @@ sync_workflow_scripts() {
             info "scripts/$name"
         fi
     done
+
+    # <target>/orca.yaml wires Orca's setup/archive hooks to the scripts shipped above (#362).
+    generate_orca_yaml
 
     # The telemetry python package the land-time ingest imports (issue #319). Warn LOUD rather
     # than print a green line over an empty target: without the package every land silently
