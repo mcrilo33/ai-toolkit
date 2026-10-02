@@ -432,14 +432,15 @@ _afk_journal_agent() { broker_journal_decision "$1" agent-snapshot "$2" reversib
 
 # resume_spoke <wt> <issue> -> restart the crashed spoke's worker in place (a retry of its Orca
 # dispatch, same worktree, same spoke_run_id); stamp the once-per-window marker and a success span.
-# rc 1 when the restart could not start (the caller then falls back to warning).
+# rc 1 when the restart could not start (the caller then falls back to warning); rc 2 = no action
+# on an unknown state (warned, nothing recorded or counted: the caller treats it as handled).
 resume_spoke() {
   local wt="$1" issue="$2" rc
   log "→ resume #$issue: worker exited with work intact — restarting it in place once"
   _afk_set_last_action "resume #$issue"
   _afk_retry_worker "$wt" "$issue"; rc=$?
   # rc 2 = no action on an unknown state: warn (rate-limited), record and count NOTHING.
-  [ "$rc" -ne 2 ] || { _afk_warn_unknown_state "$wt" "$issue" "resume skipped"; return 0; }
+  [ "$rc" -ne 2 ] || { _afk_warn_unknown_state "$wt" "$issue" "resume skipped"; return 2; }
   [ "$rc" -eq 0 ] || { log "  could not restart the worker for #$issue"; return 1; }
   _afk_mark_resumed "$issue"
   stamp_progress_epoch "$issue"   # a deliberate revival resets the reap ceiling (#133)
@@ -535,7 +536,7 @@ _revive_spoke() {
   log "→ revive #$issue: stopping the hung worker and restarting it in place"
   _afk_set_last_action "revive #$issue"
   _afk_retry_worker "$wt" "$issue"; rc=$?
-  [ "$rc" -ne 2 ] || { _afk_warn_unknown_state "$wt" "$issue" "revive skipped"; return 0; }
+  [ "$rc" -ne 2 ] || { _afk_warn_unknown_state "$wt" "$issue" "revive skipped"; return 2; }
   [ "$rc" -eq 0 ] || { log "  could not restart the worker for #$issue"; return 1; }
   _afk_mark_resumed "$issue"
   stamp_progress_epoch "$issue"
@@ -610,24 +611,21 @@ _afk_crash_reresume_or_escalate() {
     _warn_parked_last "$wt" "$issue" "$reason — parked LAST, retried at low frequency"
     return 0
   fi
-  # Never count, journal or arm a retry Orca will refuse: an unreadable or unverifiable worker is
-  # unknown, and unknown is no basis to burn the resume budget toward a blocked escalation.
-  case "$(orca_worker_liveness "$wt" 2>/dev/null)" in
-    live | exited) ;;
-    *) _afk_warn_unknown_state "$wt" "$issue" "crash ladder skipped"; return 0 ;;
-  esac
   lane="$(_afk_warned_lane reap)"                       # the default/reap lane (empty)
   _afk_warned_due "$issue" "" "$lane" || return 0       # inside the backoff — parked LAST silently
   attempts="$(_afk_warn_attempt "$issue" "$lane")"
   max="$AFK_WARN_ESCALATE_ATTEMPTS"
   if [ "$attempts" -lt "$max" ]; then
-    local msg="$reason — re-attempting the revival (attempt $(( attempts + 1 ))/$max)"
+    local msg="$reason — re-attempting the revival (attempt $(( attempts + 1 ))/$max)" rrc=0
     log "→ crash-reresume #$issue: $msg"
     _afk_set_last_action "crash-reresume #$issue"
+    "$retry_fn" "$wt" "$issue" || rrc=$?
+    # rc 2: the retry took NO action on an unknown state (and already warned). It was not an attempt:
+    # count, journal and arm NOTHING, so no-ops can never burn the budget toward a blocked escalation.
+    [ "$rrc" -ne 2 ] || return 0
     broker_journal_decision "$issue" reap "$msg" reversible
     _afk_warned_arm "$issue" "$lane"                    # advance the backoff for the next attempt/escalation
-    "$retry_fn" "$wt" "$issue" \
-      || log "  crash-reresume #$issue: revival relaunch could not be started; retrying next cadence"
+    [ "$rrc" -eq 0 ] || log "  crash-reresume #$issue: revival relaunch could not be started; retrying next cadence"
     return 0
   fi
   _afk_crash_escalate_or_park "$wt" "$issue" "$reason — resume budget exhausted (${max} attempts)"
@@ -664,8 +662,8 @@ _afk_revive_or_park_last() {
     _afk_crash_reresume_or_escalate "$wt" "$issue" "$reason — revival already tried this window" _revive_spoke
     return 0
   fi
-  _revive_spoke "$wt" "$issue" \
-    || _warn_parked_last "$wt" "$issue" "$reason — revival launch could not be started; retrying"
+  _revive_spoke "$wt" "$issue"
+  case $? in 0 | 2) ;; *) _warn_parked_last "$wt" "$issue" "$reason — revival launch could not be started; retrying" ;; esac
 }
 
 # _afk_finish_up_or_revive <wt> <issue> <reason> -> #256: the ceiling-hit decision. A spoke over
@@ -747,7 +745,8 @@ _afk_act_pushed_but_unmarked() {
     return 0
   fi
   if ! _afk_already_resumed "$issue"; then
-    _revive_spoke "$wt" "$issue" && return 0
+    _revive_spoke "$wt" "$issue"
+    case $? in 0 | 2) return 0 ;; esac   # rc 2: nothing done on an unknown state, already warned
     # revival launch could not start — fall through to the terminal decision.
   fi
   _afk_decide_pushed_but_unmarked "$wt" "$issue"
@@ -819,8 +818,8 @@ _reap_or_resume() {
   elif _afk_already_resumed "$issue"; then
     _afk_crash_reresume_or_escalate "$wt" "$issue" "pane crashed again after an auto-resume" resume_spoke
   else
-    resume_spoke "$wt" "$issue" \
-      || _warn_parked_last "$wt" "$issue" "pane crashed and the auto-resume could not be launched — retrying"
+    resume_spoke "$wt" "$issue"
+    case $? in 0 | 2) ;; *) _warn_parked_last "$wt" "$issue" "pane crashed and the auto-resume could not be launched — retrying" ;; esac
   fi
 }
 
@@ -1042,8 +1041,8 @@ recover_dead_panes() {
       if _afk_already_resumed "$issue"; then
         _afk_crash_reresume_or_escalate "$path" "$issue" "pane crashed again after an auto-resume" resume_spoke
       else
-        resume_spoke "$path" "$issue" \
-          || _warn_parked_last "$path" "$issue" "pane crashed and the auto-resume could not be launched — retrying"
+        resume_spoke "$path" "$issue"
+        case $? in 0 | 2) ;; *) _warn_parked_last "$path" "$issue" "pane crashed and the auto-resume could not be launched — retrying" ;; esac
       fi
     elif _afk_already_redispatched "$issue"; then
       _warn_parked_last "$path" "$issue" "pane crashed clean again after a re-dispatch — parked LAST, retried at low frequency"

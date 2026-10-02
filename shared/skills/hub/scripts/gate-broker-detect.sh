@@ -201,7 +201,11 @@ _afk_warn_unknown_state() {
   last="$(cat "$f" 2>/dev/null)"
   case "$last" in '' | *[!0-9]*) ;; *) [ "$(( now - last ))" -lt "$gap" ] && return 0 ;; esac
   mkdir -p "$(dirname "$f")" 2>/dev/null; printf '%s\n' "$now" > "$f" 2>/dev/null || true
-  command -v broker_warn >/dev/null 2>&1 && broker_warn "$issue" "Orca cannot say what #$issue is doing ($3) -- holding it, taking NO recovery or blocked action"
+  # Logged + journaled (a FILE line), NOT broker_warn: that overwrites the spoke's warned record
+  # (auth, pushed-but-unmarked, ...) and keeps re-notifying after Orca recovers.
+  log "  WARNING: Orca cannot say what #$issue is doing ($3) -- holding it, taking NO recovery or blocked action"
+  command -v _broker_journal_line >/dev/null 2>&1 \
+    && _broker_journal_line "$issue" unknown "Orca cannot say what #$issue is doing ($3); no action taken" reversible
   return 0
 }
 

@@ -322,8 +322,9 @@ _afk_conflict_resolve_relaunch() {
   _afk_set_last_action "conflict-resolve #$issue"
   local rc=0
   _afk_retry_worker "$wt" "$issue" "$(_afk_conflict_resolve_prompt "$issue")" || rc=$?
-  # rc 2 (no action on an unknown state) is a failure HERE: the caller must not record the
-  # resolution as dispatched, and instead warn-parks on the land lane.
+  # rc 2 = no action on an unknown state: warned, and returned as 2 so the caller neither records
+  # the resolution as dispatched nor warn-parks (a park here could escalate blocked on an unknown).
+  [ "$rc" -ne 2 ] || { _afk_warn_unknown_state "$wt" "$issue" "conflict-resolve restart skipped"; return 2; }
   [ "$rc" -eq 0 ] || { log "  could not restart the worker for the conflict-resolve of #$issue"; return 1; }
   stamp_progress_epoch "$issue"
   stamp_answer_attempt "$issue"
@@ -361,10 +362,13 @@ _afk_route_conflict_resolution() {
     else
       _warn_parked_last "$wt" "$issue" "land conflicts; live-pane resolve-inject did not register — retrying at low frequency" land
     fi
-  elif _afk_conflict_resolve_relaunch "$wt" "$issue"; then
-    _afk_mark_conflict_resolved "$issue" "$tip"
   else
-    _warn_parked_last "$wt" "$issue" "land conflicts and the resolution relaunch could not start — retrying at low frequency" land
+    _afk_conflict_resolve_relaunch "$wt" "$issue"
+    case $? in
+      0) _afk_mark_conflict_resolved "$issue" "$tip" ;;
+      2) ;;
+      *) _warn_parked_last "$wt" "$issue" "land conflicts and the resolution relaunch could not start — retrying at low frequency" land ;;
+    esac
   fi
 }
 

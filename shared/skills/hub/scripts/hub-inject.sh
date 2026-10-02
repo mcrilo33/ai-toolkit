@@ -193,35 +193,44 @@ deliver_answer() {
   else AFK_TLOG_ISSUE="$issue" deliver_text "$wt" "$text" turn_started 1; fi
 }
 
-# approve_permission <wt> -> select "Yes" (option 1, this once, NEVER "don't ask again") on the
-# waiting permission dialog: a bare `1` keypress (no Enter, which would land on whatever dialog
-# follows). Orca's prompt stages never fire for a menu key, so delivery is proven by Orca's own
-# agent state: the agent LEFT `waiting` (or its stateStartedAt moved, a new state) within
-# AFK_APPROVE_SETTLE_SECONDS (default 10). Silence is rc 1, retried next tick and NEVER resent here.
-# Records approval_injected with the delivered verdict (the permission broker threads
-# AFK_TLOG_LANE / AFK_TLOG_EPISODE).
+# approve_permission <wt> [expected-input] -> select "Yes" (option 1, this once, NEVER "don't ask
+# again") on the waiting permission dialog: a bare `1` keypress (no Enter, which would land on whatever
+# dialog follows). Orca's prompt stages never fire for a menu key, so delivery is proven by Orca's own
+# agent state: the agent LEFT `waiting`, or is waiting on a DIFFERENT tool input, within
+# AFK_APPROVE_SETTLE_SECONDS (default 10, polled every AFK_APPROVE_POLL_SECONDS). Never resent here.
+#   rc 0 delivered.   rc 1 not delivered (retried next tick).   rc 3 NOTHING TO APPROVE: the agent is
+#   no longer waiting, or its dialog is not the one judged ([expected-input] is the toolInput the
+#   caller classified), so no key is sent -- an approval must never land on a dialog nobody read.
+# Records approval_injected (delivered verdict) whenever a key was sent (the permission broker
+# threads AFK_TLOG_LANE / AFK_TLOG_EPISODE).
 approve_permission() {
-  local wt="$1" rc=1 h since now st waited=0 budget="${AFK_APPROVE_SETTLE_SECONDS:-10}" ms
+  local wt="$1" want="${2:-}" rc=1 h inp0 since st inp waited=0 ms
+  local budget="${AFK_APPROVE_SETTLE_SECONDS:-10}" poll="${AFK_APPROVE_POLL_SECONDS:-1}"
   case "$budget" in '' | *[!0-9]*) budget=10 ;; esac
-  # A FRESH read: the tick cache may predate a minutes-long reasoner step. Only a dialog that is
-  # still up gets the key (a stray `1` would otherwise land in the next prompt), and its
-  # stateStartedAt is the baseline the proof compares against.
+  case "$poll" in '' | *[!0-9]*) poll=1 ;; esac
+  # A FRESH read: the tick cache may predate a minutes-long reasoner step. The key goes only to a
+  # dialog that is still up AND is the one the caller judged.
   orca_tick_reset
-  since="$(orca_agent_field "$wt" stateStartedAt 2>/dev/null)"
-  if [ "$(orca_agent_state "$wt" 2>/dev/null)" = waiting ] && [ -n "$since" ] \
-     && [ "$(orca_worker_liveness "$wt" 2>/dev/null)" != exited ] && h="$(_hi_terminal "$wt")" \
+  st="$(orca_agent_state "$wt" 2>/dev/null)"
+  [ "$st" = unknown ] && return 1
+  [ "$st" = waiting ] || { log "  approve: agent of $wt is no longer waiting -- nothing to approve"; return 3; }
+  inp0="$(orca_agent_field "$wt" toolInput 2>/dev/null)"; since="$(orca_agent_field "$wt" stateStartedAt 2>/dev/null)"
+  if [ -n "$want" ] && [ "$inp0" != "$want" ]; then
+    log "  approve: $wt is waiting on a different dialog than the one judged -- nothing sent"; return 3
+  fi
+  if [ "$(orca_worker_liveness "$wt" 2>/dev/null)" != exited ] && h="$(_hi_terminal "$wt")" \
      && orca_send_text "$h" 1 0 0 >/dev/null; then
     while :; do
       orca_tick_reset
-      st="$(orca_agent_state "$wt" 2>/dev/null)"; now="$(orca_agent_field "$wt" stateStartedAt 2>/dev/null)"
-      if { [ "$st" != waiting ] && [ "$st" != unknown ]; } || { [ -n "$since" ] && [ -n "$now" ] && [ "$now" != "$since" ]; }; then rc=0; break; fi
+      st="$(orca_agent_state "$wt" 2>/dev/null)"; inp="$(orca_agent_field "$wt" toolInput 2>/dev/null)"
+      if { [ "$st" != waiting ] && [ "$st" != unknown ]; } || { [ "$st" = waiting ] && [ "$inp" != "$inp0" ]; }; then rc=0; break; fi
       [ "$waited" -ge "$budget" ] && break
-      sleep 1; waited=$(( waited + 1 ))
+      sleep "$poll"; waited=$(( waited + (poll > 0 ? poll : 1) ))   # a 0 poll still counts each pass
     done
-  fi
-  if [ "$rc" -eq 0 ]; then   # a human `permission` span: waiting -> the consumed approval
-    ms="$(_hi_wait_ms "$since")"
-    [ -z "$ms" ] || _hi_span "$wt" --kind human --name orca-permission-wait --human-type permission --human-wait-ms "$ms"
+    if [ "$rc" -eq 0 ]; then   # a human `permission` span: waiting -> the consumed approval
+      ms="$(_hi_wait_ms "$since")"
+      [ -z "$ms" ] || _hi_span "$wt" --kind human --name orca-permission-wait --human-type permission --human-wait-ms "$ms"
+    fi
   fi
   _hi_tlog_delivery "$wt" approval_injected permission \
     "{\"delivered\":$([ "$rc" -eq 0 ] && printf true || printf false)}"

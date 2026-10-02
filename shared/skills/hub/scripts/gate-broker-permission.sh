@@ -62,7 +62,7 @@ _reason_permission_record() {
 # is NEVER parked. park_sig identifies the park being decided and is the CALLER's, captured before
 # the minutes-long reason step.
 _reason_permission() {
-  local wt="$1" issue="$2" cmd="$3" why="$4" sig="${5:-}" q raw rc ans text rev guidance
+  local wt="$1" issue="$2" cmd="$3" why="$4" sig="${5:-}" want="${6:-}" q raw rc ans text rev guidance arc
   q="The spoke is parked on a PERMISSION dialog and wants to run this command:
 
 $cmd
@@ -115,10 +115,16 @@ path to tell the spoke>'."
       _broker_journal_line "$issue" permission "reasoner APPROVING (delivery pending): $cmd" "${rev:-unknown}"
       # Thread the issue + lane + episode so hub-inject's approval_injected delivery event keys on
       # the broker's KNOWN issue (explicit beats the branch-slug fallback) and carries the episode.
-      if AFK_TLOG_ISSUE="$issue" AFK_TLOG_LANE=permission \
-        AFK_TLOG_EPISODE="$(_gb_episode_key "$issue" "$sig")" approve_permission "$wt"; then
+      arc=0
+      AFK_TLOG_ISSUE="$issue" AFK_TLOG_LANE=permission \
+        AFK_TLOG_EPISODE="$(_gb_episode_key "$issue" "$sig")" approve_permission "$wt" "$want" || arc=$?
+      if [ "$arc" -eq 0 ]; then
         _broker_journal_line "$issue" permission "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
         _reason_permission_record "$wt" "$issue" "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
+      elif [ "$arc" -eq 3 ]; then
+        # The dialog went away (or was replaced) while the reasoner ran: nothing was sent, nothing
+        # failed -- no warn, no backoff arm; the next tick re-reads whatever is waiting.
+        _broker_journal_line "$issue" permission "reasoner APPROVED but the dialog was gone or replaced -- nothing sent: $cmd" "${rev:-unknown}"
       else
         # A delivery failure is distinct on the DURABLE surfaces (a FAILED journal line + gh),
         # so the morning review never reads an undelivered approval as "authorized and ran".
@@ -164,8 +170,9 @@ path to tell the spoke>'."
 # park_sig is the caller's already-captured signature of the park being decided; self-derived when
 # absent so a direct caller still works.
 _decide_permission() {
-  local wt="$1" issue="$2" sig="${3:-}" cmd cmd_display decision kind reason
+  local wt="$1" issue="$2" sig="${3:-}" cmd cmd_display decision kind reason want arc
   cmd="$(extract_pending_command "$wt")"
+  want="$(orca_agent_field "$wt" toolInput 2>/dev/null)"   # the dialog being judged: approve only THIS one
   if [ -z "$cmd" ]; then
     # Unreadable command: cannot classify. Decline it (the reversible action) + warn — never
     # park. The spoke gets a denial and keeps going; the backoff paces any retry. Nothing is
@@ -204,12 +211,16 @@ _decide_permission() {
     stamp_answer_attempt "$issue"
     # Thread the issue + lane + episode so hub-inject's approval_injected delivery event keys on
     # the broker's KNOWN issue (explicit beats the branch-slug fallback) and carries the episode.
-    if AFK_TLOG_ISSUE="$issue" AFK_TLOG_LANE=permission \
-      AFK_TLOG_EPISODE="$(_gb_episode_key "$issue" "$sig")" approve_permission "$wt"; then
+    arc=0
+    AFK_TLOG_ISSUE="$issue" AFK_TLOG_LANE=permission \
+      AFK_TLOG_EPISODE="$(_gb_episode_key "$issue" "$sig")" approve_permission "$wt" "$want" || arc=$?
+    if [ "$arc" -eq 0 ]; then
       log "  approved permission for #$issue"
       afk_emit_decision "$wt" success
       return 0
     fi
+    # Nothing to approve (the dialog went away or was replaced): not a failure, nothing to retry.
+    [ "$arc" -ne 3 ] || { log "  #$issue: the dialog is gone or was replaced -- nothing approved"; return 0; }
     # Delivery failed — warn + retry on the backoff, never park (#241).
     broker_warn_continue "$wt" "$issue" permission "could not deliver the approval to the spoke — will retry" reversible
     return 0
@@ -217,7 +228,7 @@ _decide_permission() {
   # ESCALATE: the fixed rules will not auto-approve this one. The reasoner decides it (#241) —
   # approve a safe/reversible command, or decline an irreversible one and name the reversible
   # path — and warns + journals the taken decision. Never park.
-  _reason_permission "$wt" "$issue" "$cmd" "$reason" "$sig"
+  _reason_permission "$wt" "$issue" "$cmd" "$reason" "$sig" "$want"
 }
 
 # --- programmatic PreToolUse permission decision (issue #253) ------------------
