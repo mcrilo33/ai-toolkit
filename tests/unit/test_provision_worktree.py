@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 import subprocess
 from pathlib import Path
@@ -252,3 +253,163 @@ def test_hub_testmon_baseline_is_prewarmed(hub: Path, wt: Path, stubs: Path) -> 
 
     assert result.returncode == 0, result.stderr
     assert (wt / ".testmondata").read_bytes() == b"baseline"
+
+
+# ── spoke OTel env block (issue #359) ─────────────────────────────────────────
+
+_OTEL_ENDPOINT_VARS = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "BETA_TRACING_ENDPOINT",
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT",
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT",
+)
+_OTEL_OVERRIDES = {
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://x:1",
+    "BETA_TRACING_ENDPOINT": "http://y:2",
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT": "http://z:3",
+}
+WT_LIB = SCRIPT.parent / "worktree-lib.sh"
+
+
+def _otel_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = {k: v for k, v in _GIT_ENV.items() if k not in _OTEL_ENDPOINT_VARS}
+    return {**env, "AI_TOOLKIT_OTEL": "1", **(extra or {})}
+
+
+def _prefix_pairs(run_id: str, body_dir: Path, repo: str, env: dict[str, str]) -> dict[str, str]:
+    """The launch prefix worktree-new/spoke-relaunch splice onto the claude command."""
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{WT_LIB}"; wt_native_otel_prefix "$1" "$2" "$3"',
+            "_",
+            run_id,
+            str(body_dir),
+            repo,
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    return dict(tok.split("=", 1) for tok in shlex.split(result.stdout))
+
+
+def _run_with_otel(
+    hub: Path, wt: Path, stubs: Path, extra: dict[str, str] | None = None, *flags: str
+) -> subprocess.CompletedProcess[str]:
+    env = {**_otel_env(extra), **_orca_env(hub, wt)}
+    return _run(wt, stubs, *flags, env=env)
+
+
+def test_otel_off_writes_no_env_block(hub: Path, wt: Path, stubs: Path) -> None:
+    result = _run(wt, stubs, env={**_orca_env(hub, wt), "AI_TOOLKIT_OTEL": "0"})
+
+    assert result.returncode == 0, result.stderr
+    assert "env" not in _settings(wt)
+
+
+def test_env_block_holds_exactly_the_launch_prefix_pairs(hub: Path, wt: Path, stubs: Path) -> None:
+    result = _run_with_otel(hub, wt, stubs)
+
+    assert result.returncode == 0, result.stderr
+    run_id = (wt / ".ai-toolkit" / "spoke-run-id").read_text().strip()
+    expected = _prefix_pairs(run_id, wt / ".ai-toolkit" / "raw-bodies", "remote", _otel_env())
+    assert _settings(wt)["env"] == expected
+    assert _settings(wt)["env"]["OTEL_RESOURCE_ATTRIBUTES"] == f"spoke_run_id={run_id},repo=remote"
+    assert (wt / ".ai-toolkit" / "raw-bodies").is_dir()
+
+
+def test_env_block_matches_the_prefix_with_overridden_endpoints(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    result = _run_with_otel(hub, wt, stubs, _OTEL_OVERRIDES)
+
+    assert result.returncode == 0, result.stderr
+    run_id = (wt / ".ai-toolkit" / "spoke-run-id").read_text().strip()
+    expected = _prefix_pairs(
+        run_id, wt / ".ai-toolkit" / "raw-bodies", "remote", _otel_env(_OTEL_OVERRIDES)
+    )
+    assert _settings(wt)["env"] == expected
+    assert _settings(wt)["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://x:1"
+
+
+def test_explicit_body_dir_and_repo_are_honoured_and_created(
+    hub: Path, wt: Path, stubs: Path, tmp_path: Path
+) -> None:
+    body_dir = tmp_path / "custom bodies"
+
+    result = _run_with_otel(
+        hub, wt, stubs, None, "--otel-body-dir", str(body_dir), "--repo-name", "named"
+    )
+
+    assert result.returncode == 0, result.stderr
+    run_id = (wt / ".ai-toolkit" / "spoke-run-id").read_text().strip()
+    assert body_dir.is_dir()
+    assert _settings(wt)["env"] == _prefix_pairs(run_id, body_dir, "named", _otel_env())
+
+
+def test_an_empty_repo_name_is_omitted_never_written_empty(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    result = _run_with_otel(hub, wt, stubs, None, "--repo-name", "")
+
+    assert result.returncode == 0, result.stderr
+    resource = _settings(wt)["env"]["OTEL_RESOURCE_ATTRIBUTES"]
+    assert "repo" not in resource
+    assert resource.startswith("spoke_run_id=")
+
+
+def test_env_block_never_carries_secrets(hub: Path, wt: Path, stubs: Path) -> None:
+    secrets = {
+        "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Basic hunter2",
+        "LANGFUSE_SECRET_KEY": "sk-lf-hunter2",
+        "LANGFUSE_PUBLIC_KEY": "pk-lf-hunter2",
+    }
+
+    result = _run_with_otel(hub, wt, stubs, secrets)
+
+    assert result.returncode == 0, result.stderr
+    raw = (wt / ".claude" / "settings.local.json").read_text()
+    assert "hunter2" not in raw
+    assert not set(secrets) & set(_settings(wt)["env"])
+    assert len(_settings(wt)["env"]) == 17
+
+
+def test_env_merge_is_additive_and_idempotent(hub: Path, wt: Path, stubs: Path) -> None:
+    assert _run_with_otel(hub, wt, stubs).returncode == 0
+    path = wt / ".claude" / "settings.local.json"
+    data = json.loads(path.read_text())
+    data["env"]["MY_KEY"] = "mine"
+    path.write_text(json.dumps(data))
+    before = _snapshot(wt)
+
+    result = _run_with_otel(hub, wt, stubs)
+
+    assert result.returncode == 0, result.stderr
+    assert _settings(wt)["env"]["MY_KEY"] == "mine"
+    assert "OTEL_RESOURCE_ATTRIBUTES" in _settings(wt)["env"]
+    assert _snapshot(wt) == before
+
+
+def test_env_pairs_helper_is_the_single_source_of_the_prefix(tmp_path: Path) -> None:
+    env = _otel_env()
+    body_dir = tmp_path / "raw bodies"
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{WT_LIB}"; wt_native_otel_env_pairs "b+1" "$1" "r"',
+            "_",
+            str(body_dir),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    pairs = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    assert pairs == _prefix_pairs("b+1", body_dir, "r", env)
