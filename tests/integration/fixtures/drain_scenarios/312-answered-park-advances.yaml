@@ -12,6 +12,7 @@ timeline:
   - { t: 0, spoke: 312, do: park }
   # The drain answers the park (records the service)...
   - { t: 100, spoke: 312, do: answer }
+  - { t: 150, run: [drain] }
   # ...and the spoke ADVANCES — it resumes working and pushes (a forward transition),
   # never silently re-parking on the same episode (#312).
   - { t: 200, spoke: 312, do: push }
