@@ -1,12 +1,12 @@
-"""Unit tests for shared/hooks/test-select.sh — the tiered, diff-aware selector.
+"""Unit tests for shared/hooks/test-select.sh — the fast-tier pre-push selector.
 
-Issue #19 makes the pre-push hook the single owner of test execution. This
-script classifies the pushed diff and runs nothing / `pytest --testmon` / the
-full suite accordingly, with default-to-full safety (anything not provably
-docs-only or python-only runs the full suite, and testmon-absent falls back to
-the full suite rather than silently skipping).
+Issue #378 makes CI the gate: the local pre-push hook runs only the fast tier —
+mapped/selected tests, the control-plane meta-test and `pytest --testmon` — and
+never the whole suite. Anything that used to escalate to the full suite (an
+unmapped change, testmon absent, an unresolvable range) now runs the mapped tests
+that exist and says that CI is the full gate.
 
-Hermetic, like test_worktree_land.py: a throwaway git repo plus a `pytest` stub
+Hermetic, like the land-script tests: a throwaway git repo plus a `pytest` stub
 on PATH whose `--help` advertises (or hides) `--testmon` and whose normal
 invocation logs `RUN <args>` and exits a chosen code. The diff range git feeds
 the pre-push hook on stdin (`<local ref> <local sha> <remote ref> <remote sha>`)
@@ -56,6 +56,10 @@ def repo(tmp_path: Path) -> Path:
     (r / "README.md").write_text("seed\n")
     _git(r, "add", "README.md")
     _git(r, "commit", "-qm", "chore: seed")
+    # A seeded testmon database (worktree-new copies the hub's baseline in) is what lets the
+    # hook run `--testmon` incrementally; excluded so `_commit`'s `git add -A` never tracks it.
+    (r / ".git" / "info" / "exclude").write_text(".testmondata\n")
+    (r / ".testmondata").write_text("db\n")
     return r
 
 
@@ -76,7 +80,14 @@ def _stdin(local_sha: str, remote_sha: str, ref: str = "refs/heads/feature/x") -
 
 
 def _make_pytest_stub(
-    bindir: Path, runlog: Path, *, testmon: bool, xdist: bool = True, exit_code: int = 0
+    bindir: Path,
+    runlog: Path,
+    *,
+    testmon: bool,
+    xdist: bool = True,
+    exit_code: int = 0,
+    collect_nodes: int = 3,
+    collect_exit: int = 0,
 ) -> None:
     """Install a `pytest` stub on PATH.
 
@@ -102,6 +113,17 @@ def _make_pytest_stub(
         f'    echo "{STUB_ENV_FINGERPRINT}"\n'
         "    exit 0 ;;\n"
         "esac\n"
+        # A `--collect-only` pass (the testmon impact probe) is logged as PROBE, never RUN, so
+        # it cannot satisfy an assertion about the real leg. It lists `collect_nodes` node ids
+        # — but only at `--verbosity=-1`, like real pytest whose `-q`/`-v` addopts reformat it.
+        'for a in "$@"; do\n'
+        '  if [ "$a" = "--collect-only" ]; then\n'
+        f'    printf "PROBE %s\\n" "$*" >> "{runlog}"\n'
+        '    case " $* " in *" --verbosity=-1 "*) ;; *) echo "tests/t.py: 9"; exit 0 ;; esac\n'
+        f'    i=0; while [ "$i" -lt {collect_nodes} ]; do echo "tests/t.py::test_$i"; i=$((i+1)); done\n'
+        f"    exit {collect_exit}\n"
+        "  fi\n"
+        "done\n"
         f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         f'printf "GITDIR=[%s]\\n" "${{GIT_DIR-UNSET}}" >> "{runlog}"\n'
         f"exit {exit_code}\n"
@@ -129,6 +151,7 @@ def _make_python_module_stub(bindir: Path, runlog: Path, *, testmon: bool) -> No
         'echo "  -n numprocesses"; exit 0 ;;\n'
         f'    --version) echo "{STUB_ENV_FINGERPRINT}"; exit 0 ;;\n'
         "  esac\n"
+        '  case " $* " in *" --collect-only "*) echo "tests/t.py::test_0"; exit 0 ;; esac\n'
         f'  printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         "  exit 0\n"
         "fi\n"
@@ -163,6 +186,13 @@ def _make_testmon_modeling_stub(bindir: Path, runlog: Path, *, impact: list[str]
         'echo "  -n numprocesses"; exit 0 ;;\n'
         f'  --version) echo "{STUB_ENV_FINGERPRINT}"; exit 0 ;;\n'
         "esac\n"
+        'for a in "$@"; do\n'
+        '  if [ "$a" = "--collect-only" ]; then\n'
+        f'    printf "PROBE %s\\n" "$*" >> "{runlog}"\n'
+        f'    for f in {impact_words}; do echo "$f::test_x"; done\n'
+        "    exit 0\n"
+        "  fi\n"
+        "done\n"
         f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         "testmon=0\n"
         'ignored=" "\n'
@@ -205,6 +235,11 @@ def _run_select(
         text=True,
         env=env,
     )
+
+
+def _ran_testmon(log: str) -> bool:
+    """True when the REAL testmon leg ran — a `RUN --testmon…` line, never the PROBE line."""
+    return any(ln.startswith("RUN --testmon") for ln in log.splitlines())
 
 
 def _runlog(path: Path) -> str:
@@ -277,7 +312,7 @@ def test_image_change_runs_nothing(repo: Path, tmp_path: Path) -> None:
     assert "RUN" not in _runlog(runlog)
 
 
-# --- the python tier: pytest --testmon (or full when testmon is absent) ----------
+# --- the python tier: pytest --testmon ------------------------------------------
 
 
 def test_python_only_with_testmon_runs_testmon(repo: Path, tmp_path: Path) -> None:
@@ -289,21 +324,9 @@ def test_python_only_with_testmon_runs_testmon(repo: Path, tmp_path: Path) -> No
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)
+    assert _ran_testmon(_runlog(runlog))
 
 
-def test_python_only_without_testmon_runs_full_suite(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=False)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    log = _runlog(runlog)
-    assert "RUN" in log  # the full suite ran
-    assert "--testmon" not in log  # but never via testmon
 
 
 def test_mixed_docs_and_python_runs_testmon(repo: Path, tmp_path: Path) -> None:
@@ -315,7 +338,7 @@ def test_mixed_docs_and_python_runs_testmon(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)  # docs alongside python stay python-tier
+    assert _ran_testmon(_runlog(runlog))  # docs alongside python stay python-tier
 
 
 def test_python_under_docs_runs_testmon(repo: Path, tmp_path: Path) -> None:
@@ -327,113 +350,21 @@ def test_python_under_docs_runs_testmon(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)  # a *.py is python even under docs/
+    assert _ran_testmon(_runlog(runlog))  # a *.py is python even under docs/
 
 
-# --- the full-suite tier: default-to-full safety ---------------------------------
 
 
-def test_full_tier_runs_two_phase_serial_split(repo: Path, tmp_path: Path) -> None:
-    # Issue #328: the FULL suite runs two-phase — the parallel-safe bulk under
-    # `-n auto -m "not serial"`, then the ref-mutating tail single-process under
-    # `-m serial` (never under xdist workers). A shell change forces the FULL tier.
-    base = _rev(repo)
-    tip = _commit(repo, {"scripts/thing.sh": "echo hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    log = _runlog(runlog)
-    assert "RUN -n auto -m not serial\n" in log  # parallel bulk, serial deselected
-    assert "RUN -m serial\n" in log  # serial tail, single-process (no -n)
-    assert "RUN -n auto\n" not in log  # never the old bare full run under xdist
 
 
-def test_full_tier_serial_leg_no_tests_is_green(repo: Path, tmp_path: Path) -> None:
-    # The serial leg exits 5 ("no tests collected") when nothing is marked serial —
-    # a GREEN outcome the two-phase runner normalizes so it never blocks a clean push.
-    base = _rev(repo)
-    tip = _commit(repo, {"scripts/thing.sh": "echo hi\n"})
-    runlog = tmp_path / "run.log"
-    # The serial leg (its argv contains `serial` but not `not`) exits 5; every other
-    # invocation exits 0.
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    (bindir / "pytest").write_text(
-        "#!/bin/sh\n"
-        'case "$1" in\n'
-        '  --help|-h) echo "usage: pytest"; echo "  --testmon"; '
-        'echo "  -n numprocesses"; exit 0 ;;\n'
-        f'  --version) echo "{STUB_ENV_FINGERPRINT}"; exit 0 ;;\n'
-        "esac\n"
-        f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
-        "is_serial=0; is_not=0\n"
-        'for a in "$@"; do\n'
-        '  [ "$a" = "serial" ] && is_serial=1\n'
-        '  [ "$a" = "not serial" ] && is_not=1\n'
-        "done\n"
-        '[ "$is_serial" = "1" ] && [ "$is_not" = "0" ] && exit 5\n'
-        "exit 0\n"
-    )
-    (bindir / "pytest").chmod(0o755)
-
-    proc = _run_select(repo, _stdin(tip, base), bindir)
-
-    assert proc.returncode == 0, proc.stderr + "\n" + _runlog(runlog)
 
 
-def test_shell_change_runs_full_suite(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"scripts/do.sh": "#!/bin/sh\necho hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    log = _runlog(runlog)
-    assert "RUN" in log
-    assert "--testmon" not in log  # .sh forces the full suite even with testmon present
 
 
-def test_yaml_config_runs_full_suite(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN" in _runlog(runlog)
-    assert "--testmon" not in _runlog(runlog)
 
 
-def test_unrecognized_extension_runs_full_suite(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"notes.txt": "plain text, not a doc type\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN" in _runlog(runlog)
-    assert "--testmon" not in _runlog(runlog)
 
 
-def test_mixed_python_and_shell_runs_full_suite(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n", "scripts/do.sh": "echo hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "--testmon" not in _runlog(runlog)  # one non-py file downgrades to full
 
 
 # --- the git-hook env strip reaches the pytest child (issue #30) -----------------
@@ -442,7 +373,7 @@ def test_runner_child_does_not_inherit_leaked_git_dir(repo: Path, tmp_path: Path
     # Classification still resolves the diff under it, but the pytest child must
     # run with GIT_DIR stripped so a git-shelling test can't reach the real repo.
     base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})  # non-py → FULL tier
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})  # python → testmon leg
     runlog = tmp_path / "run.log"
     _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
 
@@ -489,7 +420,7 @@ def test_new_branch_uses_merge_base_fallback(repo: Path, tmp_path: Path) -> None
     proc = _run_select(repo, _stdin(tip, ZERO_SHA, "refs/heads/feature/new"), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)
+    assert _ran_testmon(_runlog(runlog))
 
 
 def test_branch_deletion_runs_nothing(repo: Path, tmp_path: Path) -> None:
@@ -559,7 +490,7 @@ def test_branch_and_tag_mix_runs_the_suite(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, stdin, tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog), "a branch+tag push still tests the branch"
+    assert _ran_testmon(_runlog(runlog)), "a branch+tag push still tests the branch"
 
 
 # --- no runner but tests are demanded: fail closed (issue #213) -------------------
@@ -607,9 +538,8 @@ def test_no_pytest_blocks_python_diff(repo: Path, tmp_path: Path) -> None:
 
 
 def test_no_pytest_blocks_full_suite_demand(repo: Path, tmp_path: Path) -> None:
-    # An unmapped shell change escalates to the full suite; with no runner that
-    # full-suite demand also fails closed (issue #213) — a non-python diff that
-    # needs tests is no different from a python one.
+    # A non-python change that demands tests fails closed with no runner too
+    # (issue #213) — it is no different from a python one.
     base = _rev(repo)
     tip = _commit(repo, {"scripts/unmapped.sh": "echo hi\n"})
     sandbox = _make_no_pytest_sandbox(tmp_path)
@@ -629,9 +559,8 @@ def test_no_pytest_blocks_full_suite_demand(repo: Path, tmp_path: Path) -> None:
 
 
 def test_no_pytest_blocks_selected_diff(repo: Path, tmp_path: Path) -> None:
-    # A mapped non-python change resolves to the SELECTED tier; with no runner it
-    # fails closed too, proving the block is tier-agnostic across all three
-    # test-demanding tiers (issue #213), not just PYTHON/FULL.
+    # A mapped non-python change selects its tests; with no runner it fails closed
+    # too, proving the block is not specific to python diffs (issue #213).
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
     base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/do.sh": "#!/bin/sh\necho hi\n"})
@@ -715,7 +644,7 @@ def test_module_runner_form_uses_testmon(repo: Path, tmp_path: Path) -> None:
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)
+    assert _ran_testmon(_runlog(runlog))
 
 
 # --- env escape hatches (threaded from worktree-land's --skip-tests/--test-cmd) ---
@@ -779,243 +708,37 @@ def test_failing_suite_blocks_with_nonzero_exit(repo: Path, tmp_path: Path) -> N
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 1  # non-zero exit is what aborts the pre-push
-    assert "--testmon" in _runlog(runlog)
+    assert _ran_testmon(_runlog(runlog))
 
 
-# --- green-tree stamps: never re-run a suite already proven on this tree (#122) ---
 
 
-def _stamp_path(repo: Path) -> Path:
-    """The stamp file the gate would mint for the repo's current HEAD tree."""
-    tree = _git(repo, "rev-parse", "HEAD^{tree}").strip()
-    return repo / ".git" / ".gate-stamps" / tree
 
 
-def test_gate_pass_mints_stamp_with_tier_and_env(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    content = _stamp_path(repo).read_text()
-    assert "tier=testmon\n" in content
-    assert f"env={STUB_ENV_FINGERPRINT}\n" in content
 
 
-def test_python_without_testmon_mints_full_stamp(repo: Path, tmp_path: Path) -> None:
-    # The tier stamped is the tier that RAN: a python diff without testmon falls
-    # back to the full suite, so its stamp records the stronger proof.
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=False)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "tier=full\n" in _stamp_path(repo).read_text()
 
 
-def test_second_run_same_tree_equal_demand_skips_without_pytest(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # first run mints
-    after_first = _runlog(runlog)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert _runlog(runlog) == after_first  # pytest was NOT invoked again
-    assert "green-tree stamp" in proc.stderr  # loud, distinct skip note …
-    assert "TEST_SELECT_SKIP" not in proc.stderr  # … never mistakable for the hatch
 
 
-def test_stronger_stamp_covers_weaker_demand(repo: Path, tmp_path: Path) -> None:
-    # A full-tier stamp (from a .sh-bearing push) covers a later testmon-tier
-    # demand on the very same tree.
-    base = _rev(repo)
-    py_tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    sh_tip = _commit(repo, {"scripts/do.sh": "#!/bin/sh\necho hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(sh_tip, base), tmp_path / "bin")  # FULL run mints full
-    after_first = _runlog(runlog)
-
-    # Same working tree (HEAD = sh_tip), but this push's range is python-only,
-    # so the gate demands only testmon — the full stamp is at least as strong.
-    proc = _run_select(repo, _stdin(py_tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert _runlog(runlog) == after_first
-    assert "green-tree stamp" in proc.stderr
 
 
-def test_weaker_stamp_stronger_demand_runs_and_upgrades(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # testmon run mints testmon
-    after_first = _runlog(runlog)
-
-    # An unresolvable remote sha forces the FULL tier (cannot prove safe) — a
-    # stronger demand than the testmon stamp, so the suite must run …
-    proc = _run_select(repo, _stdin(tip, "deadbeef" * 5), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert len(_runlog(runlog)) > len(after_first)  # … and it did
-    assert "tier=full\n" in _stamp_path(repo).read_text()  # … and upgraded the stamp
 
 
-def test_changed_tracked_file_yields_new_key_and_no_skip(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # mints for this tree
-    after_first = _runlog(runlog)
-
-    tip2 = _commit(repo, {"tests/test_mod.py": "def test_x(): pass\n"})
-    proc = _run_select(repo, _stdin(tip2, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert len(_runlog(runlog)) > len(after_first)  # new tree ⇒ no skip
-    assert _stamp_path(repo).is_file()  # and the new tree got its own stamp
 
 
-def test_env_fingerprint_mismatch_never_skips(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # mints with the stub env
-    stamp = _stamp_path(repo)
-    stamp.write_text(
-        stamp.read_text().replace(f"env={STUB_ENV_FINGERPRINT}", "env=py3.9-elsewhere")
-    )
-    after_first = _runlog(runlog)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert len(_runlog(runlog)) > len(after_first)  # a wrong env re-proves, never skips
 
 
-def test_skip_env_does_not_mint(repo: Path, tmp_path: Path) -> None:
-    # TEST_SELECT_SKIP behaves exactly as today: nothing runs, nothing is proven,
-    # so no stamp may appear.
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(
-        repo, _stdin(tip, base), tmp_path / "bin", env_extra={"TEST_SELECT_SKIP": "1"}
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert not _stamp_path(repo).exists()
 
 
-def test_cmd_env_neither_consumes_nor_mints(repo: Path, tmp_path: Path) -> None:
-    # TEST_SELECT_CMD behaves exactly as today: the custom command runs even when
-    # a covering stamp exists (no consume), and its pass proves an unknown tier
-    # (no mint/upgrade).
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # mints testmon
-    custom = tmp_path / "custom.log"
-
-    proc = _run_select(
-        repo,
-        _stdin(tip, base),
-        tmp_path / "bin",
-        env_extra={"TEST_SELECT_CMD": f"echo ran >> {custom}"},
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert custom.exists() and "ran" in custom.read_text()  # ran despite the stamp
-    assert "tier=testmon\n" in _stamp_path(repo).read_text()  # and did not upgrade it
 
 
-def test_dirty_tree_does_not_consume_stamp(repo: Path, tmp_path: Path) -> None:
-    # Deviation-1 soundness guard: the suite runs against the working tree, so a
-    # dirty checkout must not be covered by a stamp for HEAD's (different) tree.
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # clean run mints
-    after_first = _runlog(runlog)
-    (repo / "pkg" / "mod.py").write_text("x = 2  # uncommitted\n")
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert len(_runlog(runlog)) > len(after_first)  # the suite ran
-    assert "working tree dirty" in proc.stderr  # logged distinctly
 
 
-def test_dirty_tree_does_not_mint(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    (repo / "pkg" / "mod.py").write_text("x = 2  # uncommitted\n")
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN" in _runlog(runlog)  # the suite still ran normally
-    assert not _stamp_path(repo).exists()  # but proved nothing about HEAD's tree
-    assert "working tree dirty" in proc.stderr
 
 
-def test_failing_suite_does_not_mint(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, exit_code=1)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 1
-    assert not _stamp_path(repo).exists()  # only a green run mints
 
 
-def test_missing_stamp_lib_degrades_to_running_the_suite(repo: Path, tmp_path: Path) -> None:
-    # An installed hook copy that predates gate-stamp.sh (the #45 stale-hook trap)
-    # must behave exactly as today: run the suite, mint nothing, crash nothing.
-    hookdir = tmp_path / "installed"
-    (hookdir / "lib").mkdir(parents=True)
-    src = TEST_SELECT.parent
-    shutil.copy(TEST_SELECT, hookdir / "test-select.sh")
-    shutil.copy(src / "lib" / "utils.sh", hookdir / "lib" / "utils.sh")
-    shutil.copy(src / "lib" / "telemetry.sh", hookdir / "lib" / "telemetry.sh")
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = subprocess.run(
-        ["bash", str(hookdir / "test-select.sh")],
-        cwd=str(repo),
-        input=_stdin(tip, base),
-        capture_output=True,
-        text=True,
-        env={**_GIT_ENV, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"},
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)  # today's behavior, unchanged
-    assert not _stamp_path(repo).exists()  # stamps silently disabled
 
 
 def _write_ref_test(repo: Path, test_rel: str, script_basename: str) -> None:
@@ -1105,25 +828,13 @@ def test_mixed_mirror_test_runs_exactly_once(repo: Path, tmp_path: Path) -> None
     assert "RAN:tests/unit/test_test_reverse_index.py\n" in log
 
 
-def test_unmapped_shell_change_escalates_to_full(repo: Path, tmp_path: Path) -> None:
-    # A tests/ dir exists but nothing references new.sh: conservative fallback.
-    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
-    base = _commit(repo, {}, "test: seed referencing tests")
-    tip = _commit(repo, {"scripts/new.sh": "echo new\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # the full suite, not a selection
 
 
 def test_unmapped_shell_change_emits_witness_warning(repo: Path, tmp_path: Path) -> None:
     # #191 witness signal (feeds #187's fail-open audit): a changed *.sh that no
     # test references is a bash blind spot — testmon tracks python imports only, so
-    # nothing re-exercises the script by subprocess/source. It still escalates to
-    # FULL, but the gate must emit a distinct, greppable warning that names it.
+    # nothing re-exercises the script by subprocess/source. The gate must emit a
+    # distinct, greppable warning that names it.
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")  # tests/ exists, refs do.sh only
     base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/new.sh": "echo new\n"})  # unmapped shell change
@@ -1133,9 +844,7 @@ def test_unmapped_shell_change_emits_witness_warning(repo: Path, tmp_path: Path)
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto -m not serial\n" in _runlog(
-        runlog
-    )  # conservative fallback: FULL still runs
+    assert "RUN -n auto -m not serial\n" not in _runlog(runlog)  # never the full suite
     assert "witness: unmapped-shell" in proc.stderr  # the greppable audit signal …
     assert "scripts/new.sh" in proc.stderr  # … naming the offending script
 
@@ -1172,8 +881,8 @@ def test_mapped_shell_change_emits_no_witness_warning(repo: Path, tmp_path: Path
 
 
 def test_unmapped_nonshell_change_emits_no_shell_witness(repo: Path, tmp_path: Path) -> None:
-    # The witness is scoped to shell: an unmapped .yml escalates to FULL but is not
-    # the testmon-blind bash blind spot, so it must not raise the shell signal.
+    # The witness is scoped to shell: an unmapped .yml is not the testmon-blind
+    # bash blind spot, so it must not raise the shell signal.
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
     base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"ci/build.yml": "on: push\n"})
@@ -1201,19 +910,6 @@ def test_exempt_shell_change_emits_no_witness_warning(repo: Path, tmp_path: Path
     assert "witness: unmapped-shell" not in proc.stderr
 
 
-def test_mixed_mapped_and_unmapped_escalates_to_full(repo: Path, tmp_path: Path) -> None:
-    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
-    base = _commit(repo, {}, "test: seed referencing tests")
-    tip = _commit(repo, {"scripts/do.sh": "echo hi\n", "scripts/new.sh": "echo new\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    log = _runlog(runlog)
-    assert "RUN -n auto -m not serial\n" in log
-    assert "RUN tests/unit/test_do.py\n" not in log  # full subsumes the selection
 
 
 def test_exempt_file_change_runs_nothing(repo: Path, tmp_path: Path) -> None:
@@ -1240,23 +936,10 @@ def test_exempt_directory_prefix_covers_children(repo: Path, tmp_path: Path) -> 
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "--testmon" in log  # python tier preserved for the py part
+    assert _ran_testmon(log)  # python tier preserved for the py part
     assert "RUN \n" not in log  # the exempt settings/ file never escalates
 
 
-def test_exempt_list_change_itself_escalates_to_full(repo: Path, tmp_path: Path) -> None:
-    # Editing the exempt list is high-stakes: its basename can never be a
-    # filename-shaped token, so it is unmapped by construction → full suite.
-    _commit(repo, {".test-select-exempt": "notes.txt\n"})
-    base = _rev(repo)
-    tip = _commit(repo, {".test-select-exempt": "notes.txt\nLICENSE\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto -m not serial\n" in _runlog(runlog)
 
 
 def test_selected_failing_suite_blocks_push(repo: Path, tmp_path: Path) -> None:
@@ -1271,54 +954,7 @@ def test_selected_failing_suite_blocks_push(repo: Path, tmp_path: Path) -> None:
     assert proc.returncode == 7  # a red selection aborts the push
 
 
-def test_selected_pass_mints_selected_stamp_with_set(repo: Path, tmp_path: Path) -> None:
-    # #123-D: a green SELECTED run is a durable proof of exactly the set that
-    # ran — the stamp records tier AND set so it can never cover a different
-    # selection (or a testmon demand) on the same tree.
-    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
-    base = _commit(repo, {}, "test: seed referencing tests")
-    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    content = _stamp_path(repo).read_text()
-    assert "tier=selected-set\n" in content
-    assert "set=tests/unit/test_do.py\n" in content
-
-
-def test_missing_reverse_index_lib_degrades_to_full(repo: Path, tmp_path: Path) -> None:
-    # An installed hook copy predating lib/test-reverse-index.sh (the #45
-    # stale-hook trap) must behave exactly as today: mapped or not, a shell
-    # change runs the full suite.
-    hookdir = tmp_path / "installed"
-    (hookdir / "lib").mkdir(parents=True)
-    src = TEST_SELECT.parent
-    shutil.copy(TEST_SELECT, hookdir / "test-select.sh")
-    for lib in ("utils.sh", "telemetry.sh", "gate-stamp.sh"):
-        shutil.copy(src / "lib" / lib, hookdir / "lib" / lib)
-    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
-    base = _commit(repo, {}, "test: seed referencing tests")
-    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = subprocess.run(
-        ["bash", str(hookdir / "test-select.sh")],
-        cwd=str(repo),
-        input=_stdin(tip, base),
-        capture_output=True,
-        text=True,
-        env={**_GIT_ENV, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"},
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # today's behavior, unchanged
-
-
-# --- the enforcement meta-test rides every pytest-running tier (#123) ------------
+# --- the enforcement meta-test rides every push that changes non-doc files (#123) --
 
 META_NODE = "tests/unit/test_test_reverse_index.py::TestControlPlaneCoverage"
 
@@ -1344,19 +980,6 @@ def test_selected_tier_appends_meta_test(repo: Path, tmp_path: Path) -> None:
     assert f"RUN -n auto tests/unit/test_do.py {META_NODE}\n" in _runlog(runlog)
 
 
-def test_python_tier_appends_meta_test_invocation(repo: Path, tmp_path: Path) -> None:
-    _write_meta_stub(repo)
-    base = _commit(repo, {}, "test: seed meta test")
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    log = _runlog(runlog)
-    assert "RUN --testmon\n" in log
-    assert f"RUN {META_NODE}\n" in log  # separate invocation, never inside --testmon
 
 
 def test_python_tier_without_meta_file_appends_nothing(repo: Path, tmp_path: Path) -> None:
@@ -1371,175 +994,27 @@ def test_python_tier_without_meta_file_appends_nothing(repo: Path, tmp_path: Pat
     assert "TestControlPlaneCoverage" not in _runlog(runlog)  # synced repos unaffected
 
 
-def test_full_tier_does_not_append_meta_test(repo: Path, tmp_path: Path) -> None:
-    # The full suite already contains the meta-test; a second invocation would
-    # double-run it.
-    _write_meta_stub(repo)
-    base = _commit(repo, {}, "test: seed meta test")
-    tip = _commit(repo, {"scripts/unmapped.sh": "echo hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    log = _runlog(runlog)
-    assert "RUN -n auto -m not serial\n" in log
-    assert "TestControlPlaneCoverage" not in log
 
 
-def test_script_under_docs_dir_is_never_a_doc(repo: Path, tmp_path: Path) -> None:
-    # C-review finding: shared/hooks/docs/helper.sh matched is_doc's */docs/*
-    # before mapping, landing an unreferenced control-plane script with a green
-    # gate while the meta-test claims the path — red for the NEXT pusher. A
-    # script suffix is never docs, wherever it lives.
-    base = _rev(repo)
-    tip = _commit(repo, {"shared/hooks/docs/helper.sh": "#!/bin/sh\necho hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # unmapped script → FULL, never NOTHING
 
 
-# --- selected-tier stamps: consume and mint with the set that ran (#123-D) --------
 
 
-def test_identical_selected_repush_consumes_stamp(repo: Path, tmp_path: Path) -> None:
-    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
-    base = _commit(repo, {}, "test: seed referencing tests")
-    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # mints selected+set
-    after_first = _runlog(runlog)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert _runlog(runlog) == after_first  # pytest not invoked again
-    assert "green-tree stamp" in proc.stderr
 
 
-def test_different_selection_same_tree_runs(repo: Path, tmp_path: Path) -> None:
-    # Two pushes with different diffs against the SAME working tree: the stamp
-    # from the first selection must not cover the second (different set).
-    _commit(
-        repo,
-        {
-            "tests/unit/test_one.py": '"""Covers one.sh."""\n',
-            "tests/unit/test_two.py": '"""Covers two.sh."""\n',
-        },
-        "test: seed referencing tests",
-    )
-    base = _rev(repo)
-    c1 = _commit(repo, {"scripts/one.sh": "echo 1\n"})
-    c2 = _commit(repo, {"scripts/two.sh": "echo 2\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(c2, c1), tmp_path / "bin")  # mints set={test_two}
-    after_first = _runlog(runlog)
-
-    proc = _run_select(repo, _stdin(c1, base), tmp_path / "bin")  # demands {test_one}
-
-    assert proc.returncode == 0, proc.stderr
-    assert len(_runlog(runlog)) > len(after_first)  # no unsound cover: it ran
-    assert "RUN -n auto tests/unit/test_one.py" in _runlog(runlog)
 
 
-def test_python_push_after_selected_stamp_still_runs_testmon(repo: Path, tmp_path: Path) -> None:
-    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
-    base = _commit(repo, {}, "test: seed referencing tests")
-    c1 = _commit(repo, {"pkg/mod.py": "x = 1\n"})
-    c2 = _commit(repo, {"scripts/do.sh": "echo hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(c2, c1), tmp_path / "bin")  # selected stamp for tree(c2)
-    after_first = _runlog(runlog)
-
-    proc = _run_select(repo, _stdin(c1, base), tmp_path / "bin")  # py-only: testmon
-
-    assert proc.returncode == 0, proc.stderr
-    assert len(_runlog(runlog)) > len(after_first)  # selected never covers testmon
-    assert "--testmon" in _runlog(runlog)
 
 
-def test_full_stamp_covers_selected_demand_and_skips(repo: Path, tmp_path: Path) -> None:
-    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
-    base = _commit(repo, {}, "test: seed referencing tests")
-    c1 = _commit(repo, {"scripts/do.sh": "echo hi\n"})
-    c2 = _commit(repo, {"scripts/unmapped.sh": "echo new\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(c2, c1), tmp_path / "bin")  # unmapped → FULL mints full
-    after_first = _runlog(runlog)
-
-    proc = _run_select(repo, _stdin(c1, base), tmp_path / "bin")  # selected demand
-
-    assert proc.returncode == 0, proc.stderr
-    assert _runlog(runlog) == after_first  # full proof covers any selection
-    assert "green-tree stamp" in proc.stderr
 
 
-def test_mixed_selected_green_mints_testmon_flag_and_repush_skips(
-    repo: Path, tmp_path: Path
-) -> None:
-    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
-    base = _commit(repo, {}, "test: seed referencing tests")
-    tip = _commit(repo, {"scripts/do.sh": "echo hi\n", "pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-    after_first = _runlog(runlog)
-
-    content = _stamp_path(repo).read_text()
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert "tier=selected-set\n" in content
-    assert "testmon=1\n" in content  # the mixed run proved testmon too
-    assert proc.returncode == 0, proc.stderr
-    assert _runlog(runlog) == after_first  # identical mixed re-push skips
 
 
 # --- review-carryover pins from subtask B (verified by probe, now pinned) ---------
 
 
-def test_mixed_diff_without_testmon_falls_back_to_full(repo: Path, tmp_path: Path) -> None:
-    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
-    base = _commit(repo, {}, "test: seed referencing tests")
-    tip = _commit(repo, {"scripts/do.sh": "echo hi\n", "pkg/mod.py": "x = 1\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=False)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    log = _runlog(runlog)
-    assert "RUN -n auto -m not serial\n" in log  # the python part demands the full suite
-    assert "--testmon" not in log
-    assert "RUN tests/unit/test_do.py" not in log  # full subsumes the selection
 
 
-def test_mapping_to_vanished_test_escalates_full(repo: Path, tmp_path: Path) -> None:
-    # A poisoned cache (clean tests/, mapping names a nonexistent test) must
-    # escalate, not run a selection that proves nothing.
-    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
-    base = _commit(repo, {}, "test: seed referencing tests")
-    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # builds the cache
-    cache = repo / ".git" / ".test-reverse-index" / _reverse_index_key(repo)
-    cache.write_text("do.sh\ttests/unit/test_gone.py\n")
-    _stamp_path(repo).unlink(missing_ok=True)  # drop any stamp so the tier re-decides
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # escalated to full
-    assert "mapped test missing" in proc.stderr
 
 
 def test_exempt_entry_cannot_hide_mapped_coverage(repo: Path, tmp_path: Path) -> None:
@@ -1572,66 +1047,18 @@ def test_exempt_only_diff_notes_exemption(repo: Path, tmp_path: Path) -> None:
     assert "exempt" in proc.stderr  # the audit trail names the real reason
 
 
-def test_missing_lib_ignores_exempt_entries_and_runs_full(repo: Path, tmp_path: Path) -> None:
-    # E relocation pin: the exempt parser lives in lib/test-reverse-index.sh;
-    # without the lib (a stale installed hook) there are no exemptions — an
-    # exempt-only diff escalates to FULL instead of skipping. Conservative,
-    # like the index degradation.
-    hookdir = tmp_path / "installed"
-    (hookdir / "lib").mkdir(parents=True)
-    src = TEST_SELECT.parent
-    shutil.copy(TEST_SELECT, hookdir / "test-select.sh")
-    for lib in ("utils.sh", "telemetry.sh", "gate-stamp.sh"):
-        shutil.copy(src / "lib" / lib, hookdir / "lib" / lib)
-    _commit(repo, {".test-select-exempt": "notes.txt\n"}, "chore: exempt notes")
-    base = _rev(repo)
-    tip = _commit(repo, {"notes.txt": "exempt change\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = subprocess.run(
-        ["bash", str(hookdir / "test-select.sh")],
-        cwd=str(repo),
-        input=_stdin(tip, base),
-        capture_output=True,
-        text=True,
-        env={**_GIT_ENV, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"},
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # FULL, never a silent exempt skip
 
 
-# ── Part 1 (issue #276): pytest-xdist on the non-testmon legs ────────────────────
-# The FULL suite and the SELECTED mapped-files leg are I/O-bound and embarrassingly
-# parallel, so test-select.sh threads `-n auto` onto them. The `--testmon` legs stay
+# ── Part 1 (issue #276): pytest-xdist on the selected leg ────────────────────────
+# The SELECTED mapped-files leg is I/O-bound and embarrassingly parallel, so
+# test-select.sh threads `-n auto` onto it. The `--testmon` leg stays
 # single-process — testmon serializes a single-writer DB and does not compose with
 # xdist (`pytest --testmon -n auto` is unsupported). The runlog records each leg's
 # argv as `RUN <args>`, so these pin exactly which legs got parallelized.
 
 
-def test_full_suite_runs_under_xdist(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"scripts/thing.sh": "echo hi\n"})  # unmapped shell → FULL
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto -m not serial\n" in _runlog(runlog)  # the full suite, parallelized
 
 
-def test_python_without_testmon_full_suite_runs_under_xdist(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})  # python, but no testmon → FULL
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=False)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "RUN -n auto -m not serial\n" in _runlog(runlog)
 
 
 def test_selected_mapped_leg_runs_under_xdist(repo: Path, tmp_path: Path) -> None:
@@ -1681,23 +1108,6 @@ def test_testmon_leg_is_never_parallelized(repo: Path, tmp_path: Path) -> None:
     assert "-n auto" not in log  # … and was never parallelized
 
 
-def test_full_suite_degrades_to_single_process_without_xdist(repo: Path, tmp_path: Path) -> None:
-    # Graceful degrade (issue #276): a runner whose `--help` does not advertise
-    # pytest-xdist runs the FULL suite single-process — the gate never blocks a push
-    # on `pytest: unrecognized -n` when the plugin is absent.
-    base = _rev(repo)
-    tip = _commit(repo, {"scripts/thing.sh": "echo hi\n"})  # unmapped shell → FULL
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, xdist=False)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    log = _runlog(runlog)
-    # Two-phase (#328) still applies without xdist — just no `-n auto` on the bulk leg.
-    assert "RUN -m not serial\n" in log  # bulk leg, single-process, no -n auto
-    assert "RUN -m serial\n" in log  # serial tail
-    assert "-n auto" not in log
 
 
 # ── Issue #326: the shell source-dependency graph prunes lib changes ─────────────
@@ -1729,20 +1139,6 @@ def test_lib_only_diff_maps_via_source_graph_to_selected(repo: Path, tmp_path: P
     assert "RUN -n auto\n" not in log  # NOT the full suite
 
 
-def test_unmapped_lib_change_still_escalates_to_full(repo: Path, tmp_path: Path) -> None:
-    # AC3: a lib with no test and no tested dependent has no mapping — the push
-    # escalates to the full suite, exactly as before the graph.
-    base = _rev(repo)
-    tip = _commit(repo, {"shared/hooks/lib/orphan.sh": "#!/bin/sh\n"})
-    runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
-
-    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
-
-    assert proc.returncode == 0, proc.stderr
-    log = _runlog(runlog)
-    assert "RUN -n auto -m not serial\n" in log  # FULL, two-phase serial split
-    assert "tests/unit/" not in log  # no phantom selection
 
 
 # --- #334: persistent per-project config (durable TEST_SELECT_SKIP/CMD) ----------
@@ -1828,3 +1224,374 @@ def test_live_env_cmd_wins_over_persistent(repo: Path, tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     assert envlog.exists() and "env" in envlog.read_text()  # live env command ran
     assert not persist.exists()  # persistent config command did NOT run
+
+
+# --- CI is the gate (#378): the local hook never runs the whole suite ---------------
+# Every diff shape that used to escalate to the full suite now runs only what is mapped
+# plus the meta-test and says that CI is the full gate. The stub runner records every
+# invocation, so "never the whole suite" is asserted on the recorded argv: each RUN
+# line must name a mapped file, the meta node, or testmon — never a bare/`-m` run.
+
+_ESCALATING_DIFFS = {
+    "unmapped-shell": {"scripts/new.sh": "echo new\n"},
+    "unmapped-yaml": {"ci/build.yml": "on: push\n"},
+    "unmapped-extension": {"notes.txt": "plain text, not a doc type\n"},
+    "python-and-unmapped-shell": {"pkg/mod.py": "x = 1\n", "scripts/new.sh": "echo new\n"},
+    "exempt-list-edit": {".test-select-exempt": "notes.txt\n"},
+    "lib-without-dependents": {"shared/hooks/lib/orphan.sh": "#!/bin/sh\n"},
+}
+
+
+def _assert_only_fast_tier_ran(log: str) -> None:
+    runs = [ln for ln in log.splitlines() if ln.startswith("RUN ")]
+    assert runs, "the fast tier should still run the meta-test"
+    for line in runs:
+        assert "-m not serial" not in line and "-m serial" not in line, line
+        assert line.strip() != "RUN" and line != "RUN -n auto", f"bare whole-suite run: {line}"
+        assert META_NODE in line or "--testmon" in line or "tests/unit/test_" in line, line
+
+
+@pytest.mark.parametrize("files", _ESCALATING_DIFFS.values(), ids=_ESCALATING_DIFFS.keys())
+def test_escalating_diff_runs_only_the_fast_tier(
+    repo: Path, tmp_path: Path, files: dict[str, str]
+) -> None:
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    _write_meta_stub(repo)
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, files)
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    _assert_only_fast_tier_ran(_runlog(runlog))
+
+
+def test_unmapped_change_says_ci_is_the_full_gate(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"scripts/new.sh": "echo new\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "CI is the full gate" in proc.stderr
+    assert "scripts/new.sh" in proc.stderr
+    assert "RUN" not in _runlog(runlog)  # no mapped tests and no meta file: nothing to run
+
+
+def test_python_without_testmon_runs_meta_and_says_ci_is_the_full_gate(
+    repo: Path, tmp_path: Path
+) -> None:
+    _write_meta_stub(repo)
+    base = _commit(repo, {}, "test: seed meta test")
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=False)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert f"RUN -n auto {META_NODE}\n" in log
+    assert "--testmon" not in log
+    assert "CI is the full gate" in proc.stderr
+
+
+def test_unresolvable_range_runs_the_meta_test_and_says_ci_is_the_full_gate(
+    repo: Path, tmp_path: Path
+) -> None:
+    _write_meta_stub(repo)
+    tip = _commit(repo, {}, "test: seed meta test")
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    bogus_remote = "1" * 40  # a remote sha this clone has never seen
+
+    proc = _run_select(repo, _stdin(tip, bogus_remote), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"RUN -n auto {META_NODE}\n" in _runlog(runlog)
+    assert "range unresolved" in proc.stderr
+    assert "CI is the full gate" in proc.stderr
+
+
+def test_python_change_runs_testmon_and_the_meta_node_once(repo: Path, tmp_path: Path) -> None:
+    _write_meta_stub(repo)
+    base = _commit(repo, {}, "test: seed meta test")
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert f"RUN -n auto {META_NODE}\n" in log
+    # testmon never double-runs the meta file: it is --ignore'd, never an explicit node.
+    assert "RUN --testmon --ignore=tests/unit/test_test_reverse_index.py\n" in log
+
+
+def test_mapping_to_a_vanished_test_is_skipped_not_escalated(repo: Path, tmp_path: Path) -> None:
+    # A poisoned cache (mapping names a nonexistent test) must not run a phantom file
+    # and must not escalate to the full suite either.
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # builds the cache
+    cache = repo / ".git" / ".test-reverse-index" / _reverse_index_key(repo)
+    cache.write_text("do.sh\ttests/unit/test_gone.py\n")
+    runlog.unlink()
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "mapped test tests/unit/test_gone.py is missing" in proc.stderr
+    assert "test_gone.py" not in _runlog(runlog)
+    assert "-m not serial" not in _runlog(runlog)
+
+
+def test_missing_reverse_index_lib_maps_nothing(repo: Path, tmp_path: Path) -> None:
+    # An installed hook copy predating lib/test-reverse-index.sh (the #45 stale-hook
+    # trap): nothing maps, so no selection runs — and nothing escalates to the suite.
+    hookdir = tmp_path / "installed"
+    (hookdir / "lib").mkdir(parents=True)
+    src = TEST_SELECT.parent
+    shutil.copy(TEST_SELECT, hookdir / "test-select.sh")
+    for lib in ("utils.sh", "telemetry.sh"):
+        shutil.copy(src / "lib" / lib, hookdir / "lib" / lib)
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = subprocess.run(
+        ["bash", str(hookdir / "test-select.sh")],
+        cwd=str(repo),
+        input=_stdin(tip, base),
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "test_do.py" not in _runlog(runlog)
+    assert "-m not serial" not in _runlog(runlog)
+
+
+def test_selected_leg_degrades_to_single_process_without_xdist(
+    repo: Path, tmp_path: Path
+) -> None:
+    # A runner whose `--help` does not advertise pytest-xdist runs the selection
+    # single-process — the gate never blocks a push on `unrecognized -n`.
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, xdist=False)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN tests/unit/test_do.py\n" in _runlog(runlog)
+    assert "-n auto" not in _runlog(runlog)
+
+
+def test_the_gate_mints_no_green_tree_stamp(repo: Path, tmp_path: Path) -> None:
+    # Stamps cached "this tree already ran the full suite locally" — a proof the gate no
+    # longer produces. A green run must leave the stamp dir absent.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert not (repo / ".git" / ".gate-stamps").exists()
+
+
+def test_python_change_without_a_testmon_database_never_seeds_one(
+    repo: Path, tmp_path: Path
+) -> None:
+    # A first `pytest --testmon` in a tree with no database executes the WHOLE suite to
+    # build it. The fast tier must never do that: it skips the leg and leaves the full run
+    # to CI, whatever else it runs.
+    (repo / ".testmondata").unlink()
+    _write_meta_stub(repo)
+    base = _commit(repo, {}, "test: seed meta test")
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "--testmon" not in _runlog(runlog)
+    assert f"RUN -n auto {META_NODE}\n" in _runlog(runlog)  # the cheap selection still ran
+    assert "no testmon database" in proc.stderr and "CI is the full gate" in proc.stderr
+
+
+def test_testmon_database_path_follows_testmon_datafile(repo: Path, tmp_path: Path) -> None:
+    (repo / ".testmondata").unlink()
+    elsewhere = tmp_path / "baseline.db"
+    elsewhere.write_text("db\n")
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(
+        repo, _stdin(tip, base), tmp_path / "bin", env_extra={"TESTMON_DATAFILE": str(elsewhere)}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _ran_testmon(_runlog(runlog))
+
+
+# --- the testmon leg is bounded: never a serial run of most of the suite (#378, #375) ---
+# A stale / invalidated / unrepresentative database makes `pytest --testmon` select most of
+# the suite, and testmon cannot run under xdist: one tests-only push ran ~5800 tests serially
+# for 34 minutes. The leg first asks testmon what it WOULD run (collect-only) and skips it —
+# deferring to CI — past TEST_SELECT_TESTMON_MAX, or when that cannot be established.
+
+
+def test_testmon_selecting_most_of_the_suite_is_skipped(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_nodes=5800)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "PROBE --testmon --collect-only --verbosity=-1" in log  # the impact was probed ...
+    assert not [ln for ln in log.splitlines() if ln.startswith("RUN") and "--testmon" in ln]
+    assert "testmon would select 5800 tests" in proc.stderr  # ... and the skip is loud
+    assert "CI is the full gate" in proc.stderr
+
+
+def test_testmon_selecting_a_small_impact_set_runs(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_nodes=12)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN --testmon\n" in _runlog(runlog)
+    assert "12 impacted test(s)" in proc.stderr
+
+
+def test_testmon_cap_is_tunable(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_nodes=12)
+
+    proc = _run_select(
+        repo, _stdin(tip, base), tmp_path / "bin", env_extra={"TEST_SELECT_TESTMON_MAX": "5"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN --testmon\n" not in _runlog(runlog)
+
+
+def test_testmon_leg_skipped_when_its_impact_cannot_be_established(
+    repo: Path, tmp_path: Path
+) -> None:
+    # An unreadable impact set is no basis for an unbounded serial run.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_exit=3)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN --testmon\n" not in _runlog(runlog)
+    assert "could not be established" in proc.stderr
+
+
+def test_a_tests_only_python_push_never_runs_an_unbounded_testmon_leg(
+    repo: Path, tmp_path: Path
+) -> None:
+    # The #375 shape: a tests-only diff in a worktree whose database selects everything.
+    _write_meta_stub(repo)
+    base = _commit(repo, {}, "test: seed meta test")
+    tip = _commit(repo, {"tests/unit/test_new.py": "def test_a():\n    pass\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_nodes=5800)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    runs = [ln for ln in _runlog(runlog).splitlines() if ln.startswith("RUN ")]
+    # only the meta node (parallel) and the testmon impact probe — never a serial testmon run
+    assert f"RUN -n auto {META_NODE}" in runs
+    assert all(META_NODE in r for r in runs), runs
+
+
+def test_testmon_probe_is_immune_to_host_pytest_verbosity(repo: Path, tmp_path: Path) -> None:
+    # A host's addopts / PYTEST_ADDOPTS change the listing format; the probe pins it with
+    # --verbosity=-1 (the stub prints an uncountable `file: N` summary without it), so a big
+    # impact set can never read as zero and slip into an unbounded serial run.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_nodes=5800)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert "testmon would select 5800 tests" in proc.stderr
+    assert "RUN --testmon\n" not in _runlog(runlog)
+
+
+def test_testmon_probe_with_no_countable_nodes_is_skipped_not_run(
+    repo: Path, tmp_path: Path
+) -> None:
+    # rc 0 and zero node ids is an unreadable listing — never a licence to run the leg.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_nodes=0)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN --testmon\n" not in _runlog(runlog)
+    assert "could not be established" in proc.stderr
+
+
+def test_testmon_collection_error_blocks_the_push(repo: Path, tmp_path: Path) -> None:
+    # A broken import is a definite failure; the unbounded leg used to block on it.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_nodes=1, collect_exit=2)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 2
+    assert "collection failed" in proc.stderr
+    assert "tests/t.py::test_0" in proc.stderr  # the stdout report is shown, not swallowed
+
+
+def test_testmon_probe_tripwire_breach_blocks_the_push(repo: Path, tmp_path: Path) -> None:
+    # Collection imports every test module, so an isolation escape can fire during the probe;
+    # the tripwire's abort code must reach the hook's exit, not be read as "unknown".
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_exit=97)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 97  # the tripwire's abort code reaches the hook's exit
+    assert "RUN --testmon\n" not in _runlog(runlog)

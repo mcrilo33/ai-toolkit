@@ -75,3 +75,45 @@ def test_report_red_references_run_and_commit(report_red: dict[str, Any]) -> Non
     script = "\n".join(step.get("run", "") for step in report_red["steps"])
     assert "github.run_id" in script or "GITHUB_RUN_ID" in script
     assert "github.sha" in script or "GITHUB_SHA" in script
+
+
+# --- CI is the gate (#378) -------------------------------------------------------
+
+
+def test_every_branch_push_triggers_ci(workflow: dict[str, Any]) -> None:
+    # `on:` parses as boolean True (YAML 1.1). main and PRs stay covered.
+    triggers = {str(k): v for k, v in workflow.items()}["True"]
+    assert triggers["push"]["branches"] == ["**"]
+    assert "pull_request" in triggers
+
+
+def test_newer_push_cancels_the_older_run_of_the_same_branch(
+    workflow: dict[str, Any],
+) -> None:
+    concurrency = workflow["concurrency"]
+    assert concurrency["group"] == "ci-${{ github.ref }}"
+    assert concurrency["cancel-in-progress"] is True
+
+
+def test_pytest_suite_runs_serially_until_the_suite_is_xdist_safe(
+    workflow: dict[str, Any],
+) -> None:
+    # `-n auto` surfaced a new timing flake on every CI attempt (#378, epic #377), so the Linux
+    # suite stays single-process; CI is the gate and must be reproducible. Re-enable xdist
+    # (and the `serial` tail, #328) only once #377 lands, updating this test with it.
+    runs = [s.get("run", "") for s in workflow["jobs"]["test"]["steps"]]
+    pytest_runs = [r for r in runs if "pytest" in r]
+    assert pytest_runs == ["python -m pytest tests/ -q"]
+    assert not any("-n " in r or "xdist" in r for r in runs)
+    # Serial takes ~9-10 min: a 10-minute limit times out (reported `cancelled`, which the
+    # ready/land gate reads as a failure) on ~40% of runs, so the timeout must leave headroom.
+    assert workflow["jobs"]["test"]["timeout-minutes"] >= 15
+
+
+def test_report_red_files_issues_only_for_main_and_prs(
+    report_red: dict[str, Any],
+) -> None:
+    # Every branch is gated now; a red WIP branch must not file a backlog issue.
+    condition = report_red["steps"][0]["if"]
+    assert "refs/heads/main" in condition
+    assert "pull_request" in condition

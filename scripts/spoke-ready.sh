@@ -16,6 +16,11 @@
 # nothing to mis-assemble or chain. worktree-new.sh seeds the matching allow rule
 # ``Bash(bash .ai-toolkit/scripts/spoke-ready.sh:*)``.
 #
+# ready/<N> is also gated on CI (#378): the full suite runs in CI on every branch push,
+# so this refuses until a CI run for HEAD's exact SHA reports success (polling, bounded
+# by WT_READY_CI_WAIT seconds). --no-wait checks once; --local-gate runs the former local
+# full suite once instead of waiting (offline escape hatch), recorded in the tag message.
+#
 # The tag is ANNOTATED and force-moved, so a re-run is IDEMPOTENT (it re-points
 # the marker at the current tip and re-pushes). The push fires the pre-push hook
 # exactly as a hand-typed push would (no --no-verify): the gate itself
@@ -24,6 +29,8 @@
 #
 # Usage:
 #   spoke-ready.sh <issue>               # emit ready/<issue>  (whole issue done)
+#   spoke-ready.sh --no-wait <issue>     # ready/<issue>: check CI once, never poll
+#   spoke-ready.sh --local-gate <issue>  # ready/<issue>: run the full suite locally, not CI
 #   spoke-ready.sh --gate <issue>        # emit gate/<issue>   (PLAN-gate park)
 #   spoke-ready.sh --accept <issue>      # emit accept/<issue> (built+reviewed; human sign-off)
 #   spoke-ready.sh --blocked <issue>     # emit blocked/<issue> (stuck; answer + re-queue)
@@ -60,7 +67,7 @@ unset _c
 _SR_T0="$(command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true)"
 
 usage() {
-  echo "usage: spoke-ready.sh [--gate|--accept|--blocked] <issue> [-m <reason>]" >&2
+  echo "usage: spoke-ready.sh [--gate|--accept|--blocked] [--no-wait|--local-gate] <issue> [-m <reason>]" >&2
   echo "       spoke-ready.sh --queued <primary>   # print this spoke's queued subtasks" >&2
   exit 2
 }
@@ -82,6 +89,8 @@ BODY=""
 PLAN_FILE=""
 CAPABILITY=""   # --dispatch-capability: the Orca preamble token, remembered for later invocations
 QUERY_QUEUE=0   # --queued <N>: print the queued subtasks and exit (read-only, #278)
+NO_WAIT=0       # --no-wait: ready/<N> checks CI once instead of polling (#378)
+LOCAL_GATE=0    # --local-gate: ready/<N> runs the full suite locally instead of waiting for CI (#378)
 
 # set_state <kind> <subject> — select the marker namespace, rejecting a second
 # state flag so e.g. `--gate --accept` can't emit an ambiguous marker.
@@ -111,6 +120,8 @@ while [ "$#" -gt 0 ]; do
     # --queued <N> (#278): print the subtask issues still queued for this spoke and exit.
     # Read-only — it emits no marker, so merely LOOKING at the queue can never land the spoke.
     --queued)      QUERY_QUEUE=1; shift ;;
+    --no-wait)     NO_WAIT=1; shift ;;
+    --local-gate)  LOCAL_GATE=1; shift ;;
     -h|--help)     usage ;;
     -*)            echo "spoke-ready: unknown option: $1" >&2; usage ;;
     *)             [ -z "$ISSUE" ] || { echo "spoke-ready: unexpected argument: $1" >&2; usage; }
@@ -119,6 +130,14 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$ISSUE" ] || { echo "spoke-ready: an issue number is required" >&2; usage; }
+if [ "$KIND" != "ready" ] && [ "$NO_WAIT$LOCAL_GATE" != "00" ]; then
+  echo "spoke-ready: --no-wait/--local-gate only apply to ready/<N>" >&2
+  usage
+fi
+if [ "$NO_WAIT$LOCAL_GATE" = "11" ]; then
+  echo "spoke-ready: --no-wait conflicts with --local-gate (pick one)" >&2
+  usage
+fi
 
 # Orca hands a dispatched worker its capability token in the preamble only; ask / worker_done need
 # it. Remember the one the agent passes (0600, under the gitignored .ai-toolkit/) so a later
@@ -295,6 +314,40 @@ verify_ready_preconditions() {
   fi
 }
 
+# verify_ci_green <issue> — exit 1 unless CI reports success for HEAD's exact SHA (#378).
+# HEAD == @{upstream} was just verified, so this is the SHA the push put on origin.
+# Polls up to WT_READY_CI_WAIT seconds (default 540: under the 10-minute tool timeout; a
+# re-run is idempotent), or checks once with --no-wait. Reasons come from wt_ci_refusal.
+verify_ci_green() {
+  local issue="$1" sha rc=0
+  sha="$(git rev-parse --verify HEAD)"
+  wt_ci_check "$sha" "$([ "$NO_WAIT" = 1 ] && echo 0 || echo "${WT_READY_CI_WAIT:-540}")" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "→ CI is green for ${sha:0:9} ($WT_CI_URL)"
+    return 0
+  fi
+  echo "spoke-ready: refusing ready/$issue — $(wt_ci_refusal "$rc")." >&2
+  case "$rc" in
+    1) echo "  Fix it on the branch, push (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2 ;;
+    2) echo "  Re-run once it finishes (bash .ai-toolkit/scripts/spoke-ready.sh $issue); the wait is bounded by WT_READY_CI_WAIT." >&2 ;;
+    3) echo "  Push the branch (bash .ai-toolkit/scripts/spoke-push.sh) so CI runs on this SHA, then re-run." >&2 ;;
+  esac
+  exit 1
+}
+
+# --local-gate (#378): the offline escape hatch. The pre-push hook is the single executor
+# of local tests (under its repo-integrity tripwire), so the suite rides the marker push as
+# TEST_SELECT_CMD. A missing hook would run NOTHING and ship ungated (the #196 fail-open
+# shape), so refuse without one.
+require_prepush_hook() {
+  local hook
+  hook="$(git rev-parse --git-path hooks/pre-push 2>/dev/null || true)"
+  [ -n "$hook" ] && [ -x "$hook" ] && return 0
+  echo "spoke-ready: refusing --local-gate — no executable pre-push hook here, so the suite would not run." >&2
+  echo "  Install it (scripts/install-git-hooks.sh), then re-run." >&2
+  exit 1
+}
+
 # READY_FORCED records a force bypass so it can be stamped into the tag annotation
 # below — a bypass of auto_land's trust gate must be auditable at LAND time, not just
 # a line in this shell's stderr the hub never sees (issue #206).
@@ -340,6 +393,11 @@ if [ "$KIND" = "ready" ]; then
     echo "spoke-ready: ⚠ AI_TOOLKIT_READY_FORCE=1 — emitting ready/$ISSUE WITHOUT verifying its preconditions (clean tree / pushed tip / review artifact). This bypasses auto_land's trust gate." >&2
   else
     verify_ready_preconditions "$ISSUE"
+    if [ "$LOCAL_GATE" = "1" ]; then
+      require_prepush_hook
+    else
+      verify_ci_green "$ISSUE"
+    fi
   fi
 fi
 
@@ -359,7 +417,7 @@ TAG="$KIND/$ISSUE"
 # (issue #206): the hub reads the tag body at land time (%(contents:body)), so the
 # audit trail travels WITH the marker instead of living only in this shell's stderr.
 if [ "$READY_FORCED" = "1" ]; then
-  FORCE_NOTE="AI_TOOLKIT_READY_FORCE=1: ready-gate preconditions (clean tree / pushed tip / review artifact) NOT verified — auto_land trust gate bypassed."
+  FORCE_NOTE="AI_TOOLKIT_READY_FORCE=1: ready-gate preconditions (clean tree / pushed tip / review artifact / CI) NOT verified — auto_land trust gate bypassed."
   if [ -n "$BODY" ]; then
     BODY="$BODY
 
@@ -367,6 +425,15 @@ $FORCE_NOTE"
   else
     BODY="$FORCE_NOTE"
   fi
+fi
+
+# A --local-gate ready records that the suite ran locally and CI was not consulted, so the
+# land (and a human reading the tag) can tell it from a CI-green ready (#378).
+if [ "$LOCAL_GATE" = "1" ]; then
+  LOCAL_NOTE="LOCAL_GATE: full suite run locally (--local-gate); CI was not consulted for this ready."
+  BODY="${BODY:+$BODY
+
+}$LOCAL_NOTE"
 fi
 
 # The annotated tag carries SUBJECT (the state word) and, when a reason was
@@ -417,6 +484,16 @@ git tag -f -a "$TAG" "${MSG_ARGS[@]}"
 # pytest-shape filter IS kept — a STALE installed pre-push hook (predating the
 # tag-only short-circuit) can still run the suite inside this push, and a red
 # suite quoting a transport phrase must read as a failed gate, not staleness.
+# The first push runs the local gate when asked: TEST_SELECT_CMD is exported only inside
+# this subshell, so the transport-death retry below (which only happens AFTER the hook
+# passed) re-pushes without re-running the suite.
+_push_tag() {
+  (
+    # unset first: an inherited TEST_SELECT_SKIP would make the hook exit 0 without the suite
+    if [ "$LOCAL_GATE" = "1" ]; then unset TEST_SELECT_SKIP; TEST_SELECT_CMD="$(wt_local_gate_cmd)"; export TEST_SELECT_CMD; fi
+    wt_git_push -f origin "$TAG"
+  )
+}
 echo "→ wt_git_push -f origin $TAG (SSH keepalive, issue #119)"
 # The capture file exists only to classify a failure; a host without a writable
 # TMPDIR degrades to an uncaptured keepalive push (classification then rests on
@@ -427,13 +504,25 @@ if [ -n "$PUSH_LOG" ]; then
   # tee streams the output live AND captures it; PIPESTATUS[0] keeps git's own
   # exit code even if tee itself fails (pipefail would report tee's rc, turning
   # a landed marker into a spurious "rejected").
-  wt_git_push -f origin "$TAG" 2>&1 | tee "$PUSH_LOG" || PUSH_RC="${PIPESTATUS[0]}"
+  _push_tag 2>&1 | tee "$PUSH_LOG" || PUSH_RC="${PIPESTATUS[0]}"
+  # The hook must report running the local gate, else exit 0 proves nothing (disabled hook,
+  # persistent skip config): refuse rather than stamp "ran locally" over it.
+  if [ "$PUSH_RC" -eq 0 ] && [ "$LOCAL_GATE" = "1" ] \
+     && ! grep -q 'running custom suite (TEST_SELECT_CMD)' "$PUSH_LOG"; then
+    echo "spoke-ready: refusing --local-gate — the pre-push hook did not report running the suite (disabled or skipped by config?); the marker is NOT trusted" >&2
+    git push origin ":refs/tags/$TAG" >/dev/null 2>&1 || true
+    git tag -d "$TAG" >/dev/null 2>&1 || true
+    rm -f "$PUSH_LOG"
+    exit 1
+  fi
 else
   echo "spoke-ready: warning — cannot create a capture file under ${TMPDIR:-/tmp}; pushing uncaptured" >&2
-  wt_git_push -f origin "$TAG" || PUSH_RC=$?
+  _push_tag || PUSH_RC=$?
 fi
 RETRY_TRANSPORT=0
-if [ "$PUSH_RC" -ne 0 ] \
+# A bare exit 141 is NOT proof the gate passed (a killed gate shares it), so a local-gate
+# marker is never retried on transport shape alone.
+if [ "$PUSH_RC" -ne 0 ] && [ "$LOCAL_GATE" != "1" ] \
    && wt_push_transport_died "$PUSH_RC" "${PUSH_LOG:-/dev/null}" \
    && ! grep -qE '[0-9]+ (failed|error)|Interrupted' "${PUSH_LOG:-/dev/null}" 2>/dev/null; then
   RETRY_TRANSPORT=1
@@ -448,6 +537,9 @@ if [ "$PUSH_RC" -ne 0 ]; then
     fi
   else
     echo "spoke-ready: push of $TAG rejected — the marker did not reach origin" >&2
+    # The hub reads the LOCAL tag: a ready that never passed its gate must not linger in the
+    # shared ref store as if the spoke were landable.
+    [ "$KIND" != "ready" ] || git tag -d "$TAG" >/dev/null 2>&1 || true
     exit "$PUSH_RC"
   fi
 fi

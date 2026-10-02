@@ -535,8 +535,11 @@ def test_observe_captures_command_output_to_capfile(repo: Path, tmp_path: Path) 
 def _make_pytest_stub(bindir: Path, body: str) -> None:
     """Install a `pytest` stub: answers `--help`, else runs `body` then exits 0."""
     bindir.mkdir(parents=True, exist_ok=True)
+    # The stub leaves STUB_RAN behind so a "passes" test can prove the gate really ran it
+    # (an unmapped diff runs nothing since #378, which would pass those tests vacuously).
     (bindir / "pytest").write_text(
-        f'#!/bin/sh\ncase "$1" in --help|-h) echo "usage: pytest"; exit 0 ;; esac\n{body}\nexit 0\n'
+        '#!/bin/sh\ncase "$1" in --help|-h) echo "usage: pytest"; exit 0 ;; esac\n'
+        f'echo ran >> "{bindir}/STUB_RAN"\n{body}\nexit 0\n'
     )
     (bindir / "pytest").chmod(0o755)
 
@@ -557,11 +560,17 @@ def _run_select(
     )
 
 
+# A diff that makes the (fast-tier) gate actually run pytest: the yml maps, through the
+# reverse index, to the test file that names it, so the stub runs as the selected suite
+# (an unmapped diff would run nothing since #378 — CI is the full gate).
+_GATED_DIFF = {"ci/build.yml": "on: push\n", "tests/unit/test_build.py": '"""Covers build.yml."""\n'}
+
+
 def test_breach_ref_move_aborts_and_restores(repo: Path, tmp_path: Path) -> None:
-    # A FULL-tier diff (.yml) so the stub runs as the suite; the stub mutates the
+    # A mapped diff so the stub runs as the suite; the stub mutates the
     # real repo (moves main) the way an escaped test would.
     base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    tip = _commit(repo, _GATED_DIFF)
     before = _rev(repo, "main")
     _make_pytest_stub(tmp_path / "bin", "git commit --allow-empty -q -m sneak")
 
@@ -578,7 +587,7 @@ def test_breach_ref_move_aborts_and_restores(repo: Path, tmp_path: Path) -> None
 
 def test_breach_bare_flip_aborts_and_restores(repo: Path, tmp_path: Path) -> None:
     base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    tip = _commit(repo, _GATED_DIFF)
     _make_pytest_stub(tmp_path / "bin", "git config core.bare true")
 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
@@ -590,19 +599,20 @@ def test_breach_bare_flip_aborts_and_restores(repo: Path, tmp_path: Path) -> Non
 
 def test_clean_run_passes(repo: Path, tmp_path: Path) -> None:
     base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    tip = _commit(repo, _GATED_DIFF)
     _make_pytest_stub(tmp_path / "bin", ":")  # touches nothing
 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr  # no trip on a clean run
+    assert (tmp_path / "bin" / "STUB_RAN").exists()  # ... and the gate really ran the stub
 
 
 def test_hermetic_tmpdir_does_not_trip(repo: Path, tmp_path: Path) -> None:
     # A well-behaved hermetic test creates and deletes its OWN tmpdir repo; that
     # must NOT count as mutating THIS repo (no false positive).
     base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    tip = _commit(repo, _GATED_DIFF)
     _make_pytest_stub(
         tmp_path / "bin",
         'd="$(mktemp -d)"; git init -q "$d"; '
@@ -613,6 +623,7 @@ def test_hermetic_tmpdir_does_not_trip(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "bin" / "STUB_RAN").exists()  # the gate really ran the stub
 
 
 def test_known_gitdir_scenario_passes_through(repo: Path, tmp_path: Path) -> None:
@@ -620,7 +631,7 @@ def test_known_gitdir_scenario_passes_through(repo: Path, tmp_path: Path) -> Non
     # pytest child runs with it stripped (issue #30), so a hermetic test reaches
     # only its own tmpdir — the tripwire sees an intact repo and lets the push by.
     base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    tip = _commit(repo, _GATED_DIFF)
     _make_pytest_stub(
         tmp_path / "bin",
         'd="$(mktemp -d)"; git init -q "$d"; rm -rf "$d"',
@@ -631,6 +642,7 @@ def test_known_gitdir_scenario_passes_through(repo: Path, tmp_path: Path) -> Non
     )
 
     assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "bin" / "STUB_RAN").exists()  # the gate really ran the stub
 
 
 def test_live_spoke_commit_mid_gate_passes_and_survives(
@@ -640,7 +652,7 @@ def test_live_spoke_commit_mid_gate_passes_and_survives(
     # while the gate runs. The push must NOT abort and the spoke's commit must
     # NOT be rewound.
     base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    tip = _commit(repo, _GATED_DIFF)
     _make_pytest_stub(tmp_path / "bin", f'git -C "{spoke}" commit --allow-empty -q -m spoke-work')
 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
@@ -669,7 +681,7 @@ def test_sibling_rewind_mid_gate_out_of_scope_passes(
     # gate neither reports a breach nor "restores" the sibling ref.
     _git(spoke, "commit", "--allow-empty", "-qm", "spoke-work")
     base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    tip = _commit(repo, _GATED_DIFF)
     rewind_target = _rev(repo, "refs/heads/feature/spoke~1")
     _make_pytest_stub(tmp_path / "bin", f'git -C "{spoke}" reset -q --hard HEAD~1')
 
@@ -685,7 +697,7 @@ def test_concurrent_marker_tag_mid_gate_passes_and_survives(repo: Path, tmp_path
     # out-of-scope appeared ref: no breach, and the restore must not delete it
     # (the pre-#188 whole-namespace restore rolled such tags back).
     base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    tip = _commit(repo, _GATED_DIFF)
     _make_pytest_stub(tmp_path / "bin", "git tag ready/99 HEAD")
 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
@@ -700,7 +712,7 @@ def test_concurrent_remote_tracking_update_mid_gate_passes(repo: Path, tmp_path:
     # in the shared store — the false REPO-INTEGRITY BREACH that aborted
     # legitimate pushes. Out of scope now: the push proceeds.
     base = _rev(repo)
-    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    tip = _commit(repo, _GATED_DIFF)
     _make_pytest_stub(tmp_path / "bin", "git update-ref refs/remotes/origin/feature/other HEAD")
 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")

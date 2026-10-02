@@ -26,6 +26,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _ci_gh_support import make_ci_gh
 from _orca_stub import install_dispatch_env
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -306,15 +307,16 @@ class TestWorktreeLandSpoke:
         _git(wt, "tag", "ready/9")
         _git(wt, "push", "-q", "origin", "ready/9")
 
-        # Stub gh so the issue-close is a no-op; skip the suite.
+        # Stub `code`; the green-CI `gh` below also answers the issue-close as a no-op.
         bindir = tmp_path / "bin"
         bindir.mkdir(exist_ok=True)
-        for name in ("gh", "code"):
+        for name in ("code",):
             stub = bindir / name
             stub.write_text("#!/bin/sh\nexit 0\n")
             stub.chmod(0o755)
         env = _tele_env(telemetry_dir)
-        env["PATH"] = f"{bindir}:{os.environ['PATH']}"
+        # The land waits for a green CI run on the SHA (#378): a green `gh` goes first.
+        env["PATH"] = f"{make_ci_gh()}:{bindir}:{os.environ['PATH']}"
         suite = bindir / "suite"
         suite.write_text("#!/bin/sh\nexit 0\n")
         suite.chmod(0o755)
@@ -376,12 +378,13 @@ class TestWorktreeScriptSpans:
 
         bindir = tmp_path / "bin"
         bindir.mkdir(exist_ok=True)
-        for name in ("gh", "code"):
+        for name in ("code",):
             stub = bindir / name
             stub.write_text("#!/bin/sh\nexit 0\n")
             stub.chmod(0o755)
         env = _tele_env(telemetry_dir)
-        env["PATH"] = f"{bindir}:{os.environ['PATH']}"
+        # The land waits for a green CI run on the SHA (#378): a green `gh` goes first.
+        env["PATH"] = f"{make_ci_gh()}:{bindir}:{os.environ['PATH']}"
 
         res = _run(WORKTREE_LAND, hub, env, "9", "--skip-tests")
 

@@ -326,14 +326,10 @@ wt_git_push() {
 # wt_push_transport_died <push-exit-code> <captured-output-file> — did a failed
 # push die at the TRANSPORT layer? git only enters the transfer phase after the
 # pre-push hook exits 0, so the named signatures are proof the gate ran green.
-# worktree-land uses that — TOGETHER WITH a positive green-tree stamp for the
-# pushed tree (wt_gate_green_stamped, issue #214) — to retry once with the suite
-# skipped. The bare exit 141 (SIGPIPE) is deliberately KEPT here as a transport
-# candidate even though a gate killed mid-run can share it: the caller no longer
-# trusts 141 alone, requiring the green stamp a killed gate never leaves. A
-# failed gate (pytest output + git's local refusal) matches nothing here —
-# deliberately no bare "broken pipe" pattern, which a BrokenPipeError traceback
-# in pytest output would fake.
+# spoke-ready uses that to retry a marker push once. The bare exit 141 (SIGPIPE)
+# is deliberately KEPT as a transport candidate. A failed gate (pytest output +
+# git's local refusal) matches nothing here — deliberately no bare "broken pipe"
+# pattern, which a BrokenPipeError traceback in pytest output would fake.
 wt_push_transport_died() {
   [ "${1:-0}" -eq 141 ] && return 0
   grep -qiE \
@@ -341,91 +337,104 @@ wt_push_transport_died() {
     "$2" 2>/dev/null
 }
 
-# wt_gate_green_stamped — 0 iff a GREEN-TREE stamp (issue #122) EXISTS for THIS
-# tree's HEAD^{tree}. It is the positive proof worktree-land requires before
-# honoring a transport retry (issue #214): a stamp is written ONLY by a passing
-# gate (test-select.sh mints on rc==0), so its presence proves this exact tree
-# ran green at some tier for some runner, whereas a gate KILLED mid-run
-# (SIGPIPE/OOM — exit 141, no pytest summary) never reaches its mint. The retry-
-# with-suite-skipped is refused absent such a stamp. shared/hooks/lib/gate-stamp.sh
-# is the authoritative WRITER; this reader mirrors its placement contract
-# (<git-common-dir>/.gate-stamps/ keyed by HEAD^{tree}) WITHOUT sourcing it, so
-# the READER path resolves identically in the ai-toolkit checkout and a synced
-# downstream hub (which carries no shared/hooks/lib/).
-#
-# Scope of the proof (deliberately weaker than the writer's gate_stamp_check):
-#   • EXISTENCE only — no tier/runner-fingerprint match. A pre-existing stamp
-#     that does not COVER the current demand (a weaker tier, a different runner)
-#     is accepted here even though the gate would not have consumed it. The tree
-#     is still proven green (at that other tier/env), so this is bounded — never
-#     "ship an untested tree" — and matches what a clean-FF land already trusts
-#     via AUTO_SKIP (issue #96). It is NOT a full re-verification.
-#   • The key is HEAD^{tree} alone — NOT gated on a clean working tree the way
-#     the writer's gate_stamp_tree is. The push does not move HEAD, so HEAD^{tree}
-#     is exactly the pushed tree; keeping the clean check would let the gate's own
-#     .testmondata* writes read the tree "dirty" post-push and deny a legitimate
-#     retry.
-# Fail-CLOSED on absence: an unborn HEAD or a missing stamp returns non-zero, so
-# the retry rolls back. This means the #119 keepalive retry is disabled whenever
-# no stamp was minted — an untracked file on the hub (the land tolerates it via
-# `git status --porcelain -uno`, but the writer's untracked-sensitive
-# gate_stamp_tree skips the mint) or a pre-#122 installed hook (STAMPS=0). Those
-# are the safe direction: re-running the land re-runs the gate.
-# _wt_gate_stamp_file — print the stamp path for HEAD^{tree}: the #122 contract
-# <git-common-dir>/.gate-stamps/<HEAD^{tree}>, resolved WITHOUT sourcing gate-stamp.sh
-# so a synced hub (no shared/hooks/lib/) resolves it identically. rc 1 (no output) on
-# an unborn HEAD or an unresolvable common dir. Shared by both stamp readers below.
-_wt_gate_stamp_file() {
-  local common tree
-  tree="$(git rev-parse -q --verify 'HEAD^{tree}' 2>/dev/null)" || return 1
-  [ -n "$tree" ] || return 1
-  common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
-  [ -n "$common" ] || return 1
-  case "$common" in /*) ;; *) common="$PWD/$common" ;; esac
-  printf '%s/.gate-stamps/%s' "$common" "$tree"
+# --- CI is the gate (issue #378) ------------------------------------------------
+# The full suite runs in CI on every branch push; the ready and land scripts wait for a
+# green run on the exact SHA instead of re-running the suite on the dev machine.
+# Dependencies: `gh` (authenticated) and python3 (JSON parsing). When either is missing
+# the answer is "unavailable" and the caller refuses loudly, pointing at --local-gate.
+
+# wt_ci_state <sha> -> "<state>|<run-url>|<run-id>" on stdout, always rc 0.
+# state: success | pending | failure | none (no run for the SHA) | unavailable.
+# Several runs can share a SHA (a push run and a pull_request run, re-runs, a run
+# cancelled by a newer one): any success wins, else any unfinished run reads pending,
+# else the newest run's failure.
+wt_ci_state() {
+  local runs
+  command -v gh >/dev/null 2>&1 || { echo "unavailable||"; return 0; }
+  runs="$(gh run list --commit "$1" --workflow "${WT_CI_WORKFLOW:-CI}" \
+    --json status,conclusion,url,databaseId 2>/dev/null)" || { echo "unavailable||"; return 0; }
+  printf '%s' "$runs" | python3 -c '
+import json, sys
+runs = json.load(sys.stdin)
+def pick(rs):
+    return "%s|%s" % (rs[0]["url"], rs[0]["databaseId"])
+ok = [r for r in runs if r["conclusion"] == "success"]
+live = [r for r in runs if r["status"] != "completed"]
+if ok:
+    print("success|" + pick(ok))
+elif live:
+    print("pending|" + pick(live))
+elif runs:
+    print("failure|" + pick(runs))
+else:
+    print("none||")
+' 2>/dev/null || echo "unavailable||"
 }
 
-wt_gate_green_stamped() {
-  local stamp
-  stamp="$(_wt_gate_stamp_file)" || return 1
-  [ -f "$stamp" ]
+# wt_ci_check <sha> <max-wait-seconds> -> poll until CI settles for <sha>; sets
+# WT_CI_STATE / WT_CI_URL / WT_CI_RUN. rc 0 green, 1 failed, 2 still pending at the
+# bound, 3 no run for the SHA, 4 gh unavailable. A max of 0 is a single check. A just-
+# pushed SHA has no run for a few seconds, so "none" only becomes final once
+# WT_CI_NONE_GRACE seconds (default 90) have passed.
+wt_ci_check() {
+  local sha="$1" max="${2:-0}" told="" poll="${WT_CI_POLL:-15}" grace="${WT_CI_NONE_GRACE:-90}"
+  local start waited=0 seen="" last_url="" last_run=""
+  # A garbage bound must not turn into a numeric-test error that polls forever (Principle 2):
+  # sanitize to the safe defaults. The bound is WALL-CLOCK (gh's own latency counts), so a
+  # slow `gh run list` cannot stretch the wait past what the caller's tool timeout allows.
+  case "$max" in '' | *[!0-9]*) max=0 ;; esac
+  case "$poll" in '' | *[!0-9]* | 0) poll=15 ;; esac
+  case "$grace" in '' | *[!0-9]*) grace=90 ;; esac
+  start="$(date +%s)"
+  while :; do
+    IFS='|' read -r WT_CI_STATE WT_CI_URL WT_CI_RUN <<< "$(wt_ci_state "$sha")"
+    case "$WT_CI_STATE" in
+      success) return 0 ;;
+      failure) return 1 ;;
+      unavailable) return 4 ;;
+      pending) seen=1; last_url="$WT_CI_URL"; last_run="$WT_CI_RUN" ;;
+    esac
+    # Once a run has been SEEN, a later empty list is a transient API answer, not "no run":
+    # keep polling to the bound and report it pending (never the misleading "no CI run").
+    if [ "$WT_CI_STATE" = none ] && [ -n "$seen" ]; then
+      WT_CI_URL="$last_url"; WT_CI_RUN="$last_run"
+    fi
+    if [ "$waited" -ge "$max" ] || { [ "$WT_CI_STATE" = none ] && [ -z "$seen" ] && [ "$waited" -ge "$grace" ]; }; then
+      if [ "$WT_CI_STATE" = pending ] || [ -n "$seen" ]; then return 2; fi
+      return 3
+    fi
+    [ -n "$told" ] || { echo "→ waiting for CI on ${sha:0:9} (up to ${max}s; ${WT_CI_URL:-run not created yet})" >&2; told=1; }
+    sleep "$poll"
+    waited=$(( $(date +%s) - start ))
+  done
 }
 
-# wt_gate_green_stamped_fresh <max_age_seconds> — like wt_gate_green_stamped, but
-# additionally requires the stamp to be YOUNGER than <max_age_seconds> by file mtime.
-# A tree-identical fast-forward land (issue #270) consults this to reuse a RECENT
-# green proof instead of re-running the gate on a byte-identical tree. Existence-only
-# is the same bounded trust a clean-FF land already extends via AUTO_SKIP (issue #96)
-# — the tree WAS proven green (at some tier/env) — and the freshness bound guards
-# against env drift (a new runner/dep since the proof) waving through a tree proven
-# long ago. Fail-CLOSED: a missing stamp, an unreadable/absent mtime, a future mtime
-# (clock skew), or an age beyond the bound all return non-zero, so the land re-runs
-# the gate. The mtime read is numeric (epoch seconds), so it needs no LC_ALL pin.
-wt_gate_green_stamped_fresh() {
-  local max_age="$1" stamp now mtime age
-  [ -n "$max_age" ] || return 1
-  stamp="$(_wt_gate_stamp_file)" || return 1
-  [ -f "$stamp" ] || return 1
-  now="$(date +%s 2>/dev/null)" || return 1
-  mtime="$(_wt_file_mtime "$stamp")" || return 1
-  [ -n "$mtime" ] || return 1
-  age=$(( now - mtime ))
-  [ "$age" -ge 0 ] || return 1          # future mtime (clock skew) → fail closed
-  [ "$age" -le "$max_age" ]
+# wt_ci_refusal <wt_ci_check-rc> -> the one-line reason a non-green check gives.
+wt_ci_refusal() {
+  local jobs=""
+  case "$1" in
+    1)
+      jobs="$(gh run view "$WT_CI_RUN" --json jobs \
+        --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")' 2>/dev/null || true)"
+      printf 'CI failed (%s%s)' "$WT_CI_URL" "${jobs:+, failing jobs: $jobs}" ;;
+    2) printf 'CI pending (%s)' "$WT_CI_URL" ;;
+    3) printf 'no CI run for this SHA (was it pushed?)' ;;
+    *) printf 'cannot read CI: gh or python3 is unavailable (offline? use --local-gate)' ;;
+  esac
+}
+
+# wt_local_gate_cmd -> the shell command --local-gate hands the pre-push hook as
+# TEST_SELECT_CMD (so it runs under the hook's repo-integrity tripwire): the former
+# local full suite, once — the parallel bulk under -n auto, then the ref-mutating
+# `serial` tail single-process (#328). Exit 5 (nothing collected) is green on either leg.
+wt_local_gate_cmd() {
+  printf '%s' 'r=pytest; [ -x .venv/bin/pytest ] && r=.venv/bin/pytest; command -v "$r" >/dev/null || r="python3 -m pytest"; $r -q -n auto -m "not serial"; a=$?; $r -q -m serial; b=$?; [ "$a" = 5 ] && a=0; [ "$b" = 5 ] && b=0; [ "$a" -ne 0 ] && exit "$a"; exit "$b"'
 }
 
 # --- portable date/time -------------------------------------------------------
 # BSD (macOS) and GNU date differ; try the BSD form first, fall back to GNU.
 # Kept here so the unattended supervisor (hub-afk.sh) and any future caller share
 # one copy of the date/time helpers.
-
-# _wt_file_mtime <path> -> the file's mtime in epoch seconds. GNU `stat -c %Y` first
-# (Linux/CI), BSD `stat -f %m` as the fallback (macOS dev host): the GNU form errors
-# on BSD stat (unknown -c) so the || cleanly selects the right one, the mirror of the
-# BSD-first date helpers below. rc 1 (no output) when the path is unreadable.
-_wt_file_mtime() {
-  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
-}
 
 # wt_date_ymd <epoch> -> YYYY-MM-DD (local time).
 wt_date_ymd() {
