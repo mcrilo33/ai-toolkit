@@ -50,6 +50,8 @@ set -euo pipefail
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 source "$HOOK_DIR/lib/scope-guard.sh"
+# shellcheck source=lib/identity.sh
+source "$HOOK_DIR/lib/identity.sh"
 
 # ── Resolve the guarded base branch (the ONE canonical resolver, issue #117) ─
 # wt_base_branch: config ai-toolkit.base-branch > AI_TOOLKIT_BASE_BRANCH >
@@ -252,16 +254,9 @@ COMMAND=$(get_shell_command "$INPUT")
 GATE_RE='worktree-land\.sh|(^|[;&|`(){}]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[cC][[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+(checkout|switch|merge|branch|reset|update-ref|push)\b'
 printf '%s' "$COMMAND" | grep -qE "$GATE_RE" || exit 0
 
-# ── Spoke vs hub: WT_SPOKE (role marker) or a linked-worktree git-dir ─────────
+# ── Spoke vs hub: the identity record, else WT_SPOKE or a linked-worktree git-dir ─
 ROOT=$(project_root_from_payload "$INPUT")
-GIT_DIR=$(git -C "$ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)
-
-IS_SPOKE=0
-[ -n "${WT_SPOKE:-}" ] && IS_SPOKE=1
-case "$GIT_DIR" in
-  */.git/worktrees/*) IS_SPOKE=1 ;;
-esac
-[ "$IS_SPOKE" = "1" ] || exit 0
+ai_toolkit_identity_is_spoke "$ROOT" any || exit 0
 
 DEFAULT=$(hub_default_branch "$ROOT")
 CURRENT=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)

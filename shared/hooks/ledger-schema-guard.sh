@@ -14,9 +14,10 @@
 # subject-changing TaskUpdate is DENIED with the expected format (same UX as
 # commit-gauntlet); a status-only TaskUpdate (no subject) passes untouched.
 #
-# SCOPE — a solo-cycle is a SPOKE concept, so this is gated on WT_SPOKE (the
-# mechanical spoke-role signal worktree-new.sh sets); the hub and /quick lanes do
-# not set it, so their ledgers are never blocked. A missing jq degrades to ALLOW —
+# SCOPE — a solo-cycle is a SPOKE concept, so this is gated on the worktree's
+# .ai-toolkit/identity record (lib/identity.sh), else WT_SPOKE (the spoke-role signal
+# worktree-new.sh sets); the hub and /quick lanes have neither, so their ledgers are
+# never blocked. A missing jq degrades to ALLOW —
 # a broken environment must never wedge every TaskCreate/TaskUpdate.
 #
 # The ` · ` (U+00B7) and ` — ` (U+2014) separators are matched as LITERAL BYTES
@@ -28,12 +29,14 @@ set -euo pipefail
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/utils.sh
 source "$HOOK_DIR/lib/utils.sh"
+# shellcheck source=lib/identity.sh
+source "$HOOK_DIR/lib/identity.sh"
 
 INPUT=$(read_stdin)
 [ -n "$INPUT" ] || exit 0
 
 # Spoke-only + jq-required (see header). Both degrade to ALLOW, never block.
-[ -n "${WT_SPOKE:-}" ] || exit 0
+ai_toolkit_identity_is_spoke "$(project_root_from_payload "$INPUT")" env || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
 
 TOOL_NAME=$(get_tool_name "$INPUT")

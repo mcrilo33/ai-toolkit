@@ -60,9 +60,6 @@ set -euo pipefail
 # lib is sourced or any subprocess runs.
 [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || [ -n "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}" ] || exit 0
 
-# Spoke-role gate (see header): only a spoke runs solo-cycles.
-[ -n "${WT_SPOKE:-}" ] || exit 0
-
 # Without jq we cannot safely read the payload; degrade to a no-op.
 command -v jq >/dev/null 2>&1 || exit 0
 
@@ -78,6 +75,12 @@ source "$HOOK_DIR/lib/utils.sh"
 # layer) resolve the worktree root / spoke_run_id from it.
 INPUT=$(read_stdin)
 [ -n "$INPUT" ] || exit 0
+
+# Spoke-role gate (see header): only a spoke runs solo-cycles — the worktree's identity
+# record, else WT_SPOKE.
+# shellcheck source=lib/identity.sh
+source "$HOOK_DIR/lib/identity.sh"
+ai_toolkit_identity_is_spoke "$(_telemetry_project_root)" env || exit 0
 
 # Emit one marker, idempotent per (phase, key). Guarded like the #139 callers so a
 # missing emit layer can never fail the hook.

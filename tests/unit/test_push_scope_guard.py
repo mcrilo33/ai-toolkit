@@ -796,6 +796,7 @@ def _write_identity(root: Path, text: str) -> None:
 
 def test_identity_record_makes_a_plain_checkout_a_spoke(hub: Path) -> None:
     # Orca "half spoke": not a linked worktree by git-dir, but provisioned with a record.
+    _git(hub, "checkout", "-q", "-b", "orca-migration")
     _write_identity(hub, "issue=360\n")
     payload = _cursor_shell_payload("git push origin main", root=hub)
 
@@ -805,6 +806,7 @@ def test_identity_record_makes_a_plain_checkout_a_spoke(hub: Path) -> None:
 
 
 def test_empty_identity_issue_leaves_a_plain_checkout_a_hub(hub: Path) -> None:
+    _git(hub, "checkout", "-q", "-b", "orca-migration")
     _write_identity(hub, "issue=\nlane=spoke\n")
     payload = _cursor_shell_payload("git push origin main", root=hub)
 
@@ -815,6 +817,7 @@ def test_empty_identity_issue_leaves_a_plain_checkout_a_hub(hub: Path) -> None:
 
 def test_wt_spoke_env_alone_does_not_make_a_hub_a_spoke(hub: Path) -> None:
     # This guard's fallback is the git-dir pattern ONLY — never the env marker.
+    _git(hub, "checkout", "-q", "-b", "orca-migration")
     payload = _cursor_shell_payload("git push origin main", root=hub)
 
     result = run_guard(payload, cwd=hub, extra_env={"WT_SPOKE": "1"})

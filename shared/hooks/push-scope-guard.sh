@@ -79,6 +79,8 @@ set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
+# shellcheck source=lib/identity.sh
+source "$HOOK_DIR/lib/identity.sh"
 
 # ── Read payload and extract shell command ───────────────────────────────────
 INPUT=$(read_stdin)
@@ -99,11 +101,9 @@ ROOT=$(project_root_from_payload "$INPUT")
 GIT_DIR=$(git -C "$ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)
 [ -z "$GIT_DIR" ] && exit 0
 
-# ── Spoke vs hub: a linked worktree's git-dir lives under .git/worktrees/ ───
+# ── Spoke vs hub: the identity record, else a linked worktree's git-dir ─────
 IS_SPOKE=0
-case "$GIT_DIR" in
-  */.git/worktrees/*) IS_SPOKE=1 ;;
-esac
+ai_toolkit_identity_is_spoke "$ROOT" gitdir && IS_SPOKE=1
 
 # ── Resolve the guarded base branch (the ONE canonical resolver, issue #117) ─
 # wt_base_branch: config ai-toolkit.base-branch > AI_TOOLKIT_BASE_BRANCH >
