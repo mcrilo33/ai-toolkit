@@ -499,14 +499,12 @@ wt_tmux_session() {
 }
 
 # --- worktree enumeration / resolution (Orca, #364) ----------------------------
-# Orca lists every git worktree of a registered repo, including ones made by plain `git worktree
-# add`, and carries the issue as a field (`linkedIssue`), so lookup never re-parses a branch slug.
-# Anything Orca cannot supply falls back to the identity record, inside identity.sh.
+# Orca lists every git worktree of a registered repo and carries the issue as `linkedIssue`, so
+# lookup never re-parses a branch slug; what Orca lacks falls back to the identity record.
 
 # _wt_orca_rows <main> -> one US(0x1f)-separated "path branch issue displayName" row per non-main
-# worktree (US, not TAB: `read` collapses runs of whitespace IFS, which would shift an empty
-# branch or issue). FAILS CLOSED: Orca missing, the repo unregistered or a bad reply returns 1
-# with a loud message -- an empty list must never read as "nothing in flight".
+# worktree (not TAB: `read` collapses whitespace IFS runs, shifting an empty field). FAILS CLOSED:
+# Orca missing, repo unregistered or a bad reply returns 1 loudly -- never an empty "nothing in flight".
 _wt_orca_rows() {
   local main="$1" rows wt br iss disp
   orca_json worktree list --repo "path:$main" \

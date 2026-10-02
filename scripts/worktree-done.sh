@@ -14,11 +14,10 @@
 #                             ingested the spoke already, so the hook would ingest it twice)
 #                             (all flags are position-independent)
 #
-# Teardown is `orca worktree rm` -- Orca owns the checkout, so nothing here removes a directory
-# behind its back. It refuses a dirty tree unless --force is given. The branch is pruned -- local
-# and origin -- but ONLY when it is fully merged into the hub's base branch, so an abandoned
-# teardown never loses unmerged work: Orca may delete the local branch of its own accord, so the
-# tip and merged-ness are recorded BEFORE the removal and an unmerged branch is put back after it.
+# Teardown is `orca worktree rm` (Orca owns the checkout). The branch is pruned -- local and origin --
+# ONLY when fully merged into the hub's base, so an abandoned teardown never loses unmerged work:
+# Orca may delete the local branch itself, so tip and merged-ness are recorded BEFORE the removal
+# and an unmerged branch is put back after it.
 #
 set -euo pipefail
 
@@ -111,11 +110,13 @@ if [ -n "$COMMON_GIT_DIR" ] && [ -e "$COMMON_GIT_DIR/hub-guard-allow" ]; then
     || wt_warn "couldn't remove hub-guard-allow — delete it by hand: rm \"$COMMON_GIT_DIR/hub-guard-allow\""
 fi
 
-# `worktree rm` can outlive the CLI's ~30 s limit (the archive hook alone may take 120 s): a drop is
-# settled by listing the worktrees, and the removal is never re-issued.
+# `worktree rm` can outlive the CLI's ~30 s limit (the archive hook may take 120 s): a drop is settled
+# by listing worktrees (never re-issuing the rm). "Gone" needs a real list that still shows the main
+# worktree but not $WT_DIR -- a garbled or empty reply is "unknown".
 _wt_gone() {
   orca_json worktree list --repo "path:$REPO_ROOT" \
-    && ! printf '%s' "$ORCA_OUT" | jq -e --arg p "$WT_DIR" '.result.worktrees[]? | select(.path == $p)' >/dev/null
+    && printf '%s' "$ORCA_OUT" | jq -e --arg p "$WT_DIR" '(.result.worktrees | type == "array")
+         and any(.result.worktrees[]; .isMainWorktree == true) and all(.result.worktrees[]; .path != $p)' >/dev/null
 }
 echo "→ removing worktree: $WT_DIR"
 orca_call_settled _wt_gone worktree rm --worktree "path:$WT_DIR" ${FORCE:+"$FORCE"} ${RUN_HOOKS:+"$RUN_HOOKS"} \
@@ -146,6 +147,12 @@ prune_branch() {
   # here because that ancestor proof is the authority. If even -D refuses,
   # leave origin/<branch> alone too rather than delete a remote whose local
   # counterpart we couldn't remove.
+  # Keep it if it moved on during the removal (a live spoke can commit during the hook): the merged
+  # proof was for $TIP only.
+  if [ -n "$TIP" ] && [ "$(git rev-parse -q --verify "refs/heads/$WT_BRANCH" || echo "$TIP")" != "$TIP" ]; then
+    wt_warn "branch $WT_BRANCH gained commits while it was being removed -- kept; merge it or abandon it with: git branch -D \"$WT_BRANCH\""
+    return
+  fi
   if git show-ref --verify --quiet "refs/heads/$WT_BRANCH" && ! git branch -D "$WT_BRANCH"; then
     wt_warn "couldn't delete local branch $WT_BRANCH — see git's message above; leaving origin/$WT_BRANCH (if any) in place."
     return

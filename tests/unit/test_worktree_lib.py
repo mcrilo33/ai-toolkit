@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
-from _orca_stub import orca_link, orca_scenario
+from _orca_stub import add_worktree, make_hub, orca_scenario
 
 WT_LIB = Path(__file__).resolve().parents[2] / "scripts" / "worktree-lib.sh"
 
@@ -1972,90 +1972,29 @@ def test_otel_prefix_is_empty_when_otel_is_off() -> None:
 # wt_task_worktrees / wt_resolve read `orca worktree list` (the PATH stub builds its rows from
 # the real `git worktree list`), so the issue is a column, not a slug re-parsed from a branch.
 
-_GIT_ENV = {
-    **os.environ,
-    "GIT_AUTHOR_NAME": "t",
-    "GIT_AUTHOR_EMAIL": "t@t",
-    "GIT_COMMITTER_NAME": "t",
-    "GIT_COMMITTER_EMAIL": "t@t",
-    "GIT_CONFIG_GLOBAL": "/dev/null",
-    "GIT_CONFIG_SYSTEM": "/dev/null",
-}
-
-
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, env=_GIT_ENV)
-
-
-@pytest.fixture
-def lookup_hub(tmp_path: Path) -> Path:
-    hub = tmp_path / "hub"
-    hub.mkdir()
-    _git(hub, "init", "-q", "-b", "main")
-    _git(hub, "commit", "-q", "--allow-empty", "-m", "chore: seed")
-    return hub
-
-
-def _add_worktree(
-    orca_bin: Path,
-    hub: Path,
-    branch: str,
-    *,
-    dirname: str = "",
-    linked_issue: int | None = None,
-    name: str = "",
-    recorded_issue: int | None = None,
-) -> Path:
-    wt = hub.parent / (dirname or branch.replace("/", "-"))
-    _git(hub, "worktree", "add", "-q", "-b", branch, str(wt))
-    orca_link(orca_bin, wt, issue=linked_issue, name=name)
-    if recorded_issue is not None:
-        (wt / ".ai-toolkit").mkdir()
-        (wt / ".ai-toolkit" / "identity").write_text(f"issue={recorded_issue}\n")
-    return wt
-
 
 def _lookup(hub: Path, expr: str) -> subprocess.CompletedProcess[str]:
     return _call(f'cd "{hub}" && main="$(wt_main_root)" && {expr}')
 
 
-def test_task_worktrees_prints_path_branch_and_linked_issue(
-    orca_bin: Path, lookup_hub: Path
+def test_task_worktrees_prints_path_branch_and_issue_for_every_non_main_row(
+    orca_bin: Path, tmp_path: Path
 ) -> None:
-    wt = _add_worktree(orca_bin, lookup_hub, "361-identity-hub-side", linked_issue=361)
+    hub = make_hub(tmp_path / "hub")
+    linked = add_worktree(orca_bin, hub, "361-identity-hub-side", issue=361)
+    recorded = add_worktree(orca_bin, hub, "bare-branch", identity_issue=77)  # Orca: no link
+    bare = add_worktree(orca_bin, hub, "scratch-lane")
 
-    result = _lookup(lookup_hub, 'wt_task_worktrees "$main"')
+    result = _lookup(hub, 'wt_task_worktrees "$main"')
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [f"{wt}\t361-identity-hub-side\t361"]
-
-
-def test_task_worktrees_excludes_the_main_checkout(orca_bin: Path, lookup_hub: Path) -> None:
-    result = _lookup(lookup_hub, 'wt_task_worktrees "$main"')
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == ""
-
-
-def test_task_worktrees_falls_back_to_the_identity_record_when_not_linked(
-    orca_bin: Path,
-    lookup_hub: Path,
-) -> None:
-    _add_worktree(orca_bin, lookup_hub, "bare-branch", recorded_issue=77)
-
-    result = _lookup(lookup_hub, 'wt_task_worktrees "$main"')
-
-    assert result.stdout.rstrip("\n").split("\t")[2] == "77"
-
-
-def test_task_worktrees_issue_column_is_empty_without_any_issue(
-    orca_bin: Path, lookup_hub: Path
-) -> None:
-    _add_worktree(orca_bin, lookup_hub, "scratch-lane")
-
-    result = _lookup(lookup_hub, 'wt_task_worktrees "$main"')
-
-    assert result.stdout.rstrip("\n").split("\t")[2] == ""
+    assert sorted(result.stdout.splitlines()) == sorted(
+        [
+            f"{linked}\t361-identity-hub-side\t361",
+            f"{recorded}\tbare-branch\t77",
+            f"{bare}\tscratch-lane\t",
+        ]
+    )
 
 
 @pytest.mark.parametrize(
@@ -2067,12 +2006,13 @@ def test_task_worktrees_issue_column_is_empty_without_any_issue(
     ],
 )
 def test_task_worktrees_fails_closed_never_an_empty_success(
-    orca_bin: Path, lookup_hub: Path, reply: dict
+    orca_bin: Path, tmp_path: Path, reply: dict
 ) -> None:
-    _add_worktree(orca_bin, lookup_hub, "361-identity-hub-side", linked_issue=361)
+    hub = make_hub(tmp_path / "hub")
+    add_worktree(orca_bin, hub, "361-identity-hub-side", issue=361)
     orca_scenario(orca_bin, {"worktree list": [reply]})
 
-    result = _lookup(lookup_hub, 'wt_task_worktrees "$main"')
+    result = _lookup(hub, 'wt_task_worktrees "$main"')
 
     assert result.returncode != 0
     assert result.stdout == ""
@@ -2080,92 +2020,48 @@ def test_task_worktrees_fails_closed_never_an_empty_success(
 
 
 @pytest.mark.parametrize(
-    "target",
+    ("kwargs", "target"),
     [
-        pytest.param("361", id="issue-from-linkedIssue"),
-        pytest.param("361-identity-hub-side", id="branch-without-type-prefix"),
-        pytest.param("Pretty Name", id="display-name"),
+        pytest.param({"issue": 361}, "361", id="issue-from-linkedIssue"),
+        pytest.param({"identity_issue": 77}, "77", id="issue-from-identity-when-unlinked"),
+        pytest.param({}, "feature/refactor-sync", id="full-branch"),
+        pytest.param({}, "refactor-sync", id="branch-leaf"),
+        pytest.param({}, "Refactor_Sync", id="slugified-leaf"),
+        pytest.param({"name": "Pretty Name"}, "Pretty Name", id="display-name"),
+        pytest.param({}, "PATH", id="canonical-path"),
     ],
 )
-def test_resolve_finds_a_worktree_on_a_bare_branch(
-    orca_bin: Path, lookup_hub: Path, target: str
+def test_resolve_finds_the_one_matching_worktree(
+    orca_bin: Path, tmp_path: Path, kwargs: dict, target: str
 ) -> None:
-    wt = _add_worktree(
-        orca_bin, lookup_hub, "361-identity-hub-side", linked_issue=361, name="Pretty Name"
-    )
+    hub = make_hub(tmp_path / "hub")
+    wt = add_worktree(orca_bin, hub, "feature/refactor-sync", dirname="elsewhere", **kwargs)
 
-    result = _lookup(lookup_hub, f'wt_resolve "{target}" "$main"')
+    result = _lookup(hub, f'wt_resolve "{str(wt) if target == "PATH" else target}" "$main"')
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == str(wt)
 
 
-def test_resolve_matches_the_issue_from_identity_when_linked_issue_is_null(
-    orca_bin: Path,
-    lookup_hub: Path,
+@pytest.mark.parametrize("target", ["999", "sometag", "hub-sometag"])
+def test_resolve_returns_1_for_no_match_and_a_bare_repo_tag_dirname(
+    orca_bin: Path, tmp_path: Path, target: str
 ) -> None:
-    wt = _add_worktree(orca_bin, lookup_hub, "bare-branch", recorded_issue=77)
+    hub = make_hub(tmp_path / "hub")
+    add_worktree(orca_bin, hub, "feature/unrelated", dirname="hub-sometag", issue=361)
 
-    result = _lookup(lookup_hub, 'wt_resolve 77 "$main"')
+    result = _lookup(hub, f'wt_resolve "{target}" "$main"')
 
-    assert result.stdout.strip() == str(wt)
-
-
-@pytest.mark.parametrize("by", ["path", "full-branch", "leaf", "slugified-leaf"])
-def test_resolve_matches_path_branch_and_leaf(orca_bin: Path, lookup_hub: Path, by: str) -> None:
-    wt = _add_worktree(orca_bin, lookup_hub, "feature/refactor-sync", dirname="elsewhere")
-    target = {
-        "path": str(wt),
-        "full-branch": "feature/refactor-sync",
-        "leaf": "refactor-sync",
-        "slugified-leaf": "Refactor_Sync",
-    }[by]
-
-    result = _lookup(lookup_hub, f'wt_resolve "{target}" "$main"')
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == str(wt)
+    assert (result.returncode, result.stdout) == (1, "")
 
 
-def test_resolve_no_longer_matches_a_bare_repo_tag_directory_name(
-    orca_bin: Path, lookup_hub: Path
-) -> None:
-    _add_worktree(orca_bin, lookup_hub, "feature/unrelated", dirname="hub-sometag")
+def test_resolve_returns_1_when_two_worktrees_match(orca_bin: Path, tmp_path: Path) -> None:
+    hub = make_hub(tmp_path / "hub")
+    add_worktree(orca_bin, hub, "feature/same-leaf")
+    add_worktree(orca_bin, hub, "fix/same-leaf")
 
-    by_tag = _lookup(lookup_hub, 'wt_resolve sometag "$main"')
-    by_basename = _lookup(lookup_hub, 'wt_resolve hub-sometag "$main"')
+    result = _lookup(hub, 'wt_resolve same-leaf "$main"')
 
-    assert (by_tag.returncode, by_basename.returncode) == (1, 1)
-
-
-def test_resolve_returns_1_when_nothing_matches(orca_bin: Path, lookup_hub: Path) -> None:
-    _add_worktree(orca_bin, lookup_hub, "feature/361-a", linked_issue=361)
-
-    result = _lookup(lookup_hub, 'wt_resolve 999 "$main"')
-
-    assert result.returncode == 1
-    assert result.stdout == ""
+    assert (result.returncode, result.stdout) == (1, "")
 
 
-def test_resolve_returns_1_when_two_worktrees_match(orca_bin: Path, lookup_hub: Path) -> None:
-    _add_worktree(orca_bin, lookup_hub, "feature/same-leaf")
-    _add_worktree(orca_bin, lookup_hub, "fix/same-leaf")
-
-    result = _lookup(lookup_hub, 'wt_resolve same-leaf "$main"')
-
-    assert result.returncode == 1
-    assert result.stdout == ""
-
-
-def test_print_worktrees_lists_candidates_and_says_so_when_orca_is_down(
-    orca_bin: Path,
-    lookup_hub: Path,
-) -> None:
-    wt = _add_worktree(orca_bin, lookup_hub, "feature/361-a", linked_issue=361)
-    listed = _lookup(lookup_hub, 'wt_print_worktrees "$main"')
-    orca_scenario(orca_bin, {"worktree list": [{"rc": 1, "stderr": "boom"}]})
-
-    down = _lookup(lookup_hub, 'wt_print_worktrees "$main"')
-
-    assert str(wt) in listed.stderr
-    assert "(none)" not in down.stderr

@@ -30,7 +30,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _orca_stub import orca_link, orca_scenario
+from _orca_stub import add_worktree, make_hub, orca_scenario
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BATCH_PLAN = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.sh"
@@ -1669,27 +1669,8 @@ def _inflight_nums(cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _hub_with_worktree(tmp_path: Path, orca_bin: Path, branch: str, issue: int | None) -> Path:
-    hub, wt = tmp_path / "hub", tmp_path / "wt"
-    env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
-    for args in (
-        ["init", "-q", "-b", "main", str(hub)],
-        [
-            "-C",
-            str(hub),
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "chore: seed",
-        ],
-        ["-C", str(hub), "worktree", "add", "-q", "-b", branch, str(wt)],
-    ):
-        subprocess.run(["git", *args], check=True, capture_output=True, env=env)
-    orca_link(orca_bin, wt, issue=issue)
+    hub = make_hub(tmp_path / "hub")
+    add_worktree(orca_bin, hub, branch, issue=issue)
     return hub
 
 

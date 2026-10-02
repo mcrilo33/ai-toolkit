@@ -63,20 +63,16 @@ case "$common_dir" in
 esac
 seen_file="${HUB_READY_SEEN_FILE:-$common_dir/hub-ready-seen}"
 
-# branch_for_issue <issue> → "<branch>\t<path>" for the worktree Orca links to this issue, or
-# non-zero if none. The hub holds the spoke's worktree until landing, so this resolves in the normal
-# case; absence is the degraded (already-torn-down) case. Falls back to scanning the task worktrees
-# (which also reads the identity record) when Orca's `issue:` selector finds nothing.
+# branch_for_issue <issue> → "<branch>\t<path>" for this repo's worktree on that issue (Orca's
+# linkedIssue, else identity), or non-zero if none (the already-torn-down case). A scan of THIS repo,
+# not `orca worktree show issue:<n>`, whose selector spans every registered repo.
 branch_for_issue() {
-  local issue="$1" path branch num
-  if orca worktree show --worktree "issue:$issue" --json 2>/dev/null \
-       | jq -er '.result.worktree | select(.branch != null) | "\(.branch | sub("^refs/heads/"; ""))\t\(.path)"' 2>/dev/null; then
-    return 0
-  fi
+  local issue="$1" rows path branch num
   command -v wt_task_worktrees >/dev/null 2>&1 || return 1
-  while IFS=$'\t' read -r path branch num; do
+  rows="$(wt_task_worktrees "$main_root" 2>/dev/null)" || return 1
+  while IFS=$'\037' read -r path branch num; do
     [ "$num" = "$issue" ] && [ -n "$branch" ] && { printf '%s\t%s\n' "$branch" "$path"; return 0; }
-  done < <(wt_task_worktrees "$main_root" 2>/dev/null)
+  done <<<"${rows//$'\t'/$'\037'}"
   return 1
 }
 

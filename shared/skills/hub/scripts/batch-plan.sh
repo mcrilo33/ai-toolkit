@@ -985,15 +985,14 @@ PYEOF
 }
 
 # _batch_inflight_issue_nums — the issue of each task worktree, one per line, from `orca worktree list`
-# (its `linkedIssue`; the main checkout is skipped). Used to seed the --explain view with the live
-# in-flight set so it can attribute blocked-by-scope collisions to a running spoke. A standalone parse
-# (no worktree-lib dependency) in the existing embedded python; LC_ALL=C keeps it byte-stable (#189/#194).
-# If Orca cannot answer it warns and prints nothing: the explain view just loses its in-flight
-# attribution, it never guesses.
+# (its `linkedIssue`; the main checkout is skipped), to seed the --explain view's in-flight set so it
+# can attribute blocked-by-scope collisions to a running spoke. Standalone (no worktree-lib
+# dependency); LC_ALL=C keeps it byte-stable (#189/#194). If Orca cannot answer it warns and prints
+# nothing: the view loses its attribution, it never guesses.
 _batch_inflight_issue_nums() {
   local out
-  out="$(LC_ALL=C orca worktree list --repo "path:$(git rev-parse --show-toplevel 2>/dev/null || pwd)" --json 2>&1)" || {
-    echo "batch-plan: orca worktree list failed -- in-flight attribution dropped from the explain view: $out" >&2
+  out="$(LC_ALL=C orca worktree list --repo "path:$(git rev-parse --show-toplevel 2>/dev/null || pwd)" --json 2>/dev/null)" || {
+    echo "batch-plan: orca worktree list failed -- in-flight attribution dropped from the explain view" >&2
     return 0
   }
   printf '%s' "$out" | LC_ALL=C python3 -c '

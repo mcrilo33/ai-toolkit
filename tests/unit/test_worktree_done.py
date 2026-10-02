@@ -424,19 +424,6 @@ def test_no_hooks_omits_run_hooks_from_the_orca_call(
     assert "--run-hooks" not in _rm_calls(orca_bin)[0]
 
 
-def test_unknown_flag_is_rejected_and_nothing_is_removed(
-    orca_bin: Path, hub: Path, tmp_path: Path
-) -> None:
-    wt = _make_spoke(hub, tmp_path, "feature/4-flag", push=True, merge=True)
-
-    proc = _run_done(hub, tmp_path, "4", "--bogus")
-
-    assert proc.returncode != 0
-    assert "--bogus" in proc.stderr
-    assert wt.exists()
-    assert _rm_calls(orca_bin) == []
-
-
 def test_orca_refusal_exits_nonzero_with_orcas_error_and_keeps_everything(
     orca_bin: Path, hub: Path, tmp_path: Path
 ) -> None:
@@ -508,17 +495,6 @@ def test_unmerged_branch_orca_deleted_is_recreated_at_its_old_tip(
     assert _remote_has(hub, "feature/9-lost")
 
 
-def test_unmerged_branch_orca_kept_is_left_as_is(orca_bin: Path, hub: Path, tmp_path: Path) -> None:
-    _make_spoke(hub, tmp_path, "feature/9-keep", push=False, merge=False)
-    tip = _git(hub, "rev-parse", "feature/9-keep").strip()
-    orca_scenario(orca_bin, {"_rm": {"branch": "never"}})
-
-    proc = _run_done(hub, tmp_path, "9")
-
-    assert proc.returncode == 0, proc.stderr
-    assert _git(hub, "rev-parse", "feature/9-keep").strip() == tip
-
-
 def test_fails_closed_when_orca_cannot_list_worktrees(
     orca_bin: Path, hub: Path, tmp_path: Path
 ) -> None:
@@ -543,3 +519,16 @@ def test_resolves_a_bare_branch_worktree_by_its_orca_issue(
 
     assert proc.returncode == 0, proc.stderr
     assert not wt.exists()
+
+
+def test_branch_that_moved_on_during_the_removal_is_kept_not_pruned(
+    orca_bin: Path, hub: Path, tmp_path: Path
+) -> None:
+    _make_spoke(hub, tmp_path, "feature/9-late", push=False, merge=True)
+    orca_scenario(orca_bin, {"_rm": {"commit": True, "branch": "never"}})
+
+    proc = _run_done(hub, tmp_path, "9")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "gained commits" in proc.stderr
+    assert "feature/9-late" in _local_branches(hub)

@@ -980,9 +980,8 @@ fi
 # at the end so the caller can tell "nothing shipped" (1) from "shipped, cleanup incomplete" (3).
 CLEANUP_INCOMPLETE=""
 if [ -n "$WT_DIR" ]; then
-  # Release the spoke's Orca worker NOW -- after the ingest above read the settled state, before the
-  # removal -- so its terminal closes and the OTel exporter stops (the old tmux reap's job, #273).
-  # No recorded dispatch (a non-Orca lane) => nothing to release; a failure warns and goes on.
+  # Release the spoke's Orca worker after the ingest, before the removal: its terminal closes and the
+  # OTel exporter stops (the old tmux reap's job, #273). No recorded dispatch => nothing to release.
   DISPATCH_ID="$(ai_toolkit_identity_get orca_dispatch_id "$WT_DIR" 2>/dev/null || true)"
   if [ -n "$DISPATCH_ID" ]; then
     orca_json orchestration worker-release --dispatch "$DISPATCH_ID" \

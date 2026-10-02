@@ -259,8 +259,8 @@ fi
 
 # --- Worktrees -------------------------------------------------------------
 bold "Worktrees"
-# The hub (main checkout) first, then the task worktrees from `orca worktree list` (its linkedIssue
-# column replaces the branch-slug parse). Orca unreachable => a loud line, never a silent empty table.
+# The hub first, then the task worktrees from `orca worktree list` (its issue column replaces the
+# slug parse). Orca unreachable => a loud line, never a silent empty table.
 hub_branch="$(git -C "$main_root" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "(detached)")"
 printf '  %-28s %s  (hub)\n' "$hub_branch" "$main_root"
 # Issues that have a worktree, to cross-reference the open-issues list below.
@@ -270,7 +270,7 @@ if ! command -v wt_task_worktrees >/dev/null 2>&1; then
 elif ! wt_rows="$(wt_task_worktrees "$main_root")"; then
   wt_rows=""; echo "  (could not list task worktrees: orca is unavailable -- see the error above)"
 fi
-while IFS=$'\t' read -r path branch issue_num; do
+while IFS=$'\037' read -r path branch issue_num; do
   [ -n "$path" ] || continue
   [ -n "$branch" ] || branch="(detached)"
   worktree_issues+="$issue_num"$'\n'
@@ -348,7 +348,7 @@ while IFS=$'\t' read -r path branch issue_num; do
   # Task ledger sub-line (Tasks system or TodoWrite)
   todos_out="$(todos_for_path "$path")"
   [ -n "$todos_out" ] && printf "      ↳ todos: %s\n" "$todos_out"
-done <<<"$wt_rows"
+done <<<"${wt_rows//$'\t'/$'\037'}"
 echo
 
 # --- Hub agents (issue #245) -------------------------------------------------

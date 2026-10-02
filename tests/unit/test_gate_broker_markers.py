@@ -15,7 +15,7 @@ from _gate_broker_support import (
     _call,
     _perm_env,
 )
-from _orca_stub import orca_link, orca_scenario
+from _orca_stub import add_worktree, make_hub, orca_link, orca_scenario
 
 
 @pytest.fixture(autouse=True)
@@ -1486,32 +1486,14 @@ def test_read_done_epoch_falls_back_to_the_file_without_a_log(tmp_path: Path) ->
 
 def _inflight_hub(tmp_path: Path, orca_bin: Path, *, linked: bool) -> tuple[Path, Path]:
     """A hub with ONE task worktree on a bare branch (no `<type>/<n>-` slug to parse)."""
-    hub, wt = tmp_path / "hub", tmp_path / "wt"
-    env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
-    for args in (
-        ["init", "-q", "-b", "main", str(hub)],
-        [
-            "-C",
-            str(hub),
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "chore: seed",
-        ],
-        ["-C", str(hub), "worktree", "add", "-q", "-b", "scratch-lane", str(wt)],
-    ):
-        subprocess.run(["git", *args], check=True, capture_output=True, env=env)
-    if linked:
-        orca_link(orca_bin, wt, issue=361)
-    else:
-        (wt / ".ai-toolkit").mkdir()
-        (wt / ".ai-toolkit" / "identity").write_text("issue=361\n")
-    return hub, wt
+    hub = make_hub(tmp_path / "hub")
+    return hub, add_worktree(
+        orca_bin,
+        hub,
+        "scratch-lane",
+        issue=361 if linked else None,
+        identity_issue=None if linked else 361,
+    )
 
 
 def _in_hub(hub: Path, expr: str) -> subprocess.CompletedProcess[str]:
@@ -1548,3 +1530,20 @@ def test_inflight_worktrees_fails_closed_when_orca_cannot_answer(
     assert "IS_RC=1" in result.stdout
     assert result.stdout.count("361") == 0, "an unreachable Orca must never read as an empty set"
     assert "orca" in result.stderr
+
+
+def test_inflight_worktrees_keeps_a_detached_row_with_a_linked_issue(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    hub = make_hub(tmp_path / "hub")
+    wt = tmp_path / "rebasing"
+    subprocess.run(
+        ["git", "-C", str(hub), "worktree", "add", "-q", "--detach", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    orca_link(orca_bin, wt, issue=42)
+
+    result = _in_hub(hub, "inflight_worktrees")
+
+    assert result.stdout.splitlines() == [f"{wt}\t42"], "an empty branch must not shift columns"

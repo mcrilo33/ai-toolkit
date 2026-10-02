@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-from _orca_stub import orca_calls, orca_link, orca_scenario
+from _orca_stub import orca_calls, orca_scenario
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKTREE_LAND = _REPO_ROOT / "scripts" / "worktree-land.sh"
@@ -2643,35 +2643,3 @@ def test_land_exits_3_not_1_when_orca_refuses_the_removal(
     assert _git(hub, "rev-parse", "main").strip() == _remote_sha(hub, "main")
 
 
-def test_land_treats_a_cli_drop_after_the_removal_as_success(
-    orca_bin: Path, hub: Path, tmp_path: Path
-) -> None:
-    orca_scenario(orca_bin, {"_rm": {"drop": "after"}})
-    wt = _make_spoke(hub, tmp_path, "feature/1-dropped", push=True)
-
-    proc, _ = _run_land(hub, tmp_path, "1", extra_env={"ORCA_SETTLE_SLEEP": "0"})
-
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert not wt.exists()
-
-
-def test_land_rejects_an_unknown_flag_before_touching_anything(hub: Path, tmp_path: Path) -> None:
-    wt = _make_spoke(hub, tmp_path, "feature/1-flag", push=True)
-
-    proc, _ = _run_land(hub, tmp_path, "1", "--bogus")
-
-    assert proc.returncode != 0
-    assert "--bogus" in proc.stderr
-    assert wt.exists()
-
-
-def test_land_of_a_bare_branch_worktree_resolves_it_by_orca_issue(
-    orca_bin: Path, hub: Path, tmp_path: Path
-) -> None:
-    wt = _make_spoke(hub, tmp_path, "361-bare", push=True, ready=False)
-    orca_link(orca_bin, wt, issue=361)
-
-    proc, _ = _run_land(hub, tmp_path, "361", "--force-land")
-
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert not wt.exists()

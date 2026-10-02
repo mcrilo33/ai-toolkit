@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -99,6 +100,8 @@ def remove(row, repo, rm):
     if "--force" not in argv and subprocess.run(
             [GIT, "-C", row["path"], "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
         fail("worktree_dirty", f"orca stub: {row['path']} has uncommitted changes; pass --force")
+    if rm.get("commit"):  # a live spoke keeps committing while the archive hook runs
+        subprocess.run([GIT, "-C", row["path"], "commit", "-q", "--allow-empty", "-m", "late"], check=True)
     subprocess.run([GIT, "-C", repo, "worktree", "remove", "--force", row["path"]], check=True)
     flag = {"merged": "-d", "always": "-D"}.get(rm.get("branch", "merged"))
     if flag and row["branch"]:
@@ -212,7 +215,7 @@ def orca_scenario(bindir: Path, scenario: dict) -> None:
 
     `_rm` simulates `worktree rm`: `refuse` (Orca declines), `drop` (`"after"`: the removal
     happened but the CLI died with `runtime_unavailable`; `"before"`: it died without removing)
-    and `branch` (`merged` = `git branch -d` like Orca, `always` = `-D`, `never` = keep it).
+    and `commit` (the spoke commits during the removal) and `branch` (`merged` = `git branch -d` like Orca, `always` = `-D`, `never` = keep it).
     """
     (bindir / ".orca-stub" / "scenario.json").write_text(json.dumps(scenario))
 
@@ -225,6 +228,42 @@ def orca_link(bindir: Path, path: Path, *, issue: int | None = None, name: str =
     entry.update({"linkedIssue": issue} if issue is not None else {})
     entry.update({"displayName": name} if name else {})
     meta_f.write_text(json.dumps(meta))
+
+
+def make_hub(root: Path) -> Path:
+    """Create a git repo on `main` with one empty commit (identity comes from tests/conftest.py)."""
+    root.mkdir(parents=True)
+    for args in (
+        ["init", "-q", "-b", "main"],
+        ["commit", "-q", "--allow-empty", "-m", "chore: seed"],
+    ):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+    return root
+
+
+def add_worktree(
+    bindir: Path,
+    hub: Path,
+    branch: str,
+    *,
+    dirname: str = "",
+    issue: int | None = None,
+    name: str = "",
+    identity_issue: int | None = None,
+) -> Path:
+    """`git worktree add` a sibling of `hub`; `issue` / `name` become what the stub reports as its
+    Orca `linkedIssue` / `displayName`, `identity_issue` is written to its identity record."""
+    wt = hub.parent / (dirname or branch.replace("/", "-"))
+    subprocess.run(
+        ["git", "-C", str(hub), "worktree", "add", "-q", "-b", branch, str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    orca_link(bindir, wt, issue=issue, name=name)
+    if identity_issue is not None:
+        (wt / ".ai-toolkit").mkdir()
+        (wt / ".ai-toolkit" / "identity").write_text(f"issue={identity_issue}\n")
+    return wt
 
 
 def install_forbidden_stubs(bindir: Path) -> Path:

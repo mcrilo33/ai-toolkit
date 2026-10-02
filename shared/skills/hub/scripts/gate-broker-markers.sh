@@ -781,18 +781,18 @@ _afk_find_script() {
 
 # --- in-flight survey ---------------------------------------------------------
 # "<path>\t<issue>" per task worktree that names an issue: Orca's linkedIssue, else the identity
-# record (both resolved by wt_task_worktrees, so a worktree on a bare branch is still in flight and
-# nothing here parses a slug). Returns 1 with wt_task_worktrees' loud message when Orca cannot answer:
-# an empty in-flight set would over-dispatch, so it must never read as "nothing running".
-# UPGRADE: every call is one local `orca worktree list` (plus an identity read per unlinked row), no
-# cache -- memoize it per tick if the per-tick cost ever shows in a drain profile.
+# record (resolved by wt_task_worktrees; no slug parse). Returns 1 with its loud message when Orca
+# cannot answer: an empty set would over-dispatch, so it must never read as "nothing running".
+# UPGRADE: each call is one local `orca worktree list` (no cache) -- memoize per tick if it shows
+# in a drain profile.
 inflight_worktrees() {
   local main rows path br num
   main="$(wt_main_root 2>/dev/null)" || return 0
   rows="$(wt_task_worktrees "$main")" || return 1
-  while IFS=$'\t' read -r path br num; do
+  # TAB -> US: `read` collapses runs of a whitespace IFS, shifting a detached row's empty branch.
+  while IFS=$'\037' read -r path br num; do
     if [ -n "$path" ] && [ -n "$num" ]; then printf '%s\t%s\n' "$path" "$num"; fi
-  done <<<"$rows"
+  done <<<"${rows//$'\t'/$'\037'}"
   return 0
 }
 inflight_issues() {
