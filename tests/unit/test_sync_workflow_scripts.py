@@ -476,3 +476,32 @@ def test_worktree_lib_module_source_exists_and_is_executable(module: str) -> Non
     src = REPO_ROOT / "scripts" / f"worktree-{module}-lib.sh"
     assert src.is_file(), f"scripts/worktree-{module}-lib.sh missing"
     assert os.access(src, os.X_OK), f"worktree-{module}-lib.sh is not executable"
+
+
+# ── provision-worktree.sh registration (issue #359) ───────────────────────────
+# The shared Orca/tmux provisioning script. worktree-new.sh calls it as a sibling from a synced
+# target's .ai-toolkit/scripts/, so it must ship there. Toolkit-root script: default source case.
+PROVISION_WORKTREE = REPO_ROOT / "scripts" / "provision-worktree.sh"
+
+
+def test_provision_worktree_registered_in_sync_loop() -> None:
+    assert "provision-worktree.sh" in _for_name_list(), (
+        "provision-worktree.sh is not registered in sync_workflow_scripts() — worktree-new.sh "
+        "would fail to provision every spoke in a synced target"
+    )
+
+
+def test_provision_worktree_takes_the_default_root_source_case() -> None:
+    body = _sync_workflow_scripts_body()
+    hub_case = re.search(r"\n\s*([\w.|-]*provision-worktree\.sh[\w.|-]*)\)\s+src=", body)
+    assert hub_case is None, (
+        "provision-worktree.sh must not have an explicit case mapping — it takes the default "
+        'src="$SCRIPT_DIR/$name" (toolkit-root scripts/)'
+    )
+
+
+def test_provision_worktree_source_exists_and_is_executable() -> None:
+    assert PROVISION_WORKTREE.is_file(), (
+        "scripts/provision-worktree.sh missing — sync would copy nothing"
+    )
+    assert os.access(PROVISION_WORKTREE, os.X_OK), "scripts/provision-worktree.sh is not executable"
