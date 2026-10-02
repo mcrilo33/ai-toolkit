@@ -17,8 +17,9 @@
 #   • a non-python changed file that maps to referencing tests (reverse index,
 #     issue #123)
 #       → exactly the mapped test files, under `-n auto`
-#   • a python change with testmon installed
-#       → `pytest --testmon` (never under xdist: testmon is single-writer)
+#   • a python change with testmon installed AND a testmon database already present
+#       → `pytest --testmon` (never under xdist: testmon is single-writer). A first run
+#         without a database would execute the whole suite to seed it, so none starts.
 #   • the control-plane coverage meta-test (#123) rides along whenever anything
 #     non-doc changed: an unmapped script stays red there until a test names it
 #
@@ -350,7 +351,14 @@ if [ "${#SEL_ARR[@]}" -gt 0 ]; then
 fi
 
 if [ "$has_py" = "1" ]; then
-  if runner_has "--testmon"; then
+  if ! runner_has "--testmon"; then
+    note "python change but testmon not installed — only the selected tests ran; CI is the full gate"
+  elif [ ! -f "${TESTMON_DATAFILE:-.testmondata}" ]; then
+    # A first testmon run in a tree without a database executes the WHOLE suite to build
+    # it — exactly what this tier must never do. The seeded baseline worktree-new copies
+    # in is what makes testmon incremental here; without it, leave the seeding to CI.
+    note "python change but no testmon database (${TESTMON_DATAFILE:-.testmondata}) — a first run would execute the whole suite, so none is started; CI is the full gate"
+  else
     # Dedup (issue #270): the selected files ALREADY ran, in full, above. --ignore each
     # (and the meta file) so testmon collects everything EXCEPT them: any impacted test
     # inside a selected file already ran, so nothing is missed and nothing double-runs.
@@ -365,8 +373,6 @@ if [ "$has_py" = "1" ]; then
     # set, --ignore leaves it nothing to run — a GREEN outcome, never a block.
     [ "$rc2" != "5" ] || rc2=0
     [ "$rc" -ne 0 ] || rc=$rc2
-  else
-    note "python change but testmon not installed — only the selected tests ran; CI is the full gate"
   fi
 fi
 exit "$rc"

@@ -469,7 +469,10 @@ git tag -f -a "$TAG" "${MSG_ARGS[@]}"
 # this subshell, so the transport-death retry below (which only happens AFTER the hook
 # passed) re-pushes without re-running the suite.
 _push_tag() {
-  ( [ "$LOCAL_GATE" != "1" ] || export TEST_SELECT_CMD="$(wt_local_gate_cmd)"; wt_git_push -f origin "$TAG" )
+  (
+    if [ "$LOCAL_GATE" = "1" ]; then TEST_SELECT_CMD="$(wt_local_gate_cmd)"; export TEST_SELECT_CMD; fi
+    wt_git_push -f origin "$TAG"
+  )
 }
 echo "→ wt_git_push -f origin $TAG (SSH keepalive, issue #119)"
 # The capture file exists only to classify a failure; a host without a writable

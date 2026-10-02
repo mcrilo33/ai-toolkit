@@ -91,13 +91,17 @@ def test_land_records_landing_before_the_merge(tmp_path: Path) -> None:
     # BEFORE removing the worktree, so mid-land the watchdog saw "dead pane, no
     # marker" and false-fired. `landing` must therefore be recorded BEFORE the merge
     # runs — not after it completes, which would leave the same blind window.
-    # Proven by source order: the write precedes the `git merge` call.
+    # Since #378 the land also waits for CI (minutes) before merging, so the write must
+    # precede that wait too. Proven by source order: the write precedes the CI gate call and
+    # the merge call (the function bodies above are definitions, not execution).
     land = (REPO_ROOT / "scripts" / "worktree-land.sh").read_text()
     write_at = land.find('wt_tlog_transition "$ISSUE" landing')
-    merge_at = land.find('if ! git merge --no-edit "$WT_BRANCH"')
+    gate_at = land.find('land_require_ci_green "$(git rev-parse')
+    merge_at = land.find("\nland_merge_into_default\n")
 
     assert write_at != -1, "worktree-land.sh must record the landing transition"
-    assert merge_at != -1
+    assert gate_at != -1 and merge_at != -1
+    assert write_at < gate_at, "landing must be recorded BEFORE the CI wait starts (#290, #378)"
     assert write_at < merge_at, "landing must be recorded BEFORE the merge starts (#290)"
 
 

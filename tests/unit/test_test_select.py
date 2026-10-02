@@ -56,6 +56,10 @@ def repo(tmp_path: Path) -> Path:
     (r / "README.md").write_text("seed\n")
     _git(r, "add", "README.md")
     _git(r, "commit", "-qm", "chore: seed")
+    # A seeded testmon database (worktree-new copies the hub's baseline in) is what lets the
+    # hook run `--testmon` incrementally; excluded so `_commit`'s `git add -A` never tracks it.
+    (r / ".git" / "info" / "exclude").write_text(".testmondata\n")
+    (r / ".testmondata").write_text("db\n")
     return r
 
 
@@ -1378,3 +1382,41 @@ def test_the_gate_mints_no_green_tree_stamp(repo: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert not (repo / ".git" / ".gate-stamps").exists()
+
+
+def test_python_change_without_a_testmon_database_never_seeds_one(
+    repo: Path, tmp_path: Path
+) -> None:
+    # A first `pytest --testmon` in a tree with no database executes the WHOLE suite to
+    # build it. The fast tier must never do that: it skips the leg and leaves the full run
+    # to CI, whatever else it runs.
+    (repo / ".testmondata").unlink()
+    _write_meta_stub(repo)
+    base = _commit(repo, {}, "test: seed meta test")
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "--testmon" not in _runlog(runlog)
+    assert f"RUN -n auto {META_NODE}\n" in _runlog(runlog)  # the cheap selection still ran
+    assert "no testmon database" in proc.stderr and "CI is the full gate" in proc.stderr
+
+
+def test_testmon_database_path_follows_testmon_datafile(repo: Path, tmp_path: Path) -> None:
+    (repo / ".testmondata").unlink()
+    elsewhere = tmp_path / "baseline.db"
+    elsewhere.write_text("db\n")
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(
+        repo, _stdin(tip, base), tmp_path / "bin", env_extra={"TESTMON_DATAFILE": str(elsewhere)}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "--testmon" in _runlog(runlog)
