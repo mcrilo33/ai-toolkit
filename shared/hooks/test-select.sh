@@ -382,24 +382,25 @@ if [ "$has_py" = "1" ]; then
     # pins the output to bare node ids whatever the host config says.
     tm_listing="$(run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon --collect-only --verbosity=-1 ${IGNORE_ARR[@]+"${IGNORE_ARR[@]}"} 2>"$tm_err")" || tm_rc=$?
     tm_count="$(printf '%s\n' "$tm_listing" | grep -c '::' || true)"
-    tm_tail="$(tail -n 5 "$tm_err" 2>/dev/null || true)"
+    tm_tail="$(cat "$tm_err" 2>/dev/null || true)"
     [ "$tm_err" = /dev/null ] || rm -f "$tm_err"
     if [ "$tm_rc" = "$TRIPWIRE_BREACH_RC" ]; then
       # Collection imports conftest and every test module: an isolation escape can fire here, and
       # the tripwire already restored the snapshot — the push must abort, not carry on.
-      printf '%s\n' "$tm_tail" >&2
+      [ -z "$tm_tail" ] || printf '%s\n' "$tm_tail" >&2
       note "testmon impact probe tripped the repo-integrity tripwire — blocking the push"
       [ "$rc" -ne 0 ] || rc="$tm_rc"
     elif [ "$tm_rc" = "2" ]; then
       # A collection error is a DEFINITE failure (a broken import), not an unknown: block, as the
       # unbounded leg itself would have.
-      printf '%s\n' "$tm_tail" >&2
+      # pytest prints the collection error report (module, traceback) on STDOUT.
+      printf '%s\n' "$tm_listing" | tail -n 20 >&2
       note "testmon collection failed (a test or its imports do not load) — blocking the push"
       [ "$rc" -ne 0 ] || rc="$tm_rc"
     elif { [ "$tm_rc" != "0" ] && [ "$tm_rc" != "5" ]; } || { [ "$tm_rc" = "0" ] && [ "$tm_count" -eq 0 ]; }; then
       # rc 0 with no node ids is an unreadable listing (an old pytest ignoring the flag, a
       # plugin reformatting output) — never a licence to run an unbounded serial leg.
-      printf '%s\n' "$tm_tail" >&2
+      [ -z "$tm_tail" ] || printf '%s\n' "$tm_tail" | tail -n 5 >&2
       note "testmon impact could not be established (collect-only exited $tm_rc, $tm_count node ids) — leg skipped; CI is the full gate"
     elif [ "$tm_count" -gt "$TM_MAX" ]; then
       note "testmon would select $tm_count tests (> $TM_MAX, TEST_SELECT_TESTMON_MAX) — a stale or unrepresentative database; leg skipped, CI is the full gate"

@@ -237,6 +237,11 @@ def _run_select(
     )
 
 
+def _ran_testmon(log: str) -> bool:
+    """True when the REAL testmon leg ran — a `RUN --testmon…` line, never the PROBE line."""
+    return any(ln.startswith("RUN --testmon") for ln in log.splitlines())
+
+
 def _runlog(path: Path) -> str:
     return path.read_text() if path.exists() else ""
 
@@ -319,7 +324,7 @@ def test_python_only_with_testmon_runs_testmon(repo: Path, tmp_path: Path) -> No
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)
+    assert _ran_testmon(_runlog(runlog))
 
 
 
@@ -333,7 +338,7 @@ def test_mixed_docs_and_python_runs_testmon(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)  # docs alongside python stay python-tier
+    assert _ran_testmon(_runlog(runlog))  # docs alongside python stay python-tier
 
 
 def test_python_under_docs_runs_testmon(repo: Path, tmp_path: Path) -> None:
@@ -345,7 +350,7 @@ def test_python_under_docs_runs_testmon(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)  # a *.py is python even under docs/
+    assert _ran_testmon(_runlog(runlog))  # a *.py is python even under docs/
 
 
 
@@ -415,7 +420,7 @@ def test_new_branch_uses_merge_base_fallback(repo: Path, tmp_path: Path) -> None
     proc = _run_select(repo, _stdin(tip, ZERO_SHA, "refs/heads/feature/new"), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)
+    assert _ran_testmon(_runlog(runlog))
 
 
 def test_branch_deletion_runs_nothing(repo: Path, tmp_path: Path) -> None:
@@ -485,7 +490,7 @@ def test_branch_and_tag_mix_runs_the_suite(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, stdin, tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog), "a branch+tag push still tests the branch"
+    assert _ran_testmon(_runlog(runlog)), "a branch+tag push still tests the branch"
 
 
 # --- no runner but tests are demanded: fail closed (issue #213) -------------------
@@ -639,7 +644,7 @@ def test_module_runner_form_uses_testmon(repo: Path, tmp_path: Path) -> None:
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)
+    assert _ran_testmon(_runlog(runlog))
 
 
 # --- env escape hatches (threaded from worktree-land's --skip-tests/--test-cmd) ---
@@ -703,7 +708,7 @@ def test_failing_suite_blocks_with_nonzero_exit(repo: Path, tmp_path: Path) -> N
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 1  # non-zero exit is what aborts the pre-push
-    assert "--testmon" in _runlog(runlog)
+    assert _ran_testmon(_runlog(runlog))
 
 
 
@@ -931,7 +936,7 @@ def test_exempt_directory_prefix_covers_children(repo: Path, tmp_path: Path) -> 
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "--testmon" in log  # python tier preserved for the py part
+    assert _ran_testmon(log)  # python tier preserved for the py part
     assert "RUN \n" not in log  # the exempt settings/ file never escalates
 
 
@@ -1445,7 +1450,7 @@ def test_testmon_database_path_follows_testmon_datafile(repo: Path, tmp_path: Pa
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "--testmon" in _runlog(runlog)
+    assert _ran_testmon(_runlog(runlog))
 
 
 # --- the testmon leg is bounded: never a serial run of most of the suite (#378, #375) ---
@@ -1569,12 +1574,13 @@ def test_testmon_collection_error_blocks_the_push(repo: Path, tmp_path: Path) ->
     base = _rev(repo)
     tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
     runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_exit=2)
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_nodes=1, collect_exit=2)
 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 2
     assert "collection failed" in proc.stderr
+    assert "tests/t.py::test_0" in proc.stderr  # the stdout report is shown, not swallowed
 
 
 def test_testmon_probe_tripwire_breach_blocks_the_push(repo: Path, tmp_path: Path) -> None:
