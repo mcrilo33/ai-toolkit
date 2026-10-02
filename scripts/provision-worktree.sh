@@ -501,3 +501,40 @@ if [ "$AI_TOOLKIT_OTEL" = "1" ]; then
     fi
   fi
 fi
+
+# --- check the Orca worker skills (issue #359) ----------------------------------
+# A worker agent in an Orca worktree needs the `orca-cli` and `orchestration` skills. Warn
+# when either is missing — NEVER fail: a missing skill degrades the worker, it does not leave
+# the tree ungated, and the Orca CLI can disconnect at ~30s (03-spike.md #12), so a dropped
+# probe is a warning too. Silent when the `orca` CLI is absent (a tmux-only host).
+# The probe is bounded by PROVISION_ORCA_TIMEOUT seconds (default 20, under the ~30s drop).
+# `orca skills installed --json` has no pinned schema, so every string in the output counts
+# as a candidate name; a skill is present when one equals its exact name.
+check_orca_skills() {
+  command -v orca >/dev/null 2>&1 || return 0
+  local limit="${PROVISION_ORCA_TIMEOUT:-20}" out pid watchdog rc=0 skill
+  out="$(mktemp)"
+  orca skills installed --json > "$out" 2>/dev/null &
+  pid=$!
+  ( sleep "$limit"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  watchdog=$!
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$watchdog" 2>/dev/null || true
+  if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then
+    wt_warn "orca skills installed timed out after ${limit}s — could not verify the Orca worker skills"
+  elif [ "$rc" -ne 0 ]; then
+    wt_warn "orca skills installed failed (exit $rc) — could not verify the Orca worker skills"
+  elif ! command -v jq >/dev/null 2>&1; then
+    wt_warn "jq is missing — could not verify the Orca worker skills"
+  elif ! jq -e . "$out" >/dev/null 2>&1; then
+    wt_warn "orca skills installed returned unparseable JSON — could not verify the Orca worker skills"
+  else
+    for skill in orca-cli orchestration; do
+      jq -e --arg s "$skill" '[.. | strings] | index($s) != null' "$out" >/dev/null 2>&1 \
+        || wt_warn "Orca worker skill '$skill' is not installed — run: orca skills install $skill"
+    done
+  fi
+  rm -f "$out"
+  return 0
+}
+check_orca_skills
