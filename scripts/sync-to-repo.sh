@@ -570,7 +570,7 @@ sync_workflow_scripts() {
     local dst_dir="$TARGET/.ai-toolkit/scripts"
     make_dir "$dst_dir"
 
-    # telemetry.sh and base-branch.sh are co-located here (not only under
+    # telemetry.sh, base-branch.sh, enabled.sh and identity.sh are co-located here (not only under
     # hooks/lib/) so the worktree scripts can source them as siblings — see
     # worktree-lib.sh's telemetry and base-branch blocks.
     local name src

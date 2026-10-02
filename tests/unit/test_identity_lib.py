@@ -14,6 +14,8 @@ Contract under test:
     git-dir; `env`: WT_SPOKE only; `gitdir`: git-dir only).
   * `ai_toolkit_identity_has_issue_anchor [root]` — record `issue`, else the branch
     carries a tracker key or a bare number right after the type prefix.
+  * `ai_toolkit_identity_issue_at <root>` — the hub-side by-path reader (#361): the record's
+    numeric `issue` ONLY (no branch fallback), empty + rc 1 otherwise, never an error.
 """
 
 from __future__ import annotations
