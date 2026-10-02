@@ -82,6 +82,7 @@ code ~/Repos/ai-toolkit
 | Script | Role |
 |--------|------|
 | `scripts/worktree-new.sh` | Create a worktree + branch, copy `.claude/`, fold into VS Code, open a tmux window running `claude` |
+| `scripts/provision-worktree.sh` | Provision a worktree's policy layer (git exclude, `.testmondata` pre-warm, `.ai-toolkit/*`, `.claude/`, `settings.local.json` allow/deny + spoke OTel env); shared by `worktree-new.sh` and Orca's setup hook (`ORCA_*` env or explicit flags), idempotent, fail-loud |
 | `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → merge → suite → push → teardown → issue close |
 | `scripts/worktree-done.sh` | Resolve a worktree by issue / slug / branch / path and tear it down safely |
 | `scripts/worktree-lib.sh` | Shared slugify + main-root + worktree-resolution helpers (sourced by the others) |
