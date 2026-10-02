@@ -334,3 +334,94 @@ class TestTelemetryPackageSync:
         assert result.returncode == 0
         assert not (target_repo / TELEMETRY_DST).exists()
         assert f"[dry-run] would write {TELEMETRY_DST}/langfuse_spoke_tree.py" in result.stdout
+
+
+# ── the generated orca.yaml (issue #362) ──────────────────────────────────────
+# Synced scripts live at .ai-toolkit/scripts/, so the toolkit's repo-root orca.yaml cannot be
+# copied verbatim: sync GENERATES <target>/orca.yaml with the paths rewritten. A host's own
+# orca.yaml (one the manifest does not own) is never clobbered.
+class TestOrcaYamlSync:
+    MANIFEST_NAME = ".ai-toolkit-manifest.json"
+    HOST_YAML = "scripts:\n  setup: ./host-setup.sh\n"
+
+    def test_generated_orca_yaml_points_at_the_synced_scripts(self, target_repo: Path) -> None:
+        import yaml
+
+        _run_sync(target_repo, "claude")
+
+        config = yaml.safe_load((target_repo / "orca.yaml").read_text())
+        assert config["setupAgentStartupPolicy"] == "wait-for-setup"
+        assert config["scripts"] == {
+            "setup": "./.ai-toolkit/scripts/provision-worktree.sh",
+            "archive": "./.ai-toolkit/scripts/archive-worktree.sh",
+        }
+        for command in config["scripts"].values():
+            assert os.access(target_repo / command, os.X_OK), f"{command} missing or not executable"
+
+    def test_orca_yaml_recorded_in_manifest_for_every_tool(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "all")
+
+        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
+        for tool in ("copilot", "cursor", "claude"):
+            assert "orca.yaml" in manifest["tools"][tool], f"{tool}: orca.yaml not recorded"
+
+    def test_host_orca_yaml_is_never_clobbered(self, target_repo: Path) -> None:
+        host = target_repo / "orca.yaml"
+        host.write_text(self.HOST_YAML)
+
+        result = _run_sync(target_repo, "all")
+
+        assert host.read_text() == self.HOST_YAML
+        assert "orca.yaml" in result.stdout and "skipped" in result.stdout
+        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
+        assert all("orca.yaml" not in files for files in manifest["tools"].values())
+
+    def test_host_orca_yaml_stays_unowned_across_resyncs(self, target_repo: Path) -> None:
+        host = target_repo / "orca.yaml"
+        host.write_text(self.HOST_YAML)
+
+        _run_sync(target_repo, "all")
+        _run_sync(target_repo, "all")
+
+        assert host.read_text() == self.HOST_YAML
+
+    def test_resync_is_byte_identical(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "all")
+        first = (target_repo / "orca.yaml").read_bytes()
+
+        _run_sync(target_repo, "all")
+
+        assert (target_repo / "orca.yaml").read_bytes() == first
+
+    def test_manifest_owned_orca_yaml_is_regenerated(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "all")
+        generated = (target_repo / "orca.yaml").read_bytes()
+        (target_repo / "orca.yaml").write_text("# hand edit\n")
+
+        _run_sync(target_repo, "all")
+
+        assert (target_repo / "orca.yaml").read_bytes() == generated
+
+    def test_dry_run_writes_no_orca_yaml(self, target_repo: Path) -> None:
+        result = subprocess.run(
+            ["bash", str(SYNC_SCRIPT), str(target_repo), "claude", "--dry-run"],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert not (target_repo / "orca.yaml").exists()
+        assert "[dry-run] would write orca.yaml" in result.stdout
+
+    def test_dry_run_leaves_a_host_orca_yaml_alone(self, target_repo: Path) -> None:
+        host = target_repo / "orca.yaml"
+        host.write_text(self.HOST_YAML)
+
+        result = subprocess.run(
+            ["bash", str(SYNC_SCRIPT), str(target_repo), "claude", "--dry-run"],
+            capture_output=True,
+            text=True,
+        )
+
+        assert host.read_text() == self.HOST_YAML
+        assert "[dry-run] would write orca.yaml" not in result.stdout

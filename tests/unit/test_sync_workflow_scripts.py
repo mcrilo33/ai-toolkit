@@ -505,3 +505,35 @@ def test_provision_worktree_source_exists_and_is_executable() -> None:
         "scripts/provision-worktree.sh missing — sync would copy nothing"
     )
     assert os.access(PROVISION_WORKTREE, os.X_OK), "scripts/provision-worktree.sh is not executable"
+
+
+# ── archive-worktree.sh + generated orca.yaml registration (issue #362) ───────
+# Orca's `scripts.archive` hook. A synced target's generated orca.yaml points at
+# ./.ai-toolkit/scripts/archive-worktree.sh, so it must ship there. Toolkit-root script.
+ARCHIVE_WORKTREE = REPO_ROOT / "scripts" / "archive-worktree.sh"
+
+
+def test_archive_worktree_registered_in_sync_loop() -> None:
+    assert "archive-worktree.sh" in _for_name_list(), (
+        "archive-worktree.sh is not registered in sync_workflow_scripts() — the generated "
+        "orca.yaml would point Orca's archive hook at a missing script"
+    )
+
+
+def test_archive_worktree_takes_the_default_root_source_case() -> None:
+    body = _sync_workflow_scripts_body()
+    mapped = re.search(r"\n\s*([\w.|-]*archive-worktree\.sh[\w.|-]*)\)\s+src=", body)
+    assert mapped is None, (
+        'archive-worktree.sh must take the default src="$SCRIPT_DIR/$name" (toolkit-root scripts/)'
+    )
+
+
+def test_archive_worktree_source_exists_and_is_executable() -> None:
+    assert ARCHIVE_WORKTREE.is_file(), "scripts/archive-worktree.sh missing"
+    assert os.access(ARCHIVE_WORKTREE, os.X_OK), "scripts/archive-worktree.sh is not executable"
+
+
+def test_sync_workflow_scripts_generates_orca_yaml() -> None:
+    assert "orca.yaml" in _sync_workflow_scripts_body(), (
+        "sync_workflow_scripts() must generate <target>/orca.yaml (issue #362)"
+    )
