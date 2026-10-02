@@ -43,16 +43,19 @@ Lint, type-check and the anti-gutting scan are separate commit-time hooks and ar
 branch cancels that branch's older run. The Linux suite runs **serially** — one
 `pytest tests/ -q` process, about nine minutes on a runner. The issue text asked for
 `-n auto`, but the first CI runs under xdist surfaced a different timing-sensitive failure on
-every attempt (gate-broker retry windows, hook-chaining EPIPE): flakes that serial CI had always
-masked. CI is the gate, so it has to be reproducible; re-enable `-n auto -m "not serial"` plus a
+every attempt (gate-broker retry windows, #299 retry journaling order, hook-chaining EPIPE):
+flakes that serial CI had always masked. The job's timeout is 20 minutes because a serial run takes
+9-10: a timeout is reported as `cancelled`, which the ready/land gate reads as a failure.
+CI is the gate, so it has to be reproducible; re-enable `-n auto -m "not serial"` plus a
 `-m serial` tail once epic #377 makes the suite xdist-safe.
 
 Tests that **escape isolation and rewrite real shared refs** (the tripwire family) carry the
 `serial` marker (registered in `pyproject.toml`) and must never run under xdist workers;
 `tests/conftest.py` installs a fail-loud guard for a bare, path-less `-n auto` (an explicit
-`tests/` path bypasses it, so an xdist CI run must exclude the marker itself). ShellCheck and the sync-idempotency check run alongside. The macOS control-plane job
-stays `continue-on-error` until its flakes are fixed (separate issue). Only pushes to `main`
-and PRs file `CI red: …` backlog issues; a red spoke branch is reported to its own spoke.
+`tests/` path bypasses it, so an xdist CI run must exclude the marker itself). ShellCheck and the
+sync-idempotency check run alongside. The macOS control-plane job stays `continue-on-error` until
+its flakes are fixed (#384). Only pushes to `main` and PRs file `CI red: …` backlog issues; a red
+spoke branch is reported to its own spoke.
 
 ## Gating ready and land
 

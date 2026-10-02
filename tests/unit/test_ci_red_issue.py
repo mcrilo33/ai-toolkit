@@ -105,6 +105,9 @@ def test_pytest_suite_runs_serially_until_the_suite_is_xdist_safe(
     pytest_runs = [r for r in runs if "pytest" in r]
     assert pytest_runs == ["python -m pytest tests/ -q"]
     assert not any("-n " in r or "xdist" in r for r in runs)
+    # Serial takes ~9-10 min: a 10-minute limit times out (reported `cancelled`, which the
+    # ready/land gate reads as a failure) on ~40% of runs, so the timeout must leave headroom.
+    assert workflow["jobs"]["test"]["timeout-minutes"] >= 15
 
 
 def test_report_red_files_issues_only_for_main_and_prs(
