@@ -2167,3 +2167,93 @@ def test_present_config_overrides_the_literal_fallback(tmp_path: Path) -> None:
     )
 
     assert "M=claude-haiku-4-5 E=max" in result.stdout, result.stdout
+
+
+# ── wt_native_otel_prefix characterization (issue #359) ──────────────────────
+# The launch prefix is consumed verbatim by worktree-new.sh and spoke-relaunch.sh; these
+# goldens pin its bytes so the single-source refactor (env pairs feeding both the prefix and
+# the settings.local.json env block) provably changes nothing a spawn observes.
+
+_OTEL_COMMON_HEAD = (
+    "CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 "
+    "OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp "
+    "ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false "
+    "OTEL_EXPORTER_OTLP_PROTOCOL=grpc "
+)
+_OTEL_COMMON_TAIL = (
+    "OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 "
+    "OTEL_LOG_RAW_API_BODIES=file:/w/raw\\ bodies AI_TOOLKIT_OTEL_BODY_DIR=/w/raw\\ bodies "
+)
+_OTEL_ENDPOINT_VARS = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "BETA_TRACING_ENDPOINT",
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT",
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT",
+)
+_OTEL_DEFAULT_ENDPOINTS = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 "
+    "BETA_TRACING_ENDPOINT=http://localhost:4418 "
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT=http://localhost:4318 "
+)
+_OTEL_OVERRIDDEN_ENDPOINTS = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT=http://x:1 BETA_TRACING_ENDPOINT=http://y:2 "
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT=http://z:3 "
+)
+_OTEL_OVERRIDES = {
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://x:1",
+    "BETA_TRACING_ENDPOINT": "http://y:2",
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT": "http://z:3",
+}
+
+
+def _otel_prefix(repo: str, overrides: dict[str, str] | None = None) -> str:
+    env = {k: v for k, v in os.environ.items() if k not in _OTEL_ENDPOINT_VARS}
+    env.update({"AI_TOOLKIT_OTEL": "1", **(overrides or {})})
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{WT_LIB}"; wt_native_otel_prefix "b+1" "/w/raw bodies" "$1"',
+            "_",
+            repo,
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+@pytest.mark.parametrize(
+    ("repo", "overrides", "endpoints", "resource"),
+    [
+        ("", None, _OTEL_DEFAULT_ENDPOINTS, "spoke_run_id=b+1"),
+        ("my repo", None, _OTEL_DEFAULT_ENDPOINTS, "spoke_run_id=b+1\\,repo=my\\ repo"),
+        ("r", _OTEL_OVERRIDES, _OTEL_OVERRIDDEN_ENDPOINTS, "spoke_run_id=b+1\\,repo=r"),
+        ("", _OTEL_OVERRIDES, _OTEL_OVERRIDDEN_ENDPOINTS, "spoke_run_id=b+1"),
+    ],
+)
+def test_otel_prefix_bytes_are_pinned(
+    repo: str, overrides: dict[str, str] | None, endpoints: str, resource: str
+) -> None:
+    expected = (
+        f"{_OTEL_COMMON_HEAD}{endpoints}{_OTEL_COMMON_TAIL}OTEL_RESOURCE_ATTRIBUTES={resource} "
+    )
+
+    assert _otel_prefix(repo, overrides) == expected
+
+
+def test_otel_prefix_is_empty_when_otel_is_off() -> None:
+    env = {k: v for k, v in os.environ.items() if k not in _OTEL_ENDPOINT_VARS}
+    env["AI_TOOLKIT_OTEL"] = "0"
+
+    result = subprocess.run(
+        ["bash", "-c", f'source "{WT_LIB}"; wt_native_otel_prefix "b+1" "/w/raw bodies" r'],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
