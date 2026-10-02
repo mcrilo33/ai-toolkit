@@ -203,7 +203,7 @@ echo "→ lane / mode        $LANE / $MODE"
 # through shared/hooks/lib/identity.sh — the env marker, git-dir pattern and branch slug
 # are only its fallbacks. key=value, LF-terminated, no quoting; empty values are allowed
 # (empty orca_* means a worktree Orca did not dispatch). Each Orca id is the flag, else (the
-# worktree id only) ORCA_WORKTREE_ID, else the previous record. `issue` is the NUMERIC issue only
+# worktree id only, inside Orca's setup hook) ORCA_WORKTREE_ID, else the previous record. `issue` is the NUMERIC issue only
 # (an express lane's slug identity lives in lane/slug). Written to a sibling temp file then
 # renamed, so a reader never sees a partial record.
 _id_leaf="${BRANCH##*/}"
@@ -215,7 +215,13 @@ _id_prev() {
   [ -f "$WT_DIR/.ai-toolkit/identity" ] || return 0
   sed -n "s/^$1=//p" "$WT_DIR/.ai-toolkit/identity" | head -n1
 }
-_id_orca_wt="${ORCA_WT_ID:-${ORCA_WORKTREE_ID:-$(_id_prev orca_worktree_id)}}"
+# ORCA_WORKTREE_ID describes THIS worktree only inside Orca's setup hook (ORCA_WORKTREE_PATH names
+# it); from any other Orca terminal it is the dispatching terminal's own worktree.
+_id_env_wt=""
+if [ -n "${ORCA_WORKTREE_PATH:-}" ] && [ "$(cd "$ORCA_WORKTREE_PATH" 2>/dev/null && pwd)" = "$WT_DIR" ]; then
+  _id_env_wt="${ORCA_WORKTREE_ID:-}"
+fi
+_id_orca_wt="${ORCA_WT_ID:-${_id_env_wt:-$(_id_prev orca_worktree_id)}}"
 _id_dispatch="${ORCA_DISPATCH:-$(_id_prev orca_dispatch_id)}"
 _id_run="${RUN_ID:-$(_id_prev run_id)}"
 # A CR/LF in a value would inject extra record lines (the reader's first match wins).
@@ -238,7 +244,7 @@ if ! {
   rm -f "$IDENTITY_TMP"
   wt_die "could not write .ai-toolkit/identity"
 fi
-unset _id_leaf _id_type _id_issue _id_orca_wt _id_dispatch _id_run _v IDENTITY_TMP
+unset _id_leaf _id_type _id_issue _id_orca_wt _id_env_wt _id_dispatch _id_run _v IDENTITY_TMP
 echo "→ identity record    .ai-toolkit/identity"
 [ "$IDENTITY_ONLY" -eq 0 ] || exit 0
 

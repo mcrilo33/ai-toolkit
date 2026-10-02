@@ -252,23 +252,14 @@ PROVISION_ENV=()
 _wt_provision() {
   env -u PROVISION_TASK_TITLE -u PROVISION_TASK_BODY ${PROVISION_ENV[@]+"${PROVISION_ENV[@]}"} \
     bash "$SCRIPT_DIR/provision-worktree.sh" \
-    --worktree "$WT_DIR" --repo-root "$REPO_ROOT" --issue "$ISSUE" --lane "$LANE" \
+    --worktree "$WT_DIR" --repo-root "$REPO_ROOT" --issue "$WT_TAG" --lane "$LANE" \
     --mode "$MODE" --branch "$BRANCH" --spoke-run-id "$SPOKE_RUN_ID" \
     --otel-body-dir "$WT_DIR/.ai-toolkit/raw-bodies" --repo-name "$(wt_repo_name "$REPO_ROOT")" \
     --orca-worktree-id "$WT_ID" --run-id "$RUN_ID" "$@"
 }
 _wt_provision \
-  || wt_die "provisioning $WT_DIR failed — the worktree is NOT gated; fix the error above, then re-run provision-worktree.sh against it"
+  || wt_die "provisioning $WT_DIR failed — the worktree is NOT gated; fix the error above, then re-run: bash $SCRIPT_DIR/provision-worktree.sh --worktree $WT_DIR --repo-root $REPO_ROOT --issue $WT_TAG --lane $LANE --mode $MODE --branch $BRANCH --orca-worktree-id $WT_ID"
 SPOKE_RUN_ID="$(cat "$WT_DIR/.ai-toolkit/spoke-run-id")"
-
-# #300 writer: record `dispatched` — the actor that CAUSES the transition (this
-# spawn) records it at the instant it happens. Shadow-only: the drain still reads
-# dispatch-<issue>.epoch and nothing decides on the log yet. AFK_TLOG_RUN stamps
-# the freshly-minted spoke_run_id onto the record, so a spoke's whole lifecycle is
-# greppable by run even across a relaunch. Best-effort (wt_tlog_* no-op without the
-# lib, and skip an ad-hoc slug with no issue number).
-AFK_TLOG_RUN="$SPOKE_RUN_ID" wt_tlog_transition "$ISSUE" dispatched worktree-new.sh \
-  "spawn --mode $MODE" "{\"branch\":\"$BRANCH\",\"lane\":\"$LANE\",\"mode\":\"$MODE\"}"
 
 # The task contract path (written by provision-worktree.sh) the default seed prompt points at.
 TASK_MD="$WT_DIR/.ai-toolkit/task.md"
@@ -361,39 +352,6 @@ PYEOF
 # default (Q2: no extra permission mechanism; the hooks stay the cage).
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") claude --model $(printf '%q' "$WT_AGENT_MODEL") --effort $(printf '%q' "$WT_AGENT_EFFORT") --dangerously-skip-permissions"
 
-# --- seed the queued-subtask channel (issue #278) ----------------------------
-# The packed group's extra issues become this spoke's subtask queue. Seeded HERE, at spawn,
-# rather than only on hub-afk's routing pass: /next-batch dispatches interactively with no
-# drain running, so a packed spoke would otherwise find an empty queue, emit ready/<primary>,
-# and silently drop its subtasks on the floor.
-#
-# Placed THIS LATE on purpose — after every fallible setup step (task.md, the allowlist
-# merge, model resolution, the gh label mirror), immediately before the launch. This dir is
-# keyed by ISSUE and SHARED, not worktree-local, so a spawn that dies after seeding would
-# strand it: a later, unrelated spoke for the same issue would inherit the entries and be
-# refused at ready/<primary> forever. Nothing before this point can now leave that behind.
-#
-# The path contract (<git-common-dir>/ai-toolkit-afk/queued-<spoke>/<issue>, one empty file
-# per queued issue) is INLINED rather than sourced: its owner, gate-broker-markers.sh, is a
-# hub-skill module this script cannot reach from a synced target — the same split the
-# outbound event spool already lives with, where the two sides share only the path. One file
-# per issue keeps create/unlink atomic, so this can never race the spoke's own clears.
-# Best-effort: the queue is a scheduling optimization and must not fail an otherwise-fine
-# spawn (the spoke would simply ship its primary and the subtasks dispatch fresh).
-if [ "${#SUBTASK_LIST[@]}" -gt 0 ]; then
-  # --git-common-dir answers RELATIVE to cwd (a bare `.git` from the checkout root), so
-  # anchor it on $REPO_ROOT rather than trusting wherever this script happens to stand.
-  _q_common="$(cd "$REPO_ROOT" && git rev-parse --git-common-dir 2>/dev/null || printf '.git')"
-  case "$_q_common" in /*) ;; *) _q_common="$REPO_ROOT/$_q_common" ;; esac
-  _q_dir="${AFK_STATE_DIR:-$_q_common/ai-toolkit-afk}/queued-$ISSUE"
-  mkdir -p "$_q_dir" 2>/dev/null || true
-  for _st in "${SUBTASK_LIST[@]}"; do
-    : > "$_q_dir/$_st" 2>/dev/null || true
-  done
-  echo "→ queued subtasks    ${SUBTASK_LIST[*]} (shipped on this branch before ready/$ISSUE)"
-  unset _q_common _q_dir _st
-fi
-
 # Bring up the otelcol collector, then the Langfuse message bridge, before the
 # spoke starts streaming, so an opted-in (AI_TOOLKIT_OTEL=1) spoke auto-populates
 # Langfuse with no manual step. Order matters: the collector (:4317, what CC
@@ -416,14 +374,62 @@ TERM_H="$(orca_terminal_handle)"
 orca_wait_agent "$TERM_H" || wt_die "claude did not start in Orca terminal $TERM_H (worktree kept at $WT_DIR)"
 orca_json terminal wait --terminal "$TERM_H" --for tui-idle --timeout-ms 20000 || true
 _wt_die_if_trust_blocked
+# Re-check: the shell prompt satisfies tui-idle too, so claude may have exited during that wait.
+orca_wait_agent "$TERM_H" || wt_die "claude is no longer running in Orca terminal $TERM_H (worktree kept at $WT_DIR)"
 orca_call_settled "" orchestration worker-start --run "$RUN_ID" --terminal "$TERM_H" \
   --worktree "path:$WT_DIR" --task-title "$WT_NAME" --spec "$PROMPT" \
   || { _wt_die_if_trust_blocked; wt_die "orca worker-start failed (never re-issued): ${ORCA_ERR:-$ORCA_OUT} — terminal $TERM_H, worktree $WT_DIR"; }
 DISPATCH_ID="$(orca_dispatch_id)"
-[ -n "$DISPATCH_ID" ] || wt_die "worker-start reported no dispatch id: $ORCA_OUT"
-_wt_provision --identity-only --orca-dispatch-id "$DISPATCH_ID" \
-  || wt_warn "could not record the dispatch id in .ai-toolkit/identity"
-echo "→ launched claude in Orca terminal $TERM_H (dispatch $DISPATCH_ID, run $RUN_ID)"
+echo "→ launched claude in Orca terminal $TERM_H (dispatch ${DISPATCH_ID:-?}, run $RUN_ID)"
+
+# #300 writer: record `dispatched` — the actor that CAUSES the transition (this
+# spawn) records it once the launch has succeeded. Shadow-only: the drain still reads
+# dispatch-<issue>.epoch and nothing decides on the log yet. AFK_TLOG_RUN stamps
+# the freshly-minted spoke_run_id onto the record, so a spoke's whole lifecycle is
+# greppable by run even across a relaunch. Best-effort (wt_tlog_* no-op without the
+# lib, and skip an ad-hoc slug with no issue number).
+AFK_TLOG_RUN="$SPOKE_RUN_ID" wt_tlog_transition "$ISSUE" dispatched worktree-new.sh \
+  "spawn --mode $MODE" "{\"branch\":\"$BRANCH\",\"lane\":\"$LANE\",\"mode\":\"$MODE\"}"
+
+# --- seed the queued-subtask channel (issue #278) ----------------------------
+# The packed group's extra issues become this spoke's subtask queue. Seeded HERE, at spawn,
+# rather than only on hub-afk's routing pass: /next-batch dispatches interactively with no
+# drain running, so a packed spoke would otherwise find an empty queue, emit ready/<primary>,
+# and silently drop its subtasks on the floor.
+#
+# Placed AFTER the launch has succeeded on purpose: this dir is keyed by ISSUE and SHARED, not
+# worktree-local, so a spawn that dies after seeding would strand it — a later, unrelated spoke
+# for the same issue would inherit the entries and be refused at ready/<primary> forever. The
+# launch is the last step that can fail; the spoke only reads the queue at ready time.
+#
+# The path contract (<git-common-dir>/ai-toolkit-afk/queued-<spoke>/<issue>, one empty file
+# per queued issue) is INLINED rather than sourced: its owner, gate-broker-markers.sh, is a
+# hub-skill module this script cannot reach from a synced target — the same split the
+# outbound event spool already lives with, where the two sides share only the path. One file
+# per issue keeps create/unlink atomic, so this can never race the spoke's own clears.
+# Best-effort: the queue is a scheduling optimization and must not fail an otherwise-fine
+# spawn (the spoke would simply ship its primary and the subtasks dispatch fresh).
+if [ "${#SUBTASK_LIST[@]}" -gt 0 ]; then
+  # --git-common-dir answers RELATIVE to cwd (a bare `.git` from the checkout root), so
+  # anchor it on $REPO_ROOT rather than trusting wherever this script happens to stand.
+  _q_common="$(cd "$REPO_ROOT" && git rev-parse --git-common-dir 2>/dev/null || printf '.git')"
+  case "$_q_common" in /*) ;; *) _q_common="$REPO_ROOT/$_q_common" ;; esac
+  _q_dir="${AFK_STATE_DIR:-$_q_common/ai-toolkit-afk}/queued-$ISSUE"
+  mkdir -p "$_q_dir" 2>/dev/null || true
+  for _st in "${SUBTASK_LIST[@]}"; do
+    : > "$_q_dir/$_st" 2>/dev/null || true
+  done
+  echo "→ queued subtasks    ${SUBTASK_LIST[*]} (shipped on this branch before ready/$ISSUE)"
+  unset _q_common _q_dir _st
+fi
+
+# The spoke is live: recording its dispatch id is best-effort and never fails the spawn.
+if [ -n "$DISPATCH_ID" ]; then
+  _wt_provision --identity-only --orca-dispatch-id "$DISPATCH_ID" \
+    || wt_warn "could not record the dispatch id in .ai-toolkit/identity"
+else
+  wt_warn "worker-start reported no dispatch id; .ai-toolkit/identity keeps it empty"
+fi
 
 # The one-shot preflights above only cover the spawn instant; the watchdog
 # daemon keeps the collector+bridge alive for the whole spoke lifetime (machine

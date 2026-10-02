@@ -112,7 +112,7 @@ removed afterwards (`orca worktree rm --force`); the inert `Run` rows they creat
 
 (b) invalidates "the settings env replaces the launch prefix": with `worker-start --agent claude` Orca owns the command line, so
 spokes would stop tracing to Langfuse. S4 therefore launches the agent itself —
-`orca terminal create --worktree path:<wt> --command "<OTel prefix> WT_SPOKE=<tag> CLAUDE_EFFORT=<e> claude --model <m> --dangerously-skip-permissions"`
+`orca terminal create --worktree path:<wt> --command "<OTel prefix> WT_SPOKE=<tag> claude --model <m> --effort <e> --dangerously-skip-permissions"`
 — waits for `agentIdentity: claude`, and delivers the seed with `worker-start --terminal <handle> --worktree path:<wt> --spec …`.
 
 - `wt_native_otel_prefix` stays the single source of the prefix; `WT_SPOKE` lives in **both** the prefix and the settings env block.
