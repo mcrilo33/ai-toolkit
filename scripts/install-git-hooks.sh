@@ -114,7 +114,8 @@ cp "$SHARED_HOOKS/commit-quality.sh" \
 cp "$SHARED_HOOKS/lib/utils.sh" "$SHARED_HOOKS/lib/telemetry.sh" \
    "$SHARED_HOOKS/lib/gate-stamp.sh" \
    "$SHARED_HOOKS/lib/test-reverse-index.sh" \
-   "$SHARED_HOOKS/lib/enabled.sh" "$SCRIPTS_DST/lib/"
+   "$SHARED_HOOKS/lib/enabled.sh" \
+   "$SHARED_HOOKS/lib/identity.sh" "$SCRIPTS_DST/lib/"
 chmod +x "$SCRIPTS_DST"/*.sh
 info "Copied cage scripts → $SCRIPTS_DST"
 
