@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -554,4 +555,32 @@ def test_cp_fallback_without_rsync_copies_and_keeps_the_local_settings(
     assert (wt / ".claude" / "skills" / "s" / "SKILL.md").is_file()
     for excluded in (".review", "worktrees", "settings.json.bak"):
         assert not (wt / ".claude" / excluded).exists(), excluded
+    assert _settings(wt)["permissions"]["allow"][0] == "Bash(custom:*)"
+
+
+def test_cp_fallback_failure_exits_nonzero_and_keeps_the_local_settings(
+    hub: Path, wt: Path, tmp_path: Path
+) -> None:
+    gh_only = tmp_path / "gh-only"
+    _stub(gh_only, "gh", "exit 1")
+    env = {
+        **_GIT_ENV,
+        **_orca_env(hub, wt),
+        "PATH": f"{gh_only}{os.pathsep}{_path_without(tmp_path, 'rsync')}",
+    }
+    assert subprocess.run(["bash", str(SCRIPT)], cwd=str(wt), env=env).returncode == 0
+    path = wt / ".claude" / "settings.local.json"
+    data = json.loads(path.read_text())
+    data["permissions"]["allow"].insert(0, "Bash(custom:*)")
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    # A plain file where the hub has a directory makes `cp -R` fail on the re-run.
+    shutil.rmtree(wt / ".claude" / "skills")
+    (wt / ".claude" / "skills").write_text("conflict")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)], cwd=str(wt), env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode != 0
+    assert "copy failed (cp)" in result.stderr
     assert _settings(wt)["permissions"]["allow"][0] == "Bash(custom:*)"

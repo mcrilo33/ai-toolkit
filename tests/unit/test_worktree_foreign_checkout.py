@@ -30,6 +30,8 @@ WORKTREE_SCRIPTS = (
     "worktree-lib.sh",
     "worktree-otel-lib.sh",
     "worktree-gh-lib.sh",
+    # worktree-new.sh runs it as a sibling to gate every spawn (issue #359).
+    "provision-worktree.sh",
 )
 # Co-located next to the scripts by sync-to-repo.sh (like telemetry.sh) so
 # worktree-lib.sh finds it as a sibling in a synced target (issue #117).
