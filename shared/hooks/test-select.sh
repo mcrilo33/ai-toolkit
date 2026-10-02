@@ -19,7 +19,9 @@
 #       → exactly the mapped test files, under `-n auto`
 #   • a python change with testmon installed AND a testmon database already present
 #       → `pytest --testmon` (never under xdist: testmon is single-writer). A first run
-#         without a database would execute the whole suite to seed it, so none starts.
+#         without a database would execute the whole suite to seed it, so none starts. A
+#         collect-only pass bounds it further: past TEST_SELECT_TESTMON_MAX (200) impacted
+#         tests, or an unreadable count, the leg is skipped and CI covers it.
 #   • the control-plane coverage meta-test (#123) rides along whenever anything
 #     non-doc changed: an unmapped script stays red there until a test names it
 #
@@ -366,13 +368,29 @@ if [ "$has_py" = "1" ]; then
     IGNORE_ARR=()
     for t in ${MAPPED_FILES[@]+"${MAPPED_FILES[@]}"}; do IGNORE_ARR+=("--ignore=$t"); done
     [ ! -f "$META_TEST_FILE" ] || IGNORE_ARR+=("--ignore=$META_TEST_FILE")
-    note "python change — pytest --testmon (selected files ran above; --ignore'd so testmon can't double-run them)"
-    rc2=0
-    run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon ${IGNORE_ARR[@]+"${IGNORE_ARR[@]}"} || rc2=$?
-    # Exit 5 = "no tests collected": when the selected files ARE testmon's whole impact
-    # set, --ignore leaves it nothing to run — a GREEN outcome, never a block.
-    [ "$rc2" != "5" ] || rc2=0
-    [ "$rc" -ne 0 ] || rc=$rc2
+    # Bound the leg BEFORE running it: testmon cannot run under xdist, and a database that is
+    # stale, invalidated (new deps / python) or simply unrepresentative selects most of the
+    # suite — a ~5800-test serial run took 34 minutes on a tests-only push (#375). A collect-
+    # only pass lists exactly what testmon would run; past TEST_SELECT_TESTMON_MAX tests (or if
+    # the count cannot be established) the leg is skipped and CI, the full gate, covers it.
+    TM_MAX="${TEST_SELECT_TESTMON_MAX:-200}"
+    case "$TM_MAX" in '' | *[!0-9]*) TM_MAX=200 ;; esac
+    tm_rc=0
+    tm_listing="$(run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon --collect-only -q ${IGNORE_ARR[@]+"${IGNORE_ARR[@]}"} 2>/dev/null)" || tm_rc=$?
+    tm_count="$(printf '%s\n' "$tm_listing" | grep -c '::' || true)"
+    if [ "$tm_rc" != "0" ] && [ "$tm_rc" != "5" ]; then
+      note "testmon impact could not be established (collect-only exited $tm_rc) — leg skipped; CI is the full gate"
+    elif [ "$tm_count" -gt "$TM_MAX" ]; then
+      note "testmon would select $tm_count tests (> $TM_MAX, TEST_SELECT_TESTMON_MAX) — a stale or unrepresentative database; leg skipped, CI is the full gate"
+    else
+      note "python change — pytest --testmon, $tm_count impacted test(s) (selected files ran above; --ignore'd so testmon can't double-run them)"
+      rc2=0
+      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon ${IGNORE_ARR[@]+"${IGNORE_ARR[@]}"} || rc2=$?
+      # Exit 5 = "no tests collected": when the selected files ARE testmon's whole impact
+      # set, --ignore leaves it nothing to run — a GREEN outcome, never a block.
+      [ "$rc2" != "5" ] || rc2=0
+      [ "$rc" -ne 0 ] || rc=$rc2
+    fi
   fi
 fi
 exit "$rc"

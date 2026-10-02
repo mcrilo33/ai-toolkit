@@ -20,7 +20,7 @@ personal-account repo, so lands stay scripted.
 | ------------- | ---- |
 | All docs-only (`*.md`, `docs/`, `LICENSE`, `*.rst`, images) or exempt (`.test-select-exempt`) | nothing |
 | A non-python file that maps to referencing tests (reverse index) | exactly those test files, under `-n auto` |
-| A python change, testmon installed **and** a testmon database present | `pytest --testmon` (never under xdist) |
+| A python change, testmon installed **and** a database present, **and** testmon would select ≤ `TEST_SELECT_TESTMON_MAX` (200) tests | `pytest --testmon` (never under xdist) |
 | Any non-doc change | plus the control-plane coverage meta-test |
 
 A `*.py` file counts as python even under `docs/` (e.g. `docs/conf.py`).
@@ -130,10 +130,12 @@ To skip that seed, a maintained baseline `.testmondata` lives at
   by hand. An aged baseline only widens testmon's impact set; it never wrong-greens.
 - **Staleness.** testmon keys its `environment` row on `system_packages` +
   `python_version`, so a copied baseline whose `.venv` dep set differs (e.g. after a
-  `requirements-dev.txt` bump) is invalidated automatically — testmon then re-runs the
-  full suite. The fast tier only guards a *missing* database, not an *invalidated* one, so
-  a stale baseline can still make one python push run long locally (it never wrong-greens).
-  Rebuild the baseline after a dependency bump; bounding this automatically is a follow-up.
+  `requirements-dev.txt` bump) is invalidated and testmon would re-select the whole suite.
+  The fast tier therefore **probes first**: `pytest --testmon --collect-only -q` lists what
+  testmon would run, and past `TEST_SELECT_TESTMON_MAX` tests (default 200) — or if the count
+  cannot be established — the leg is skipped with a loud note and CI covers it. (A tests-only
+  push once ran ~5800 tests serially for 34 minutes: testmon cannot use xdist.) Rebuild the
+  baseline after a dependency bump to get incremental selection back.
 
 ## Safe fallbacks
 
@@ -141,8 +143,8 @@ The fast tier never starts a run it cannot bound, and never waves a push through
 
 - **No pytest resolvable → the push is blocked** for any diff that demands tests (docs-only and
   exempt diffs need no runner). `TEST_SELECT_SKIP=1` is the explicit override.
-- **testmon not installed, or no testmon database → the mapped tests only**, with a note that CI
-  is the full gate.
+- **testmon not installed, no testmon database, or an impact set past the cap → the mapped
+  tests only**, with a note that CI is the full gate.
 - **A diff range that can't be resolved → the mapped tests that exist plus the meta-test**, with
   the same note.
 - **Selector missing or non-executable → the push is refused** (fail-closed): a missing gate must
