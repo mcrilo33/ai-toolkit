@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 from _gate_broker_support import _DISPLAY_CASE, _PANE_PID, _agent_ps_stub, _fake_tmux_pane
+from _orca_stub import install_orca_stub
 from bash_session import BashSession, fresh_call
 
 # hub-afk.sh targets the macOS control plane: it reads transcript mtimes with BSD
@@ -7183,10 +7184,15 @@ def _gh_auth_stub(tmp_path: Path, *, exit_code: int) -> Path:
     return fake_bin
 
 
-def test_arm_preconditions_pass_when_all_ok(tmp_path: Path) -> None:
+def test_arm_preconditions_reach_the_interim_orca_guard_when_all_else_is_ok(
+    tmp_path: Path,
+) -> None:
+    # Every static precondition passes, so the ONLY refusal left is the interim #365 guard
+    # (dispatch is Orca-only since #363, but the supervisor still watches tmux panes).
     repo = _clean_hub(tmp_path)
     fake_bin = _gh_auth_stub(tmp_path, exit_code=0)
     env = {
+        **install_orca_stub(fake_bin),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_STATE": str(tmp_path / "no-state"),  # off ⇒ no live supervisor
         "AFK_DEFAULT_BRANCH": "main",
@@ -7194,7 +7200,9 @@ def test_arm_preconditions_pass_when_all_ok(tmp_path: Path) -> None:
 
     result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
 
-    assert "RC=0" in result.stdout, result.stdout + result.stderr
+    assert "RC=1" in result.stdout, result.stdout + result.stderr
+    assert "#365" in result.stderr
+    assert "uncommitted" not in result.stderr and "gh auth" not in result.stderr
 
 
 def test_arm_preconditions_refuses_when_supervisor_live(tmp_path: Path) -> None:
@@ -7241,6 +7249,7 @@ def test_arm_preconditions_tolerates_untracked_files(tmp_path: Path) -> None:
     (repo / "synced-artifact.txt").write_text("generated\n")  # untracked only
     fake_bin = _gh_auth_stub(tmp_path, exit_code=0)
     env = {
+        **install_orca_stub(fake_bin),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_STATE": str(tmp_path / "no-state"),
         "AFK_DEFAULT_BRANCH": "main",
@@ -7248,7 +7257,8 @@ def test_arm_preconditions_tolerates_untracked_files(tmp_path: Path) -> None:
 
     result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
 
-    assert "RC=0" in result.stdout, "untracked files alone must not refuse to arm"
+    # Reaching the interim guard (not the dirty-tree refusal) proves untracked files pass.
+    assert "#365" in result.stderr and "uncommitted" not in result.stderr, result.stderr
 
 
 def test_arm_preconditions_refuses_off_base_branch(tmp_path: Path) -> None:
