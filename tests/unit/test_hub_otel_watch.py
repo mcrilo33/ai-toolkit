@@ -1,16 +1,16 @@
 """Unit tests for shared/skills/hub/scripts/hub-otel-watch.sh.
 
-The hub-side OTel watchdog (issue #115): when ≥1 spoke pane is live it ensures the
+The hub-side OTel watchdog (issue #115): when ≥1 spoke agent is live (per Orca, #363) it ensures the
 otelcol collector (:4317) and the Langfuse message bridge (:4319) are up —
 recycling a dead/stale one via the worktree-lib ensure paths — and is a silent
 no-op when no spoke runs. Meant to be run on a loop from the hub (main checkout).
 
 These tests source the script (a source-guard keeps ``main`` from running on
 import) and drive its layers directly with the tmux/worktree probes and the
-docker-touching preflights stubbed, so no real tmux, git, or docker is invoked:
+docker-touching preflights stubbed, so no real orca, git, or docker is invoked:
 
-  * ``main`` orchestration — ensure exactly when a spoke pane is live, else silent;
-  * ``spoke_pane_live`` — the pane-vs-spoke-worktree correlation predicate.
+  * ``main`` orchestration — ensure exactly when a spoke agent is live, else silent;
+  * ``spoke_agent_live`` — the Orca-agent-vs-spoke-worktree correlation predicate.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _orca_stub import install_forbidden_stubs, install_orca_stub, stub_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_OTEL_WATCH = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-otel-watch.sh"
@@ -53,9 +54,9 @@ _ENSURE_STUBS = "; ".join(
 # ── main orchestration ────────────────────────────────────────────────────────
 
 
-def test_main_ensures_stack_when_spoke_pane_live() -> None:
+def test_main_ensures_stack_when_spoke_agent_live() -> None:
     # A spoke pane is live → ensure BOTH collector and bridge against MAIN_ROOT.
-    result = _call(f"spoke_pane_live() {{ return 0; }}; {_ENSURE_STUBS}; main")
+    result = _call(f"spoke_agent_live() {{ return 0; }}; {_ENSURE_STUBS}; main")
 
     assert result.returncode == 0, result.stderr
     assert "COLLECTOR /repo" in result.stdout
@@ -66,7 +67,7 @@ def test_main_ensures_collector_before_bridge() -> None:
     # Ordering matters: the collector forks LLM I/O + audit events to the bridge,
     # so it must be ensured first — mirror wt_otel_collector_preflight's "run BEFORE
     # the bridge preflight" contract.
-    result = _call(f"spoke_pane_live() {{ return 0; }}; {_ENSURE_STUBS}; main")
+    result = _call(f"spoke_agent_live() {{ return 0; }}; {_ENSURE_STUBS}; main")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.index("COLLECTOR") < result.stdout.index("BRIDGE")
@@ -75,7 +76,7 @@ def test_main_ensures_collector_before_bridge() -> None:
 def test_main_is_silent_noop_when_no_spoke_pane() -> None:
     # No spoke pane live → touch nothing (a quiet no-op; the stack need not run when
     # no spoke does). Never fail.
-    result = _call(f"spoke_pane_live() {{ return 1; }}; {_ENSURE_STUBS}; main")
+    result = _call(f"spoke_agent_live() {{ return 1; }}; {_ENSURE_STUBS}; main")
 
     assert result.returncode == 0, result.stderr
     assert "COLLECTOR" not in result.stdout
@@ -87,7 +88,7 @@ def test_main_warns_and_skips_when_otel_opted_out() -> None:
     # no-op and that spoke's traces are lost (the #115 footgun). main() must NOT
     # ensure, and must surface a one-line stderr notice rather than fail.
     parts = [
-        "spoke_pane_live() { return 0; }",
+        "spoke_agent_live() { return 0; }",
         "MAIN_ROOT=/repo",
         "unset AI_TOOLKIT_OTEL",
         'wt_otel_collector_preflight() { echo "COLLECTOR $1"; }',
@@ -102,16 +103,16 @@ def test_main_warns_and_skips_when_otel_opted_out() -> None:
     assert "AI_TOOLKIT_OTEL" in result.stderr
 
 
-# ── spoke_pane_live predicate ─────────────────────────────────────────────────
+# ── spoke_agent_live predicate ─────────────────────────────────────────────────
 
 
-def test_spoke_pane_live_true_when_pane_sits_in_spoke_worktree() -> None:
+def test_spoke_agent_live_true_when_pane_sits_in_spoke_worktree() -> None:
     # A tmux pane's path equals a spoke worktree path → live.
     parts = [
         "MAIN_ROOT=/repo",
         '_spoke_worktree_paths() { printf "%s\\n" /repo/wt-115; }',
-        '_pane_paths() { printf "%s\\n" /repo/wt-115; }',
-        "spoke_pane_live && echo LIVE || echo IDLE",
+        '_agent_paths() { printf "%s\\n" /repo/wt-115; }',
+        "spoke_agent_live && echo LIVE || echo IDLE",
     ]
     result = _call("; ".join(parts))
 
@@ -119,13 +120,13 @@ def test_spoke_pane_live_true_when_pane_sits_in_spoke_worktree() -> None:
     assert result.stdout.strip() == "LIVE"
 
 
-def test_spoke_pane_live_false_when_only_hub_pane() -> None:
+def test_spoke_agent_live_false_when_only_hub_pane() -> None:
     # The only pane sits in the hub (not a spoke worktree) → idle, no ensure.
     parts = [
         "MAIN_ROOT=/repo",
         '_spoke_worktree_paths() { printf "%s\\n" /repo/wt-115; }',
-        '_pane_paths() { printf "%s\\n" /repo; }',
-        "spoke_pane_live && echo LIVE || echo IDLE",
+        '_agent_paths() { printf "%s\\n" /repo; }',
+        "spoke_agent_live && echo LIVE || echo IDLE",
     ]
     result = _call("; ".join(parts))
 
@@ -133,13 +134,13 @@ def test_spoke_pane_live_false_when_only_hub_pane() -> None:
     assert result.stdout.strip() == "IDLE"
 
 
-def test_spoke_pane_live_false_when_no_spoke_worktrees() -> None:
+def test_spoke_agent_live_false_when_no_spoke_worktrees() -> None:
     # No linked spoke worktrees at all → idle regardless of panes.
     parts = [
         "MAIN_ROOT=/repo",
         '_spoke_worktree_paths() { printf ""; }',
-        '_pane_paths() { printf "%s\\n" /repo/wt-115; }',
-        "spoke_pane_live && echo LIVE || echo IDLE",
+        '_agent_paths() { printf "%s\\n" /repo/wt-115; }',
+        "spoke_agent_live && echo LIVE || echo IDLE",
     ]
     result = _call("; ".join(parts))
 
@@ -191,11 +192,11 @@ def test_spoke_worktree_paths_lists_spoke_excludes_hub(hub_with_spoke: tuple[Pat
     assert str(hub) not in resolved
 
 
-def test_spoke_pane_live_resolves_symlinked_pane_path(
+def test_spoke_agent_live_resolves_symlinked_pane_path(
     hub_with_spoke: tuple[Path, Path], tmp_path: Path
 ) -> None:
     # A pane whose path reaches the spoke through a symlinked root (the /tmp →
-    # /private/tmp trap) still correlates: spoke_pane_live canonicalizes both the
+    # /private/tmp trap) still correlates: spoke_agent_live canonicalizes both the
     # real spoke worktree path and the symlinked pane path. Would read IDLE if
     # wt_realpath resolution were dropped, so this genuinely exercises it.
     hub, spoke = hub_with_spoke
@@ -203,13 +204,81 @@ def test_spoke_pane_live_resolves_symlinked_pane_path(
     link.symlink_to(spoke)
     parts = [
         f"MAIN_ROOT={hub}",
-        f'_pane_paths() {{ printf "%s\\n" {link}; }}',
-        "spoke_pane_live && echo LIVE || echo IDLE",
+        f'_agent_paths() {{ printf "%s\\n" {link}; }}',
+        "spoke_agent_live && echo LIVE || echo IDLE",
     ]
     result = _call("; ".join(parts))
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "LIVE"
+
+
+# ── liveness comes from Orca agent state, never tmux panes (#363) ─────────────
+
+
+def _ps_reply(*entries: tuple[Path, int]) -> dict:
+    """A `orca worktree ps` reply: one worktree per (path, agent count)."""
+    return {
+        "ok": True,
+        "result": {
+            "worktrees": [
+                {"path": str(p), "agents": [{"state": "working"}] * n} for p, n in entries
+            ]
+        },
+    }
+
+
+def _call_with_orca(
+    tmp_path: Path, expr: str, ps: dict | None
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    bindir = tmp_path / "bin"
+    bindir.mkdir(parents=True)
+    forbidden = install_forbidden_stubs(bindir)
+    scenario = {"worktree ps": [{"out": ps}]} if ps is not None else {}
+    env = {**os.environ, **install_orca_stub(bindir, scenario=scenario)}
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{HUB_OTEL_WATCH}"; {expr}'],
+        capture_output=True,
+        text=True,
+        env=stub_env(bindir, env),
+    )
+    return proc, forbidden
+
+
+def test_agent_paths_lists_only_worktrees_with_an_orca_agent(tmp_path: Path) -> None:
+    ps = _ps_reply((Path("/r/wt-1"), 1), (Path("/r/wt-2"), 0))
+
+    result, _ = _call_with_orca(tmp_path, "_agent_paths", ps)
+
+    assert result.stdout.split() == ["/r/wt-1"]
+
+
+def test_a_spoke_with_an_orca_agent_is_live_and_tmux_is_never_asked(
+    hub_with_spoke: tuple[Path, Path], tmp_path: Path
+) -> None:
+    hub, spoke = hub_with_spoke
+
+    result, forbidden = _call_with_orca(
+        tmp_path,
+        f"MAIN_ROOT={hub}; spoke_agent_live && echo LIVE || echo IDLE",
+        _ps_reply((spoke, 1)),
+    )
+
+    assert result.stdout.strip() == "LIVE", result.stderr
+    assert forbidden.read_text() == ""
+
+
+def test_an_agent_only_in_the_hub_or_no_agent_at_all_reads_idle(
+    hub_with_spoke: tuple[Path, Path], tmp_path: Path
+) -> None:
+    hub, spoke = hub_with_spoke
+    probe = f"MAIN_ROOT={hub}; spoke_agent_live && echo LIVE || echo IDLE"
+
+    only_hub, _ = _call_with_orca(tmp_path / "a", probe, _ps_reply((hub, 2), (spoke, 0)))
+    no_orca, _ = _call_with_orca(tmp_path / "b", probe, None)
+
+    assert only_hub.stdout.strip() == "IDLE"
+    assert no_orca.stdout.strip() == "IDLE"
 
 
 # ── daemon mode (#138): _watch_loop ticks + --daemon pidfile singleton ───────
@@ -234,7 +303,7 @@ _LOOP_ENV = "; ".join(
 
 
 def _pane_pattern_stub(tmp_path: Path, pattern: str) -> str:
-    """A spoke_pane_live stub scripted per tick: 'L' = live, anything else = idle.
+    """A spoke_agent_live stub scripted per tick: 'L' = live, anything else = idle.
 
     Ticks beyond the pattern read as idle, so every loop terminates. The tick
     count persists in a file the test can assert on.
@@ -242,7 +311,7 @@ def _pane_pattern_stub(tmp_path: Path, pattern: str) -> str:
     ticks = tmp_path / "ticks"
     return (
         f'TICKS="{ticks}"; PATTERN="{pattern}"; '
-        "spoke_pane_live() { "
+        "spoke_agent_live() { "
         'n=$(( $(cat "$TICKS" 2>/dev/null || echo 0) + 1 )); printf "%s" "$n" > "$TICKS"; '
         'c="${PATTERN:$((n-1)):1}"; [ "$c" = "L" ]; }'
     )
@@ -366,7 +435,7 @@ def test_daemon_removes_pidfile_on_sigterm(tmp_path: Path) -> None:
     # no-watchdog failure #138 exists to kill).
     pidfile = tmp_path / "watch.pid"
     parts = [
-        "spoke_pane_live() { return 0; }",
+        "spoke_agent_live() { return 0; }",
         _LOOP_ENV,
         "export HUB_OTEL_WATCH_INTERVAL=0.05",
         f'export HUB_OTEL_WATCH_PIDFILE="{pidfile}"',
