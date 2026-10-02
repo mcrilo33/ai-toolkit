@@ -122,6 +122,11 @@ os.environ.setdefault("GIT_COMMITTER_EMAIL", "tests@ai-toolkit.invalid")
 # tests/unit/test_spoke_ready.py::test_conftest_strips_ready_force.
 os.environ.pop("AI_TOOLKIT_READY_FORCE", None)
 
+# Stub warm-guard isolation (#376). tests/_stubs.WARM_ENV makes every stub it wrote exit 0 as a
+# no-op; an inherited value would silence every stub in the suite. Only warm_stubs sets it, on
+# the child it execs.
+os.environ.pop("AI_TOOLKIT_STUB_WARM", None)
+
 # Telemetry isolation (issue #49) — see the module docstring. Drop the opt-in so the
 # recorder no-ops, and redirect the dir to a throwaway sandbox as belt-and-suspenders
 # against any test that re-enables telemetry without supplying its own dir.
