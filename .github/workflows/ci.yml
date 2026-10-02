@@ -1,15 +1,19 @@
 name: CI
 
+# CI is the gate (#378): every branch push runs the full suite, so the ready and land
+# scripts can wait for a green run on the exact SHA instead of re-running the suite on
+# the dev machine. PRs and main stay covered.
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
 
 permissions:
   contents: read
 
+# A newer push to the same ref cancels that ref's in-flight run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -33,8 +37,17 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
 
-      - name: Run tests
-        run: python -m pytest tests/ -q
+      # Two phases (#328): tests that rewrite real shared refs are marked `serial` and
+      # must never run under xdist workers. Exit 5 = nothing collected, which is green.
+      - name: Run tests (parallel bulk)
+        run: python -m pytest tests/ -q -n auto -m "not serial"
+
+      - name: Run tests (serial tail)
+        run: |
+          rc=0
+          python -m pytest tests/ -q -m serial || rc=$?
+          [ "$rc" -eq 5 ] && rc=0
+          exit "$rc"
 
   shellcheck:
     name: ShellCheck
@@ -187,7 +200,10 @@ jobs:
       contents: read
       issues: write
     steps:
+      # Branch pushes are now gated too (#378); a red WIP branch is reported to its own
+      # spoke by the ready/land scripts, so only main and PRs file backlog issues.
       - name: File or update a "CI red" issue per failed job
+        if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           # On pull_request, GITHUB_SHA is the throwaway merge commit; prefer

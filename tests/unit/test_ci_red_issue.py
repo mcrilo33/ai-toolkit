@@ -75,3 +75,40 @@ def test_report_red_references_run_and_commit(report_red: dict[str, Any]) -> Non
     script = "\n".join(step.get("run", "") for step in report_red["steps"])
     assert "github.run_id" in script or "GITHUB_RUN_ID" in script
     assert "github.sha" in script or "GITHUB_SHA" in script
+
+
+# --- CI is the gate (#378) -------------------------------------------------------
+
+
+def test_every_branch_push_triggers_ci(workflow: dict[str, Any]) -> None:
+    # `on:` parses as boolean True (YAML 1.1). main and PRs stay covered.
+    triggers = {str(k): v for k, v in workflow.items()}["True"]
+    assert triggers["push"]["branches"] == ["**"]
+    assert "pull_request" in triggers
+
+
+def test_newer_push_cancels_the_older_run_of_the_same_branch(
+    workflow: dict[str, Any],
+) -> None:
+    concurrency = workflow["concurrency"]
+    assert concurrency["group"] == "ci-${{ github.ref }}"
+    assert concurrency["cancel-in-progress"] is True
+
+
+def test_pytest_suite_runs_parallel_bulk_then_serial_tail(
+    workflow: dict[str, Any],
+) -> None:
+    # An explicit tests/ path bypasses the conftest xdist guard, so the serial-marked
+    # tests must be excluded from the -n auto phase here, not left to the guard.
+    runs = [s.get("run", "") for s in workflow["jobs"]["test"]["steps"]]
+    assert any('-n auto -m "not serial"' in r for r in runs)
+    assert any("-m serial" in r and "-n" not in r for r in runs)
+
+
+def test_report_red_files_issues_only_for_main_and_prs(
+    report_red: dict[str, Any],
+) -> None:
+    # Every branch is gated now; a red WIP branch must not file a backlog issue.
+    condition = report_red["steps"][0]["if"]
+    assert "refs/heads/main" in condition
+    assert "pull_request" in condition
