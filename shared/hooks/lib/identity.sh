@@ -12,6 +12,10 @@
 # lines, `#` comments and lines without `=` are ignored, and the first occurrence of a key
 # wins.
 #
+# Record semantics: `issue` is the NUMERIC issue (empty for an express/slug lane; a
+# non-numeric value is treated as unknown); `slug` is the branch's last path segment
+# (feature/360-foo -> 360-foo) and `type` its prefix.
+#
 # API (root defaults to the current directory):
 #   ai_toolkit_identity_get <key> [root]        value + rc 0; empty + rc 1 when unknown
 #   ai_toolkit_identity_issue [root]            record issue, else branch-leaf leading digits
@@ -23,8 +27,10 @@
 ai_toolkit_identity_get() {
   local key="${1:-}" root="${2:-.}" file line value=""
   file="$root/.ai-toolkit/identity"
-  [ -n "$key" ] && [ -f "$file" ] || return 1
+  case "$key" in "" | *[!a-z0-9_]*) return 1 ;; esac
+  [ -f "$file" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
     case "$line" in
       "$key="*) value="${line#*=}"; break ;;
     esac
@@ -33,10 +39,18 @@ ai_toolkit_identity_get() {
   printf '%s' "$value"
 }
 
+# The recorded issue when it is a number (anything else is unknown, never an issue).
+_ai_toolkit_identity_recorded_issue() {
+  local v
+  v="$(ai_toolkit_identity_get issue "${1:-.}")" || return 1
+  case "$v" in *[!0-9]*) return 1 ;; esac
+  printf '%s' "$v"
+}
+
 # The issue number: the record, else the leading digits of the branch's last path segment.
 ai_toolkit_identity_issue() {
   local root="${1:-.}" v branch leaf
-  if v="$(ai_toolkit_identity_get issue "$root")"; then
+  if v="$(_ai_toolkit_identity_recorded_issue "$root")"; then
     printf '%s' "$v"
     return 0
   fi
@@ -51,7 +65,11 @@ ai_toolkit_identity_issue() {
 # by $2: `env` = WT_SPOKE only, `gitdir` = linked-worktree git-dir only, `any` = either.
 ai_toolkit_identity_is_spoke() {
   local root="${1:-.}" fb="${2:-any}" gd
-  ai_toolkit_identity_get issue "$root" >/dev/null && return 0
+  case "$fb" in
+    any | env | gitdir) ;;
+    *) printf 'identity.sh: unknown is_spoke fallback "%s" (any|env|gitdir)\n' "$fb" >&2; return 2 ;;
+  esac
+  _ai_toolkit_identity_recorded_issue "$root" >/dev/null && return 0
   case "$fb" in
     env | any) [ -n "${WT_SPOKE:-}" ] && return 0 ;;
   esac
@@ -72,7 +90,7 @@ ai_toolkit_identity_is_spoke() {
 # incidental numbers inside a slug (oauth-2-factor, utf-8) or version/year tokens.
 ai_toolkit_identity_has_issue_anchor() {
   local root="${1:-.}" branch
-  ai_toolkit_identity_get issue "$root" >/dev/null && return 0
+  _ai_toolkit_identity_recorded_issue "$root" >/dev/null && return 0
   branch="$(git -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   if echo "$branch" | grep -qE '(^|[/_-])[A-Z][A-Z0-9]+-[0-9]+([/_-]|$)' \
      || echo "$branch" | grep -qE '/[0-9]+([/_-]|$)' \

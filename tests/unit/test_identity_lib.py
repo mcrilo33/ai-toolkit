@@ -256,3 +256,65 @@ def test_anchor_falls_back_to_the_existing_branch_regexes(
     result = _ok(_call(hub, f'ai_toolkit_identity_has_issue_anchor "{hub}"'))
 
     assert result.returncode == (0 if anchored else 1)
+
+
+# --- hardening ------------------------------------------------------------------
+
+
+def test_get_reads_a_last_line_without_a_trailing_newline(tmp_path: Path) -> None:
+    _record(tmp_path, "issue=360")
+
+    result = _ok(_call(tmp_path, f'ai_toolkit_identity_get issue "{tmp_path}"'))
+
+    assert result.stdout == "360"
+
+
+def test_get_strips_a_carriage_return(tmp_path: Path) -> None:
+    _record(tmp_path, "issue=360\r\nlane=spoke\r\n")
+
+    result = _ok(_call(tmp_path, f'ai_toolkit_identity_get issue "{tmp_path}"'))
+
+    assert result.stdout == "360"
+
+
+@pytest.mark.parametrize("key", ["#issue", "a=b", "", "Issue"])
+def test_get_rejects_an_invalid_key(tmp_path: Path, key: str) -> None:
+    _record(tmp_path, "#issue=1\na=b=2\n=3\nIssue=4\n")
+
+    result = _ok(_call(tmp_path, f'ai_toolkit_identity_get "{key}" "{tmp_path}"'))
+
+    assert (result.returncode, result.stdout) == (1, "")
+
+
+def test_a_non_numeric_recorded_issue_is_unknown_and_falls_back(hub: Path) -> None:
+    _git(hub, "checkout", "-q", "-b", "feature/fix-typo")
+    _record(hub, "issue=fix-typo\n")
+
+    issue = _ok(_call(hub, f'ai_toolkit_identity_issue "{hub}"'))
+    anchor = _ok(_call(hub, f'ai_toolkit_identity_has_issue_anchor "{hub}"'))
+    spoke = _ok(_call(hub, f'ai_toolkit_identity_is_spoke "{hub}" gitdir'))
+
+    assert (issue.returncode, anchor.returncode, spoke.returncode) == (1, 1, 1)
+
+
+def test_an_unknown_is_spoke_selector_fails_loudly(hub: Path) -> None:
+    result = _ok(_call(hub, f'ai_toolkit_identity_is_spoke "{hub}" gitdirs'))
+
+    assert result.returncode == 2
+    assert "unknown is_spoke fallback" in result.stderr
+
+
+def test_every_function_is_safe_under_set_euo_pipefail(hub: Path, tmp_path: Path) -> None:
+    linked = _linked(hub, tmp_path, "feature/5-x")
+    expr = (
+        "set -euo pipefail; "
+        f'ai_toolkit_identity_get issue "{linked}" || true; '
+        f'ai_toolkit_identity_issue "{linked}" || true; '
+        f'ai_toolkit_identity_is_spoke "{linked}" || true; '
+        f'ai_toolkit_identity_has_issue_anchor "{linked}" || true; echo done'
+    )
+
+    result = _ok(_call(linked, expr))
+
+    assert result.stdout.strip().endswith("done"), result.stderr
+    assert "unbound" not in result.stderr

@@ -186,26 +186,38 @@ echo "→ lane / mode        $LANE / $MODE"
 # Identity record (#360): spoke identity is RECORDED here and read back by the guards
 # through shared/hooks/lib/identity.sh — the env marker, git-dir pattern and branch slug
 # are only its fallbacks. key=value, LF-terminated, no quoting; empty values are allowed
-# (no orca_* means the tmux path). orca_* come from the Orca env when set; run_id is S4's.
-# Written to a sibling temp file then renamed, so a reader never sees a partial record.
+# (no orca_* means the tmux path). orca_worktree_id comes from ORCA_WORKTREE_ID when set;
+# orca_dispatch_id and run_id are written empty until S4. `issue` is the NUMERIC issue only
+# (an express lane's slug identity lives in lane/slug). Written to a sibling temp file then
+# renamed, so a reader never sees a partial record.
 _id_leaf="${BRANCH##*/}"
 _id_type=""
 case "$BRANCH" in */*) _id_type="${BRANCH%%/*}" ;; esac
+_id_issue=""
+[[ "$ISSUE" =~ ^[0-9]+$ ]] && _id_issue="$ISSUE"
+_id_orca_wt="${ORCA_WORKTREE_ID:-}"
+# A CR/LF in a value would inject extra record lines (the reader's first match wins).
+for _v in "$_id_type" "$_id_leaf" "$SPOKE_RUN_ID" "$_id_orca_wt"; do
+  case "$_v" in *$'\n'* | *$'\r'*) wt_die "identity value contains a newline: $_v" ;; esac
+done
 IDENTITY_TMP="$(mktemp "$WT_DIR/.ai-toolkit/identity.XXXXXX")"
-{
-  printf 'issue=%s\n' "$ISSUE"
+if ! {
+  printf 'issue=%s\n' "$_id_issue"
   printf 'type=%s\n' "$_id_type"
   printf 'slug=%s\n' "$_id_leaf"
   printf 'mode=%s\n' "$MODE"
   printf 'lane=%s\n' "$LANE"
   printf 'spoke_run_id=%s\n' "$SPOKE_RUN_ID"
-  printf 'orca_worktree_id=%s\n' "${ORCA_WORKTREE_ID:-}"
-  printf 'orca_dispatch_id=%s\n' "${ORCA_DISPATCH_ID:-}"
+  printf 'orca_worktree_id=%s\n' "$_id_orca_wt"
+  printf 'orca_dispatch_id=\n'
   printf 'run_id=\n'
-} > "$IDENTITY_TMP"
-mv -f "$IDENTITY_TMP" "$WT_DIR/.ai-toolkit/identity"
-unset _id_leaf _id_type IDENTITY_TMP
-echo "→ identity record    .ai-toolkit/identity (#$ISSUE)"
+} > "$IDENTITY_TMP" || ! chmod 644 "$IDENTITY_TMP" \
+  || ! mv -f "$IDENTITY_TMP" "$WT_DIR/.ai-toolkit/identity"; then
+  rm -f "$IDENTITY_TMP"
+  wt_die "could not write .ai-toolkit/identity"
+fi
+unset _id_leaf _id_type _id_issue _id_orca_wt _v IDENTITY_TMP
+echo "→ identity record    .ai-toolkit/identity"
 
 # --- write the task contract to disk (issue #177) ----------------------------
 # Anchoring used to be an LLM errand: the seed prompt told the spoke to run

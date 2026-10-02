@@ -639,12 +639,35 @@ def test_identity_record_leaves_absent_orca_ids_and_run_id_empty(
 def test_identity_record_takes_orca_ids_from_the_environment(
     hub: Path, wt: Path, stubs: Path
 ) -> None:
-    env = {**_orca_env(hub, wt), "ORCA_WORKTREE_ID": "wt-42", "ORCA_DISPATCH_ID": "dsp-7"}
+    env = {**_orca_env(hub, wt), "ORCA_WORKTREE_ID": "wt-42"}
 
     assert _run(wt, stubs, env=env).returncode == 0
 
     record = _identity(wt)
-    assert (record["orca_worktree_id"], record["orca_dispatch_id"]) == ("wt-42", "dsp-7")
+    assert (record["orca_worktree_id"], record["orca_dispatch_id"]) == ("wt-42", "")
+
+
+def test_identity_record_of_an_express_lane_leaves_issue_empty(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    args = ["--worktree", str(wt), "--repo-root", str(hub), "--issue", "fix-typo"]
+
+    result = _run(wt, stubs, *args, "--lane", "express")
+
+    assert result.returncode == 0, result.stderr
+    record = _identity(wt)
+    assert (record["issue"], record["lane"]) == ("", "express")
+
+
+def test_identity_value_with_a_newline_is_refused_not_injected(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    env = {**_orca_env(hub, wt), "ORCA_WORKTREE_ID": "wt-1\nrun_id=evil"}
+
+    result = _run(wt, stubs, env=env)
+
+    assert result.returncode != 0
+    assert not (wt / ".ai-toolkit" / "identity").exists()
 
 
 def test_identity_record_rewrite_is_byte_identical_and_leaves_no_temp_files(
