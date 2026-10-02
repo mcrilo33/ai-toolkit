@@ -71,7 +71,7 @@ gh run list --commit <sha> --workflow CI --json status,conclusion,url,databaseId
 | no run for the SHA after a short grace | `no CI run for this SHA (was it pushed?)` |
 | `gh`/`python3` unavailable | `cannot read CI … use --local-gate` |
 
-Several runs can share a SHA (a push run and a PR run, re-runs); any success wins. A just-pushed
+Several runs can share a SHA (a push run and a PR run, re-runs); any success wins. The gate judges only the **run-level** conclusion — a `continue-on-error` job such as the macOS control-plane job can fail without turning the run red, and is never consulted. Once a run has been seen, a transient empty answer is treated as pending, not "no run". A just-pushed
 SHA has no run for a few seconds, so "none" only becomes final after `WT_CI_NONE_GRACE`
 (default 90 s). `--no-wait` checks once and never polls. `AI_TOOLKIT_READY_FORCE=1` still
 bypasses every precondition, CI included, and stamps the bypass into the tag.

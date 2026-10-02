@@ -1782,9 +1782,11 @@ def test_ci_state_queries_the_ci_workflow_for_the_exact_commit(tmp_path: Path) -
 def test_ci_state_is_unavailable_when_gh_is_absent(tmp_path: Path) -> None:
     sandbox = tmp_path / "nogh"
     sandbox.mkdir()
-    os.symlink(shutil.which("python3") or "/usr/bin/python3", sandbox / "python3")
+    # Only bash and python3: `gh` lives in /usr/bin on CI runners, so /bin must not be on PATH.
+    for tool in ("bash", "python3"):
+        os.symlink(shutil.which(tool) or f"/usr/bin/{tool}", sandbox / tool)
 
-    proc = _ci("wt_ci_state abc123", {"PATH": f"{sandbox}:/bin"})
+    proc = _ci("wt_ci_state abc123", {"PATH": str(sandbox)})
 
     assert proc.stdout.strip() == "unavailable||"
 
@@ -2182,3 +2184,51 @@ def test_resolve_returns_1_when_two_worktrees_match(orca_bin: Path, tmp_path: Pa
     assert (result.returncode, result.stdout) == (1, "")
 
 
+
+
+def test_ci_check_treats_an_empty_list_after_a_seen_run_as_pending_not_missing(
+    tmp_path: Path,
+) -> None:
+    # Observed on a real push: the run was listed, then one poll came back `[]`; reporting
+    # "no CI run for this SHA" for a SHA whose run exists is a lie. Once seen, empty = transient.
+    bindir = tmp_path / "ghbin"
+    bindir.mkdir()
+    counter = tmp_path / "n"
+    (bindir / "gh").write_text(
+        "#!/bin/sh\n"
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "{counter}"\n'
+        'if [ "$n" -le 1 ]; then\n'
+        '  printf \'[{"status":"in_progress","conclusion":"","url":"https://x/run","databaseId":7}]\'\n'
+        "else printf '[]'; fi\n"
+    )
+    (bindir / "gh").chmod(0o755)
+
+    proc = subprocess.run(
+        ["bash", "-c", f'. "{WT_LIB}"; wt_ci_check abc123 3; rc=$?; echo "$WT_CI_URL"; exit $rc'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "WT_CI_POLL": "1",
+            "WT_CI_NONE_GRACE": "0",
+        },
+    )
+
+    assert proc.returncode == 2, proc.stderr  # pending at the bound, never 3 ("no run")
+    assert proc.stdout.strip() == "https://x/run"  # and the URL survives for the message
+
+
+def test_ci_state_judges_the_run_level_conclusion_never_individual_jobs(tmp_path: Path) -> None:
+    # A `continue-on-error` job (the macOS job, #384) can fail while the RUN concludes success.
+    # The gate reads only the run's own conclusion, and never looks at jobs for a green run.
+    env = _gh_stub(tmp_path, [_ci_run("completed", "success")], jobs="Shell control-plane (macOS)")
+    log = tmp_path / "gh-all.log"
+    gh = tmp_path / "ghbin" / "gh"
+    gh.write_text(gh.read_text().replace("#!/bin/sh\n", f'#!/bin/sh\necho "$*" >> "{log}"\n', 1))
+
+    proc = _ci("wt_ci_check abc123 0; echo rc=$?", env)
+
+    assert proc.stdout.strip() == "rc=0"
+    assert "run view" not in log.read_text()  # no per-job lookup on a green run

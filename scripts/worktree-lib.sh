@@ -378,7 +378,7 @@ else:
 # WT_CI_NONE_GRACE seconds (default 90) have passed.
 wt_ci_check() {
   local sha="$1" max="${2:-0}" told="" poll="${WT_CI_POLL:-15}" grace="${WT_CI_NONE_GRACE:-90}"
-  local start waited=0
+  local start waited=0 seen="" last_url="" last_run=""
   # A garbage bound must not turn into a numeric-test error that polls forever (Principle 2):
   # sanitize to the safe defaults. The bound is WALL-CLOCK (gh's own latency counts), so a
   # slow `gh run list` cannot stretch the wait past what the caller's tool timeout allows.
@@ -392,9 +392,15 @@ wt_ci_check() {
       success) return 0 ;;
       failure) return 1 ;;
       unavailable) return 4 ;;
+      pending) seen=1; last_url="$WT_CI_URL"; last_run="$WT_CI_RUN" ;;
     esac
-    if [ "$waited" -ge "$max" ] || { [ "$WT_CI_STATE" = none ] && [ "$waited" -ge "$grace" ]; }; then
-      [ "$WT_CI_STATE" = pending ] && return 2
+    # Once a run has been SEEN, a later empty list is a transient API answer, not "no run":
+    # keep polling to the bound and report it pending (never the misleading "no CI run").
+    if [ "$WT_CI_STATE" = none ] && [ -n "$seen" ]; then
+      WT_CI_URL="$last_url"; WT_CI_RUN="$last_run"
+    fi
+    if [ "$waited" -ge "$max" ] || { [ "$WT_CI_STATE" = none ] && [ -z "$seen" ] && [ "$waited" -ge "$grace" ]; }; then
+      if [ "$WT_CI_STATE" = pending ] || [ -n "$seen" ]; then return 2; fi
       return 3
     fi
     [ -n "$told" ] || { echo "→ waiting for CI on ${sha:0:9} (up to ${max}s; ${WT_CI_URL:-run not created yet})" >&2; told=1; }

@@ -16,6 +16,7 @@ when a test needs to assert env threading or rollback.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -726,8 +727,8 @@ def test_land_refuses_without_gh_and_points_at_local_gate(
     hub: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     _make_spoke(hub, tmp_path, "feature/1-nogh", push=True)
-    # `gh` may be installed on the host: a PATH holding only the stubs hides it.
-    env_path = {"PATH": f"{tmp_path / 'bin'}:{orca_bin}:{_basic_path()}"}
+    # `gh` is installed on CI runners and dev hosts alike: hide it explicitly.
+    env_path = {"PATH": f"{tmp_path / 'bin'}:{orca_bin}:{_path_without_gh(tmp_path)}"}
 
     proc, _ = _run_land(hub, tmp_path, "1", no_gh=True, extra_env=env_path)
 
@@ -735,9 +736,23 @@ def test_land_refuses_without_gh_and_points_at_local_gate(
     assert "--local-gate" in proc.stderr
 
 
-def _basic_path() -> str:
-    """System dirs without a Homebrew `gh`: enough for git/bash/coreutils/python3."""
-    return os.pathsep.join(d for d in ("/usr/bin", "/bin", "/usr/sbin", "/sbin") if Path(d).is_dir())
+def _path_without_gh(tmp_path: Path) -> Path:
+    """A dir of symlinks to every system tool in /usr/bin and /bin except `gh`.
+
+    `gh` is preinstalled on CI runners (and on dev hosts), so "gh absent" cannot be modelled by
+    trimming PATH to the system dirs — it must be a PATH that has everything else but not gh.
+    """
+    farm = tmp_path / "nogh-path"
+    farm.mkdir(exist_ok=True)
+    for d in ("/usr/bin", "/bin"):
+        if not Path(d).is_dir():
+            continue
+        for entry in os.scandir(d):
+            link = farm / entry.name
+            if entry.name != "gh" and not link.exists():
+                with contextlib.suppress(OSError):
+                    link.symlink_to(entry.path)
+    return farm
 
 
 def test_skip_tests_does_not_bypass_the_ci_gate(hub: Path, tmp_path: Path) -> None:
@@ -852,7 +867,7 @@ def test_local_gate_runs_the_full_suite_through_the_hook_and_never_asks_ci(
 
 def test_local_gate_works_with_gh_absent(hub: Path, tmp_path: Path, orca_bin: Path) -> None:
     _make_spoke(hub, tmp_path, "feature/1-offline", push=True, ready=True)
-    env_path = {"PATH": f"{tmp_path / 'bin'}:{orca_bin}:{_basic_path()}"}
+    env_path = {"PATH": f"{tmp_path / 'bin'}:{orca_bin}:{_path_without_gh(tmp_path)}"}
 
     proc, _ = _run_land(hub, tmp_path, "1", "--local-gate", no_gh=True, extra_env=env_path)
 
