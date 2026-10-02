@@ -519,6 +519,15 @@ if [ "$KIND" = "ready" ]; then
   rm -f "$(_queued_dir "$(_branch_primary)")/$ISSUE" 2>/dev/null || true
 fi
 
+# Trace node: this run as a kind=script span, tagged with the marker namespace it
+# emitted (phase = ready|gate|accept|blocked) so the trace tells a completion
+# marker apart from a PLAN-gate park. emits stays null on push (parser-filled).
+# An `if` (not `&&`) so a missing emit layer leaves the script's exit status 0.
+if command -v telemetry_emit_span >/dev/null 2>&1; then
+  telemetry_emit_span --kind script --name spoke-ready \
+    --phase "$KIND" --status success --start-ms "$_SR_T0"
+fi
+
 # --- Orca: tell the coordinator (#365) ---------------------------------------
 # ready / --blocked end the worker's task: send worker_done succeeded / failed, AFTER the tag push
 # (the tag is the durable record; this is the notification). Only a spoke session (WT_SPOKE, the
@@ -584,13 +593,4 @@ ${BODY:0:3000}" approve,revise "$_gate_ms" >"$_gate_out" || _gate_rc=$?
       echo "spoke-ready: the plan needs changes (reply above). Amend it, then re-park with --gate." >&2
       exit 3 ;;
   esac
-fi
-
-# Trace node: this run as a kind=script span, tagged with the marker namespace it
-# emitted (phase = ready|gate|accept|blocked) so the trace tells a completion
-# marker apart from a PLAN-gate park. emits stays null on push (parser-filled).
-# An `if` (not `&&`) so a missing emit layer leaves the script's exit status 0.
-if command -v telemetry_emit_span >/dev/null 2>&1; then
-  telemetry_emit_span --kind script --name spoke-ready \
-    --phase "$KIND" --status success --start-ms "$_SR_T0"
 fi
