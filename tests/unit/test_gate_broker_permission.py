@@ -1026,3 +1026,59 @@ def test_danger_wall_journals_under_the_record_issue_not_the_branch_slug(
 
     assert _perm(result.stdout) == "deny", result.stdout + result.stderr
     assert _journal_issues(env) == {"361"}
+
+
+# -- rc 3 at both broker call sites: the dialog went away while we decided (#365) ----------------
+
+
+def _gone_scenario(orca_bin: Path, wt: Path) -> Path:
+    """A scenario file the answerer/classifier swaps in mid-decision: the agent is `working` again."""
+    alt = orca_bin / "alt-scenario.json"
+    orca_park(orca_bin, wt, state="working")
+    alt.write_text((orca_bin / ".orca-stub" / "scenario.json").read_text())
+    return alt
+
+
+def _no_failure_record(state: Path) -> None:
+    assert not (state / "warned-state-5").exists(), "a vanished dialog arms no retry backoff"
+    assert _events_named(state, 5, "escalated") == [], "and is not a failed delivery"
+
+
+def test_a_dialog_that_vanishes_before_a_mechanical_approve_is_a_noop(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
+    alt = _gone_scenario(orca_bin, spoke_repo)
+    _park_perm(orca_bin, spoke_repo, _AUTO_APPROVABLE)
+    env = _gate_env(tmp_path, "false")
+    state = Path(env["AFK_STATE_DIR"])
+    scenario = orca_bin / ".orca-stub" / "scenario.json"
+
+    # the dialog is answered elsewhere between classifying it and approving it
+    result = _call(
+        f'classify_permission() {{ cp "{alt}" "{scenario}"; printf "APPROVE\\tok\\n"; }}; '
+        f"_decide_permission '{spoke_repo}' 5",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _sent_texts(orca_bin) == [], "no key goes to a dialog that is gone"
+    _no_failure_record(state)
+
+
+def test_a_dialog_that_vanishes_while_the_reasoner_runs_is_journaled_not_failed(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path
+) -> None:
+    alt = _gone_scenario(orca_bin, spoke_repo)
+    _park_perm(orca_bin, spoke_repo, _PUSH_MAIN)
+    scenario = orca_bin / ".orca-stub" / "scenario.json"
+    env = _gate_env(tmp_path, f"cp '{alt}' '{scenario}'; printf 'ANSWER: APPROVE'")
+    state = Path(env["AFK_STATE_DIR"])
+
+    result = _call(f"_decide_permission '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert _sent_texts(orca_bin) == []
+    journal = (state / "decision-journal.jsonl").read_text()
+    assert "dialog was gone or replaced" in journal
+    assert "delivery FAILED" not in journal
+    _no_failure_record(state)

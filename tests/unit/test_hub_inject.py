@@ -287,10 +287,34 @@ def test_approve_permission_refuses_a_dialog_other_than_the_one_judged(
     wt = _wt(tmp_path)
     orca_park(orca_bin, wt, state="waiting", tool="Bash", tool_input="rm -rf build")
 
-    result = _call(f'approve_permission "{wt}" "git status"')
+    result = _call(f"approve_permission \"{wt}\" $'Bash\\tgit status'")
 
     assert result.returncode == 3
     assert _sends(orca_bin) == [], "an approval must never land on a dialog nobody classified"
+
+
+def test_approve_permission_refuses_another_tool_on_the_same_flattened_input(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # Orca flattens toolInput per tool (a Read and an Edit of the same file are both the path), so the
+    # judged identity is the tool name AND the input.
+    wt = _wt(tmp_path)
+    orca_park(orca_bin, wt, state="waiting", tool="Edit", tool_input="/a")
+
+    result = _call(f"approve_permission \"{wt}\" $'Read\\t/a'")
+
+    assert result.returncode == 3
+    assert _sends(orca_bin) == []
+
+
+def test_an_empty_judged_identity_is_compared_not_ignored(tmp_path: Path, orca_bin: Path) -> None:
+    wt = _wt(tmp_path)
+    orca_park(orca_bin, wt, state="waiting", tool="Bash", tool_input="rm -rf build")
+
+    result = _call(f'approve_permission "{wt}" ""')
+
+    assert result.returncode == 3
+    assert _sends(orca_bin) == []
 
 
 def test_approve_permission_sends_to_the_dialog_that_was_judged(
@@ -299,7 +323,7 @@ def test_approve_permission_sends_to_the_dialog_that_was_judged(
     wt = _wt(tmp_path)
     orca_park(orca_bin, wt, state="waiting", tool="Bash", tool_input="git status")
 
-    result = _call(f'approve_permission "{wt}" "git status"')
+    result = _call(f"approve_permission \"{wt}\" $'Bash\\tgit status'")
 
     assert result.returncode == 0, result.stderr
     assert len(_sends(orca_bin)) == 1
