@@ -38,16 +38,16 @@ SECRETS_SCAN = REPO_ROOT / "shared" / "hooks" / "secrets-scan.sh"
 # carries no contiguous secret literal (which the pre-write scanner would block).
 FAKE_SECRET = "AKIA" + "1234567890ABCDEF"
 
-FABLE = "claude-fable-5"
-OPUS = "claude-opus-5"
-SONNET = "claude-sonnet-5"
+FABLE = "claude-fable-5-1"
+OPUS = "claude-opus-5-5"
+SONNET = "claude-sonnet-5-5"
 
 # Mirrors shared/agents/metadata.yml's #141 routing — now sourced from the config.
-# architect/planner returned to FABLE when claude-fable-5 became available again
+# architect/planner returned to FABLE when claude-fable-5-1 became available again
 # (they fell back to OPUS during the #218 retirement window).
-# (model, effort) per agent — Claude 5 modernization (2026-08-17): the reasoning
-# tier is Opus 5; design/judgment agents keep max effort on the scarce models,
-# while the routine workhorses (green/refactor/docs) run Sonnet at high effort.
+# (model, effort) per agent — the reasoning tier is Opus 5.5; design/judgment
+# agents keep max effort on the scarce models, while the routine workhorses
+# (green/refactor/docs) run Sonnet 5.5 at high effort.
 # Per-issue escalation stays available via the lane:reasoning label override.
 EXPECTED_AGENT_ROUTING = {
     "architect": (FABLE, "max"),
@@ -111,6 +111,17 @@ def test_spoke_effort_defaults_to_max_when_absent(tmp_path: Path) -> None:
     )
 
     assert cfg.spoke_model(config) == ("claude-opus-4-8[1m]", "max")
+
+
+def test_cli_spoke_env_falls_back_to_sane_default_when_unrouted(tmp_path: Path) -> None:
+    # #358: the CLI's own config-less fallback (no model.spoke block at all) must be
+    # the sane budget default, never an Opus/max/[1m] literal (AFK principle #2 — a
+    # silent fallback must default to the SAFE/CHEAP option).
+    config_path = _write(tmp_path, "base_branch: develop\n").as_posix()
+
+    out = cfg._cli(["prog", "spoke-env", config_path])
+
+    assert out == "WT_AGENT_MODEL_DEFAULT=claude-sonnet-5-5\nWT_AGENT_EFFORT_DEFAULT=high"
 
 
 # ─── agent_model ───
@@ -500,11 +511,11 @@ def real_config() -> dict:
 
 
 def test_real_config_spoke_seed(real_config: dict) -> None:
-    # Claude 5 modernization (2026-08-17): the spoke driver runs Sonnet 5/high (no
-    # 1m tier); Sonnet 5 matches Opus 4.8 per-turn at a fraction of the cost, so the
-    # 07-16 speed rationale for an Opus driver no longer holds. Per-issue escalation
-    # via lane:reasoning or an explicit Model: line.
-    assert cfg.spoke_model(real_config) == ("claude-sonnet-5", "high")
+    # Claude 5.5/5.1 refresh (2026-10-02, #358): the spoke driver runs Sonnet 5.5/high
+    # (no 1m tier); Sonnet 5.5 matches or exceeds the prior Opus generation per-turn at
+    # a fraction of the cost, so the 07-16 speed rationale for an Opus driver still
+    # does not hold. Per-issue escalation via lane:reasoning or an explicit Model: line.
+    assert cfg.spoke_model(real_config) == ("claude-sonnet-5-5", "high")
 
 
 def test_real_config_base_branch_defaults_to_autodetect(real_config: dict) -> None:

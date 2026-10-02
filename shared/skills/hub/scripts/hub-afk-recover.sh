@@ -957,7 +957,7 @@ _afk_service_auth_halt() {
 # bounds it so a wedged probe can't itself freeze the reap.
 _afk_auth_is_dead() {
   local cmd raw rc
-  cmd="${AFK_AUTH_PROBE_CMD:-claude -p --no-session-persistence --model claude-opus-4-8 ok}"
+  cmd="${AFK_AUTH_PROBE_CMD:-claude -p --no-session-persistence --model claude-haiku-4-5 ok}"
   raw="$(_afk_with_timeout "${AFK_AUTH_PROBE_TIMEOUT:-30}" bash -c "$cmd" 2>&1)"; rc=$?
   [ "$rc" -ne 0 ] && is_auth_failure "$raw"
 }

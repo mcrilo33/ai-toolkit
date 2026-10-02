@@ -44,7 +44,7 @@ from typing import cast
 DEFAULT_MODEL = "claude-haiku-4-5"
 
 # Default cache-creation price (USD per token), Opus tier. Override with --price.
-DEFAULT_PRICE = 0.00000625
+DEFAULT_PRICE = 0.000005
 
 DEFAULT_ENDPOINT = "https://api.anthropic.com"
 COUNT_TOKENS_PATH = "/v1/messages/count_tokens"

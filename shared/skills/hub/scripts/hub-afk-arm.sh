@@ -315,7 +315,7 @@ _afk_arm_claude_check() {
   case "$secs" in '' | *[!0-9]*) secs=120 ;; esac   # never let a typo lift the bound
   [ "$secs" -lt 1 ] && secs=120
   if _afk_network_is_down; then printf 'offline\n'; return 1; fi
-  cmd="${AFK_AUTH_PROBE_CMD:-claude -p --no-session-persistence --model claude-opus-4-8 ok}"
+  cmd="${AFK_AUTH_PROBE_CMD:-claude -p --no-session-persistence --model claude-haiku-4-5 ok}"
   raw="$(_afk_with_timeout "$secs" bash -c "$cmd" 2>&1)"; rc=$?
   if [ "$rc" -eq 0 ]; then printf 'alive\n'; return 0; fi
   if is_auth_failure "$raw"; then printf 'auth-dead\n'; return 1; fi

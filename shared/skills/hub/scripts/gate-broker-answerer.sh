@@ -906,7 +906,7 @@ run_answerer() {
   # reads the raw stream. `--verbose` is required for stream-json under `-p`; a deployed CLI that
   # lacks the format exits nonzero → the audit reads no stream (rc 2) and the void degrades to the
   # #244 activity fallback — safe, never stranding.
-  local cmd="${AFK_ANSWERER_CMD:-claude -p --no-session-persistence --output-format stream-json --verbose --model claude-opus-4-8 --allowedTools '$tools'}"
+  local cmd="${AFK_ANSWERER_CMD:-claude -p --no-session-persistence --output-format stream-json --verbose --model claude-opus-5-5 --allowedTools '$tools'}"
   local secs; secs="$(_afk_answerer_timeout)"
   # Write isolation (#237): run the reasoner against a throwaway COPY of the worktree, not the
   # spoke's LIVE tree — so even a tool that ignores the read-only allowlist writes into the

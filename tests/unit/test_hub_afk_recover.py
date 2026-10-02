@@ -59,3 +59,13 @@ def test_module_file_is_present_and_executable() -> None:
 
     assert mod.is_file(), f"{MODULE} missing"
     assert os.access(mod, os.X_OK), f"{MODULE} is not executable"
+
+
+def test_auth_is_dead_default_probe_runs_on_haiku() -> None:
+    # #358: the auth probe spends an Opus call on a two-token `ok` liveness ping — pure
+    # waste. The default AFK_AUTH_PROBE_CMD belongs on the cheap tier (Haiku), never the
+    # retired claude-opus-4-8 literal.
+    src = _call("declare -f _afk_auth_is_dead").stdout
+
+    assert "claude-haiku-4-5" in src
+    assert "claude-opus-4-8" not in src

@@ -24,6 +24,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.langfuse_spoke_tree import (
+    _DEFAULT_PRICE,
     _DISK_CATEGORY_ORDER,
     _REQUEST_CATEGORY_ORDER,
     EnrichmentContext,
@@ -63,6 +64,7 @@ from telemetry.langfuse_spoke_tree import (
     trace_id_for,
     transcript_scan_root,
 )
+from telemetry.measure_context_cost import DEFAULT_PRICE
 from telemetry.request_body import (
     ContextItem,
     decompose_request_body,
@@ -195,6 +197,14 @@ def _dur(total_ms: int, components: dict[str, int] | None = None) -> dict:
     filled = {key: 0 for key in classes}
     filled.update(components or {})
     return {"total_ms": total_ms, "components": filled}
+
+
+def test_default_price_mirrors_measure_context_cost() -> None:
+    # #358: the cache-creation write rate must move together with
+    # measure_context_cost.DEFAULT_PRICE, or the two cost views diverge. Assert the
+    # cross-module equality itself, not a duplicated literal — a future refresh that
+    # updates one constant (and its own pin) but forgets the other must fail here.
+    assert _DEFAULT_PRICE == DEFAULT_PRICE
 
 
 class TestBuildBatch:

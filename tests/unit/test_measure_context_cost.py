@@ -17,6 +17,8 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.measure_context_cost import (
+    DEFAULT_MODEL,
+    DEFAULT_PRICE,
     Category,
     CountTokensError,
     Item,
@@ -74,6 +76,21 @@ def _failing_counter():
         raise CountTokensError("unreachable")
 
     return counter
+
+
+# --- default pricing/model constants (#358) ---------------------------------
+
+
+def test_default_price_matches_opus_5_5_cache_write_rate() -> None:
+    # Opus 5.5 input is $4/MTok; the cache-creation write rate is a conservative
+    # upper bound mirrored in langfuse_spoke_tree's _DEFAULT_PRICE — the two must
+    # move together or the cost views diverge.
+    assert DEFAULT_PRICE == 0.000005
+
+
+def test_default_model_is_unchanged_haiku_for_count_tokens() -> None:
+    # The count_tokens model stays Haiku — only the cache-write price moved.
+    assert DEFAULT_MODEL == "claude-haiku-4-5"
 
 
 # --- frontmatter parsing -----------------------------------------------------

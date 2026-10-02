@@ -1,12 +1,12 @@
 """Unit tests for the agent model routing POLICY (issues #141, #142).
 
-Fable is scarce; Opus 5 is the reasoning tier. The per-agent model must
+Fable is scarce; Opus 5.5 is the reasoning tier. The per-agent model must
 therefore route by role: Fable only for the design/plan agents (`architect`,
-`planner`), Opus 5 for the reasoning-heavy ones, Sonnet 5 for the
-capable-but-routine ones, and Haiku for none. Effort routes by role too
-(Claude 5 modernization, 2026-08-17): `max` is reserved for the design/judgment
-agents; the routine workhorses run `high`. Per-issue escalation stays available
-via the `lane:reasoning` label override in the config.
+`planner`), Opus 5.5 for the reasoning-heavy ones, Sonnet 5.5 for the
+capable-but-routine ones, and Haiku for none. Effort routes by role too:
+`max` is reserved for the design/judgment agents; the routine workhorses run
+`high`. Per-issue escalation stays available via the `lane:reasoning` label
+override in the config.
 
 Since #142 the routing lives in `settings/ai-toolkit.yml` (the single source of
 truth), NOT in `shared/agents/metadata.yml` frontmatter — sync stamps it into
@@ -31,15 +31,15 @@ from metadata_parser import parse  # noqa: E402
 
 AGENTS_METADATA = REPO_ROOT / "shared" / "agents" / "metadata.yml"
 
-FABLE = "claude-fable-5"
-OPUS = "claude-opus-5"
-SONNET = "claude-sonnet-5"
+FABLE = "claude-fable-5-1"
+OPUS = "claude-opus-5-5"
+SONNET = "claude-sonnet-5-5"
 
-# (model, effort) per agent. Claude 5 modernization (2026-08-17): the reasoning
-# tier is Opus 5; design/judgment agents keep their scarce models at max, and the
-# routine workhorses (green/refactor/docs) run Sonnet 5 at high.
+# (model, effort) per agent. The reasoning tier is Opus 5.5; design/judgment
+# agents keep their scarce models at max, and the routine workhorses
+# (green/refactor/docs) run Sonnet 5.5 at high.
 EXPECTED_ROUTING = {
-    # architect/planner returned to claude-fable-5 when it became available again
+    # architect/planner returned to claude-fable-5-1 when it became available again
     # (they fell back to opus during the #218 retirement window).
     "architect": (FABLE, "max"),
     "planner": (FABLE, "max"),
@@ -87,7 +87,7 @@ def test_max_effort_reserved_for_judgment_agents(config: dict, name: str) -> Non
 
 
 def test_fable_reserved_for_design_agents(config: dict) -> None:
-    # claude-fable-5 is back after the #218 retirement window, but stays scarce:
+    # claude-fable-5-1 is back after the #218 retirement window, but stays scarce:
     # only the design/plan agents (architect, planner) may route to it.
     for name in EXPECTED_ROUTING:
         routed = cfg.agent_model(config, name)
