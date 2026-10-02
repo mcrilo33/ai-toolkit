@@ -1,62 +1,118 @@
-# Pre-push test gate
+# Test gate: CI is the gate
 
-The native pre-push hook is the **single owner of test execution** in this
-toolkit's worktree workflow: every `git push` runs a tiered, diff-aware test
-selector exactly once — **one push = one run**. There is no separate land-side
-suite run; landing merges and pushes, and the push is what gets gated.
+**CI runs the full suite; the local machine only runs the fast tier.** Every branch push
+triggers the `CI` workflow (`.github/workflows/ci.yml`), and `spoke-ready.sh` and
+`worktree-land.sh` refuse to ship a SHA until CI is green for exactly that SHA. The native
+pre-push hook (`shared/hooks/test-select.sh`) therefore never runs the whole suite — it runs
+the cheap, diff-aware tests that give a developer feedback in seconds.
 
-## Tiers
+Why (issue #378, option B of the Orca gating proposal): local full gates
+took 5–33 minutes per branch, collided with the agents on the same machine (load 10–21), and
+failed on main-level flakes six times in one day, while CI already ran the same suite on
+`ubuntu-latest` in about seven minutes. GitHub's native merge queue is unavailable on a
+personal-account repo, so lands stay scripted.
 
-`shared/hooks/test-select.sh` classifies the diff a push carries and runs the
-cheapest sufficient suite, with **default-to-full safety** — anything not
-provably docs-only or python-only runs the full suite.
+## The fast tier (pre-push)
+
+`test-select.sh` classifies the diff a push carries and runs only what is cheap:
 
 | Changed files | Runs |
 | ------------- | ---- |
-| All docs-only (`*.md`, `docs/`, `LICENSE`, `*.rst`, images) | nothing |
-| Every non-doc file is `*.py` | `pytest --testmon` (coverage-based test-impact) |
-| Anything else (`.sh`, `Dockerfile`, `*.yml`, `Makefile`, unrecognized) | the full suite |
+| All docs-only (`*.md`, `docs/`, `LICENSE`, `*.rst`, images) or exempt (`.test-select-exempt`) | nothing |
+| A non-python file that maps to referencing tests (reverse index) | exactly those test files, under `-n auto` |
+| A python change, testmon installed **and** a database present, **and** testmon would select ≤ `TEST_SELECT_TESTMON_MAX` (200) tests | `pytest --testmon` (never under xdist) |
+| Any non-doc change | plus the control-plane coverage meta-test |
 
-A `*.py` file counts as python even under `docs/` (e.g. `docs/conf.py`): testmon
-judges its impact rather than the path skipping it as a doc.
+A `*.py` file counts as python even under `docs/` (e.g. `docs/conf.py`).
 
-## Parallelism (pytest-xdist)
+Where a diff used to escalate to the full suite — an unmapped, non-exempt change; testmon
+absent; no testmon database; a diff range that cannot be resolved — the hook now runs the
+mapped tests that exist and prints that **CI is the full gate**. It never starts a run whose
+size it cannot bound: a first `pytest --testmon` in a tree without a database would execute
+the whole suite to seed it, so that leg is skipped (the baseline `worktree-new.sh` copies in
+is what keeps testmon incremental). The meta-test (`TestControlPlaneCoverage`) keeps the
+invariant that an unmapped control-plane script cannot ship green: it is red until a test
+references the script or `.test-select-exempt` lists it.
 
-The **non-testmon** legs — the full suite and the SELECTED mapped-files leg — run
-under `pytest-xdist`'s `-n auto` (one worker per core), since the suite is
-I/O-bound and embarrassingly parallel. The post-land full sweep
-(`gate-sweep.sh`) parallelizes the same way. The `--testmon` legs stay
-single-process: testmon serializes a single-writer DB and does not compose with
-xdist (`pytest --testmon -n auto` is unsupported). This is guarded on the runner
-advertising `-n numprocesses` in `pytest --help`, so a checkout without
-`pytest-xdist` installed degrades to single-process rather than erroring the push.
+Lint, type-check and the anti-gutting scan are separate commit-time hooks and are unchanged.
 
-## The serial tail: two-phase full runs (`serial` marker)
+## CI
 
-A minority of tests **escape isolation and rewrite real shared refs** (the tripwire
-family) and so cannot run under xdist workers safely; run bare under `-n auto` they
-would corrupt a worker or trip the tripwire, capping how well the parallel majority
-scales (issue #328). These carry the `serial` marker (registered in `pyproject.toml`),
-and every unavoidable full run is **two-phase**:
+`.github/workflows/ci.yml` runs on push to **every branch** (plus PRs), with
+`concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }` so a newer push to a
+branch cancels that branch's older run. The Linux suite runs **serially** — one
+`pytest tests/ -q` process, about nine minutes on a runner. The issue text asked for
+`-n auto`, but the first CI runs under xdist surfaced a different timing-sensitive failure on
+every attempt (gate-broker retry windows, #299 retry journaling order, hook-chaining EPIPE):
+flakes that serial CI had always masked. The job's timeout is 20 minutes because a serial run takes
+9-10: a timeout is reported as `cancelled`, which the ready/land gate reads as a failure.
+CI is the gate, so it has to be reproducible; re-enable `-n auto -m "not serial"` plus a
+`-m serial` tail once epic #377 makes the suite xdist-safe.
 
-1. **Parallel bulk** — `-n auto -m "not serial"`: the xdist-safe majority.
-2. **Serial tail** — `-m serial`, single-process (no `-n`): the ref-mutating minority.
+Tests that **escape isolation and rewrite real shared refs** (the tripwire family) carry the
+`serial` marker (registered in `pyproject.toml`) and must never run under xdist workers;
+`tests/conftest.py` installs a fail-loud guard for a bare, path-less `-n auto` (an explicit
+`tests/` path bypasses it, so an xdist CI run must exclude the marker itself). ShellCheck and the
+sync-idempotency check run alongside. The macOS control-plane job stays `continue-on-error` until
+its flakes are fixed (#384). Only pushes to `main` and PRs file `CI red: …` backlog issues; a red
+spoke branch is reported to its own spoke.
 
-Both phases run under the same tripwire; the combined exit code is the verdict. The
-serial leg's exit 5 ("no tests collected" — nothing marked `serial`, e.g. a fresh
-checkout or a synced repo with none) is normalized to green. This applies to the FULL
-leg and the testmon-absent full fallback in `test-select.sh`, and to `gate-sweep.sh`'s
-post-land sweep; the `--testmon` and SELECTED legs are unchanged.
+## Gating ready and land
 
-`tests/conftest.py` installs a fail-loud guard: if a `serial`-marked test is collected
-under a **bare, path-less `-n auto`** — the whole-suite invocation this split replaces —
-the run refuses rather than let a ref-mutating test corrupt a worker. It deliberately does
-NOT fire when the caller names test files explicitly (the SELECTED gate leg, or a dev
-running specific files), since that is a deliberate selection, not the whole-suite run.
-Under-marking degrades safely: an unmarked ref-mutator that reaches the parallel phase
-still trips the tripwire (a loud, blocked push), never silent corruption.
-`tests/unit/test_serial_marker.py` guards the marker registration and the guard's
-fire/no-fire cases.
+`spoke-ready.sh <N>` (the `ready/<N>` marker) refuses until CI reports **success for HEAD's
+exact SHA**, after the existing clean-tree / pushed-tip / review-artifact preconditions:
+
+```bash
+gh run list --commit <sha> --workflow CI --json status,conclusion,url,databaseId
+```
+
+| CI state | Message |
+| -------- | ------- |
+| unfinished after the bounded wait (`WT_READY_CI_WAIT`, default 540 s) | `CI pending (<url>)` |
+| completed, not successful | `CI failed (<url>, failing jobs: …)` |
+| no run for the SHA after a short grace | `no CI run for this SHA (was it pushed?)` |
+| `gh`/`python3` unavailable | `cannot read CI … use --local-gate` |
+
+Several runs can share a SHA (a push run and a PR run, re-runs); any success wins. The gate judges only the **run-level** conclusion — a `continue-on-error` job such as the macOS control-plane job can fail without turning the run red, and is never consulted. Once a run has been seen, a transient empty answer is treated as pending, not "no run". A just-pushed
+SHA has no run for a few seconds, so "none" only becomes final after `WT_CI_NONE_GRACE`
+(default 90 s). `--no-wait` checks once and never polls. `AI_TOOLKIT_READY_FORCE=1` still
+bypasses every precondition, CI included, and stamps the bypass into the tag.
+
+`worktree-land.sh` never runs tests itself:
+
+1. The branch tip (the ready SHA) must be CI-green (`LAND_CI_WAIT_MAX`, default 1200 s). A red run
+   exits the precondition code (5) so the drain escalates instead of retrying; pending / no run /
+   no `gh` exit 1.
+2. If the default branch is an ancestor of the tip, the land is a pure **fast-forward of a
+   CI-green SHA** and the main push skips the local hook (`TEST_SELECT_SKIP=1`).
+3. Otherwise (main moved) the default branch is merged **into the spoke branch, on the spoke**,
+   pushed, and the land waits for CI on the new tip before main fast-forwards to it. A conflict
+   exits 4 (the resolution lane); a main that keeps moving stops after `LAND_SYNC_ROUNDS` (3).
+4. If origin still advances between the CI check and the push, the recovery re-syncs the spoke
+   against the new main and re-waits for CI (`LAND_LOCK_PUSH_RETRIES`).
+
+`--skip-tests` only skips the hook's fast tier on the main push — it does **not** waive CI, which
+is what the drain's `auto_land` passes. The land lock is held across the CI waits, so queued lands
+serialize behind a slow CI run (`LAND_LOCK_WAIT_MAX`).
+
+## Offline escape hatch: `--local-gate`
+
+When CI is unreachable (no network, `gh` missing or unauthenticated), `--local-gate` on
+`spoke-ready.sh` or `worktree-land.sh` runs the **former local full suite once** — the parallel
+bulk under `-n auto -m "not serial"`, then the serial tail — instead of waiting for CI. It rides
+the pre-push hook as `TEST_SELECT_CMD`, so the suite runs under the repo-integrity tripwire; a
+missing or non-executable hook aborts rather than shipping ungated. It is recorded in the land
+log (`suite: local full suite … (--local-gate)`, also in the issue-close comment) and in the
+`ready/<N>` tag message (`LOCAL_GATE: …`). `worktree-land.sh --test-cmd <cmd>` gates with a custom
+command the same way. `--local` micro-spokes (never pushed, so CI has never seen them) keep the
+hub-side merge and the hook's fast tier.
+
+## Parallelism
+
+The mapped-files leg runs under `pytest-xdist`'s `-n auto`, guarded on the runner advertising
+`-n numprocesses` in `pytest --help` so a checkout without `pytest-xdist` degrades to
+single-process rather than erroring the push. The `--testmon` leg stays single-process: testmon
+serializes a single-writer DB and `pytest --testmon -n auto` is unsupported.
 
 ## Pre-warmed `.testmondata` baseline
 
@@ -70,31 +126,35 @@ To skip that seed, a maintained baseline `.testmondata` lives at
   affected tests) instead of the full seed. No path rewrite is needed — testmon
   stores rootdir-relative paths, so a DB built at one absolute path is reused at
   another.
-- **Refresh.** `gate-sweep.sh` rebuilds the baseline after a **green** post-land full
-  sweep, running `pytest --testmon` with `TESTMON_DATAFILE` pointed at the baseline
-  (single-process — testmon does not compose with xdist) so the hub's own
-  `.testmondata` is untouched.
+- **Refresh.** `gate-sweep.sh` rebuilt the baseline after a green post-land full sweep, but
+  that sweep only fires for a pruned green-tree stamp and the gate no longer mints stamps
+  (CI is the gate, #378), so nothing refreshes it now: a baseline ages until it is rebuilt
+  by hand. An aged baseline only widens testmon's impact set; it never wrong-greens.
 - **Staleness.** testmon keys its `environment` row on `system_packages` +
   `python_version`, so a copied baseline whose `.venv` dep set differs (e.g. after a
-  `requirements-dev.txt` bump) is invalidated automatically — testmon re-runs the
-  full suite. A missing or unreadable baseline likewise degrades to today's
-  full-suite seed. Both paths fail toward *more* testing, never a wrong-green.
+  `requirements-dev.txt` bump) is invalidated and testmon would re-select the whole suite.
+  The fast tier therefore **probes first**: `pytest --testmon --collect-only -q` lists what
+  testmon would run, and past `TEST_SELECT_TESTMON_MAX` tests (default 200) — or if the count
+  cannot be established — the leg is skipped with a loud note and CI covers it. A collection
+  error blocks the push outright. The probe runs no tests but, like any testmon invocation, may
+  update the database (it can only widen later selections, never produce a false green). (A tests-only
+  push once ran ~5800 tests serially for 34 minutes: testmon cannot use xdist.) Rebuild the
+  baseline after a dependency bump to get incremental selection back.
 
 ## Safe fallbacks
 
-The gate is built to fail toward *more* testing, never toward silently skipping:
+The fast tier never starts a run it cannot bound, and never waves a push through on missing evidence:
 
-- **testmon not installed → the full suite.** The python tier degrades to the
-  whole suite rather than skipping python tests. Install it with `pip install
-  pytest-testmon` (declared in `requirements-dev.txt`) to get test-impact
-  selection.
-- **No pytest resolvable → nothing to run.** The gate degrades rather than
-  erroring the push.
-- **A diff range that can't be resolved → the full suite** (it cannot be proven
-  safe).
-- **Selector missing or non-executable → the push is refused** (fail-closed): a
-  missing gate must not silently ship untested code. Re-run
-  `scripts/install-git-hooks.sh` to restore it.
+- **No pytest resolvable → the push is blocked** for any diff that demands tests (docs-only and
+  exempt diffs need no runner). `TEST_SELECT_SKIP=1` is the explicit override.
+- **testmon not installed, no testmon database, or an impact set past the cap → the mapped
+  tests only**, with a note that CI is the full gate.
+- **A diff range that can't be resolved → the mapped tests that exist plus the meta-test**, with
+  the same note.
+- **Selector missing or non-executable → the push is refused** (fail-closed): a missing gate must
+  not silently ship untested code. Re-run `scripts/install-git-hooks.sh` to restore it.
+- **CI is the backstop for all of the above:** a SHA cannot be marked ready or landed without a
+  green full-suite run (or an explicit, logged `--local-gate`).
 
 ## How the range is resolved
 
@@ -188,29 +248,24 @@ This copies `test-select.sh` (and the other cage scripts) into the repo's
 `.git/hooks/ai-toolkit-scripts/` and wires the pre-push hook to run it as a
 **blocking** gate — a non-zero exit aborts the push. `shared/hooks/*.sh` also
 sync into target repos via `scripts/sync-to-repo.sh`. Without the native hook
-installed, a push runs no gate; `worktree-land.sh` warns when that is the case so
-a green land is never mistaken for a tested one.
+installed, a push runs no fast tier; CI still gates ready and land, and the
+`--local-gate` / `--test-cmd` paths refuse to run without the hook.
 
 ## Landing
 
-`worktree-land.sh` does not run the suite itself. It merges the spoke branch and
-pushes the default branch; that push's pre-push hook is the test gate. A rejected
-push — the gate failing, or a remote refusal — rolls the merge back with
-`git reset --keep`, leaving a clean hub. The escape hatches are threaded into the
-hook rather than run land-side:
+See [Gating ready and land](#gating-ready-and-land) above. The land never runs the suite; a
+rejected push (a remote refusal, or the local gate of a `--local-gate` / `--test-cmd` land) rolls
+the merge back with `git reset --keep`, leaving a clean hub.
 
 | Flag | Effect |
 | ---- | ------ |
-| `--skip-tests` | Threads `TEST_SELECT_SKIP=1` — the gate runs nothing |
-| `--test-cmd <cmd>` | Threads `TEST_SELECT_CMD=<cmd>` — the gate runs `<cmd>` instead of the tiered selection |
+| `--skip-tests` | Threads `TEST_SELECT_SKIP=1` — the hook's fast tier is skipped; CI is still required |
+| `--local-gate` | Runs the former local full suite once via the hook instead of waiting for CI |
+| `--test-cmd <cmd>` | Threads `TEST_SELECT_CMD=<cmd>` — the hook runs `<cmd>` instead of consulting CI |
 
-## Why one push = one run
+## Why CI, not the local machine
 
-The previous flow tested the same merged state twice at land time: a blanket
-land-side `pytest` *and* the native pre-push hook firing on the main push. Making
-the hook the single owner removes the redundancy and adds diff-awareness — a
-docs-only change pays nothing, a python-only change pays only its test impact.
-
-There is deliberately no fast-forward dedup and no commit pass-cache: a
-fast-forward land re-tests already-green commits once, which is still one push,
-one run.
+The previous flow ran a ~6-minute suite inside every spoke push, again on the hub's main push, and
+sometimes twice for one branch — on the same machine the agents were using. Moving the full run to
+CI removes the contention and the main-level flakes from the push path while keeping a hard gate:
+the SHA that reaches `main` is always one a CI run passed.

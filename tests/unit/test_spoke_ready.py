@@ -30,13 +30,27 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _ci_gh_support import CI_URL as _CI_URL
+from _ci_gh_support import FAILED_RUNS as _FAILED
+from _ci_gh_support import GREEN_RUNS
+from _ci_gh_support import PENDING_RUNS as _PENDING
+from _ci_gh_support import make_ci_gh as _make_ci_gh
 from _stubs import write_stub
 
 SPOKE_READY = Path(__file__).resolve().parents[2] / "scripts" / "spoke-ready.sh"
 
+# CI is the gate (#378): ready/<N> waits for a green CI run on HEAD, so every test
+# gets a `gh` that reports one — the suite must never reach the real GitHub.
+_GREEN_GH = _make_ci_gh()
+
 # Pin git config to nothing: a host's global/system config (core.hooksPath,
 # init.templateDir) must not reach the fixture repo's commits or pushes.
-_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+_GIT_ENV = {
+    **os.environ,
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "PATH": f"{_GREEN_GH}:{os.environ['PATH']}",
+}
 
 OWN = "fix/45-spoke-ready"
 
@@ -885,20 +899,17 @@ def _install_git_shim(tmp_path: Path, *, fail_pushes: str | None = None) -> tupl
             "  fi\n"
         )
     shim = bindir / "git"
-    write_stub(
-        shim,
-        "#!/bin/sh\n"
+    write_stub(shim, "#!/bin/sh\n"
         'if [ "$1" = push ]; then\n'
         f'  echo "GIT_SSH_COMMAND=[$GIT_SSH_COMMAND] $*" >> "{log}"\n'
         f"{fail_snippet}"
         "fi\n"
-        f'exec "{real_git}" "$@"\n',
-    )
+        f'exec "{real_git}" "$@"\n')
     return log, bindir
 
 
 def _run_with_shim(repo: Path, bindir: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{_GIT_ENV['PATH']}"}
     env.pop("GIT_SSH_COMMAND", None)
     return _run(repo, *args, env=env)
 
@@ -1004,19 +1015,15 @@ def test_marker_push_survives_unwritable_tmpdir(spoke: Path, remote: Path, tmp_p
 
 
 def _gh_logging_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
-    bindir = tmp_path / "ghbin"
-    bindir.mkdir(exist_ok=True)
     log = tmp_path / "gh-calls.log"
-    gh = bindir / "gh"
-    write_stub(gh, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_LOG"\n')
-    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}", "GH_LOG": str(log)}
+    env = {**_GIT_ENV, "PATH": f"{_make_ci_gh()}:{os.environ['PATH']}", "GH_LOG": str(log)}
     return env, log
 
 
 @pytest.mark.parametrize(
     "args",
-    [("45",), ("--gate", "45"), ("--accept", "45"), ("--blocked", "45")],
-    ids=["ready", "gate", "accept", "blocked"],
+    [("--gate", "45"), ("--accept", "45"), ("--blocked", "45")],
+    ids=["gate", "accept", "blocked"],
 )
 def test_spoke_ready_emits_no_gh_calls(
     spoke: Path, remote: Path, tmp_path: Path, args: tuple[str, ...]
@@ -1028,6 +1035,17 @@ def test_spoke_ready_emits_no_gh_calls(
     assert proc.returncode == 0, proc.stderr
     calls = log.read_text() if log.exists() else ""
     assert calls == "", f"spoke-ready must not touch gh — the hub mirrors, not the spoke: {calls!r}"
+
+
+def test_ready_only_reads_ci_through_gh(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    # ready/<N> reads CI (#378) but stays a non-writer: only `gh run list`, never a mutation.
+    env, log = _gh_logging_env(tmp_path)
+
+    proc = _run(spoke, "45", env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text().splitlines()
+    assert calls and all(c.startswith("run list ") for c in calls), calls
 
 
 # ── #278: the queued-subtask channel, consumed at the ready boundary ──────────
@@ -1191,3 +1209,288 @@ def test_queue_gate_outranks_an_unmet_precondition(spoke: Path, tmp_path: Path) 
     assert proc.returncode == 5, "the queue's distinct code, not the precondition's generic 1"
     assert "265" in proc.stderr
     assert "not clean" not in proc.stderr, "the queue is reported, not the incidental dirt"
+
+
+# ── CI is the gate (#378): ready/<N> waits for a green run on HEAD's exact SHA ────────
+# The full suite runs in CI on every branch push, so the local gate is gone: ready refuses
+# on pending / failed / missing CI and succeeds on green. `gh` is stubbed with realistic
+# `gh run list --json` output (see _make_ci_gh). --local-gate is the offline escape hatch.
+
+
+
+def _ci_env(tmp_path: Path, runs_json: str, **extra: str) -> tuple[dict[str, str], Path]:
+    """An env whose `gh run list` answers `runs_json`; polls fast, waits briefly."""
+    log = tmp_path / "gh-calls.log"
+    env = {
+        **_GIT_ENV,
+        "PATH": f"{_make_ci_gh(runs_json)}:{os.environ['PATH']}",
+        "GH_LOG": str(log),
+        "WT_CI_POLL": "1",
+        "WT_CI_NONE_GRACE": "0",
+        "WT_READY_CI_WAIT": "2",
+        **extra,
+    }
+    return env, log
+
+
+def test_ready_succeeds_on_green_ci_and_says_so(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    env, _ = _ci_env(tmp_path, GREEN_RUNS)
+
+    result = _run(spoke, "45", env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "CI is green" in result.stdout
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_queries_ci_for_the_exact_head_sha(spoke: Path, tmp_path: Path) -> None:
+    env, log = _ci_env(tmp_path, GREEN_RUNS)
+    head = _git(spoke, "rev-parse", "HEAD").strip()
+
+    _run(spoke, "45", env=env)
+
+    first = log.read_text().splitlines()[0]
+    assert f"--commit {head}" in first
+    assert "--workflow CI" in first
+
+
+def test_ready_refused_while_ci_is_pending(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    env, _ = _ci_env(tmp_path, _PENDING)
+
+    result = _run(spoke, "45", env=env)
+
+    assert result.returncode != 0
+    assert f"CI pending ({_CI_URL})" in result.stderr
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+    assert _git(spoke, "tag", "-l", "ready/45").strip() == ""  # no half-emitted local tag
+
+
+def test_ready_refused_when_ci_failed_and_names_the_failing_jobs(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    env, _ = _ci_env(tmp_path, _FAILED, GH_JOBS="Pytest suite, ShellCheck")
+
+    result = _run(spoke, "45", env=env)
+
+    assert result.returncode != 0
+    assert f"CI failed ({_CI_URL}, failing jobs: Pytest suite, ShellCheck)" in result.stderr
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_refused_when_no_ci_run_exists_for_the_sha(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    env, _ = _ci_env(tmp_path, "[]")
+
+    result = _run(spoke, "45", env=env)
+
+    assert result.returncode != 0
+    assert "no CI run for this SHA (was it pushed?)" in result.stderr
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_no_wait_checks_ci_exactly_once(spoke: Path, tmp_path: Path) -> None:
+    env, log = _ci_env(tmp_path, _PENDING, WT_READY_CI_WAIT="600")  # a long wait the flag must skip
+
+    result = _run(spoke, "--no-wait", "45", env=env)
+
+    assert result.returncode != 0
+    assert "CI pending" in result.stderr
+    assert len(log.read_text().splitlines()) == 1  # one `gh run list`, no polling
+
+
+def test_ready_polls_until_a_pending_run_turns_green(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    # The stub reports in_progress on its first call and success afterwards.
+    ghdir = tmp_path / "flip"
+    ghdir.mkdir()
+    n = tmp_path / "n"
+    write_stub(ghdir / "gh", "#!/bin/sh\n"
+        f'c=$(cat "{n}" 2>/dev/null || echo 0); c=$((c+1)); echo $c > "{n}"\n'
+        'if [ "$c" -ge 2 ]; then s=completed; k=success; else s=in_progress; k=""; fi\n'
+        f'printf \'[{{"status":"%s","conclusion":"%s","url":"{_CI_URL}","databaseId":1}}]\' "$s" "$k"\n')
+    env = {**_GIT_ENV, "PATH": f"{ghdir}:{os.environ['PATH']}", "WT_CI_POLL": "1",
+           "WT_READY_CI_WAIT": "30"}
+
+    result = _run(spoke, "45", env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert int(n.read_text()) >= 2
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_refused_when_gh_is_unavailable_and_points_at_local_gate(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    sandbox = tmp_path / "nogh"
+    sandbox.mkdir()
+    for tool in ("git", "bash", "python3", "mktemp", "tee", "rm", "dirname", "sort", "tr",
+                 "awk", "sed", "head", "date", "stat", "cat", "grep", "uname"):
+        found = shutil.which(tool)
+        if found:
+            os.symlink(found, sandbox / tool)
+    env = {**_GIT_ENV, "PATH": str(sandbox)}
+
+    result = _run(spoke, "45", env=env)
+
+    assert result.returncode != 0
+    assert "--local-gate" in result.stderr
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_force_skips_the_ci_gate(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    env, log = _ci_env(tmp_path, _PENDING, AI_TOOLKIT_READY_FORCE="1")
+
+    result = _run(spoke, "45", env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not log.exists()  # a forced ready never consults CI
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ci_gate_does_not_apply_to_the_other_markers(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    env, _ = _ci_env(tmp_path, _FAILED)
+
+    for flag, ref in (("--gate", "gate/45"), ("--accept", "accept/45"), ("--blocked", "blocked/45")):
+        result = _run(spoke, flag, "45", env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert _remote_has_ref(remote, f"refs/tags/{ref}")
+
+
+# --- --local-gate: the offline escape hatch --------------------------------------------
+
+
+def _install_prepush_hook(
+    repo: Path, tmp_path: Path, *, exit_code: int = 0, announce: bool = True
+) -> Path:
+    """A pre-push hook recording the TEST_SELECT_CMD it was handed, then exiting `exit_code`."""
+    seen = tmp_path / "hook-saw-cmd"
+    hooks = Path(_git(repo, "rev-parse", "--git-path", "hooks").strip())
+    hooks = hooks if hooks.is_absolute() else repo / hooks
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-push"
+    announce_line = (
+        'echo "test-select: running custom suite (TEST_SELECT_CMD)" >&2' if announce else ":"
+    )
+    write_stub(hook, f'#!/bin/sh\ncat >/dev/null\n{announce_line}\n'
+        f'printf "%s" "${{TEST_SELECT_CMD-UNSET}}" >> "{seen}"\nexit {exit_code}\n')
+    return seen
+
+
+def _offline_env(tmp_path: Path) -> dict[str, str]:
+    """A PATH where `gh` fails the way an offline machine's does."""
+    ghdir = tmp_path / "offline"
+    ghdir.mkdir(exist_ok=True)
+    write_stub(ghdir / "gh", "#!/bin/sh\nexit 1\n")
+    return {**_GIT_ENV, "PATH": f"{ghdir}:{os.environ['PATH']}"}
+
+
+def test_local_gate_runs_the_full_suite_through_the_hook_and_never_calls_gh(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    seen = _install_prepush_hook(spoke, tmp_path)
+    env, log = _ci_env(tmp_path, _FAILED)  # CI red: the escape hatch must not consult it
+
+    result = _run(spoke, "--local-gate", "45", env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '-n auto -m "not serial"' in seen.read_text()  # the former full suite, with xdist
+    assert "-m serial" in seen.read_text()
+    assert not log.exists()
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_local_gate_works_offline(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    _install_prepush_hook(spoke, tmp_path)
+
+    result = _run(spoke, "--local-gate", "45", env=_offline_env(tmp_path))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_local_gate_is_recorded_in_the_ready_tag_message(spoke: Path, tmp_path: Path) -> None:
+    _install_prepush_hook(spoke, tmp_path)
+
+    _run(spoke, "--local-gate", "45")
+
+    body = _git(spoke, "tag", "-l", "--format=%(contents:body)", "ready/45")
+    assert "LOCAL_GATE" in body and "--local-gate" in body
+
+
+def test_a_ci_gated_ready_carries_no_local_gate_note(spoke: Path) -> None:
+    _run(spoke, "45")
+
+    assert "LOCAL_GATE" not in _git(spoke, "tag", "-l", "--format=%(contents:body)", "ready/45")
+
+
+def test_local_gate_failure_blocks_the_marker(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    _install_prepush_hook(spoke, tmp_path, exit_code=1)
+
+    result = _run(spoke, "--local-gate", "45")
+
+    assert result.returncode != 0
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_local_gate_refused_without_a_prepush_hook(spoke: Path, remote: Path) -> None:
+    result = _run(spoke, "--local-gate", "45")
+
+    assert result.returncode != 0
+    assert "pre-push hook" in result.stderr
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_local_gate_still_runs_the_other_preconditions(spoke: Path, tmp_path: Path) -> None:
+    _install_prepush_hook(spoke, tmp_path)
+    (spoke / "work.txt").write_text("dirty\n")
+
+    result = _run(spoke, "--local-gate", "45")
+
+    assert result.returncode != 0
+    assert "working tree" in result.stderr.lower()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("--local-gate", "--no-wait", "45"), ("--gate", "--local-gate", "45"), ("--accept", "--no-wait", "45")],
+    ids=["gate-vs-wait", "gate-marker", "accept-marker"],
+)
+def test_ci_flags_are_usage_errors_when_misapplied(spoke: Path, args: tuple[str, ...]) -> None:
+    result = _run(spoke, *args)
+
+    assert result.returncode == 2
+
+
+def test_local_gate_refused_when_the_hook_never_ran_the_suite(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    # A hook that exits 0 without announcing the custom suite (disabled / persistent skip) is
+    # not proof the suite ran: refuse, and leave no marker local or remote.
+    _install_prepush_hook(spoke, tmp_path, announce=False)
+
+    result = _run(spoke, "--local-gate", "45")
+
+    assert result.returncode != 0
+    assert "did not report running the suite" in result.stderr
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+    assert _git(spoke, "tag", "-l", "ready/45").strip() == ""
+
+
+def test_local_gate_ignores_an_inherited_test_select_skip(spoke: Path, tmp_path: Path) -> None:
+    seen = _install_prepush_hook(spoke, tmp_path)
+
+    result = _run(spoke, "--local-gate", "45", env={**_GIT_ENV, "TEST_SELECT_SKIP": "1"})
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '-n auto -m "not serial"' in seen.read_text()
+
+
+def test_a_ready_whose_gate_failed_leaves_no_local_tag(spoke: Path, tmp_path: Path) -> None:
+    _install_prepush_hook(spoke, tmp_path, exit_code=1)
+
+    result = _run(spoke, "--local-gate", "45")
+
+    assert result.returncode != 0
+    assert _git(spoke, "tag", "-l", "ready/45").strip() == ""  # the hub reads local tags

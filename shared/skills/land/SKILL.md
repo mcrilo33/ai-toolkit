@@ -3,7 +3,8 @@
 Land a finished task from the hub: `/land <id>`. The hub starts and ends tasks; spokes
 only execute. A spoke's push is its ship gate — landing (merge, push, teardown, issue
 close) happens **here**, on the main checkout, never inside the worktree. Landing runs
-no suite itself: the push's pre-push hook is the single test gate (`docs/test-gate.md`).
+no tests itself: CI is the gate — the land requires a green CI run on the exact SHA it ships
+(`docs/test-gate.md`).
 
 The deterministic sequence lives in `.ai-toolkit/scripts/worktree-land.sh`; this skill orchestrates
 it: pick the target, confirm, run, then report and refresh the hub picture.
@@ -56,8 +57,9 @@ a land is a merge plus an irreversible teardown. Then:
 
 | Flag | Effect |
 |------|--------|
-| `--skip-tests` | Skip the pre-push test gate (threads `TEST_SELECT_SKIP=1`) |
-| `--test-cmd <cmd>` | Run `<cmd>` as the gate instead of the tiered selection (threads `TEST_SELECT_CMD`) |
+| `--skip-tests` | Skip the pre-push hook's fast tier on the main push (threads `TEST_SELECT_SKIP=1`); CI is still required |
+| `--local-gate` | Offline escape hatch: run the former local full suite once instead of waiting for CI; recorded in the land log |
+| `--test-cmd <cmd>` | Run `<cmd>` as the gate instead of consulting CI (threads `TEST_SELECT_CMD`) |
 | `--local` | Micro-spoke landing: skips upstream guards; accepts a bare local branch with no upstream; refuses any branch that has an upstream and refuses the default branch itself |
 | `--force-land` | Land a numbered branch that carries no `ready/<issue>` marker (an express/ad-hoc branch that never emits one); the marker guard is otherwise mandatory |
 
@@ -66,10 +68,11 @@ The script runs, in order, aborting safely at the first failure:
 1. **Guards** — hub on a clean default branch; worktree resolved, clean, fully pushed
    (neither ahead of nor behind its upstream); for a numbered branch, a `ready/<issue>`
    marker points at the tip (unless `--force-land`).
-2. **Merge** — fast-forward when possible, else a merge commit.
-3. **Ship** — `git push origin <default>`; the **pre-push hook is the test gate**
-   (tiered and diff-aware — `docs/test-gate.md`), so the suite runs once on that push.
-   A rejected push (the gate failing or a remote refusal) rolls back with
+2. **Gate + merge** — the branch tip must be CI-green (`CI pending/failed/no run` refuse). When
+   the default branch moved, it is merged **into the spoke, on the spoke**, pushed, and CI is
+   awaited on the new tip; the hub then only fast-forwards to a CI-green SHA.
+3. **Ship** — `git push origin <default>` (no local tests: CI already proved that SHA).
+   A rejected push (a remote refusal, or the local gate of `--local-gate`) rolls back with
    `git reset --keep` and nothing is pushed. Then the telemetry ingest → release the
    spoke's Orca worker (`worker-release`, which closes its terminal) → `worktree-done.sh`
    (`orca worktree rm`, without the archive hook: the ingest already ran; the merged

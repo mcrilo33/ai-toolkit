@@ -94,7 +94,7 @@ Orca is a prerequisite of this repo and of every synced repo: `worktree-new.sh` 
 | `scripts/worktree-new.sh` | Dispatch one task: `orca worktree create`, rename the branch, provision, launch `claude` in an Orca terminal, deliver the seed with `orca orchestration worker-start` |
 | `scripts/orca-lib.sh` | The only caller of the `orca` CLI: version floor, `--json` capture, settle-after-timeout (never re-issues a mutation), field extractors |
 | `scripts/provision-worktree.sh` | Provision a worktree's policy layer (git exclude, `.testmondata` pre-warm, `.ai-toolkit/*`, `.claude/`, `settings.local.json` allow/deny + spoke OTel env); shared by `worktree-new.sh`, `worktree-quick.sh` and Orca's setup hook (`ORCA_*` env or explicit flags), idempotent, fail-loud |
-| `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → merge → suite → push → teardown → issue close |
+| `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → CI green → merge → push → teardown → issue close |
 | `scripts/worktree-done.sh` | Resolve a worktree by issue / slug / branch / path and tear it down safely |
 | `scripts/worktree-lib.sh` | Shared slugify + main-root + worktree-resolution helpers (sourced by the others) |
 
@@ -200,8 +200,8 @@ hub — `/land 42` in the hub session (the `land` skill), or directly:
 
 ```bash
 cd ~/Repos/ai-toolkit            # merge hub, already on main
-scripts/worktree-land.sh 42      # guards → merge (ff when possible) → full suite →
-                                 # push origin main → teardown → close issue #42
+scripts/worktree-land.sh 42      # guards → CI green → ff-merge → push origin main →
+                                 # teardown → close issue #42
 ```
 
 Completion is explicit: a per-subtask push is indistinguishable from a finished issue,
@@ -212,14 +212,28 @@ spoke emits after its FINAL subtask's push via the canonical emitter
 dashboard); pass `--force-land` only for an express/ad-hoc branch that never carries
 one. A successful land consumes the marker (deletes the local + remote tag).
 
+**CI is the gate** (issue #378; see [`test-gate.md`](./test-gate.md)). The full suite runs
+in CI on every branch push, so neither side re-runs it locally:
+
+- `spoke-ready.sh <N>` refuses to emit `ready/<N>` until CI reports **success for HEAD's exact
+  SHA** — `CI pending (url)`, `CI failed (url, failing jobs)` or `no CI run for this SHA (was it
+  pushed?)` otherwise. It polls for up to `WT_READY_CI_WAIT` seconds; `--no-wait` checks once.
+- `worktree-land.sh` requires CI green on the branch tip and runs **no tests of its own**. When
+  the tip already contains `main` the land is a pure fast-forward of that CI-green SHA. When
+  `main` moved, it merges `main` **into the spoke branch, on the spoke**, pushes it, waits for CI
+  on the new SHA, and only then fast-forwards `main` — so the SHA that reaches `main` is always
+  one CI passed, and a conflict is the spoke's to resolve (exit 4).
+- The spoke's own `git push` still runs the **fast tier** (mapped tests, the meta-test and
+  incremental testmon) in seconds; never the whole suite.
+- **Offline escape hatch:** `--local-gate` on either script runs the former local full suite once
+  (`-n auto`) instead of waiting for CI, and records that in the land log and the ready tag
+  message. Use it only when CI is unreachable.
+
 One command runs the whole landing: it refuses with a precise reason unless the hub is
-clean on `main` and the spoke is clean, fully pushed, and marked ready; a failing suite
-rolls `main` back (`git reset --keep`) with nothing pushed. Every gate-bearing push
-the worktree scripts perform carries SSH keepalive options (`ServerAliveInterval`,
-issue #119) so the multi-minute in-push gate can't stale the connection (the
-completion-marker tag push stays plain — tag-only pushes skip the gate on a fresh
-connection); if the gate ran green and the transfer still died, the land retries once
-with `TEST_SELECT_SKIP=1` — loudly — and a failed gate never retries. On success it
+clean on `main` and the spoke is clean, fully pushed, marked ready and CI-green; a rejected
+push rolls `main` back (`git reset --keep`) with nothing pushed. Pushes the worktree scripts
+perform carry SSH keepalive options (`ServerAliveInterval`, issue #119) — the
+completion-marker tag push stays plain, since tag-only pushes skip the gate. On success it
 releases the spoke's Orca worker (`worker-release`, which closes its terminal) and calls
 `worktree-done.sh --no-hooks` — an `orca worktree rm` — then the now-merged branch is
 pruned local + origin. An unmerged branch is never pruned. It then closes the issue via

@@ -6,35 +6,39 @@
 # branch, after the spoke has pushed — never from inside a worktree.
 #
 # Usage:
-#   scripts/worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--local] [--force-land] [--test-cmd <cmd>]
+#   scripts/worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--local] [--force-land] [--local-gate] [--test-cmd <cmd>]
 #
 #   <issue|slug|branch|path>  anything that identifies the task worktree
-#   --skip-tests              skip the pre-push test gate (threads TEST_SELECT_SKIP=1)
+#   --skip-tests              skip the pre-push hook's fast tier on the main push (CI is
+#                             still required: it is the gate, issue #378)
 #   --local                   micro-spoke path: skip upstream guards and accept a bare
 #                             local branch with no registered worktree (the hub's diff
 #                             review is the gate; merge+push is what ships the work)
 #   --force-land              land a numbered branch that carries no ready/<issue>
 #                             completion marker (express/ad-hoc branches that never
 #                             emit one); the marker guard is otherwise mandatory
-#   --test-cmd <cmd>          run <cmd> as the gate instead of the tiered selection
+#   --local-gate              offline escape hatch: run the former local full suite once
+#                             (-n auto) on the merged tree instead of waiting for CI, and
+#                             record that in the land log
+#   --test-cmd <cmd>          run <cmd> once on the merged tree instead of waiting for CI
 #                             (threads TEST_SELECT_CMD to the pre-push hook)
 #
-# The pre-push hook is the SINGLE owner of test execution (issue #19): landing
-# merges locally and pushes main, and that push's pre-push hook runs the tiered,
-# diff-aware suite — "one push = one run". Landing no longer runs pytest itself;
-# --skip-tests/--test-cmd are threaded to the hook via TEST_SELECT_*.
-#
-# A clean fast-forward land of an already-gated branch (ready/<issue> marker at
-# the tip) re-tests an identical tree, so the gate is auto-skipped there (issue
-# #96); diverged/merge-commit lands still run it. Set LAND_FORCE_GATE=1 to force
-# the gate back on even for a clean-FF land.
+# CI IS THE GATE (issue #378): landing never runs tests itself. The full suite runs in
+# CI on every branch push, so a pushed spoke lands only on a green CI run for the exact
+# SHA being shipped:
+#   * the ready SHA must be CI-green (bounded wait: LAND_CI_WAIT_MAX, default 1200s);
+#   * when the default branch is an ancestor of it, the land is a pure fast-forward of
+#     that CI-green SHA and the main push skips the local hook;
+#   * when the default branch moved, it is merged INTO the spoke branch ON THE SPOKE,
+#     pushed, and CI must go green on the new tip before main fast-forwards to it.
 #
 # Sequence, each step aborting safely on failure:
 #   guards  hub on default branch + clean; worktree resolved, clean, fully pushed;
 #           numbered branches carry a ready/<issue> marker at their tip (issue #16)
-#   merge   --ff-only when possible, else a merge commit (plain `git merge`)
-#   ship    push origin <default> — the pre-push hook is the test gate; a rejected
-#           push (gate failed or remote refused) rolls back `git reset --keep`.
+#   gate    CI green for the tip (merging the default branch into the spoke if it moved)
+#   merge   --ff-only of the CI-green tip (--local / --local-gate / --test-cmd: a plain
+#           `git merge`, gated locally instead)
+#   ship    push origin <default>; a rejected push rolls back `git reset --keep`.
 #           Then ingest → worker-release → worktree-done.sh (`orca worktree rm`) → `gh issue close`
 #   release the spoke's Orca worker (`worker-release`), then tear down via worktree-done.sh --no-hooks
 #
@@ -62,16 +66,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # if a host ever carried spaces). A crashed holder is broken (dead pid, or a hard age
 # bound as a wedged-alive/pid-reuse backstop); a live holder is waited on and the wait
 # is LOGGED, never silent (fail-loud, Principle 2). Bounds are env-tunable for tests.
-: "${LAND_LOCK_WAIT_MAX:=1200}"        # hard cap (s) to wait before failing loud
-: "${LAND_LOCK_STALE_SECONDS:=1800}"   # break even a live-looking holder past this age (0 disables)
+# The land now holds the lock across CI waits (LAND_CI_WAIT_MAX each, up to LAND_SYNC_ROUNDS
+# of them, #378), so both bounds must outlast a slow CI run or a live holder is aged out.
+: "${LAND_LOCK_WAIT_MAX:=5400}"        # hard cap (s) to wait before failing loud
+: "${LAND_LOCK_STALE_SECONDS:=5400}"   # break even a live-looking holder past this age (0 disables)
 : "${LAND_LOCK_POLL:=2}"               # poll interval (s) between acquire attempts
 : "${LAND_LOCK_PUSH_RETRIES:=1}"       # non-ff push-recovery re-merge+retry attempts (issue #315)
 case "$LAND_LOCK_PUSH_RETRIES" in '' | *[!0-9]*) LAND_LOCK_PUSH_RETRIES=1 ;; esac
 # Sanitize a garbage value to the SAFE default, never to 0 (Principle 2): a STALE_SECONDS
 # silently zeroed would read EVERY live lock as stale and disable the mutex. An EXPLICIT
 # numeric 0 is honored as "no age backstop" (dead-pid break only), handled in _land_lock_stale.
-case "$LAND_LOCK_WAIT_MAX"      in '' | *[!0-9]*) LAND_LOCK_WAIT_MAX=1200 ;; esac
-case "$LAND_LOCK_STALE_SECONDS" in '' | *[!0-9]*) LAND_LOCK_STALE_SECONDS=1800 ;; esac
+case "$LAND_LOCK_WAIT_MAX"      in '' | *[!0-9]*) LAND_LOCK_WAIT_MAX=5400 ;; esac
+case "$LAND_LOCK_STALE_SECONDS" in '' | *[!0-9]*) LAND_LOCK_STALE_SECONDS=5400 ;; esac
 case "$LAND_LOCK_POLL"          in '' | *[!0-9]* | 0) LAND_LOCK_POLL=2 ;; esac
 
 _LAND_LOCK=""   # the lock dir once WE own it — the release guard's ownership witness
@@ -196,21 +202,29 @@ SKIP_TESTS=""
 LOCAL=""
 FORCE_LAND=""
 TEST_CMD=""
+LOCAL_GATE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --skip-tests)  SKIP_TESTS=1; shift ;;
     --local)       LOCAL=1; shift ;;
     --force-land)  FORCE_LAND=1; shift ;;
+    --local-gate)  LOCAL_GATE=1; shift ;;
     --test-cmd)    [ "$#" -ge 2 ] || wt_die "--test-cmd needs a value"; TEST_CMD="$2"; shift 2 ;;
     --test-cmd=*)  TEST_CMD="${1#--test-cmd=}"; shift ;;
-    -*)            wt_die "unknown option: $1 (supported: --skip-tests, --local, --force-land, --test-cmd)" ;;
+    -*)            wt_die "unknown option: $1 (supported: --skip-tests, --local, --force-land, --local-gate, --test-cmd)" ;;
     *)
       [ -z "$TARGET" ] || wt_die "unexpected extra argument: $1"
       TARGET="$1"; shift
       ;;
   esac
 done
-[ -n "$TARGET" ] || wt_die "usage: worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--local] [--force-land] [--test-cmd <cmd>]"
+[ -n "$TARGET" ] || wt_die "usage: worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--local] [--force-land] [--local-gate] [--test-cmd <cmd>]"
+[ -z "$LOCAL_GATE" ] || [ -z "$TEST_CMD" ] || wt_die "--local-gate and --test-cmd conflict (pick one)"
+# A local gate that is also told to skip tests would report "ran" over a hook that ran nothing.
+[ -z "$SKIP_TESTS" ] || { [ -z "$LOCAL_GATE" ] && [ -z "$TEST_CMD" ]; } \
+  || wt_die "--skip-tests conflicts with --local-gate/--test-cmd (a gate that is skipped proves nothing)"
+# --local-gate is --test-cmd with the canonical full-suite command (issue #378).
+[ -z "$LOCAL_GATE" ] || TEST_CMD="$(wt_local_gate_cmd)"
 
 # --- guards: the hub ----------------------------------------------------------
 git rev-parse --git-dir >/dev/null 2>&1 || wt_die "run this from inside your checkout (cd into the repo first)"
@@ -494,13 +508,6 @@ fi
 # between hub and spoke worktrees, so a marker the spoke set is visible here.
 # Exempt: --local micro-spokes (never push, no marker), ad-hoc/non-numbered
 # branches (their one push IS completion), and --force-land (explicit override).
-#
-# GATED_TREE records that we can PROVE the branch tip was already test-gated: the
-# marker sits at the tip (==this verified completion) and the upstream guards above
-# confirmed tip == pushed upstream (ahead==0 && behind==0), so the spoke's push ran
-# the gate on exactly this tree. It licenses the clean-FF gate skip below (#96);
-# without a marker (--local/--force-land/ad-hoc) we make no such claim.
-GATED_TREE=""
 if [ -z "$LOCAL" ] && [ -z "$FORCE_LAND" ] && [ -n "$ISSUE" ]; then
   MARKER="ready/${ISSUE}"
   MARKER_SHA="$(git rev-parse -q --verify "refs/tags/${MARKER}^{commit}" 2>/dev/null || true)"
@@ -510,248 +517,156 @@ if [ -z "$LOCAL" ] && [ -z "$FORCE_LAND" ] && [ -n "$ISSUE" ]; then
   elif [ "$MARKER_SHA" != "$TIP_SHA" ]; then
     wt_die "${MARKER} marker is stale (points at ${MARKER_SHA:0:9}, branch tip is ${TIP_SHA:0:9}) — the spoke pushed more work after signalling complete. Re-tag at the tip on the spoke (git tag -f ${MARKER} && git push -f origin ${MARKER}), or pass --force-land."
   fi
-  GATED_TREE=1
 fi
 
-# --- merge ----------------------------------------------------------------------
+# --- gate + merge (issue #378: CI is the gate) -----------------------------------
+# CI mode (a pushed spoke, no --local-gate/--test-cmd): the ready tip must be CI-green,
+# the default branch is merged into the spoke on the spoke when it moved (re-waiting for
+# CI on the new tip), and the hub then only FAST-FORWARDS to a CI-green SHA. The other
+# modes (--local micro-spokes, --local-gate, --test-cmd) merge on the hub and are gated
+# locally by the pre-push hook instead.
+#
 # A DETERMINISTIC merge conflict is a distinct failure from a transient push rejection
 # (issue #285): a conflict is a pure function of the two tips, so an unattended auto_land
-# must route it to a resolution lane (revive the spoke to merge origin/<default> + resolve
-# + re-push) rather than blind-retry the identical, expensive land. Signal it with a
-# dedicated exit code (WT_LAND_CONFLICT_EXIT, default 4 — 1 is the generic die and 3 is
-# cleanup-incomplete) plus a machine-readable CONFLICT marker naming the conflicting
-# file(s), captured BEFORE `git merge --abort` wipes the unmerged index entries.
-# The exit code IS the machine contract, so a non-numeric override falls back to 4 rather
-# than reaching `exit` with a bareword.
+# must route it to a resolution lane rather than blind-retry the identical land. Signal it
+# with a dedicated exit code (WT_LAND_CONFLICT_EXIT, default 4 — 1 is the generic die and 3
+# is cleanup-incomplete) plus a machine-readable CONFLICT marker naming the conflicting
+# file(s), captured BEFORE `git merge --abort` wipes the unmerged index entries. The exit
+# code IS the machine contract, so a non-numeric override falls back to 4.
 : "${WT_LAND_CONFLICT_EXIT:=4}"
 case "$WT_LAND_CONFLICT_EXIT" in '' | *[!0-9]*) WT_LAND_CONFLICT_EXIT=4 ;; esac
+CI_MODE=""
+[ -n "$LOCAL" ] || [ -n "$TEST_CMD" ] || CI_MODE=1
+AUTO_SKIP=""        # the main push skips the hook: CI already proved this exact SHA
+LOCAL_GATE_UNPROVEN=""
+CI_URL=""
 PRE_SHA="$(git rev-parse HEAD)"
-# #300 writer, INTENT-FIRST: record `landing` BEFORE the merge starts. This is the
+
+land_merge_conflict() {
+  local dir="$1" files
+  # `|| true`: guard the capture under set -e so a nonzero pipeline can never abort the
+  # script BEFORE the abort + exit below (which guarantee a clean tree + the conflict code).
+  files="$(git -C "$dir" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ' || true)"
+  files="${files% }"
+  git -C "$dir" merge --abort 2>/dev/null || true
+  printf '%s: CONFLICT %s\n' "$WT_PROG" "$files" >&2
+  printf '%s: merge of %s conflicts with %s on: %s — rebase the branch on %s (on the spoke, then push, when it has one) and re-run\n' \
+    "$WT_PROG" "$WT_BRANCH" "$DEFAULT" "${files:-(unknown)}" "$DEFAULT" >&2
+  # #300 writer: the landing attempt ended in a deterministic conflict. Recorded so a
+  # reader can tell "land tried and needs resolution" from "land never ran" (#285).
+  wt_tlog_transition "$ISSUE" land_failed worktree-land.sh "merge conflict" \
+    "{\"conflicts\":\"${files:-unknown}\"}"
+  exit "$WT_LAND_CONFLICT_EXIT"
+}
+
+# land_require_ci_green <sha> -> return once CI is green for <sha> (CI_URL set), else die
+# with the reason from wt_ci_refusal. A RED run is an invariant only the spoke can fix, so
+# it exits the precondition code (#354) and auto_land escalates it instead of retrying;
+# pending at the bound / no run / no gh are transient or environmental (exit 1).
+land_require_ci_green() {
+  local sha="$1" rc=0 why
+  wt_ci_check "$sha" "${LAND_CI_WAIT_MAX:-1200}" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    CI_URL="$WT_CI_URL"
+    echo "→ CI is green for ${sha:0:9} ($CI_URL)"
+    return 0
+  fi
+  why="$(wt_ci_refusal "$rc")"
+  wt_tlog_transition "$ISSUE" land_failed worktree-land.sh "$why" "{\"sha\":\"${sha:0:9}\"}"
+  [ "$rc" -ne 1 ] || wt_land_precondition_die "$why — fix it on the spoke, push, and re-emit ready"
+  wt_die "$why — nothing landed. Re-run once CI settles, or pass --local-gate to run the suite locally."
+}
+
+# land_move_ready_markers <old> <new> -> re-point every ready/<N> tag at <old> to <new>,
+# keeping its annotation (the force/local-gate audit notes live in the body), and re-push it.
+land_move_ready_markers() {
+  local t msg
+  while IFS= read -r t; do
+    [ "$(git rev-parse -q --verify "refs/tags/$t^{commit}" 2>/dev/null)" = "$1" ] || continue
+    msg="$(git tag -l --format='%(contents)' "$t")"
+    git tag -f -a "$t" -m "$msg" "$2" >/dev/null \
+      && ( export TEST_SELECT_SKIP=1; wt_git_push -f origin "refs/tags/$t" >/dev/null 2>&1 ) \
+      || wt_warn "couldn't move $t to the merged tip ${2:0:9} — re-tag it on the spoke before re-landing"
+  done < <(git for-each-ref --format='%(refname:short)' 'refs/tags/ready/*' 2>/dev/null || true)
+}
+
+# land_sync_with_default -> make the spoke tip contain the default branch. While it does
+# not: merge the default branch INTO the spoke ON THE SPOKE (conflicts are the spoke's to
+# resolve), push the spoke, and wait for CI on the new tip — so the hub's merge is a pure
+# fast-forward of a CI-green SHA (land-resolve-on-spoke-then-FF). Bounded rounds guard a
+# default branch that keeps moving under the land.
+land_sync_with_default() {
+  local round=0 tip old
+  while ! git merge-base --is-ancestor "$DEFAULT" "refs/heads/$WT_BRANCH"; do
+    round=$(( round + 1 ))
+    [ "$round" -le "${LAND_SYNC_ROUNDS:-3}" ] \
+      || wt_die "$DEFAULT kept moving through ${LAND_SYNC_ROUNDS:-3} spoke merges — nothing landed; re-run"
+    echo "→ $DEFAULT moved past $WT_BRANCH — merging it into the branch on the spoke, then waiting for CI (round $round)"
+    old="$(git rev-parse "refs/heads/$WT_BRANCH")"
+    git -C "$WT_DIR" merge --no-edit "$DEFAULT" || land_merge_conflict "$WT_DIR"
+    tip="$(git rev-parse "refs/heads/$WT_BRANCH")"
+    # CI is this SHA's gate, so the spoke push skips the hook's fast tier (and its minutes).
+    if ! ( export TEST_SELECT_SKIP=1; cd "$WT_DIR" && wt_git_push origin "$WT_BRANCH" ); then
+      # Undo the unpushed merge so the spoke is exactly what it was (pushed, tip == upstream):
+      # a re-land must not trip the "ahead of upstream" precondition on our own commit.
+      git -C "$WT_DIR" reset --keep "$old" >/dev/null 2>&1 || true
+      wt_die "pushing the merged $WT_BRANCH failed — nothing landed; re-run"
+    fi
+    # The land moved the tip, so the land records it (Principle 1): ready/<N> markers sitting
+    # at the old tip follow it, else a re-land after a CI timeout reads a "stale" marker.
+    land_move_ready_markers "$old" "$tip"
+    land_require_ci_green "$tip"
+  done
+}
+
+# land_merge_into_default -> put the branch on the default branch (sets MERGED_SHA).
+land_merge_into_default() {
+  if [ -n "$CI_MODE" ]; then
+    land_sync_with_default
+    git merge --ff-only "$WT_BRANCH" >/dev/null \
+      || wt_die "could not fast-forward $DEFAULT to $WT_BRANCH — nothing landed; re-run"
+  elif ! git merge --no-edit "$WT_BRANCH"; then
+    land_merge_conflict "$REPO_ROOT"
+  fi
+  MERGED_SHA="$(git rev-parse HEAD)"
+}
+
+# #300 writer, INTENT-FIRST: record `landing` BEFORE the gate and merge start. This is the
 # state the design table calls literally unlearnable today, and its absence caused
 # #290: a land consumes the ready tag and kills the spoke's window BEFORE removing
 # the worktree, so for that window the watchdog sees "no marker, dead pane" and
 # fires dead-pane on a spoke that is being landed successfully. With `landing`
 # recorded up front, that read becomes "landing, 40s in" — the false-fire has no
-# room to exist. Recorded even if the merge then conflicts or the gate kills us:
-# an explicit in-flight state with an onset is exactly the point.
-echo "→ merging $WT_BRANCH into $DEFAULT"
+# room to exist (and a CI wait can now be minutes long). Recorded even if the gate
+# or merge then fails: an explicit in-flight state with an onset is exactly the point.
+echo "→ landing $WT_BRANCH into $DEFAULT"
 wt_tlog_transition "$ISSUE" landing worktree-land.sh "merge $WT_BRANCH into $DEFAULT" \
   "{\"branch\":\"$WT_BRANCH\",\"base\":\"$PRE_SHA\"}"
-if ! git merge --no-edit "$WT_BRANCH"; then
-  # `|| true`: guard the capture under set -e so a nonzero pipeline can never abort the
-  # script BEFORE the abort + exit below (which guarantee a clean hub + the conflict code).
-  CONFLICT_FILES="$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ' || true)"
-  CONFLICT_FILES="${CONFLICT_FILES% }"
-  git merge --abort 2>/dev/null || true
-  printf '%s: CONFLICT %s\n' "$WT_PROG" "$CONFLICT_FILES" >&2
-  printf '%s: merge of %s conflicts with %s on: %s — rebase the branch on %s (on the spoke, then push, when it has one) and re-run\n' \
-    "$WT_PROG" "$WT_BRANCH" "$DEFAULT" "${CONFLICT_FILES:-(unknown)}" "$DEFAULT" >&2
-  # #300 writer: the landing attempt ended in a deterministic conflict. Recorded so a
-  # reader can tell "land tried and needs resolution" from "land never ran" (#285).
-  wt_tlog_transition "$ISSUE" land_failed worktree-land.sh "merge conflict" \
-    "{\"conflicts\":\"${CONFLICT_FILES:-unknown}\"}"
-  exit "$WT_LAND_CONFLICT_EXIT"
+if [ -n "$CI_MODE" ]; then
+  land_require_ci_green "$(git rev-parse "refs/heads/$WT_BRANCH")"
+  AUTO_SKIP=1
 fi
-MERGED_SHA="$(git rev-parse HEAD)"
+land_merge_into_default
 
-# Roll the hub back to its pre-merge tip. A failed reset leaves the hub on the merge
-# commit — unrecoverable here, so die with by-hand instructions. Shared by the three
-# land abort paths (merge-sanity, missing-hook, push-rejection) so the recovery
-# command and its guidance never drift across copies (issue #196).
+# Roll the hub back to its pre-merge tip. A failed reset leaves the hub on the merged
+# tip — unrecoverable here, so die with by-hand instructions. Shared by the land abort
+# paths (missing-hook, push-rejection) so the recovery command and its guidance never
+# drift across copies (issue #196).
 land_reset_keep_or_die() {
   git reset --keep "$PRE_SHA" \
-    || wt_die "rollback failed — hub is still on the merge commit; reset by hand: git reset --keep $PRE_SHA"
+    || wt_die "rollback failed — hub is still on the merged tip; reset by hand: git reset --keep $PRE_SHA"
 }
 
-# --- skip the redundant gate on a clean fast-forward land (issue #96) -------------
-# A clean fast-forward leaves HEAD identical to the branch tip the spoke already
-# gated on its push (GATED_TREE: marker == tip == upstream), so re-running the
-# pre-push suite re-tests an identical tree — the dominant cost of a land whenever
-# the diff escalates test-select to the full suite. A diverged merge instead builds
-# a NEW merge commit (HEAD != branch tip) whose combined tree was never tested as a
-# unit, so its gate must still run. Explicit --skip-tests / --test-cmd already own
-# the gate decision; LAND_FORCE_GATE=1 is the escape hatch to force it back on.
-AUTO_SKIP=""
-AUTO_SKIP_STAMP=""   # distinct witness for the marker-less #270 stamp-reuse skip
-if [ -z "$SKIP_TESTS" ] && [ -z "$TEST_CMD" ] && [ -z "${LAND_FORCE_GATE:-}" ]; then
-  IS_CLEAN_FF=""
-  if [ "$MERGED_SHA" = "$(git rev-parse "refs/heads/$WT_BRANCH")" ]; then
-    IS_CLEAN_FF=1
-  fi
-  if [ -n "$GATED_TREE" ] && [ -n "$IS_CLEAN_FF" ]; then
-    # #96: marker == tip == upstream proved the spoke gated exactly this tree.
-    AUTO_SKIP=1
-  elif [ -z "$LOCAL" ] && [ -z "$FORCE_LAND" ] && [ -z "$GATED_TREE" ] && [ -n "$IS_CLEAN_FF" ] \
-       && wt_gate_green_stamped_fresh "${LAND_STAMP_MAX_AGE:-86400}"; then
-    # #270: a non-numbered (/quick) FF land carries no ready marker, so GATED_TREE is
-    # empty and #96 can't fire — but the merged HEAD^{tree} already has a RECENT green
-    # stamp (the spoke's push minted it on the shared common dir moments ago). The
-    # merged tree is byte-identical to what was just proven green, so reuse the proof
-    # instead of re-running the whole gate. Existence-only + a freshness bound is the
-    # same bounded trust #96 extends on a clean FF (see wt_gate_green_stamped_fresh).
-    # --force-land / --local lands are excluded: they deliberately keep running the
-    # gate. A diverged merge (IS_CLEAN_FF empty) builds a new combined tree with no
-    # stamp and is untouched. LAND_STAMP_MAX_AGE (default 24h) tunes the bound.
-    AUTO_SKIP=1
-    AUTO_SKIP_STAMP=1
-  fi
-fi
-
-# --- merge-sanity on a diverged --skip-tests land (issue #174) --------------------
-# auto_land trusts the ready-marker green and lands with --skip-tests — correct
-# per-branch, but a DIVERGED land builds a merge commit whose combined tree (the
-# hub's post-marker commits + the branch) nobody ever tested: the one untested
-# state that reaches $DEFAULT unattended. Before pushing it, run a BOUNDED sanity
-# check on the merged tree: `pytest --collect-only -q` (import/collection health)
-# plus the tests the reverse index maps to the files the merge changed — NEVER the
-# full suite (the #140 ref-collision class). Target wall-clock < 60s: collection is
-# a couple of seconds, and the mapped bodies are capped (MERGE_SANITY_MAX_MAPPED) so
-# a change to a widely-referenced script can't drag the land into a multi-minute
-# suite. A pytest failure rolls the merge back and aborts (the /afk caller then
-# escalates blocked/<N>). Fires ONLY for --skip-tests + a real merge commit;
-# fast-forward --skip-tests lands and manual (no --skip-tests) lands are untouched.
-merge_sanity_rollback() {
-  wt_warn "merge-sanity check FAILED on the diverged merge (issue #174) — rolling back: git reset --keep $PRE_SHA"
-  land_reset_keep_or_die
-  wt_die "landing aborted: the diverged --skip-tests merge failed its merge-sanity check; nothing was pushed. Fix on the branch, push from the spoke, and re-run."
-}
-
-# run_merge_sanity — exit code is a THREE-way signal so the report can stay honest:
-#   0  the check RAN and passed
-#   1  the check RAN and a pytest run failed (or the tripwire tripped) → abort
-#   2  DEGRADED: no libs / no runner — nothing was actually verified (don't claim
-#      "passed"). Only code 1 blocks the land; a degrade proceeds like the rest of
-#      this script's best-effort tail.
-# Runs in a SUBSHELL: sourcing the hook libs may `exit 0` when the toolkit is
-# globally off (enabled.sh) or arm a telemetry EXIT trap — both must stay contained
-# so the land in progress is never aborted or instrumented by the check's own libs.
-run_merge_sanity() (
-  lib_dir=""
-  for cand in "$SCRIPT_DIR/../shared/hooks/lib" \
-              "$(git rev-parse --git-path hooks/ai-toolkit-scripts/lib 2>/dev/null || true)"; do
-    if [ -n "$cand" ] && [ -f "$cand/utils.sh" ] && [ -f "$cand/test-reverse-index.sh" ]; then
-      lib_dir="$cand"; break
-    fi
-  done
-  if [ -z "$lib_dir" ]; then
-    wt_warn "merge-sanity: hook libs not found — SKIPPING the diverged-land check (install with scripts/install-git-hooks.sh); the merged tree is UNVERIFIED"
-    return 2
-  fi
-  # shellcheck source=../shared/hooks/lib/utils.sh
-  source "$lib_dir/utils.sh" 2>/dev/null || true
-  # shellcheck source=../shared/hooks/lib/test-reverse-index.sh
-  source "$lib_dir/test-reverse-index.sh" 2>/dev/null || true
-  # Guard every function used below — a partial source (edited/truncated lib) can
-  # define some and not others, and calling an undefined one under set -e would
-  # abort the land instead of degrading.
-  if ! command -v detect_pytest >/dev/null 2>&1 \
-     || ! command -v run_under_tripwire_scoped >/dev/null 2>&1 \
-     || ! command -v reverse_index_tests_for >/dev/null 2>&1; then
-    wt_warn "merge-sanity: hook libs incomplete — SKIPPING the diverged-land check; the merged tree is UNVERIFIED"
-    return 2
-  fi
-
-  runner="$(detect_pytest "." || true)"
-  if [ -z "$runner" ]; then
-    wt_warn "merge-sanity: no pytest available — SKIPPING the diverged-land check; the merged tree is UNVERIFIED"
-    return 2
-  fi
-  read -r -a runner_arr <<< "$runner"
-
-  # Strip git's ambient repo-targeting env before every pytest child (the same
-  # defense test-select.sh applies): a test that shells out to git must hit its own
-  # tmpdir, never the REAL hub repo, even if worktree-land was invoked with GIT_*
-  # exported. The tripwire is the backstop; this keeps it from firing in the first
-  # place.
-  git_unset=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
-    -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX)
-
-  # The check runs in the SHARED hub ref store, where sibling spokes legitimately move
-  # their own refs mid-run (a committed head, a pushed branch's remote-tracking ref, an
-  # /afk drain's ready/<N> tag). Scope the tripwire to the one ref the land itself owns —
-  # refs/heads/$DEFAULT, the merge commit we are about to push — so sibling churn is not
-  # mistaken for an escape and the restore can never roll a sibling ref back (issue #205).
-  # A test that escapes onto $DEFAULT is still caught and aborts the land.
-  sanity_scope="refs/heads/$DEFAULT"
-
-  # Collection/import health of the whole suite against the merged tree — bounded
-  # (no test bodies execute), catches a cross-import break the combined tree adds.
-  echo "→ merge-sanity: pytest --collect-only -q on the merged tree (import/collection health)"
-  run_under_tripwire_scoped "$sanity_scope" "${git_unset[@]}" "${runner_arr[@]}" --collect-only -q || return 1
-
-  # The tests test-select maps to the files the merge changed (PRE_SHA..MERGED_SHA),
-  # deduped and existing only. No mapping → collection health was the whole check.
-  mapped=""
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    hits="$(reverse_index_tests_for "$f")"
-    [ -n "$hits" ] && mapped="$mapped$hits"$'\n'
-  done < <(git diff --name-only "$PRE_SHA" "$MERGED_SHA" 2>/dev/null || true)
-
-  sel=()
-  while IFS= read -r t; do
-    [ -n "$t" ] || continue
-    [ -f "$t" ] && sel+=("$t")
-  done < <(printf '%s' "$mapped" | sort -u)
-
-  if [ "${#sel[@]}" -eq 0 ]; then
-    echo "→ merge-sanity: no mapped tests for the merged diff — collection health only"
-    return 0
-  fi
-  # Boundedness cap: a change to a widely-referenced control-plane script (e.g. the
-  # land script itself) maps a dozen heavy subprocess-driven suites — running them
-  # would blow the < 60s target and stall an /afk drain holding the land lock. When
-  # the mapped set is large, keep the fast collection-health signal and skip the
-  # mapped bodies with a loud note rather than the full suite (MERGE_SANITY_MAX_MAPPED
-  # tunes the cap).
-  if [ "${#sel[@]}" -gt "${MERGE_SANITY_MAX_MAPPED:-4}" ]; then
-    wt_warn "merge-sanity: the merged diff maps ${#sel[@]} test files (> ${MERGE_SANITY_MAX_MAPPED:-4}) — too many to stay bounded; running collection health only (raise MERGE_SANITY_MAX_MAPPED to force them)"
-    return 0
-  fi
-  echo "→ merge-sanity: mapped tests for the merged diff — ${sel[*]}"
-  run_under_tripwire_scoped "$sanity_scope" "${git_unset[@]}" "${runner_arr[@]}" "${sel[@]}" || return 1
-  return 0
-)
-
-MERGE_SANITY_RAN=""
-if [ -n "$SKIP_TESTS" ] && [ "$MERGED_SHA" != "$(git rev-parse "refs/heads/$WT_BRANCH")" ]; then
-  echo "→ diverged --skip-tests land — running the bounded merge-sanity check (issue #174)"
-  MS_RC=0
-  run_merge_sanity || MS_RC=$?
-  case "$MS_RC" in
-    0) MERGE_SANITY_RAN=1 ;;      # ran and passed — the report may say so
-    2) : ;;                       # degraded (warned inside) — report stays honest
-    *) merge_sanity_rollback ;;   # ran and failed / tripwire → roll back and abort
-  esac
-fi
-
-# --- ship: push main; the pre-push hook is the single test gate (issue #19) -------
-# --skip-tests / --test-cmd are threaded to the hook via TEST_SELECT_*, so the
-# hook stays the single executor. A rejected push — the gate failing, or a remote
-# refusal — rolls the merge back, so a failed land always leaves a clean hub.
-if [ -n "$SKIP_TESTS" ]; then
-  if [ -n "$MERGE_SANITY_RAN" ]; then
-    SUITE_RESULT="skipped (--skip-tests); merge-sanity check passed on the diverged tree (issue #174)"
-  else
-    SUITE_RESULT="skipped (--skip-tests)"
-  fi
-elif [ -n "$AUTO_SKIP" ]; then
-  if [ -n "$AUTO_SKIP_STAMP" ]; then
-    SUITE_RESULT="skipped (clean fast-forward; fresh green-tree stamp reused, issue #270)"
-  else
-    SUITE_RESULT="skipped (clean fast-forward of an already-gated tree, issue #96)"
-  fi
-elif [ -n "$TEST_CMD" ]; then
-  SUITE_RESULT="via pre-push hook (--test-cmd: $TEST_CMD)"
-else
-  SUITE_RESULT="via pre-push hook (tiered)"
-fi
-# The pre-push hook IS the test gate (issue #19). If a gate is REQUIRED here (not a
-# --skip-tests / auto-skip land) and no executable hook is installed, the push would
-# run NOTHING — a missing enforcement precondition silently shipping untested code to
-# $DEFAULT (the #187 fail-open shape, issue #196). ABORT: roll the merge back and die
-# with the install command, so landing ungated is only ever a visible flag, never an
-# environmental accident.
+# --- ship: push main (issue #378) ------------------------------------------------------
+# A CI-green push skips the hook (CI already proved this exact SHA); --skip-tests skips its
+# fast tier too; --test-cmd/--local-gate thread the command to the hook, the single executor
+# of local tests. A rejected push rolls the merge back, so a failed land leaves a clean hub.
+#
+# The pre-push hook IS the local test gate. If a gate is REQUIRED here (not a skipped /
+# CI-proven land) and no executable hook is installed, the push would run NOTHING — a
+# missing enforcement precondition silently shipping untested code to $DEFAULT (the #187
+# fail-open shape, issue #196). ABORT: roll the merge back and die with the install
+# command, so landing ungated is only ever a visible flag, never an environmental accident.
 if [ -z "$SKIP_TESTS" ] && [ -z "$AUTO_SKIP" ]; then
   PREPUSH_HOOK="$(git rev-parse --git-path hooks/pre-push 2>/dev/null || true)"
   if [ -z "$PREPUSH_HOOK" ] || [ ! -x "$PREPUSH_HOOK" ]; then
@@ -760,17 +675,17 @@ if [ -z "$SKIP_TESTS" ] && [ -z "$AUTO_SKIP" ]; then
     wt_die "landing aborted: the pre-push test gate is REQUIRED but no executable hook is installed here, so the push would ship untested code to $DEFAULT. Install it with scripts/install-git-hooks.sh, or land ungated on purpose with --skip-tests. Nothing was pushed."
   fi
 fi
-echo "→ pushing $DEFAULT to origin (the pre-push hook runs the test gate)"
+echo "→ pushing $DEFAULT to origin"
 
-# One ship attempt; a non-empty $1 forces TEST_SELECT_SKIP=1 (the retry lane).
-# The subshell scopes the exports; the push routes through wt_git_push so the
-# SSH connection is kept alive across the multi-minute in-push gate (issue #119).
+# One ship attempt. The subshell scopes the exports; the push routes through wt_git_push
+# so the SSH connection is kept alive across a long local gate (issue #119).
 land_push() {
   (
-    if [ -n "$SKIP_TESTS" ] || [ -n "$AUTO_SKIP" ] || [ -n "${1:-}" ]; then
+    if [ -n "$SKIP_TESTS" ] || [ -n "$AUTO_SKIP" ]; then
       export TEST_SELECT_SKIP=1
     fi
-    if [ -n "$TEST_CMD" ]; then export TEST_SELECT_CMD="$TEST_CMD"; fi
+    # An inherited skip would make the hook exit 0 without running the local gate.
+    if [ -n "$TEST_CMD" ]; then unset TEST_SELECT_SKIP; export TEST_SELECT_CMD="$TEST_CMD"; fi
     wt_git_push origin "$DEFAULT"
   )
 }
@@ -800,21 +715,13 @@ land_push_remote_advanced() {
 
 # land_nonff_recover -> a push the remote refused because origin advanced under us, reconciled
 # and retried under the still-held land lock — up to LAND_LOCK_PUSH_RETRIES times (issue #315).
-# Each attempt: roll our merge back, re-fetch, ff local $DEFAULT to the NEW origin tip, RE-MERGE
-# the branch (a NEW combined tree), and re-push. The re-merge is untested, so the retry RE-RUNS
-# its gate — a gated land pushes through land_push "" so the pre-push hook fires on the new
-# HEAD^{tree} (which has no green stamp), and a --skip-tests land re-runs the bounded merge-sanity
-# check on the fresh diverged tree first. Updates PRE_SHA/MERGED_SHA/SUITE_RESULT and returns 0
-# when a retry lands; returns 1 (caller rolls back) on a fresh conflict, a fetch/ff failure, a
-# non-advance push failure, or exhausted retries.
+# Each attempt: roll our merge back, re-fetch, ff local $DEFAULT to the NEW origin tip, redo the
+# gate + merge (CI mode merges the new tip into the spoke and waits for CI on it again; a
+# conflict exits with the #285 contract), and re-push. Updates PRE_SHA/MERGED_SHA and returns 0
+# when a retry lands; returns 1 (caller rolls back) on a fetch/ff failure, a non-advance push
+# failure, or exhausted retries.
 land_nonff_recover() {
-  local attempt=0 conflict_files ms_rc
-  # The recovery re-merge always builds a NEW combined tree (origin gained a commit the branch
-  # lacks — that is WHY the push was non-ff), so any clean-FF gate skip (#96 / #270 AUTO_SKIP)
-  # is no longer valid: clear it so land_push "" runs the REAL pre-push gate on the new tree.
-  # A --skip-tests land keeps SKIP_TESTS and re-runs the bounded merge-sanity check instead.
-  AUTO_SKIP=""
-  AUTO_SKIP_STAMP=""
+  local attempt=0
   while [ "$attempt" -lt "$LAND_LOCK_PUSH_RETRIES" ]; do
     attempt=$(( attempt + 1 ))
     wt_warn "push refused: origin/$DEFAULT advanced under the land — reconciling and retrying under the lock (attempt $attempt/$LAND_LOCK_PUSH_RETRIES, issue #315)"
@@ -824,40 +731,10 @@ land_nonff_recover() {
     git merge --ff-only "$ORIGIN_DEFAULT" >/dev/null 2>&1 \
       || { wt_warn "recovery: could not fast-forward to origin/$DEFAULT"; return 1; }
     PRE_SHA="$(git rev-parse HEAD)"
-    if ! git merge --no-edit "$WT_BRANCH"; then
-      # A conflict against the advanced origin is DETERMINISTIC (a re-run fetches the same origin
-      # and re-conflicts), so it carries the #285 conflict contract — the CONFLICT marker + the
-      # dedicated exit code — NOT a generic rollback, so auto_land routes it to the resolution lane
-      # instead of blind-retrying. The tree is left clean (abort) and at origin (PRE_SHA), so the
-      # EXIT-trap lock release and a fresh land both start from a sane state.
-      conflict_files="$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ' || true)"
-      conflict_files="${conflict_files% }"
-      git merge --abort 2>/dev/null || true
-      printf '%s: CONFLICT %s\n' "$WT_PROG" "$conflict_files" >&2
-      printf '%s: re-merge of %s conflicts with %s after origin advanced mid-land on: %s — resolve on the spoke and re-push\n' \
-        "$WT_PROG" "$WT_BRANCH" "$DEFAULT" "${conflict_files:-(unknown)}" >&2
-      wt_tlog_transition "$ISSUE" land_failed worktree-land.sh "merge conflict after origin advanced" \
-        "{\"conflicts\":\"${conflict_files:-unknown}\"}"
-      exit "$WT_LAND_CONFLICT_EXIT"
-    fi
-    MERGED_SHA="$(git rev-parse HEAD)"
-    # --skip-tests + a real merge commit builds an untested combined tree: re-run the bounded
-    # merge-sanity check on it (issue #174) before re-pushing skipped. A gated land instead
-    # re-runs the full gate via the hook on land_push "" below (AUTO_SKIP cleared above).
-    if [ -n "$SKIP_TESTS" ] && [ "$MERGED_SHA" != "$(git rev-parse "refs/heads/$WT_BRANCH")" ]; then
-      ms_rc=0; run_merge_sanity || ms_rc=$?
-      [ "$ms_rc" -ne 1 ] || { wt_warn "recovery: merge-sanity failed on the re-merged tree (issue #174)"; return 1; }
-    fi
+    land_merge_into_default
     PUSH_RC=0
-    land_push "" 2>&1 | tee "$PUSH_LOG" || PUSH_RC=$?
-    if [ "$PUSH_RC" -eq 0 ]; then
-      if [ -n "$SKIP_TESTS" ]; then
-        SUITE_RESULT="skipped (--skip-tests); origin advanced mid-land — re-merged on the fresh tip (merge-sanity re-checked the diverged tree) and re-pushed under the lock (issue #315)"
-      else
-        SUITE_RESULT="via pre-push hook — re-gated on the re-merged tree after origin advanced mid-land (issue #315)"
-      fi
-      return 0
-    fi
+    land_push 2>&1 | tee "$PUSH_LOG" || PUSH_RC=$?
+    [ "$PUSH_RC" -ne 0 ] || return 0
     land_push_remote_advanced || { wt_warn "recovery: retry push failed for a non-advance reason"; return 1; }
     # origin advanced AGAIN — loop for another bounded attempt
   done
@@ -866,57 +743,45 @@ land_nonff_recover() {
 }
 
 # Capture the push's combined output while streaming it live: tee exits 0 and
-# pipefail is on, so PUSH_RC is git's own exit code (a 141 SIGPIPE survives) and
-# the capture file is complete when the pipeline returns.
+# pipefail is on, so PUSH_RC is git's own exit code and the capture file is complete
+# when the pipeline returns.
 PUSH_LOG="$(mktemp "${TMPDIR:-/tmp}/wt-land-push.XXXXXX")"
 PUSH_RC=0
-land_push "" 2>&1 | tee "$PUSH_LOG" || PUSH_RC=$?
+land_push 2>&1 | tee "$PUSH_LOG" || PUSH_RC=$?
 if [ "$PUSH_RC" -ne 0 ]; then
-  # Second line of defense (issue #119): retry EXACTLY once with the suite
-  # skipped when the failure is demonstrably POST-green — (a) a transport-death
-  # signature (git only enters the transfer phase after the pre-push hook exited
-  # 0) AND (b) no pytest failure shape in the capture: a FAILING gate whose
-  # output merely quotes a transport phrase (this repo's own tests embed those
-  # literals) must still read as a failed gate. The filter covers all of
-  # pytest's red summaries — "N failed", "N error(s)" (collection/internal),
-  # and the "Interrupted:" banner — none of which a green run prints ("N
-  # xfailed" has no digit before "failed" and never matches). Anything else —
-  # failed gate, policy rejection — rolls back exactly as before, and a failed
-  # retry does too.
-  if wt_push_transport_died "$PUSH_RC" "$PUSH_LOG" \
-     && ! grep -qE '[0-9]+ (failed|error)|Interrupted' "$PUSH_LOG"; then
-    # A transport-death SHAPE (exit 141 or an SSH-disconnect signature) with no
-    # pytest summary is necessary but NOT sufficient (issue #214): a gate KILLED
-    # mid-run (SIGPIPE/OOM) shares exit 141 and prints no summary either. Honor
-    # the skipped-suite retry ONLY when a green-tree stamp exists for this pushed
-    # HEAD^{tree} (issue #122) — proof the gate ran this tree green and stamped it
-    # before the transfer died. A killed gate never reaches its mint, so it leaves
-    # no stamp and rolls back rather than shipping a tree whose suite never
-    # completed. (wt_gate_green_stamped checks EXISTENCE, not tier/runner parity —
-    # see its header for the bounded weakening.)
-    if wt_gate_green_stamped; then
-      wt_warn "gate ran green (this tree is green-stamped) but the push transport died (SSH staleness, issue #119) — retrying ONCE with TEST_SELECT_SKIP=1"
-      if ! land_push retry; then
-        land_rollback "retry push failed too"
-      fi
-      # Witness the skip: record it in the suite result so the issue-close
-      # comment does not read as a normal, fully-gated land (issue #214).
-      SUITE_RESULT="$SUITE_RESULT; post-green transport death — re-pushed with TEST_SELECT_SKIP=1 (this tree was green-stamped, issue #214)"
-    else
-      land_rollback "push exited $PUSH_RC with no test summary and no green-tree stamp for this tree — the gate was killed mid-run (not a post-green transport death), or no stamp was minted; refusing to retry with the suite skipped. Re-run the land to re-run the gate (issue #214)"
-    fi
-  elif land_push_remote_advanced; then
-    # origin/$DEFAULT advanced under us (a push race despite the lock — a non-honoring pusher
-    # or CI): reconcile + retry under the lock rather than rolling back behind origin (issue
-    # #315). If recovery can't complete, land_rollback re-syncs to origin so the hub is never
-    # left behind, then aborts.
+  if land_push_remote_advanced; then
+    # origin/$DEFAULT advanced under us (a push race despite the lock — a non-honoring pusher):
+    # reconcile + retry under the lock rather than rolling back behind origin (issue #315). If
+    # recovery can't complete, land_rollback re-syncs to origin so the hub is never left behind.
     land_nonff_recover \
       || land_rollback "push rejected: origin advanced under the land and automatic recovery could not complete (issue #315)"
   else
     land_rollback "push rejected (pre-push test gate or remote)"
   fi
 fi
+# A local gate is only a gate if the hook really ran it: the installed hook also exits 0 when
+# the toolkit or the test-select hook is disabled or a persistent skip is configured. The
+# land already pushed, so this can only be loud, not roll back — but it must never write
+# "full suite ran" over a hook that ran nothing (Principle 2).
+if [ -n "$TEST_CMD" ] && ! grep -q 'running custom suite (TEST_SELECT_CMD)' "$PUSH_LOG"; then
+  wt_warn "the pre-push hook did not report running the local gate (disabled or skipped by config?) — the suite may NOT have run for this land"
+  LOCAL_GATE_UNPROVEN=1
+fi
 rm -f "$PUSH_LOG"
+
+# What gated this land, for the issue-close comment and the report (computed from the FINAL
+# merged SHA: a recovery re-merge may have moved it).
+if [ -n "$AUTO_SKIP" ]; then
+  SUITE_RESULT="no local tests — CI green for ${MERGED_SHA:0:9} ($CI_URL), issue #378"
+elif [ -n "$SKIP_TESTS" ]; then
+  SUITE_RESULT="skipped (--skip-tests)"
+elif [ -n "$LOCAL_GATE" ]; then
+  SUITE_RESULT="local full suite via the pre-push hook (--local-gate); CI not consulted${LOCAL_GATE_UNPROVEN:+ — UNVERIFIED: the hook did not report running it}"
+elif [ -n "$TEST_CMD" ]; then
+  SUITE_RESULT="via pre-push hook (--test-cmd: $TEST_CMD)"
+else
+  SUITE_RESULT="via pre-push hook (fast tier; --local land, issue #378)"
+fi
 
 # --- telemetry: hub-side Langfuse auth resolution (issue #127) --------------------
 # Hub sessions don't hand-export LANGFUSE_BASIC_AUTH, which silently skipped the
@@ -1051,30 +916,6 @@ if [ -n "$ISSUE" ]; then
   unset _q_common
 fi
 
-# --- conditional post-land background sweep (issue #124) --------------------------
-# If the gate that certified the landed tree ran a PRUNED set (a testmon/selected
-# green-tree stamp, issue #122), launch the full suite in the background as the
-# selection-miss safety net — detached, so the land's exit code and duration stay
-# untouched; gate-sweep.sh owns dedupe (a full-stamped tree is never swept), the
-# one-sweep-at-a-time lock, the stamp upgrade on green, and the issue filing on
-# red. A `full` stamp instead launches a detached baseline REFRESH (issue #327): no
-# safety-net sweep is needed, but the pre-warmed .testmondata-baseline must still be
-# rebuilt off the proven tree so the next spoke seeds cheap. No stamp (docs-only skip,
-# --skip-tests) launches nothing. gate-sweep.sh owns that tier->action decision — this
-# call is the same `--spawn $MERGED_SHA` for every tier. Best-effort like the rest of
-# the tail: a spawn that fails to launch warns and never fails the land. GATE_SWEEP_BIN
-# is the test seam.
-# NOT looped over ISSUES (#278), unlike the close/label/marker blocks above. The sweep is
-# keyed by the MERGED SHA, not by issue: one landed tree needs exactly one full-suite sweep,
-# and gate-sweep dedupes on the stamp and serializes on a one-at-a-time lock anyway — so a
-# per-issue loop would launch N identical sweeps of the same SHA and burn the box on N-1
-# no-ops. `--issue` is scalar (last-wins) and exists only to attribute a red sweep's filed
-# issue, for which the branch's primary is the right owner. Teaching gate-sweep a repeated
-# --issue so a red sweep could name every packed issue would be a genuine improvement, but
-# gate-sweep.sh is outside this issue's Scope: line.
-bash "${GATE_SWEEP_BIN:-$SCRIPT_DIR/gate-sweep.sh}" --spawn "$MERGED_SHA" \
-  --branch "$WT_BRANCH" ${ISSUE:+--issue} ${ISSUE:+"$ISSUE"} \
-  || wt_warn "post-land sweep failed to launch — landing is unaffected"
 
 # #300 writer: terminal success. Today `landed` is recorded only as ABSENCES (tag
 # consumed, worktree gone, issue closed); an explicit record closes the lifecycle.

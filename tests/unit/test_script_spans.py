@@ -20,6 +20,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _ci_gh_support import make_ci_gh
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 SPOKE_READY = SCRIPTS / "spoke-ready.sh"
@@ -27,7 +28,13 @@ SPOKE_PUSH = SCRIPTS / "spoke-push.sh"
 
 # Pin git config to nothing so a host's global/system config never reaches the
 # fixture repo's commits or pushes.
-_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+# ready/<N> waits for green CI (#378): put a green `gh` on PATH so the suite never hits GitHub.
+_GIT_ENV = {
+    **os.environ,
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "PATH": f"{make_ci_gh()}:{os.environ['PATH']}",
+}
 
 OWN = "feature/54-track-e"
 
