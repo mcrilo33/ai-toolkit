@@ -33,6 +33,7 @@ for _k in (
 # OTel is default-on in the hub; keep the base fixtures off it so env-block tests opt in.
 _GIT_ENV["AI_TOOLKIT_OTEL"] = "0"
 
+HUB_SETTINGS_LOCAL = '{"permissions": {"allow": ["Bash(hub:*)"]}}\n'
 BRANCH = "feature/359-extract"
 TITLE = "refactor(worktree): extract provision"
 BODY = "## Context\nbody line\n\nScope: scripts/x.sh\nGate: none\n"
@@ -548,6 +549,8 @@ def test_cp_fallback_without_rsync_copies_and_keeps_the_local_settings(
     data = json.loads(path.read_text())
     data["permissions"]["allow"].insert(0, "Bash(custom:*)")
     path.write_text(json.dumps(data, indent=2) + "\n")
+    # The hub carries its own, different settings.local.json that a naive re-copy would restore.
+    (hub / ".claude" / "settings.local.json").write_text(HUB_SETTINGS_LOCAL)
     second = provision()
 
     assert first.returncode == 0, first.stderr
@@ -573,6 +576,7 @@ def test_cp_fallback_failure_exits_nonzero_and_keeps_the_local_settings(
     data = json.loads(path.read_text())
     data["permissions"]["allow"].insert(0, "Bash(custom:*)")
     path.write_text(json.dumps(data, indent=2) + "\n")
+    (hub / ".claude" / "settings.local.json").write_text(HUB_SETTINGS_LOCAL)
     # A plain file where the hub has a directory makes `cp -R` fail on the re-run.
     shutil.rmtree(wt / ".claude" / "skills")
     (wt / ".claude" / "skills").write_text("conflict")
