@@ -31,7 +31,13 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from _gate_broker_support import _DISPLAY_CASE, _PANE_PID, _agent_ps_stub, _fake_tmux_pane
+from _gate_broker_support import (
+    _DISPLAY_CASE,
+    _PANE_PID,
+    _agent_ps_stub,
+    _fake_tmux_pane,
+    _write_warmed_stub,
+)
 from bash_session import BashSession, fresh_call
 
 # hub-afk.sh targets the macOS control plane: it reads transcript mtimes with BSD
@@ -5051,14 +5057,13 @@ def _reaper_tmux(
     log = tmp_path / "tmux.log"
     panes = tmp_path / "panes.txt"
     panes.write_text(f"afk:1\t{pane_path}\n" if pane_path is not None else "")
-    (fake_bin / "tmux").write_text(
-        "#!/usr/bin/env bash\n"
+    _write_warmed_stub(
+        fake_bin / "tmux",
         f'printf "%s\\n" "$*" >> "{log}"\n'
         f'if [ "$1" = "list-panes" ]; then cat "{panes}"; fi\n'
         f'if [ "$1" = "display-message" ]; then printf "{_PANE_PID}\\n"; fi\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin, log
 
@@ -5090,8 +5095,7 @@ def _reaper_env(
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    _write_warmed_stub(ready_stub, f'printf "%s\\n" "$*" >> "{ready_log}"\n')
 
     statedir = tmp_path / "statedir"
     statedir.mkdir()
@@ -7957,27 +7961,33 @@ def test_reap_pass_clears_offline_marker_when_network_recovers(tmp_path: Path) -
     # A prior outage left an offline marker; this tick the network is back and auth is healthy,
     # so reap_pass proceeds normally AND clears the stale outage marker (consecutive-offline reset).
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
     expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
     _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1"})
     env["AFK_NET_PROBE_CMD"] = "true"  # network back up (auth stub in _reaper_env is healthy)
 
-    start = time.monotonic()
-    _call(expr, env=env)
-    elapsed = time.monotonic() - start
+    # #330: the marker clear happens at the TOP of reap_pass (clear_offline_since), before
+    # _reap_or_resume's nudge path enters inject_and_verify -> _transcript_advanced, which
+    # polls up to AFK_INJECT_VERIFY_SECONDS (60s) plus a bounded retry (~122s total against
+    # the stub tmux that never advances the transcript). The fix zeroes the inject-verify
+    # budget in _reaper_env's returned env. #375: witness the skipped poll directly instead of
+    # a wall-clock budget (cold stub execs made any bound flaky under xdist). The poll's step
+    # is `sleep <AFK_INJECT_POLL_SECONDS>`; a `sleep` shim records every call and no-ops the
+    # 2s default step, so a regressed pass loops instantly and leaves its trace in the log.
+    sleep_log = tmp_path / "sleep.log"
+    shim = (
+        f'sleep() {{ printf "%s\\n" "$*" >> "{sleep_log}"; [ "$1" = 2 ] || command sleep "$@"; }}; '
+    )
+    _call(shim + expr, env=env)
 
     assert not (statedir / "offline-since.epoch").exists(), (
         "network recovery must clear the outage marker so --status stops reporting OFFLINE"
     )
-    # #330: the marker clear happens at the TOP of reap_pass (clear_offline_since), before
-    # _reap_or_resume's nudge path enters inject_and_verify -> _transcript_advanced, which
-    # polls up to AFK_INJECT_VERIFY_SECONDS (60s) plus a bounded retry (~122s total against
-    # the stub tmux that never advances the transcript). Bound the whole pass so a regression
-    # that reintroduces that dead wait fails loudly instead of silently capping the full-suite
-    # wall-clock. The fix zeroes the inject-verify budget in _reaper_env's returned env.
-    assert elapsed < 10, (
-        f"reap_pass blocked on the injector poll ({elapsed:.1f}s); the fixed path is ~2s, so "
-        "anything near the 122s pre-fix wait is a regression"
+    assert "send-keys" in tmux_log.read_text(), "the pass must reach the inject path it bounds"
+    polled = sleep_log.read_text().split() if sleep_log.exists() else []
+    assert "2" not in polled, (
+        "reap_pass entered the injector verify poll (default 2s step); with the budget zeroed "
+        f"it is skipped, so a poll step means the ~122s pre-fix wait is back (sleeps: {polled})"
     )
 
 
@@ -8972,19 +8982,6 @@ def test_recover_dead_panes_over_ceiling_near_complete_still_revives(tmp_path: P
 # So `_revive_spoke` captures a best-effort, bounded bundle to
 # <git-common-dir>/hang-forensics/<issue>-<epoch>/ BEFORE the kill. A crashed pane (no live
 # process) has nothing to capture and skips gracefully.
-
-
-def _write_warmed_stub(path: Path, body: str) -> None:
-    """Write an executable bash stub (`body` follows the shebang) and exec it once, `--warm`.
-
-    A freshly written script's FIRST exec can take seconds under xdist (macOS vets each new
-    executable) while a re-exec takes ~10ms (#374) -- longer than the bounded waits the stubbed
-    commands run under. The warm-up exec leaves a `<path>.warm` marker and runs none of `body`.
-    """
-    guard = '[ "${1:-}" = "--warm" ] && { : > "$0.warm"; exit 0; }\n'
-    path.write_text("#!/usr/bin/env bash\n" + guard + body)
-    path.chmod(0o755)
-    subprocess.run([str(path), "--warm"], check=True)
 
 
 def _forensics_bin(
