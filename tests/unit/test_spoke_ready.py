@@ -1191,3 +1191,179 @@ def test_queue_gate_outranks_an_unmet_precondition(spoke: Path, tmp_path: Path) 
     assert proc.returncode == 5, "the queue's distinct code, not the precondition's generic 1"
     assert "265" in proc.stderr
     assert "not clean" not in proc.stderr, "the queue is reported, not the incidental dirt"
+
+
+# ── Orca: the PLAN gate blocks in `ask`; ready / blocked send worker_done (#365) ─────────────
+
+
+def _orca_env(**extra: str) -> dict[str, str]:
+    """A spoke session: the role tag plus a coordinator-bound terminal, so Orca paths engage."""
+    return {**_GIT_ENV, "WT_SPOKE": "45", "ORCA_TERMINAL_HANDLE": "term_w", **extra}
+
+
+def _ask_calls(orca_bin: Path) -> list[list[str]]:
+    from _orca_stub import orca_calls
+
+    return [c for c in orca_calls(orca_bin) if c[:2] == ["orchestration", "ask"]]
+
+
+def _answer(orca_bin: Path, **result: object) -> None:
+    from _orca_stub import orca_scenario
+
+    orca_scenario(orca_bin, {"orchestration ask": [{"out": {"ok": True, "result": result}}]})
+
+
+def test_gate_blocks_in_ask_with_options_and_a_timeout_under_the_bash_limit(
+    spoke: Path, orca_bin: Path
+) -> None:
+    _answer(orca_bin, messageId="m1", answer="Approved -- proceed.")
+
+    result = _run(spoke, "--gate", "45", "-m", "the plan", env=_orca_env())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    (call,) = _ask_calls(orca_bin)
+    assert call[call.index("--options") + 1] == "approve,revise"
+    assert int(call[call.index("--timeout-ms") + 1]) < 120_000
+    assert "the plan" in call[call.index("--question") + 1]
+
+
+def test_gate_approve_consumes_its_own_tag_and_artifact(
+    spoke: Path, remote: Path, orca_bin: Path
+) -> None:
+    _answer(orca_bin, messageId="m1", answer="Approved -- proceed.")
+
+    result = _run(spoke, "--gate", "45", "-m", "the plan", env=_orca_env())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _git(spoke, "tag", "-l", "gate/45").strip() == ""
+    assert not _remote_has_ref(remote, "refs/tags/gate/45")
+    assert not (spoke / ".ai-toolkit" / "gate-45.md").exists()
+
+
+def test_gate_revise_prints_the_reply_exits_3_and_keeps_the_park(
+    spoke: Path, orca_bin: Path
+) -> None:
+    _answer(orca_bin, messageId="m1", answer="Revise: split step 2.")
+
+    result = _run(spoke, "--gate", "45", "-m", "plan", env=_orca_env())
+
+    assert result.returncode == 3
+    assert "Revise: split step 2." in result.stdout
+    assert _git(spoke, "tag", "-l", "gate/45").strip() == "gate/45"
+
+
+def test_gate_timeout_keeps_the_question_pending_and_a_rerun_resumes_it(
+    spoke: Path, orca_bin: Path
+) -> None:
+    _answer(orca_bin, messageId="m_pending", answer=None, timedOut=True)
+
+    first = _run(spoke, "--gate", "45", "-m", "plan", env=_orca_env())
+    _answer(orca_bin, messageId="m_pending", answer="Approved.")
+    second = _run(spoke, "--gate", "45", "-m", "plan", env=_orca_env())
+
+    assert first.returncode == 6
+    assert "PENDING" in first.stderr
+    assert second.returncode == 0, second.stdout + second.stderr
+    resume = _ask_calls(orca_bin)[-1]
+    assert resume[resume.index("--resume") + 1] == "m_pending"
+    assert "--question" not in resume
+    assert not (spoke / ".ai-toolkit" / "gate-45.ask").exists()
+
+
+def test_gate_failure_exits_1_and_never_reads_as_approval(spoke: Path, orca_bin: Path) -> None:
+    from _orca_stub import orca_scenario
+
+    orca_scenario(
+        orca_bin,
+        {
+            "orchestration ask": [
+                {"rc": 1, "out": {"ok": False, "error": {"code": "dispatch_capability_invalid"}}}
+            ]
+        },
+    )
+
+    result = _run(spoke, "--gate", "45", "-m", "plan", env=_orca_env())
+
+    assert result.returncode == 1
+    assert _git(spoke, "tag", "-l", "gate/45").strip() == "gate/45"
+
+
+def test_gate_outside_an_orca_worker_parks_tag_only_without_asking(
+    spoke: Path, orca_bin: Path
+) -> None:
+    result = _run(spoke, "--gate", "45", "-m", "plan")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "tag-only" in result.stderr
+    assert _ask_calls(orca_bin) == []
+
+
+def test_the_capability_flag_is_remembered_and_passed_to_ask(spoke: Path, orca_bin: Path) -> None:
+    _answer(orca_bin, messageId="m1", answer="Approved.")
+
+    _run(spoke, "--gate", "45", "-m", "plan", "--dispatch-capability", "dcap_x", env=_orca_env())
+
+    (call,) = _ask_calls(orca_bin)
+    assert call[call.index("--dispatch-capability") + 1] == "dcap_x"
+    assert (spoke / ".ai-toolkit" / "dispatch-capability").read_text().strip() == "dcap_x"
+
+
+def _sends(orca_bin: Path) -> list[list[str]]:
+    from _orca_stub import orca_calls
+
+    return [c for c in orca_calls(orca_bin) if c[:2] == ["orchestration", "send"]]
+
+
+def _record_dispatch(repo: Path) -> None:
+    (repo / ".git" / "info" / "exclude").write_text(".ai-toolkit/\n")
+    (repo / ".ai-toolkit").mkdir(exist_ok=True)
+    (repo / ".ai-toolkit" / "identity").write_text("issue=45\norca_dispatch_id=ctx_9\n")
+
+
+def test_ready_sends_worker_done_succeeded_after_the_tag_push(
+    spoke: Path, remote: Path, orca_bin: Path
+) -> None:
+    _record_dispatch(spoke)
+
+    result = _run(spoke, "45", env=_orca_env())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+    (send,) = _sends(orca_bin)
+    assert send[send.index("--type") + 1] == "worker_done"
+    assert send[send.index("--outcome") + 1] == "succeeded"
+
+
+def test_blocked_sends_worker_done_failed(spoke: Path, orca_bin: Path) -> None:
+    _record_dispatch(spoke)
+
+    result = _run(spoke, "--blocked", "45", "-m", "stuck", env=_orca_env())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    (send,) = _sends(orca_bin)
+    assert send[send.index("--outcome") + 1] == "failed"
+
+
+def test_a_failing_worker_done_never_fails_the_emission(
+    spoke: Path, remote: Path, orca_bin: Path
+) -> None:
+    from _orca_stub import orca_scenario
+
+    _record_dispatch(spoke)
+    orca_scenario(orca_bin, {"orchestration send": [{"rc": 1, "out": {"ok": False}}]})
+
+    result = _run(spoke, "45", env=_orca_env())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_no_worker_done_outside_a_spoke_session_or_for_a_packed_subtask(
+    spoke: Path, orca_bin: Path
+) -> None:
+    _record_dispatch(spoke)
+
+    _run(spoke, "--blocked", "45", "-m", "hub escalation")
+    _run(spoke, "46", env=_orca_env())
+
+    assert _sends(orca_bin) == []

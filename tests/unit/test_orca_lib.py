@@ -362,14 +362,14 @@ def test_the_worktree_probe_is_scoped_to_the_given_repo(tmp_path: Path) -> None:
 def _wt(tmp_path: Path, **identity: str) -> Path:
     wt = tmp_path / "wt"
     (wt / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
-    (wt / ".ai-toolkit" / "identity").write_text(
-        "".join(f"{k}={v}\n" for k, v in identity.items())
-    )
+    (wt / ".ai-toolkit" / "identity").write_text("".join(f"{k}={v}\n" for k, v in identity.items()))
     return wt
 
 
 def _ps(path: Path, *agents: dict) -> dict:
-    return {"out": {"ok": True, "result": {"worktrees": [{"path": str(path), "agents": list(agents)}]}}}
+    return {
+        "out": {"ok": True, "result": {"worktrees": [{"path": str(path), "agents": list(agents)}]}}
+    }
 
 
 def _workers(*rows: dict) -> dict:
@@ -400,7 +400,9 @@ def _worker(did: str, path: Path, verdict: str = "live", handle: str = "term_w",
 def test_agent_state_reads_ps(tmp_path: Path, agents: list[dict], want: str) -> None:
     wt = _wt(tmp_path)
 
-    proc, _ = _run(tmp_path, f'orca_agent_state "{wt}"', scenario={"worktree ps": [_ps(wt, *agents)]})
+    proc, _ = _run(
+        tmp_path, f'orca_agent_state "{wt}"', scenario={"worktree ps": [_ps(wt, *agents)]}
+    )
 
     assert proc.stdout.strip() == want
     assert proc.returncode == 0
@@ -453,7 +455,9 @@ def test_worker_liveness_matches_the_identity_dispatch_then_the_path(tmp_path: P
         _worker("ctx_old", wt, "exited"), _worker("ctx_new", wt, "live"), _worker("ctx_x", other)
     )
 
-    by_id, _ = _run(tmp_path, f'orca_worker_liveness "{wt}"', scenario={"orchestration worker-list": [rows]})
+    by_id, _ = _run(
+        tmp_path, f'orca_worker_liveness "{wt}"', scenario={"orchestration worker-list": [rows]}
+    )
     bare = _wt(tmp_path / "b")
     by_path, _ = _run(
         tmp_path / "b",
@@ -484,14 +488,35 @@ def test_inbox_question_joins_the_sender_handle_to_the_spoke(tmp_path: Path) -> 
             "ok": True,
             "result": {
                 "messages": [
-                    {"id": "m_other", "type": "question", "from_handle": "term_z", "body": "no", "created_at": 1},
-                    {"id": "m_late", "type": "question", "from_handle": "term_w", "body": "b", "created_at": 9},
-                    {"id": "m_early", "type": "question", "from_handle": "term_w", "body": "plan?", "created_at": 5},
+                    {
+                        "id": "m_other",
+                        "type": "question",
+                        "from_handle": "term_z",
+                        "body": "no",
+                        "created_at": 1,
+                    },
+                    {
+                        "id": "m_late",
+                        "type": "question",
+                        "from_handle": "term_w",
+                        "body": "b",
+                        "created_at": 9,
+                    },
+                    {
+                        "id": "m_early",
+                        "type": "question",
+                        "from_handle": "term_w",
+                        "body": "plan?",
+                        "created_at": 5,
+                    },
                 ]
             },
         }
     }
-    scenario = {"orchestration worker-list": [_workers(_worker("ctx_1", wt))], "orchestration check": [inbox]}
+    scenario = {
+        "orchestration worker-list": [_workers(_worker("ctx_1", wt))],
+        "orchestration check": [inbox],
+    }
 
     proc, bindir = _run(
         tmp_path,
@@ -500,7 +525,16 @@ def test_inbox_question_joins_the_sender_handle_to_the_spoke(tmp_path: Path) -> 
     )
 
     assert proc.stdout.splitlines() == ["m_early", "plan?"]
-    assert ["orchestration", "check", "--peek", "--types", "question", "--run", "run_1", "--json"] in orca_calls(bindir)
+    assert [
+        "orchestration",
+        "check",
+        "--peek",
+        "--types",
+        "question",
+        "--run",
+        "run_1",
+        "--json",
+    ] in orca_calls(bindir)
 
 
 def test_inbox_question_is_rc1_when_empty_and_rc2_when_unknown(tmp_path: Path) -> None:
@@ -518,7 +552,7 @@ def test_inbox_question_is_rc1_when_empty_and_rc2_when_unknown(tmp_path: Path) -
 
 def test_every_mutation_carries_json_and_its_own_retry_request(tmp_path: Path) -> None:
     snippet = (
-        'orca_reply m1 yes run_1; orca_send_text term_w hello 15 1 >/dev/null; '
+        "orca_reply m1 yes run_1; orca_send_text term_w hello 15 1 >/dev/null; "
         "orca_worker_stop d1; orca_worker_abandon d2; orca_worker_release d3"
     )
 
@@ -555,7 +589,9 @@ def test_send_text_without_enter_or_wait_sends_only_the_text(tmp_path: Path) -> 
 
 
 def test_send_text_failure_is_rc1_and_never_resent(tmp_path: Path) -> None:
-    scenario = {"terminal send": [{"rc": 1, "out": {"ok": False, "error": {"code": "terminal_gone"}}}]}
+    scenario = {
+        "terminal send": [{"rc": 1, "out": {"ok": False, "error": {"code": "terminal_gone"}}}]
+    }
 
     proc, bindir = _run(tmp_path, "orca_send_text term_w hi", scenario=scenario)
 
@@ -567,7 +603,9 @@ def test_worker_done_sends_the_outcome_with_the_dispatch_and_task(tmp_path: Path
     wt = _wt(tmp_path, orca_dispatch_id="ctx_1")
     scenario = {"orchestration worker-list": [_workers(_worker("ctx_1", wt))]}
 
-    proc, bindir = _run(tmp_path, f'orca_worker_done "{wt}" succeeded "ready/365"', scenario=scenario)
+    proc, bindir = _run(
+        tmp_path, f'orca_worker_done "{wt}" succeeded "ready/365"', scenario=scenario
+    )
 
     assert proc.returncode == 0, proc.stderr
     send = next(c for c in orca_calls(bindir) if c[:2] == ["orchestration", "send"])
@@ -612,7 +650,12 @@ def test_ask_timeout_is_rc3_with_the_pending_id_to_resume(tmp_path: Path) -> Non
         tmp_path,
         f'orca_ask "{wt}" q a,b 1000; echo "rc=$? id=$ORCA_ASK_ID"; '
         f'orca_ask_resume "{wt}" "$ORCA_ASK_ID" 1000; echo "rc=$?"',
-        scenario={"orchestration ask": [timeout, {"out": {"ok": True, "result": {"messageId": "msg_7", "answer": "approve"}}}]},
+        scenario={
+            "orchestration ask": [
+                timeout,
+                {"out": {"ok": True, "result": {"messageId": "msg_7", "answer": "approve"}}},
+            ]
+        },
     )
 
     assert proc.stdout.split() == ["rc=3", "id=msg_7", "approve", "rc=0"]
@@ -623,11 +666,15 @@ def test_ask_timeout_is_rc3_with_the_pending_id_to_resume(tmp_path: Path) -> Non
 
 def test_ask_cancelled_or_failed_is_rc1(tmp_path: Path) -> None:
     wt = _wt(tmp_path)
-    cancelled = {"out": {"ok": True, "result": {"messageId": "m", "answer": None, "cancelled": True}}}
+    cancelled = {
+        "out": {"ok": True, "result": {"messageId": "m", "answer": None, "cancelled": True}}
+    }
     failed = {"rc": 1, "out": {"ok": False, "error": {"code": "dispatch_capability_invalid"}}}
 
     for reply in (cancelled, failed):
-        proc, _ = _run(tmp_path, f'orca_ask "{wt}" q a 1000', scenario={"orchestration ask": [reply]})
+        proc, _ = _run(
+            tmp_path, f'orca_ask "{wt}" q a 1000', scenario={"orchestration ask": [reply]}
+        )
 
         assert proc.returncode == 1
 
@@ -636,7 +683,10 @@ def test_capability_prefers_the_env_over_the_recorded_file(tmp_path: Path) -> No
     wt = _wt(tmp_path)
     (wt / ".ai-toolkit" / "dispatch-capability").write_text("dcap_file\n")
 
-    proc, _ = _run(tmp_path, f'orca_capability "{wt}"; ORCA_DISPATCH_CAPABILITY=dcap_env orca_capability "{wt}"')
+    proc, _ = _run(
+        tmp_path,
+        f'orca_capability "{wt}"; ORCA_DISPATCH_CAPABILITY=dcap_env orca_capability "{wt}"',
+    )
 
     assert proc.stdout.split() == ["dcap_file", "dcap_env"]
 
@@ -647,3 +697,15 @@ def test_a_bare_escape_goes_without_enter_wait_or_retry_request(tmp_path: Path) 
     (call,) = orca_calls(bindir)
     assert "--retry-request" not in call
     assert "--enter" not in call
+
+
+def test_inbox_question_without_a_worker_record_is_unknown_not_none(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+
+    proc, _ = _run(
+        tmp_path,
+        f'orca_inbox_question "{wt}" id',
+        scenario={"orchestration worker-list": [_workers()]},
+    )
+
+    assert proc.returncode == 2

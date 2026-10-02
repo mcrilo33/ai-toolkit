@@ -23,14 +23,13 @@ RECOVER_FUNCTIONS = [
     "_reap_or_resume",
     "_revive_spoke",
     "resume_spoke",
-    "respawn_wedged_spoke",
     "_afk_finish_up_or_revive",
     "_afk_crash_reresume_or_escalate",
     "_afk_crash_escalate_or_park",
     "_afk_nudge_spoke",
     "_afk_auth_is_dead",
     "_afk_network_is_down",
-    "_redispatch_dead_pane",
+    "_redispatch_exited_spoke",
 ]
 
 

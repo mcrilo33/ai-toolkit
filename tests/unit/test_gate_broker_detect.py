@@ -11,46 +11,20 @@ from pathlib import Path
 
 import pytest
 from _gate_broker_support import (
-    _DISPLAY_CASE,
-    _PERMISSION_PROMPT,
-    _agent_ps_stub,
-    _ask_record,
-    _bash_tool_record,
     _call,
-    _fake_tmux_pane,
-    _gate_bash_turn,
     _gate_broker_env,
-    _gate_tool_result,
     _install_fake_claude,
     _project_dir_for,
     _seed_task_output,
-    _spoke_activity_turn,
-    _spoke_await_review_turn,
-    _spoke_coded_past_turn,
     _tag_gate_at_head,
-    _write_transcript,
 )
-
-
-def _dead_agent_bin(tmp_path: Path, spoke_repo: Path, *, capture: str = "") -> Path:
-    """A PATH bin whose tmux maps a pane to <spoke_repo> and reports a pane pid, but whose ps
-    shows NO agent under it: the #301 incident shape — a pane very much alive (list-panes maps
-    it), running a bare shell after the reboot killed claude. `capture` optionally renders a
-    stale permission dialog left in the scrollback. Returns the bin dir to prepend to PATH.
-    """
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    (fake_bin / "tmux").write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  capture-pane) printf "%s\\n" "{capture}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
-    )
-    (fake_bin / "tmux").chmod(0o755)
-    _agent_ps_stub(fake_bin, agent_alive=False)  # the pane pid has no claude descendant
-    return fake_bin
+from _orca_stub import (
+    install_forbidden_stubs,
+    install_orca_stub,
+    orca_calls,
+    orca_park,
+    orca_scenario,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -69,8 +43,6 @@ DETECT_SURFACE = (
     "slot_state",
     "spoke_over_ceiling",
     "_gate_parked",
-    "_gate_answer_landed",
-    "_gate_spoke_coded_past",
     "_gate_artifact_path",
     "_read_gate_artifact",
     "_spoke_still_parked",
@@ -91,331 +63,42 @@ def test_detect_module_surface_loads() -> None:
     assert result.stdout.strip().splitlines()[-1] == "OK"
 
 
-def test_extract_pending_question_drops_failed_gate_emission(
-    spoke_repo: Path, tmp_path: Path
+def test_extract_pending_question_returns_the_inbox_question(
+    spoke_repo: Path, orca_bin: Path
 ) -> None:
-    # A gate Bash whose tool_result is_error (a deny), then the spoke keeps working: the
-    # emission failed, so no park was ever established — extract must return empty.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [
-            _gate_bash_turn("PLAN PROSE that must not latch a phantom park"),
-            _gate_tool_result(is_error=True),
-            _spoke_activity_turn(),
-        ],
-    )
+    # A PLAN gate park is an inbox question (the agent reads `working` while its `ask` blocks).
+    orca_park(orca_bin, spoke_repo, question="REAL PLAN PROSE for a genuine park")
 
-    result = _call(
-        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
+    result = _call(f"extract_pending_question '{spoke_repo}'")
 
-    assert result.stdout.strip() == "", (
-        f"a denied gate emission must not latch a phantom park: {result.stdout!r}"
-    )
+    assert result.stdout.strip() == "REAL PLAN PROSE for a genuine park"
 
 
-def test_extract_pending_question_keeps_plan_on_successful_gate(
-    spoke_repo: Path, tmp_path: Path
+def test_extract_pending_question_formats_a_stray_ask_user_question(
+    spoke_repo: Path, orca_bin: Path
 ) -> None:
-    # A gate Bash whose tool_result is a SUCCESS (no is_error): a real park — extract still
-    # returns the plan prose so the answerer has it to reason about.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [
-            _gate_bash_turn("REAL PLAN PROSE for a genuine park"),
-            _gate_tool_result(is_error=False),
-        ],
+    ask = {
+        "questions": [
+            {"question": "Which store?", "options": [{"label": "Redis", "description": "fast"}]}
+        ]
+    }
+    orca_park(
+        orca_bin, spoke_repo, state="waiting", tool="AskUserQuestion", tool_input=json.dumps(ask)
     )
 
-    result = _call(
-        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
+    result = _call(f"extract_pending_question '{spoke_repo}'")
 
-    assert "REAL PLAN PROSE" in result.stdout, (
-        f"a successful gate park must still surface the plan: {result.stdout!r}"
-    )
+    assert result.stdout.strip() == "Q: Which store?\n  - Redis: fast"
 
 
-def test_extract_pending_question_keeps_plan_before_tool_result(
-    spoke_repo: Path, tmp_path: Path
+def test_extract_pending_question_is_empty_when_nothing_is_parked(
+    spoke_repo: Path, orca_bin: Path
 ) -> None:
-    # Backward-compat: a gate Bash with NO tool_result yet (the emission is still resolving, or
-    # a fixture omits it) stays a park — the latch clears only on a POSITIVE is_error signal.
-    projects = tmp_path / "projects"
-    _write_transcript(projects, spoke_repo, [_gate_bash_turn("PLAN awaiting its result")])
+    orca_park(orca_bin, spoke_repo, state="working")
 
-    result = _call(
-        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
+    result = _call(f"extract_pending_question '{spoke_repo}'")
 
-    assert "PLAN awaiting its result" in result.stdout, result.stdout
-
-
-def test_slot_state_busy_after_failed_gate_emission(spoke_repo: Path, tmp_path: Path) -> None:
-    # The incident shape end to end: a denied gate emission, no gate/<N> tag at the tip, the
-    # spoke still working. slot_state must read `busy`, not `waiting` — so the watchdog never
-    # answers a phantom park.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [
-            _gate_bash_turn("PLAN PROSE"),
-            _gate_tool_result(is_error=True),
-            _spoke_activity_turn(),
-        ],
-    )
-
-    result = _call(
-        f"slot_state '{spoke_repo}' 5",
-        env={"CLAUDE_PROJECTS_DIR": str(projects), "AFK_NOW": "1000000100"},
-    )
-
-    assert result.stdout.strip() == "busy", result.stdout + result.stderr
-
-
-# ── #313: a TYPED string-content reply un-latches the PLAN gate ────────────────
-# Claude Code records a real reply — a human typing in the pane AND the broker's own
-# tmux-injected approval — as a STRING-content user turn, not a text block. The pre-#313
-# extractor cleared only `pending` on such a turn, so `gate_plan` stayed latched for the
-# whole life of the spoke: every post-approval tick returned the stale plan → slot_state
-# `waiting` → the answer lane recomputed and every answer was dropped by the #247
-# tree-changed guard, burning reasoner runs until park-undeliverable fired.
-
-
-def _typed_string_reply(text: str = "Approved, proceed with the plan.") -> dict:
-    """A genuine reply as Claude Code records it on submit: a STRING-content user turn
-    carrying promptSource == "typed" (a human pane reply or the broker's tmux inject)."""
-    return {"type": "user", "promptSource": "typed", "message": {"content": text}}
-
-
-def test_extract_pending_question_clears_plan_on_typed_string_reply(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # AC1: gate emission, then a typed string-content approval, then the spoke resumes work.
-    # The reply resolved the gate → extract must return empty (no phantom park).
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [
-            _gate_bash_turn("PLAN PROSE that must not latch a phantom park"),
-            _typed_string_reply(),
-            _spoke_activity_turn(),
-        ],
-    )
-
-    result = _call(
-        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
-
-    assert result.stdout.strip() == "", (
-        f"a typed string-content reply must un-latch the gate plan: {result.stdout!r}"
-    )
-
-
-def test_slot_state_busy_after_typed_string_gate_reply(spoke_repo: Path, tmp_path: Path) -> None:
-    # AC1/AC4 end to end: the injected approval landed as a string-content turn and the spoke
-    # keeps working. slot_state must read `busy`, not `waiting` — so no park onset is stamped
-    # and the answer lane never services (consumes zero reasoner runs on) the retired gate.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [
-            _gate_bash_turn("PLAN PROSE"),
-            _typed_string_reply(),
-            _spoke_activity_turn(),
-        ],
-    )
-
-    result = _call(
-        f"slot_state '{spoke_repo}' 5",
-        env={"CLAUDE_PROJECTS_DIR": str(projects), "AFK_NOW": "1000000100"},
-    )
-
-    assert result.stdout.strip() == "busy", result.stdout + result.stderr
-
-
-def test_extract_pending_question_keeps_plan_without_reply(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # AC2 regression: a genuinely-unanswered gate park — the emission, then the spoke's own
-    # assistant activity but NO user reply of any shape — still extracts the plan so the
-    # answerer keeps its reasoning payload.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [
-            _gate_bash_turn("REAL PLAN PROSE for a genuine park"),
-            _spoke_activity_turn(),
-        ],
-    )
-
-    result = _call(
-        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
-
-    assert "REAL PLAN PROSE" in result.stdout, (
-        f"an unanswered gate park must still surface the plan: {result.stdout!r}"
-    )
-
-
-def test_extract_pending_question_keeps_plan_on_nontyped_string_reply(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # The typed guard: only a promptSource == "typed" string turn is a genuine reply. A
-    # string-content user turn WITHOUT it (every synthetic harness turn is non-typed) must
-    # NOT false-clear a still-unanswered park — mirrors _gate_answer_landed (#204).
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [
-            _gate_bash_turn("REAL PLAN PROSE awaiting a real reply"),
-            {"type": "user", "message": {"content": "a synthetic non-typed string turn"}},
-        ],
-    )
-
-    result = _call(
-        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
-
-    assert "REAL PLAN PROSE" in result.stdout, (
-        f"a non-typed string turn must not un-latch the park: {result.stdout!r}"
-    )
-
-
-def test_extract_pending_question_clears_plan_on_list_content_reply(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # AC3 regression: the pre-existing list-content text-block un-latch is unchanged — a user
-    # turn whose LIST content carries a text block still resolves the gate.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [
-            _gate_bash_turn("PLAN PROSE that a list-content reply must clear"),
-            {"type": "user", "message": {"content": [{"type": "text", "text": "Approved."}]}},
-            _spoke_activity_turn(),
-        ],
-    )
-
-    result = _call(
-        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
-    )
-
-    assert result.stdout.strip() == "", (
-        f"a list-content text-block reply must still un-latch the plan: {result.stdout!r}"
-    )
-
-
-# ── issue #312: _gate_spoke_coded_past — the #117 keeps-coding proof ───────────────────────────
-# _gate_answer_landed (#204) proves a TYPED reply landed after the gate. The #117 shape — the
-# spoke emits gate/<n> then keeps coding WITHOUT a reply — leaves no typed turn, so a distinct
-# detector proves it: a MUTATING tool_use (Edit/Write/NotebookEdit/MultiEdit) AFTER the gate
-# emission — the operation the PLAN gate exists to block — means the spoke wrote code past the
-# gate. A text-only "awaiting review" turn or a read-only tool call is NOT proof (the review's
-# false-positive case): a compliant park still emits the agent loop's trailing reply to the gate
-# Bash's tool_result. The moved-on drop uses this to RETIRE the abandoned episode instead of aging
-# it. Fail-closed: no transcript / no python3 / no post-gate WRITE → rc 1 (never retire on an
-# ambiguous read; a missed retirement is caught by the watchdog's drain-touched suppression).
-
-
-def _coded_past(spoke_repo: Path, projects: Path) -> str:
-    return (
-        _call(
-            f"_gate_spoke_coded_past '{spoke_repo}' && echo CODED || echo NO",
-            env={"CLAUDE_PROJECTS_DIR": str(projects)},
-        )
-        .stdout.strip()
-        .splitlines()[-1]
-    )
-
-
-def test_gate_spoke_coded_past_true_after_a_write(spoke_repo: Path, tmp_path: Path) -> None:
-    # The #117 shape: a gate emission, then the spoke WROTE to the worktree (an Edit) with no reply.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [_gate_bash_turn("PLAN — then I keep coding"), _spoke_coded_past_turn()],
-    )
-
-    assert _coded_past(spoke_repo, projects) == "CODED"
-
-
-def test_gate_spoke_coded_past_false_for_compliant_awaiting_review_turn(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # The review's blocker: a genuinely parked spoke ends with the agent loop's trailing text-only
-    # "awaiting review" reply to the gate Bash's tool_result. That is NOT coding past — retiring
-    # here would tear down a live gate and discard a pending answer/amendment.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [
-            _gate_bash_turn("PLAN awaiting approval"),
-            _gate_tool_result(is_error=False),
-            _spoke_await_review_turn(),
-        ],
-    )
-
-    assert _coded_past(spoke_repo, projects) == "NO"
-
-
-def test_gate_spoke_coded_past_false_for_read_only_activity(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
-    # A read-only tool call (Read) past the gate is not proof the spoke proceeded to implement —
-    # a spoke may inspect something then still wait. Only a WRITE counts.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [_gate_bash_turn("PLAN awaiting approval"), _spoke_activity_turn()],
-    )
-
-    assert _coded_past(spoke_repo, projects) == "NO"
-
-
-def test_gate_spoke_coded_past_false_for_bare_park(spoke_repo: Path, tmp_path: Path) -> None:
-    # Only the plan + gate Bash, and the gate's own tool_result — no activity after the emission.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [_gate_bash_turn("PLAN awaiting approval"), _gate_tool_result(is_error=False)],
-    )
-
-    assert _coded_past(spoke_repo, projects) == "NO"
-
-
-def test_gate_spoke_coded_past_false_for_typed_reply_only(spoke_repo: Path, tmp_path: Path) -> None:
-    # A typed reply then nothing is the #204 path (handled by _gate_answer_landed + the top
-    # self-heal), NOT the keeps-coding shape — coded-past must stay false so the two do not conflate.
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects,
-        spoke_repo,
-        [
-            _gate_bash_turn("PLAN — a human then approves"),
-            {
-                "type": "user",
-                "promptSource": "typed",
-                "message": {"content": "Approved — proceed."},
-            },
-        ],
-    )
-
-    assert _coded_past(spoke_repo, projects) == "NO"
+    assert result.stdout.strip() == ""
 
 
 def test_spoke_idle_seconds_not_refreshed_by_reasoner_write(
@@ -592,119 +275,86 @@ def test_slot_state_task_output_does_not_lift_hard_ceiling(
     assert result.stdout.strip() == "reap", result.stdout + result.stderr
 
 
-def test_slot_state_permission_park_beats_ceiling(spoke_repo: Path, tmp_path: Path) -> None:
-    # #246: a spoke parked on a permission dialog must classify `waiting` — never `reap` —
+def test_slot_state_permission_park_beats_ceiling(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    # #246: a spoke parked on a permission dialog must classify `waiting` -- never `reap` --
     # even when it is over BOTH the wall-clock ceiling (AFK_SPOKE_MAX_MINUTES) and the idle
     # ceiling (AFK_IDLE_MINUTES). Pre-fix the ceiling reap preceded park detection, so the
     # over-ceiling park was reaped + revived, re-raising the same dialog forever.
     projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    jsonl = pd / "session.jsonl"
-    # An unresolved Bash tool_use → extract_pending_command non-empty → _permission_pending true.
-    jsonl.write_text(json.dumps(_bash_tool_record("git reset -q; git add tests/x.py")) + "\n")
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # stale transcript → also over the idle ceiling
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    (fake_bin / "tmux").write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        "esac\nexit 0\n"
+    jsonl = _project_dir_for(projects, spoke_repo) / "session.jsonl"
+    jsonl.write_text("{}\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # stale transcript: also over the idle ceiling
+    orca_park(
+        orca_bin,
+        spoke_repo,
+        state="waiting",
+        tool="Bash",
+        tool_input="git reset -q; git add tests/x.py",
     )
-    (fake_bin / "tmux").chmod(0o755)
     statedir = tmp_path / "sd"
     statedir.mkdir()
-    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over the ceiling
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago: over the ceiling
 
     result = _call(
         f"slot_state '{spoke_repo}' 5",
         env={
             "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "AFK_STATE_DIR": str(statedir),
-            "AFK_NOW": "1000000000",  # ~31700 min since dispatch → well over the ceiling AND idle
+            "AFK_NOW": "1000000000",
         },
     )
 
     assert result.stdout.strip() == "waiting", result.stdout + result.stderr
 
 
-def test_broker_service_gate_injects_despite_reasoner_transcript(
-    spoke_repo: Path, reasoner_env: dict[str, str], tmp_path: Path
+def test_broker_service_gate_replies_with_the_reasoners_answer(
+    spoke_repo: Path, reasoner_env: dict[str, str], tmp_path: Path, orca_bin: Path
 ) -> None:
-    # End to end: a parked spoke, a reasoner that ANSWERS (and writes its own transcript
-    # mid-answer). The answer must be INJECTED, not dropped as stale — the #164 stranding.
-    fake_bin = Path(reasoner_env["_FAKE_BIN"])
-    _install_fake_claude(fake_bin, "ANSWER: Approved — use Redis.")
-    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, Path(reasoner_env["_SPOKE_JSONL"]))
+    # End to end: a parked spoke (an inbox question), a reasoner that ANSWERS (and writes its own
+    # transcript mid-answer). The answer must be delivered as an Orca reply, not dropped as stale.
+    _install_fake_claude(Path(reasoner_env["_FAKE_BIN"]), "ANSWER: Approved - use Redis.")
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
     ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     ready_stub.chmod(0o755)
-    env = {
-        **reasoner_env,
-        "SPOKE_READY": str(ready_stub),
-        "AFK_STATE_DIR": str(tmp_path / "sd"),
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-    }
+    env = {**reasoner_env, "SPOKE_READY": str(ready_stub), "AFK_STATE_DIR": str(tmp_path / "sd")}
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
+    replies = [c for c in orca_calls(orca_bin) if c[:2] == ["orchestration", "reply"]]
     assert result.returncode == 0, result.stderr
-    assert "dropping the stale answer" not in result.stderr, (
-        f"the answer must not be dropped as stale: {result.stderr}"
-    )
-    assert "Approved — use Redis." in tmux_log.read_text(), (
-        f"the reasoner's answer must be injected into the spoke: {tmux_log.read_text()}"
-    )
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
-        "a healthy answer must inject, not escalate to blocked"
-    )
+    assert "dropping the stale answer" not in result.stderr, result.stderr
+    assert len(replies) == 1 and "Approved - use Redis." in replies[0], replies
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
 
 
-def test_decide_permission_logs_escalate_verdict(spoke_repo: Path, tmp_path: Path) -> None:
+def test_decide_permission_logs_escalate_verdict(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # BOTH classifier verdicts are logged, not just APPROVE: a risky `git reset --hard`
     # (which shares the signature git-reset+git-add with the safe `git reset -q`) is
     # recorded as ESCALATE, so codify sees the conflict and never proposes it as unanimous.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    jsonl = pd / "session.jsonl"
-    jsonl.write_text(json.dumps(_bash_tool_record("git reset --hard; git add tests/x.py")) + "\n")
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    (fake_bin / "tmux").write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        "esac\nexit 0\n"
+    orca_park(
+        orca_bin,
+        spoke_repo,
+        state="waiting",
+        tool="Bash",
+        tool_input="git reset --hard; git add tests/x.py",
     )
-    (fake_bin / "tmux").chmod(0o755)
     statedir = tmp_path / "sd"
     statedir.mkdir()
-    ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.write_text("#!/usr/bin/env bash\ntrue\n")
     ready_stub.chmod(0o755)
     env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_STATE_DIR": str(statedir),
         "SPOKE_READY": str(ready_stub),
-        # #241: an ESCALATE verdict now routes to the reasoner (stubbed) instead of parking.
+        # #241: an ESCALATE verdict routes to the reasoner (stubbed) instead of parking.
         # The mechanical ESCALATE verdict is still recorded to decisions.log for codification.
         "AFK_ANSWERER_CMD": "printf 'ANSWER: DENY: use git restore instead'",
         "AFK_JOURNAL_GH_COMMENT": "0",
-        # Zero the inject verify timings: this stub's tmux never advances the transcript, so
-        # the deny-path inject would otherwise burn the full 60s x2 verify budget (real spokes
-        # respond, so this is a test-only bound).
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-        "AFK_INJECT_POLL_SECONDS": "0",
     }
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
@@ -712,7 +362,7 @@ def test_decide_permission_logs_escalate_verdict(spoke_repo: Path, tmp_path: Pat
     assert result.returncode == 0, result.stderr
     fields = (statedir / "decisions.log").read_text().strip().split("\t")
     assert fields[3] == "git-reset+git-add" and fields[4] == "ESCALATE", fields
-    # The safe + destructive variants now conflict → codify proposes no rule for it.
+    # The safe + destructive variants now conflict -> codify proposes no rule for it.
     (statedir / "decisions.log").write_text(
         "1\t5\tpermission\tgit-reset+git-add\tAPPROVE\n"
         "2\t7\tpermission\tgit-reset+git-add\tESCALATE\n"
@@ -803,173 +453,167 @@ def test_note_tip_progress_clears_done_epoch_on_first_sighting(
 # NOT from zero — so a fresh park gets the full HUB_WATCHDOG_PARK_CEILING before it may fire.
 # A parked spoke stamps it once on its first waiting read; a not-parked spoke clears it so a
 # later re-park re-stamps fresh. Mirrors the #263 done-epoch machinery.
-def test_slot_state_gate_parked_stamps_park_onset(spoke_repo: Path, tmp_path: Path) -> None:
-    statedir = tmp_path / "afk-state"
-    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    (pd / "session.jsonl").write_text(
-        json.dumps(
-            {"type": "assistant", "message": {"content": [{"type": "text", "text": "parked"}]}}
-        )
-        + "\n"
+def _slot(wt: Path, tmp_path: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    """slot_state for issue 5 at a pinned clock, state dir isolated under tmp_path."""
+    return _call(
+        f"slot_state '{wt}' 5",
+        env={"AFK_STATE_DIR": str(tmp_path / "afk-state"), "AFK_NOW": "1700000000", **env},
     )
 
-    result = _call(
-        f"slot_state '{spoke_repo}' 5",
-        env={
-            "AFK_STATE_DIR": str(statedir),
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "AFK_NOW": "1700000000",
-        },
-    )
+
+def test_slot_state_gate_parked_stamps_park_onset(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
+    orca_park(orca_bin, spoke_repo, question="PLAN: do the thing")
+
+    result = _slot(spoke_repo, tmp_path)
 
     assert result.stdout.strip() == "waiting", result.stdout + result.stderr
-    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1700000000"
+    assert (tmp_path / "afk-state" / "park-onset-5.epoch").read_text().strip() == "1700000000"
 
 
-def test_slot_state_question_parked_stamps_park_onset(spoke_repo: Path, tmp_path: Path) -> None:
-    # A permission/question park (no gate tag) still gets an onset stamp — the false-fire
-    # window is structural to every park type, not just the PLAN gate the incident hit.
-    statedir = tmp_path / "afk-state"
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    (pd / "session.jsonl").write_text(
-        json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n"
-    )
+def test_slot_state_question_parked_stamps_park_onset(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    # A question park (no gate tag, the agent reads `working` while its ask blocks) still gets an
+    # onset stamp -- the false-fire window is structural to every park type, not just the PLAN gate.
+    orca_park(orca_bin, spoke_repo, question="Which store?\n  - Redis: fast")
 
-    result = _call(
-        f"slot_state '{spoke_repo}' 5",
-        env={
-            "AFK_STATE_DIR": str(statedir),
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "AFK_NOW": "1700000000",
-        },
-    )
+    result = _slot(spoke_repo, tmp_path)
 
     assert result.stdout.strip() == "waiting", result.stdout + result.stderr
-    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1700000000"
+    assert (tmp_path / "afk-state" / "park-onset-5.epoch").read_text().strip() == "1700000000"
 
 
-# ── #301: a DEAD agent is a crash, not a park — slot_state must not read `waiting` ──
-#
-# tmux scrollback and git tags OUTLIVE the agent. When a reboot kills claude but the pane
-# survives (bare shell), the dialog claude last rendered is still captured and any gate/<issue>
-# tag is still at the tip — so every waiting signal still fires. Before #301 slot_state read that
-# as `waiting`, the answer lane tried to inject into the shell (ST1 now refuses, but every tick
-# fired a spurious "answer did not register — escalating"), and recover_dead_panes SKIPPED the
-# `waiting` state so the crash was never revived. The gate/<issue> case is the exact #296/#299
-# shape: a git tag is the most durable phantom-park source there is.
+# ── slot_state classifies a park from Orca alone (#365) ──
+# A park is an inbox `question` (a PLAN gate or any worker `ask`; the agent reads `working` while
+# it blocks) or the agent `waiting` on a permission dialog. A gate/<n> tag is the durable record
+# and tmux scrollback no longer exists, so neither can make a park, and an `exited` worker never
+# reads `waiting` (#301).
 
 
-def test_slot_state_gate_parked_dead_agent_is_not_waiting(spoke_repo: Path, tmp_path: Path) -> None:
-    """The #296/#299 shape: gate/<issue> at the tip, but the agent is gone."""
-    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    (pd / "session.jsonl").write_text(
-        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}})
-        + "\n"
-    )
-    fake_bin = _dead_agent_bin(tmp_path, spoke_repo)
+def test_slot_state_gate_tag_with_a_working_agent_and_empty_inbox_is_busy(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    # Agent state alone never classifies a gate park: no inbox question, no park.
+    _tag_gate_at_head(spoke_repo, 5)
+    orca_park(orca_bin, spoke_repo, state="working")
 
-    result = _call(
-        f"slot_state '{spoke_repo}' 5",
-        env={
-            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_NOW": "1700000000",
-        },
-    )
+    result = _slot(spoke_repo, tmp_path)
 
-    assert result.stdout.strip() != "waiting", (
-        "a gate tag that outlived its agent is a crash, not a park — reading it `waiting` makes "
-        f"the answer lane serve a dead shell and hides it from recover_dead_panes: {result.stdout}"
-    )
+    assert result.stdout.strip() == "busy", result.stdout + result.stderr
 
 
-def test_slot_state_permission_dead_agent_is_not_waiting(spoke_repo: Path, tmp_path: Path) -> None:
-    """A stale permission dialog in a dead pane's scrollback must not read as a live park."""
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    jsonl = pd / "session.jsonl"
-    jsonl.write_text(json.dumps(_bash_tool_record("git reset -q")) + "\n")
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    fake_bin = _dead_agent_bin(tmp_path, spoke_repo, capture=_PERMISSION_PROMPT)
+def test_slot_state_inbox_question_with_a_working_agent_is_waiting(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    orca_park(orca_bin, spoke_repo, question="Ship it?", state="working")
 
-    result = _call(
-        f"slot_state '{spoke_repo}' 5",
-        env={
-            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_NOW": "1000000000",
-        },
-    )
+    result = _slot(spoke_repo, tmp_path)
 
-    assert result.stdout.strip() != "waiting", (
-        f"a permission dialog left in a crashed pane's scrollback is not a live park: {result.stdout}"
-    )
+    assert result.stdout.strip() == "waiting", result.stdout + result.stderr
 
 
-def test_slot_state_gate_parked_live_agent_stays_waiting(spoke_repo: Path, tmp_path: Path) -> None:
-    """Preservation: a gate-parked spoke whose agent IS alive still classifies `waiting`."""
-    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    (pd / "session.jsonl").write_text(
-        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}})
-        + "\n"
-    )
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    (fake_bin / "tmux").write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
-    )
-    (fake_bin / "tmux").chmod(0o755)
-    _agent_ps_stub(fake_bin, agent_alive=True)
+def test_slot_state_permission_dialog_is_waiting_and_names_its_command(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    orca_park(orca_bin, spoke_repo, state="waiting", tool="Bash", tool_input="git reset -q")
 
-    result = _call(
-        f"slot_state '{spoke_repo}' 5",
-        env={
-            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_NOW": "1700000000",
-        },
+    state = _slot(spoke_repo, tmp_path)
+    command = _call(f"extract_pending_command '{spoke_repo}'")
+
+    assert state.stdout.strip() == "waiting", state.stdout + state.stderr
+    assert command.stdout.strip() == "git reset -q"
+
+
+@pytest.mark.parametrize(
+    "park",
+    [
+        pytest.param({"question": "PLAN: do the thing"}, id="question"),
+        pytest.param(
+            {"state": "waiting", "tool": "Bash", "tool_input": "git reset -q"}, id="permission"
+        ),
+    ],
+)
+def test_slot_state_exited_worker_with_a_lingering_park_is_not_waiting(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path, park: dict[str, str]
+) -> None:
+    # The #296/#299/#301 shape: the gate tag and the park signal outlived the worker.
+    _tag_gate_at_head(spoke_repo, 5)
+    orca_park(orca_bin, spoke_repo, liveness="exited", **park)
+
+    result = _slot(spoke_repo, tmp_path)
+
+    assert result.stdout.strip() != "waiting", result.stdout + result.stderr
+
+
+def test_slot_state_gate_parked_live_worker_stays_waiting(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    _tag_gate_at_head(spoke_repo, 5)
+    orca_park(orca_bin, spoke_repo, question="PLAN: do the thing", liveness="live")
+
+    result = _slot(spoke_repo, tmp_path)
+
+    assert result.stdout.strip() == "waiting", result.stdout + result.stderr
+
+
+def test_slot_state_is_busy_when_orca_answers_nothing(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    # Absence is not evidence (AFK principle 6): every Orca read failing is never reap/blocked.
+    _tag_gate_at_head(spoke_repo, 5)
+    down = [{"rc": 1, "out": "", "stderr": "orca: runtime_unavailable"}]
+    orca_scenario(
+        orca_bin,
+        {"worktree ps": down, "orchestration worker-list": down, "orchestration check": down},
     )
 
-    assert result.stdout.strip() == "waiting", (
-        f"a live agent parked at the gate is a genuine park: {result.stdout}{result.stderr}"
-    )
+    result = _slot(spoke_repo, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "busy", result.stdout + result.stderr
 
 
-def test_spoke_still_parked_is_false_for_a_dead_agent(spoke_repo: Path, tmp_path: Path) -> None:
-    """_spoke_still_parked drives _reap_or_resume: a dead agent showing a stale dialog must read
+def test_slot_state_never_touches_tmux(spoke_repo: Path, tmp_path: Path) -> None:
+    bindir = tmp_path / "fbin"
+    bindir.mkdir()
+    env = install_orca_stub(bindir)
+    forbidden = install_forbidden_stubs(bindir)
+    orca_park(bindir, spoke_repo, question="Ship it?")
+
+    result = _slot(spoke_repo, tmp_path, **env, PATH=f"{bindir}:{os.environ['PATH']}")
+
+    assert result.stdout.strip() == "waiting", result.stdout + result.stderr
+    assert forbidden.read_text() == "", "slot_state must not call tmux"
+
+
+def test_spoke_still_parked_is_false_for_an_exited_worker(spoke_repo: Path, orca_bin: Path) -> None:
+    """_spoke_still_parked drives _reap_or_resume: an exited worker's lingering dialog must read
     NOT parked, so the reaper revives it instead of routing it back to the answerer (#246)."""
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    (pd / "session.jsonl").write_text(json.dumps(_bash_tool_record("git reset -q")) + "\n")
-    fake_bin = _dead_agent_bin(tmp_path, spoke_repo, capture=_PERMISSION_PROMPT)
-
-    result = _call(
-        f"_spoke_still_parked '{spoke_repo}' 5 && echo PARKED || echo NOT_PARKED",
-        env={
-            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        },
+    orca_park(
+        orca_bin,
+        spoke_repo,
+        state="waiting",
+        tool="Bash",
+        tool_input="git reset -q",
+        liveness="exited",
     )
 
-    assert result.stdout.strip() == "NOT_PARKED", (
-        "a dead agent has no live park to service — _spoke_still_parked must fail toward "
-        f"'moved on' so the reaper revives rather than re-answers: {result.stdout}{result.stderr}"
-    )
+    result = _call(f"_spoke_still_parked '{spoke_repo}' 5 && echo PARKED || echo NOT_PARKED")
+
+    assert result.stdout.strip() == "NOT_PARKED", result.stdout + result.stderr
+
+
+def test_spoke_moved_on_is_false_when_orca_cannot_say(spoke_repo: Path, orca_bin: Path) -> None:
+    # A failed read is not "moved on": an ambiguous probe never drops a real escalation.
+    down = [{"rc": 1, "out": "", "stderr": "down"}]
+    orca_park(orca_bin, spoke_repo, question="q", extra={"orchestration check": down})
+
+    result = _call(f"_spoke_moved_on '{spoke_repo}' 'q' m_q && echo MOVED || echo STILL")
+
+    assert result.stdout.strip() == "STILL", result.stdout + result.stderr
 
 
 def test_stamp_park_onset_epoch_once_is_idempotent(tmp_path: Path) -> None:
@@ -1022,39 +666,6 @@ def test_clear_progress_state_drops_park_onset(tmp_path: Path) -> None:
     _call("_clear_progress_state", env={"AFK_STATE_DIR": str(statedir)})
 
     assert not (statedir / "park-onset-5.epoch").exists()
-
-
-# subtask 4: the inject-verify budget default widened 20 -> 60 ──
-
-
-def test_inject_verify_default_budget_is_60(spoke_repo: Path, tmp_path: Path) -> None:
-    # A slow first token after submit must not read as "did not register" (which fed a false
-    # escalation #3 then made sticky). Drive _transcript_advanced against a transcript that
-    # never advances with an instant fake `sleep` that just counts calls: at poll=1 the loop
-    # sleeps `budget` times, so the default budget shows up as 60 one-second polls.
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke_repo)
-    jsonl = pd / "session.jsonl"
-    jsonl.write_text("{}\n")
-    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    sleeps = fake_bin / "sleeps.log"
-    (fake_bin / "sleep").write_text(f'#!/usr/bin/env bash\necho x >> "{sleeps}"\nexit 0\n')
-    (fake_bin / "sleep").chmod(0o755)
-
-    result = _call(
-        f"_transcript_advanced '{spoke_repo}' 1000000000; echo RC=$?",
-        env={
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_INJECT_POLL_SECONDS": "1",
-        },
-    )
-
-    assert result.stdout.strip().splitlines()[-1] == "RC=1", result.stdout + result.stderr
-    count = sleeps.read_text().count("x") if sleeps.exists() else 0
-    assert count == 60, f"default inject-verify budget must be 60s (60 one-second polls): {count}"
 
 
 # subtask 5: classify_permission tightening (find/-exec, chmod +x, bare pytest) ──
@@ -1133,11 +744,12 @@ def test_read_gate_artifact_caps_at_4000_chars_not_bytes(spoke_repo: Path) -> No
     )
 
 
-def test_broker_gate_route_prefers_artifact_over_transcript(
-    spoke_repo: Path, tmp_path: Path
+def test_broker_gate_route_prefers_artifact_over_inbox_question(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     prompt_log = tmp_path / "prompt.log"
     env = _gate_broker_env(spoke_repo, tmp_path, prompt_log=prompt_log)
+    orca_park(orca_bin, spoke_repo, question="INBOX PLAN prose")
     (spoke_repo / ".ai-toolkit").mkdir()
     (spoke_repo / ".ai-toolkit" / "gate-5.md").write_text("ARTIFACT PLAN: the real plan\n")
     _tag_gate_at_head(spoke_repo, 5)
@@ -1149,23 +761,24 @@ def test_broker_gate_route_prefers_artifact_over_transcript(
     assert "ARTIFACT PLAN: the real plan" in prompt, (
         "the broker must feed the reasoner the scripted artifact plan"
     )
-    assert "TRANSCRIPT PLAN prose" not in prompt, (
-        "the artifact must REPLACE transcript extraction when present"
+    assert "INBOX PLAN prose" not in prompt, (
+        "the artifact must REPLACE the inbox question when present"
     )
 
 
-def test_broker_gate_route_falls_back_to_transcript_without_artifact(
-    spoke_repo: Path, tmp_path: Path
+def test_broker_gate_route_falls_back_to_the_inbox_question_without_artifact(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     prompt_log = tmp_path / "prompt.log"
     env = _gate_broker_env(spoke_repo, tmp_path, prompt_log=prompt_log)
+    orca_park(orca_bin, spoke_repo, question="INBOX PLAN prose")
     _tag_gate_at_head(spoke_repo, 5)  # no artifact written
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert "TRANSCRIPT PLAN prose" in prompt_log.read_text(), (
-        "with no artifact the transcript fallback must stay intact"
+    assert "INBOX PLAN prose" in prompt_log.read_text(), (
+        "with no artifact the inbox question must stay the plan the reasoner sees"
     )
 
 
@@ -1407,21 +1020,17 @@ def test_reconciler_cold_start_rebuilds_one_lossy_record(spoke_repo: Path, tmp_p
 
 
 def test_slot_state_question_park_records_a_parked_transition_with_an_episode(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # A live question park records a VISIBLE `parked` transition carrying the episode key the broker's
     # lane events use (via _gb_episode_key), so the watchdog's episode-keyed service reads go live.
     statedir = tmp_path / "afk-state"
-    projects = tmp_path / "projects"
-    _write_transcript(
-        projects, spoke_repo, [_ask_record("Ship it?", [("yes", "ship"), ("no", "hold")])]
-    )
+    orca_park(orca_bin, spoke_repo, question="Ship it?\n  - yes: ship\n  - no: hold")
 
     result = _call(
         f"slot_state '{spoke_repo}' 5",
         env={
             "AFK_STATE_DIR": str(statedir),
-            "CLAUDE_PROJECTS_DIR": str(projects),
             "AFK_NOW": "1700000000",
         },
     )
@@ -1442,7 +1051,6 @@ def test_slot_state_question_park_records_a_parked_transition_with_an_episode(
         "_gb_episode_key 5",
         env={
             "AFK_STATE_DIR": str(statedir),
-            "CLAUDE_PROJECTS_DIR": str(projects),
             "AFK_NOW": "1700000000",
         },
     ).stdout.strip()

@@ -7,7 +7,7 @@ spokes:
   - issue: 299
     slug: land
     initial:
-      agent_alive: true
+      liveness: live
 timeline:
   - { t: 0, spoke: 299, do: push }
   - { t: 10, spoke: 299, do: ready }

@@ -321,3 +321,65 @@ def stub_env(bindir: Path, base: dict[str, str] | None = None) -> dict[str, str]
     env = dict(base if base is not None else os.environ)
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     return env
+
+
+def orca_park(
+    bindir: Path,
+    wt: Path,
+    *,
+    question: str | None = None,
+    qid: str = "m_q",
+    state: str = "working",
+    tool: str | None = None,
+    tool_input: str | None = None,
+    liveness: str = "live",
+    handle: str = "term_w",
+    dispatch: str = "ctx_1",
+    extra: dict | None = None,
+) -> None:
+    """Script the Orca replies the drain reads for ONE spoke at `wt` (replaces the scenario).
+
+    `state` is the agent state in `worktree ps` (`waiting` + `tool`/`tool_input` is a permission
+    dialog); `question` is an unread inbox `question` from the spoke's terminal (a PLAN gate or any
+    worker `ask`; the agent reads `working` meanwhile); `liveness` is the worker-list verdict.
+    `extra` merges more canned replies keyed like `install_orca_stub`'s scenario.
+    """
+    agent: dict = {"state": state, "stateStartedAt": 1_000}
+    if tool:
+        agent.update(toolName=tool, toolInput=tool_input or "")
+    messages = (
+        [
+            {
+                "id": qid,
+                "type": "question",
+                "from_handle": handle,
+                "body": question,
+                "created_at": 1_000,
+            }
+        ]
+        if question
+        else []
+    )
+    worker = {
+        "dispatchId": dispatch,
+        "taskId": "task_1",
+        "agentTerminalHandle": handle,
+        "resource": {"worktreeId": f"stub-repo::{wt}"},
+        "projection": {"liveness": {"verdict": liveness}},
+    }
+    orca_scenario(
+        bindir,
+        {
+            "worktree ps": [
+                {"out": ok_reply({"worktrees": [{"path": str(wt), "agents": [agent]}]})}
+            ],
+            "orchestration worker-list": [{"out": ok_reply({"workers": [worker]})}],
+            "orchestration check": [{"out": ok_reply({"messages": messages})}],
+            **(extra or {}),
+        },
+    )
+
+
+def ok_reply(result: dict) -> dict:
+    """The `{ok: true, result}` envelope every `orca ... --json` success carries."""
+    return {"ok": True, "result": result}

@@ -11,7 +11,7 @@ one named invariant.
 
 Every afk false-fire was found by watching production for hours. This harness
 exercises the drain LOOP (the real `hub-afk.sh --once` tick) against a fake clock and
-scripted mock spokes, and asserts PRINCIPLES — not steps — over one explicit,
+scripted mock spokes (each backed by an Orca stub rebuilt from the World state at every step: agent state, worker liveness, inbox question), and asserts PRINCIPLES — not steps — over one explicit,
 append-only contract surface: the #300 transition log (spoke lifecycle). It never
 reads epochs, pane text, private functions, or log lines. A scenario changes only when a
 principle changes; a refactor of how state is COMPUTED never touches it.
@@ -28,11 +28,11 @@ spokes:
   - issue: <number>             # a mock spoke = a git worktree on feature/<issue>-<slug>
     slug: <name>
     truth:                      # scenario-declared ground truth the invariants read
-      agent: dead               # I5: the agent (claude) is gone
+      agent: dead               # I5: the agent is gone (worker exited)
       recovers: true            # I5: a dead agent must be recovered
       advances: true            # I4: an answered park must advance
     initial:
-      agent_alive: true         # ps shows a claude descendant (default true)
+      liveness: live            # the worker-list verdict: live | exited (default live)
 timeline:                       # steps, sorted by fake-clock `t` (seconds from t0)
   - { t: 0,   spoke: <n>, do: <verb> }
   - { t: 700, run: [drain] }    # run a REAL hub-afk.sh --once at AFK_NOW=t0+t
@@ -40,7 +40,8 @@ expect:
   violations: []                # invariant ids the REAL run should report (normally none)
 mutation:                       # AC5 negative control (optional)
   drop: [<transition/event>]    # withhold a scripted record (reintroduce inference)
-  env: { KEY: value }           # a seam override (e.g. AFK_SIM_PS_FORCE_ALIVE: "1")
+  report_live: true             # the stub reports a live worker for an exited one
+  env: { KEY: value }           # a seam override (extra env for the drain)
   expect_violation: <I2|I4|I5>  # the one invariant the mutation must redden
 ```
 
@@ -48,12 +49,12 @@ mutation:                       # AC5 negative control (optional)
 
 | verb | effect |
 |------|--------|
-| `park` | gate/<issue> tag + pane dialog + `parked` transition + park-onset epoch |
-| `answer` | the drain's service: a journal entry + `answer_delivered` |
+| `park` | gate/<issue> tag + unread Orca inbox question + `parked` transition + park-onset epoch |
+| `answer` | the drain's service: a journal entry + `answer_delivered`; the question is read |
 | `push` | `pushing` then `pushed` transitions |
 | `ready` | `ready/<issue>` tag + `ready` transition |
 | `commit` | advance the spoke's branch tip |
-| `kill_agent` | the agent dies; its launcher zsh keeps the pane alive (#301) |
+| `kill_agent` | the worker-list row reports `exited` (#301) |
 
 ## Scenario-authoring rules
 

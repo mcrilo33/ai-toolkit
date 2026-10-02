@@ -12,17 +12,17 @@ Design (issue #314):
      `_`-internals, or log-line greps.
   3. Black-box the drain through its existing seams: `AFK_NOW` (fake clock),
      `AFK_STATE_DIR` (state + log), the `*_CMD` / `WT_*` / `BATCH_PLAN` stubs, and a
-     PATH-shadowed tmux/gh/ps/claude. A mock spoke is a real git worktree whose
+     PATH-shadowed orca/gh/claude. A mock spoke is a real git worktree whose
      markers/transitions are scripted on the fake timeline — the real drain<->spoke
-     contract (tags + the log).
+     contract (tags + the log) — plus the Orca view of it (agent state, worker
+     liveness, inbox question), rebuilt from the World state at every timeline step.
   4. Scenarios are DATA. Each `fixtures/drain_scenarios/*.yaml` is initial state + a
      scripted timeline + the invariant it stresses. Adding coverage adds a file;
      the harness never changes. Every scenario also declares an optional `mutation`
      — a fault injected through a seam that must turn exactly its one invariant red
      (the AC5 negative control).
 
-macOS-only, exactly like the unit hub-afk suite: the drain reads transcript mtimes
-with BSD `stat -f %m` (#129). A non-C-locale / Linux CI job is #189/#194's remit.
+macOS-only, exactly like the unit hub-afk suite: the drain uses BSD `stat -f %m` (#129). A non-C-locale / Linux CI job is #189/#194's remit.
 """
 
 from __future__ import annotations
@@ -37,10 +37,11 @@ from pathlib import Path
 
 import pytest
 import yaml
+from _orca_stub import install_forbidden_stubs, install_orca_stub, ok_reply, orca_scenario
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin",
-    reason="hub-afk.sh requires BSD stat (-f %m) and the macOS tmux hub (#129)",
+    reason="hub-afk.sh requires BSD stat (-f %m) (#129)",
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -48,9 +49,6 @@ HUB_SCRIPTS = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
 HUB_AFK = HUB_SCRIPTS / "hub-afk.sh"
 TLOG_LIB = HUB_SCRIPTS / "transition-log.sh"
 SCENARIO_DIR = Path(__file__).parent / "fixtures" / "drain_scenarios"
-
-# The fake tmux/ps stubs advertise a per-spoke pane pid of 40000+issue with a
-# `claude` child at 50000+issue, so the #301 ancestor-walk resolves per spoke.
 
 # Wall-clock cap per real drain tick (see World.run_drain). Generous for
 # legitimate stubbed work; cuts a post-answer poll that would otherwise wait out a
@@ -68,8 +66,9 @@ class Spoke:
     issue: int
     slug: str
     path: Path
-    agent_alive: bool = True
-    pane_exists: bool = True
+    liveness: str = "live"  # the worker-list verdict: live | exited | unverifiable
+    state: str = "working"  # the agent state `orca worktree ps` reports
+    question: str | None = None  # an unread inbox `question` from the spoke's terminal
     truth: dict = field(default_factory=dict)
     episode: str = ""
 
@@ -84,10 +83,12 @@ class World:
     state_dir: Path = field(init=False)
     projects: Path = field(init=False)
     fake_bin: Path = field(init=False)
+    orca_bin: Path = field(init=False)
     home: Path = field(init=False)
     spokes: dict[int, Spoke] = field(default_factory=dict)
     env_extra: dict[str, str] = field(default_factory=dict)
     dropped: set[str] = field(default_factory=set)
+    report_live: bool = False  # mutation: the stub reports a live worker for an exited one
     t0: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -100,9 +101,11 @@ class World:
         self.state_dir = self.root / "state"
         self.projects = self.root / "projects"
         self.fake_bin = self.root / "bin"
+        self.orca_bin = self.root / "orca-bin"
         self.home = self.root / "home"
-        for d in (self.state_dir, self.projects, self.fake_bin, self.home):
+        for d in (self.state_dir, self.projects, self.fake_bin, self.orca_bin, self.home):
             d.mkdir(parents=True, exist_ok=True)
+        self._orca_env = install_orca_stub(self.orca_bin)
         self._init_git()
         self._write_stubs()
         self._write_window_state()
@@ -147,13 +150,6 @@ class World:
     def _write_stubs(self) -> None:
         """Shadow every real external the tick would touch with a scripted stub."""
         b = self.fake_bin
-        # tmux: list-panes maps each live spoke's pane to its worktree; the
-        # submitting Enter appends a type:"user" record (the real submit's proof of
-        # delivery); display-message advertises the pane pid; everything else no-ops.
-        (b / "tmux").write_text(_TMUX_STUB.format(state=self.state_dir))
-        # ps: only the exact #301 probe form is answered from a per-spoke table;
-        # every other ps execs the real one (hub-afk reads other -o forms).
-        (b / "ps").write_text(_PS_STUB.format(state=self.state_dir))
         # gh / claude: never reached with real args in a stubbed tick; no-op.
         (b / "gh").write_text("#!/usr/bin/env bash\nexit 0\n")
         (b / "claude").write_text("#!/usr/bin/env bash\nexit 0\n")
@@ -181,13 +177,16 @@ class World:
             f.write_text(f"{shebang}\n{_WARM_GUARD}\n{body}")
             f.chmod(0o755)
         self._warm_stubs()
+        subprocess.run(
+            ["orca", "--version"], env=self.env(self.t0), capture_output=True, check=False
+        )
 
     def _warm_stubs(self) -> None:
         """Exec every stub once, concurrently, before any tick (#374).
 
         A freshly written script's FIRST exec can take seconds under xdist (macOS vets each
         new executable) while a re-exec takes ~10ms. A tick is wall-clock-capped, so cold
-        tmux/ps stubs could burn the cap before the drain reached its recovery lane. The
+        gh/claude stubs could burn the cap before the drain reached its recovery lane. The
         `_WARM_GUARD` makes the warm-up exec side-effect-free and leaves a marker per stub."""
         warmed = self.root / "warmed"
         warmed.mkdir(exist_ok=True)
@@ -209,39 +208,63 @@ class World:
     # -- spokes -------------------------------------------------------------
 
     def add_spoke(
-        self, issue: int, slug: str, *, agent_alive: bool = True, truth: dict | None = None
+        self, issue: int, slug: str, *, liveness: str = "live", truth: dict | None = None
     ) -> Spoke:
         path = self.root / f"spoke-{issue}"
         branch = f"{issue}-{slug}"
         self._git("worktree", "add", "-q", "-b", branch, str(path), "main", cwd=self.main)
         self._git("commit", "-q", "--allow-empty", "-m", "spoke work", cwd=path)
-        spoke = Spoke(issue=issue, slug=slug, path=path, agent_alive=agent_alive, truth=truth or {})
+        spoke = Spoke(issue=issue, slug=slug, path=path, liveness=liveness, truth=truth or {})
         self.spokes[issue] = spoke
-        self._sync_pane_state(spoke)
+        self.sync_orca()
         return spoke
 
-    def _sync_pane_state(self, spoke: Spoke) -> None:
-        """Write the per-spoke ground-truth files the tmux/ps stubs read.
-
-        Two INDEPENDENT facts (#301): `pane_exists` — tmux still shows a pane (the
-        launcher `zsh` outlives the agent) — and `alive` — a `claude` descendant is
-        in the process tree. A dead agent is pane_exists=1, alive=0 (the #301 shape);
-        a gone pane is pane_exists=0 (the #290 dead-idle shape)."""
-        d = self.state_dir / "panes"
-        d.mkdir(exist_ok=True)
-        (d / f"{spoke.issue}.alive").write_text("1" if spoke.agent_alive else "0")
-        (d / f"{spoke.issue}.pane_exists").write_text("1" if spoke.pane_exists else "0")
-        (d / f"{spoke.issue}.path").write_text(str(spoke.path))
-        pane = d / f"{spoke.issue}.pane.txt"
-        if not pane.exists():
-            pane.write_text("")
+    def sync_orca(self) -> None:
+        """Rebuild the Orca stub's canned replies from the spokes' current state: the agent
+        state (`worktree ps`), the worker's liveness verdict (`worker-list`) and the unread
+        inbox question (`check`). An unrecorded worker is never a dead one (principle 6), so
+        liveness is what the scenario declares, never inferred from anything else."""
+        rows, workers, messages = [], [], []
+        for sp in self.spokes.values():
+            handle = f"term_{sp.issue}"
+            agent = {"state": sp.state, "stateStartedAt": self.t0}
+            rows.append({"path": str(sp.path), "agents": [agent]})
+            verdict = "live" if self.report_live else sp.liveness
+            workers.append(
+                {
+                    "dispatchId": f"ctx_{sp.issue}",
+                    "taskId": f"task_{sp.issue}",
+                    "agentTerminalHandle": handle,
+                    "resource": {"worktreeId": f"stub-repo::{sp.path}"},
+                    "projection": {"liveness": {"verdict": verdict}},
+                }
+            )
+            if sp.question:
+                messages.append(
+                    {
+                        "id": f"m_{sp.issue}",
+                        "type": "question",
+                        "from_handle": handle,
+                        "body": sp.question,
+                        "created_at": self.t0,
+                    }
+                )
+        orca_scenario(
+            self.orca_bin,
+            {
+                "worktree ps": [{"out": ok_reply({"worktrees": rows})}],
+                "orchestration worker-list": [{"out": ok_reply({"workers": workers})}],
+                "orchestration check": [{"out": ok_reply({"messages": messages})}],
+            },
+        )
 
     # -- env / runners ------------------------------------------------------
 
     def env(self, now: int) -> dict[str, str]:
         env = dict(os.environ)
         env.update(
-            PATH=f"{self.fake_bin}:{os.environ['PATH']}",
+            PATH=f"{self.fake_bin}:{self.orca_bin}:{os.environ['PATH']}",
+            **self._orca_env,
             HOME=str(self.home),
             AFK_NOW=str(now),
             AFK_STATE_DIR=str(self.state_dir),
@@ -264,8 +287,6 @@ class World:
             AFK_REVIEW_GATE="0",
             # Keep the drain's answer/inject/judge paths from spending CI budget on
             # retry/verify sleeps against the stubs (the fake clock only governs reads).
-            AFK_INJECT_VERIFY_SECONDS="3",
-            AFK_INJECT_POLL_SECONDS="1",
             AFK_INJECT_MENU_PAUSE="0",
             AFK_ANSWERER_TIMEOUT="10",
             AFK_JUDGE_TIMEOUT="5",
@@ -395,10 +416,6 @@ class World:
     def git(self, issue: int, *args: str) -> None:
         self._git(*args, cwd=self.spokes[issue].path)
 
-    def set_agent_alive(self, issue: int, alive: bool) -> None:
-        self.spokes[issue].agent_alive = alive
-        self._sync_pane_state(self.spokes[issue])
-
     # -- record readers (the assertion surface) -----------------------------
 
     def records(self, issue: int) -> list[dict]:
@@ -417,97 +434,6 @@ class World:
 # First line of every stub body: under `_warm_stubs` (AFK_SIM_WARM = a marker dir) the stub
 # records that it ran and exits, so the warm-up exec never executes the stub's real logic.
 _WARM_GUARD = r'[ -z "${AFK_SIM_WARM:-}" ] || { : > "$AFK_SIM_WARM/${0##*/}"; exit 0; }'
-
-_TMUX_STUB = r"""#!/usr/bin/env bash
-# Scripted tmux: reads per-spoke ground truth under {state}/panes/. The window index
-# IS the issue, so a pane target round-trips to a stable per-spoke pane pid
-# (40000+issue). A pane is listed while its window EXISTS (pane_exists=1) —
-# independent of agent liveness, since the launcher zsh outlives a dead claude (#301).
-panes_dir="{state}/panes"
-case "$1" in
-  list-panes)
-    for pf in "$panes_dir"/*.path; do
-      [ -f "$pf" ] || continue
-      iss="$(basename "$pf" .path)"
-      [ "$(cat "$panes_dir/$iss.pane_exists" 2>/dev/null)" = "1" ] || continue
-      printf 'afk:%s\t%s\n' "$iss" "$(cat "$pf")"
-    done
-    ;;
-  display-message)
-    tgt=""
-    while [ $# -gt 0 ]; do case "$1" in -t) shift; tgt="$1" ;; esac; shift; done
-    printf '%s\n' "$(( 40000 + ${{tgt##*:}} ))"
-    ;;
-  capture-pane)
-    tgt=""
-    while [ $# -gt 0 ]; do case "$1" in -t) shift; tgt="$1" ;; esac; shift; done
-    iss="${{tgt##*:}}"
-    for pf in "$panes_dir"/*.path; do
-      [ -f "$pf" ] || continue
-      if [ "$(cat "$pf")" = "$tgt" ]; then iss="$(basename "$pf" .path)"; break; fi
-    done
-    cat "$panes_dir/$iss.pane.txt" 2>/dev/null
-    ;;
-  send-keys)
-    # Model the two-keystroke submit: a literal `-l` paste is remembered, and the
-    # following Enter appends it as a type:"user" record to the pane's spoke transcript
-    # (what Claude Code writes on submit — the sole proof of delivery, #281), advancing
-    # the transcript mtime so the drain's inject-verification registers.
-    tgt=""; paste=""; mode=""; enter=""
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        -t) shift; tgt="$1" ;;
-        -l) mode="paste" ;;
-        --) : ;;
-        Enter) enter="1" ;;
-        *) [ "$mode" = "paste" ] && paste="$1" ;;
-      esac
-      shift
-    done
-    iss="${{tgt##*:}}"
-    pbuf="$panes_dir/$iss.paste"
-    [ "$mode" = "paste" ] && printf '%s' "$paste" > "$pbuf"
-    if [ -n "$enter" ]; then
-      wt="$(cat "$panes_dir/$iss.path" 2>/dev/null)"
-      [ -n "$wt" ] || exit 0
-      munged="$(printf '%s' "$wt" | sed 's/[^A-Za-z0-9]/-/g')"
-      jsonl="${{CLAUDE_PROJECTS_DIR}}/$munged/session.jsonl"
-      mkdir -p "$(dirname "$jsonl")" 2>/dev/null || true
-      if [ -s "$pbuf" ]; then
-        _AFK_TXT="$(cat "$pbuf")" python3 -c 'import json,os,sys; sys.stdout.write(json.dumps({{"type":"user","message":{{"content":[{{"type":"text","text":os.environ["_AFK_TXT"]}}]}}}},ensure_ascii=False)+chr(10))' >> "$jsonl" 2>/dev/null
-        : > "$pbuf"
-      else
-        printf '{{}}\n' >> "$jsonl"
-      fi
-    fi
-    ;;
-  *) : ;;
-esac
-exit 0
-"""
-
-_PS_STUB = r"""#!/usr/bin/env bash
-# #301 probe: answer only the exact -eo form; build a per-spoke table. A `claude`
-# child of pane pid 40000+issue exists iff that spoke's agent is alive.
-# AFK_SIM_PS_FORCE_ALIVE=1 makes the probe LIE (report a live agent for a dead one)
-# — the pre-#301 pane_current_command=zsh proxy, the #301 mutation seam.
-case "$*" in
-  "-eo pid=,ppid=,comm=")
-    for pe in "{state}"/panes/*.pane_exists; do
-      [ -f "$pe" ] || continue
-      [ "$(cat "$pe")" = "1" ] || continue
-      iss="$(basename "$pe" .pane_exists)"
-      ppid=$(( 40000 + iss )); apid=$(( 50000 + iss ))
-      printf '%s 1 -zsh\n' "$ppid"
-      if [ "$(cat "{state}/panes/$iss.alive" 2>/dev/null)" = "1" ] || [ "${{AFK_SIM_PS_FORCE_ALIVE:-0}}" = "1" ]; then
-        printf '%s %s claude\n' "$apid" "$ppid"
-      fi
-    done
-    printf '999 1 /Applications/Other.app/Contents/MacOS/claude\n'
-    ;;
-  *) exec /bin/ps "$@" ;;
-esac
-"""
 
 _LAND_STUB = r"""#!/usr/bin/env bash
 # Mimic worktree-land.sh's #300 records: landing (intent-first) -> landed, then rc 0
@@ -528,49 +454,15 @@ exit 0
 # --------------------------------------------------------------------- scenario ops
 
 
-def _seed_transcript(world: World, issue: int) -> None:
-    """A minimal parked transcript so extract_pending_question can read a question."""
-    slug = world.spokes[issue].slug
-    munged = _project_slug(world.spokes[issue].path)
-    d = world.projects / munged
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "session.jsonl").write_text(
-        json.dumps(
-            {
-                "type": "assistant",
-                "message": {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "name": "AskUserQuestion",
-                            "input": {"questions": [{"question": f"Proceed with {slug}?"}]},
-                        }
-                    ]
-                },
-            }
-        )
-        + "\n"
-    )
-
-
-def _project_slug(path: Path) -> str:
-    import re
-
-    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
-
-
-def _pane_text(world: World, issue: int, text: str) -> None:
-    (world.state_dir / "panes" / f"{issue}.pane.txt").write_text(text)
-
-
 # The declarative timeline verbs. Each mutates scripted ground truth (git tags, the
-# transition log, pane/agent state) OR runs a real drain tick.
+# transition log, the Orca-side agent/worker/inbox state) OR runs a real drain tick.
 def apply_step(world: World, step: dict, *, mutation: dict | None) -> None:
     now = world.t0 + int(step["t"])  # absolute fake-clock epoch for this step
     do = step.get("do")
     if do:
         assert "spoke" in step, f"step {step!r} has `do` but no `spoke`"
         _VERBS[do](world, int(step["spoke"]), now, step, mutation)
+    world.sync_orca()
     for actor in step.get("run", []):
         if actor == "drain":
             world.run_drain(now)
@@ -579,14 +471,11 @@ def apply_step(world: World, step: dict, *, mutation: dict | None) -> None:
 
 
 def _v_park(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
-    """A PLAN-gate park: a gate/<issue> tag at tip (slot_state=waiting, answer lane),
-    a live agent (pane + ps), a `parked` transition with a minted episode, and the
-    pre-stamped park-onset epoch."""
+    """A PLAN-gate park: a gate/<issue> tag at tip (slot_state=waiting, answer lane), an
+    unread inbox question from the spoke's terminal, a `parked` transition with a minted
+    episode, and the pre-stamped park-onset epoch."""
     spoke = world.spokes[issue]
-    _seed_transcript(world, issue)
-    # A PLAN-gate pane shows a plan awaiting approval — NOT a yes/no permission dialog
-    # (which would classify as the broker's permission lane, not the answer lane).
-    _pane_text(world, issue, "Here is my implementation plan for review.\nAwaiting gate approval.")
+    spoke.question = f"Proceed with {spoke.slug}?\nAwaiting gate approval."
     world.git(issue, "tag", "-f", f"gate/{issue}")
     spoke.episode = f"sig{issue}:{now}"
     world.write_epoch("park-onset", issue, now)
@@ -596,7 +485,9 @@ def _v_park(world: World, issue: int, now: int, step: dict, mutation: dict | Non
 def _v_answer(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
     """The drain services the park — SCRIPTED as the drain-authored records a real
     answer_pass writes: a decision-journal entry + an `answer_delivered` event. A
-    mutation `drop`s these to reintroduce the pre-#300 unrecorded service."""
+    mutation `drop`s these to reintroduce the pre-#300 unrecorded service. The question
+    leaves the inbox once read."""
+    world.spokes[issue].question = None
     world.write_journal(issue, now)
     world.event(
         issue,
@@ -623,8 +514,8 @@ def _v_commit(world: World, issue: int, now: int, step: dict, mutation: dict | N
 
 
 def _v_kill_agent(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
-    """#301: the agent (claude) dies but its launcher zsh keeps the pane alive."""
-    world.set_agent_alive(issue, False)
+    """#301: the agent dies; its worker-list row reports `exited` (the terminal may linger)."""
+    world.spokes[issue].liveness = "exited"
 
 
 _VERBS = {
@@ -709,9 +600,9 @@ def inv_answered_park_advances(world: World, scenario: dict) -> list[Violation]:
 
 def inv_dead_agent_never_injected(world: World, scenario: dict) -> list[Violation]:
     """I5 (#301): a spoke whose scenario declares the agent DEAD never receives an
-    inject (text into a dead pane executes as shell) and is instead recovered
+    inject (text into a dead terminal executes as shell) and is instead recovered
     (`revived`/`redispatched`); a live parked agent is serviced, never revived-as-dead
-    (principle 4: probe the real process, never a `zsh`/pane proxy)."""
+    (principle 4: probe the real process, never a proxy)."""
     out: list[Violation] = []
     for issue in _scenario_issues(scenario):
         agent = _spoke_truth(scenario, issue).get("agent")
@@ -725,7 +616,7 @@ def inv_dead_agent_never_injected(world: World, scenario: dict) -> list[Violatio
                         "I5",
                         issue,
                         f"#{issue} agent was DEAD but received inject events "
-                        f"{injected} — injecting into a dead pane runs prose as shell "
+                        f"{injected} — injecting into a dead terminal runs prose as shell "
                         f"in a worktree (principle 4).",
                     )
                 )
@@ -784,7 +675,7 @@ def _build_world(root: Path, scenario: dict, *, mutation: dict | None = None) ->
         world.add_spoke(
             int(s["issue"]),
             s.get("slug", "feat"),
-            agent_alive=s.get("initial", {}).get("agent_alive", True),
+            liveness=s.get("initial", {}).get("liveness", "live"),
             truth=s.get("truth", {}),
         )
     return world
@@ -796,6 +687,7 @@ def _apply_mutation_env(world: World, mutation: dict) -> None:
     product code — so exactly one invariant must redden (the AC5 negative control)."""
     if mutation.get("land_fail"):
         world.env_extra["AFK_LAND_STUB_FAIL"] = "1"
+    world.report_live = bool(mutation.get("report_live"))
     world.dropped.update(mutation.get("drop", []))
     world.env_extra.update(mutation.get("env", {}))
 
@@ -883,3 +775,17 @@ def test_world_stubs_are_warmed_before_any_tick(tmp_path: Path) -> None:
     stubs = {f.name for f in world.fake_bin.iterdir()}
     warmed = {f.name for f in (tmp_path / "warmed").glob("*")}
     assert stubs and warmed == stubs, f"stubs never warmed: {sorted(stubs - warmed)}"
+
+
+def test_drain_tick_never_touches_tmux_or_a_git_worktree_verb(tmp_path: Path) -> None:
+    """#365: the drain reads and recovers spokes through Orca only. A full tick over the
+    #301 scenario (the recovery path, formerly tmux-driven) runs with forbidden tmux/code/
+    `git worktree add|remove|prune` stubs on PATH; their log must stay empty."""
+    scenario = next(s for s in _SCENARIOS if s["id"].startswith("301-"))
+    world = _build_world(tmp_path, scenario)
+    log = install_forbidden_stubs(world.fake_bin)
+
+    _run_timeline(world, scenario, mutation=None)
+
+    assert {t["to"] for t in world.transitions(301)} & {"revived", "redispatched"}
+    assert log.read_text() == ""
