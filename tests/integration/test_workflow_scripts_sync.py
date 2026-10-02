@@ -40,9 +40,6 @@ WORKTREE_SCRIPTS = (
     "worktree-gh-lib.sh",
     "spoke-push.sh",
     "spoke-ready.sh",
-    # The dead-pane relaunch script (issue #233) ships alongside its spoke siblings so a
-    # crashed spoke can be relaunched with its identity + ledger + lifecycle span intact.
-    "spoke-relaunch.sh",
     "telemetry-ingest-spoke.sh",
     "worktree-quick.sh",
     # The land tail's conditional post-land sweep worker (issue #124) — must
@@ -76,13 +73,10 @@ for _gb_mod in ("markers", "detect", "classify", "danger", "answerer", "permissi
     SOURCES[f"gate-broker-{_gb_mod}.sh"] = HUB_SCRIPTS_DIR / f"gate-broker-{_gb_mod}.sh"
 # The hardened tmux-inject primitive (issue #251) MUST install alongside gate-broker.sh: the
 # broker now sources it as a co-located sibling ($SCRIPT_DIR/hub-inject.sh) for the ONE
-# inject_and_verify both the /afk answerer and the hub-watchdog share — if it is absent from
+# inject_and_verify the /afk answerer uses — if it is absent from
 # .ai-toolkit/scripts/ every synced /afk drain fails at startup, unable to resolve
 # inject_and_verify / approve_permission / _spoke_pane_target.
 SOURCES["hub-inject.sh"] = HUB_SCRIPTS_DIR / "hub-inject.sh"
-# The tier-2 supervision daemon (issue #251) ships so `/afk` / the hub skill can arm it in a
-# synced target like its hub-tool siblings — it cross-checks the drain and files afk-defects.
-SOURCES["hub-watchdog.sh"] = HUB_SCRIPTS_DIR / "hub-watchdog.sh"
 SOURCES["batch-plan.sh"] = HUB_SCRIPTS_DIR / "batch-plan.sh"
 # The hub-side agent dispatcher (issue #245) ships alongside its siblings so the
 # land/hub skills' `.ai-toolkit/scripts/hub-agent.sh` references resolve in a

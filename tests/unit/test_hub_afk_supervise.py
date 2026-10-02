@@ -1,6 +1,6 @@
 """Mirror tests for hub-afk-supervise.sh (issue #307 split).
 
-The runtime-SUPERVISION lane extracted from hub-afk.sh: the sleep inhibitor, the watchdog +
+The runtime-SUPERVISION lane extracted from hub-afk.sh: the watchdog +
 respawn, the self-update / self-deploy protocol, the respawn crash-loop guard + kill-wedged,
 and the restart-survival re-arm. A behaviour-neutral MOVE, so these tests assert the
 functions are reachable through the entry and physically located in the module file — plus
@@ -19,7 +19,6 @@ MODULE = "hub-afk-supervise.sh"
 SUPERVISE_FUNCTIONS = [
     "watchdog_loop",
     "watchdog_tick",
-    "_afk_arm_inhibitor",
     "_afk_heartbeat_wedged",
     "_afk_exec_self_copy",
     "_afk_self_deploy",
@@ -27,7 +26,6 @@ SUPERVISE_FUNCTIONS = [
     "_afk_selfupdate_source_scripts",
     "_afk_respawn_allowed",
     "afk_reconcile",
-    "_afk_capture_hang_forensics",
 ]
 
 ALL_MODULES = ("land", "dispatch", "arm", "supervise", "recover", "state")

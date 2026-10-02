@@ -2,7 +2,7 @@
 
 The RECOVER lane extracted from hub-afk.sh: reap / revive / nudge / dead-pane / finish-up --
 crash-resume + liveness probes, the ledger completion signal, the #255 nudge counter, the
-resume/nudge/finish-up prompts + resume/respawn, hang-forensics, the #241 revive-first lane,
+resume/nudge/finish-up prompts + resume/respawn, the #241 revive-first lane,
 _reap_or_resume, the auth/net reap-prep probes, reap_pass, and recover_dead_panes. A
 behaviour-neutral MOVE, so these tests assert the functions are reachable through the entry
 and physically located in the module file.
