@@ -307,10 +307,10 @@ class TestWorktreeLandSpoke:
         _git(wt, "tag", "ready/9")
         _git(wt, "push", "-q", "origin", "ready/9")
 
-        # Stub gh so the issue-close is a no-op; skip the suite.
+        # Stub `code`; the green-CI `gh` below also answers the issue-close as a no-op.
         bindir = tmp_path / "bin"
         bindir.mkdir(exist_ok=True)
-        for name in ("gh", "code"):
+        for name in ("code",):
             stub = bindir / name
             stub.write_text("#!/bin/sh\nexit 0\n")
             stub.chmod(0o755)
@@ -378,7 +378,7 @@ class TestWorktreeScriptSpans:
 
         bindir = tmp_path / "bin"
         bindir.mkdir(exist_ok=True)
-        for name in ("gh", "code"):
+        for name in ("code",):
             stub = bindir / name
             stub.write_text("#!/bin/sh\nexit 0\n")
             stub.chmod(0o755)

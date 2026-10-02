@@ -535,8 +535,11 @@ def test_observe_captures_command_output_to_capfile(repo: Path, tmp_path: Path) 
 def _make_pytest_stub(bindir: Path, body: str) -> None:
     """Install a `pytest` stub: answers `--help`, else runs `body` then exits 0."""
     bindir.mkdir(parents=True, exist_ok=True)
+    # The stub leaves STUB_RAN behind so a "passes" test can prove the gate really ran it
+    # (an unmapped diff runs nothing since #378, which would pass those tests vacuously).
     (bindir / "pytest").write_text(
-        f'#!/bin/sh\ncase "$1" in --help|-h) echo "usage: pytest"; exit 0 ;; esac\n{body}\nexit 0\n'
+        '#!/bin/sh\ncase "$1" in --help|-h) echo "usage: pytest"; exit 0 ;; esac\n'
+        f'echo ran >> "{bindir}/STUB_RAN"\n{body}\nexit 0\n'
     )
     (bindir / "pytest").chmod(0o755)
 
@@ -602,6 +605,7 @@ def test_clean_run_passes(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr  # no trip on a clean run
+    assert (tmp_path / "bin" / "STUB_RAN").exists()  # ... and the gate really ran the stub
 
 
 def test_hermetic_tmpdir_does_not_trip(repo: Path, tmp_path: Path) -> None:
@@ -619,6 +623,7 @@ def test_hermetic_tmpdir_does_not_trip(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "bin" / "STUB_RAN").exists()  # the gate really ran the stub
 
 
 def test_known_gitdir_scenario_passes_through(repo: Path, tmp_path: Path) -> None:
@@ -637,6 +642,7 @@ def test_known_gitdir_scenario_passes_through(repo: Path, tmp_path: Path) -> Non
     )
 
     assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "bin" / "STUB_RAN").exists()  # the gate really ran the stub
 
 
 def test_live_spoke_commit_mid_gate_passes_and_survives(
