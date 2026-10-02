@@ -75,7 +75,7 @@ BASE_START="$(wt_base_start_point "$REPO_ROOT")" \
 
 # --- create the worktree through Orca ----------------------------------------
 echo "→ creating worktree  $SLUG (via Orca, from $BASE_START)"
-_wt_probe() { orca_worktree_by_name "$SLUG"; }
+_wt_probe() { orca_worktree_by_name "$SLUG" "path:$REPO_ROOT"; }
 orca_call_settled _wt_probe worktree create --repo "path:$REPO_ROOT" --name "$SLUG" --setup skip \
   --no-parent --base-branch "$BASE_START" \
   || wt_die "orca worktree create failed: ${ORCA_ERR:-$ORCA_OUT}"

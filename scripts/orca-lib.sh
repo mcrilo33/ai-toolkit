@@ -44,10 +44,11 @@ orca_run_id() {
   [ -n "$id" ] && printf '%s\n' "$id"
 }
 
-# orca_worktree_by_name <name> -> rc 0 and ORCA_OUT shaped like a `worktree create` reply when a
-# worktree with that display name is listed. Read-only: the settle probe for `worktree create`.
+# orca_worktree_by_name <name> [repo-selector] -> rc 0 and ORCA_OUT shaped like a `worktree create`
+# reply when a worktree with that display name is listed (the listing spans every repo, so pass the
+# selector). Read-only: the settle probe for `worktree create`.
 orca_worktree_by_name() {
-  orca_json worktree list || return 1
+  orca_json worktree list ${2:+--repo "$2"} || return 1
   ORCA_OUT="$(printf '%s' "$ORCA_OUT" | jq -c --arg n "$1" \
     '[.result.worktrees[]? | select(.displayName == $n)] | .[0] // empty | {ok: true, result: {worktree: .}}')"
   [ -n "$ORCA_OUT" ]

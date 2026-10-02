@@ -220,7 +220,7 @@ BASE_START="$(wt_base_start_point "$REPO_ROOT")" \
 ISSUE_ARGS=()
 [[ "$ISSUE" =~ ^[0-9]+$ ]] && ISSUE_ARGS=(--issue "$ISSUE")
 echo "→ creating worktree  $WT_NAME (via Orca, from $BASE_START)"
-_wt_probe() { orca_worktree_by_name "$WT_NAME"; }
+_wt_probe() { orca_worktree_by_name "$WT_NAME" "path:$REPO_ROOT"; }
 orca_call_settled _wt_probe worktree create --repo "path:$REPO_ROOT" --name "$WT_NAME" --setup skip \
   --no-parent --base-branch "$BASE_START" --comment "$BRANCH ($MODE)" ${ISSUE_ARGS[@]+"${ISSUE_ARGS[@]}"} \
   || wt_die "orca worktree create failed: ${ORCA_ERR:-$ORCA_OUT}"

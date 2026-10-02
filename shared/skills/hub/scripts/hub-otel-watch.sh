@@ -69,21 +69,23 @@ _spoke_worktree_paths() {
       done
 }
 
-# _agent_paths -> the path of every worktree Orca reports a live agent in, one per line (empty
-# when orca is absent or unreachable). Split out so spoke_agent_live is testable with no real Orca.
+# _agent_paths -> the path of every worktree Orca reports a live agent in, one per line. rc 2 when
+# Orca did not answer: "unknown" is never "idle" (AFK principle 6). Split out so spoke_agent_live
+# is testable with no real Orca.
 _agent_paths() {
-  orca_json worktree ps --limit 500 || return 0
+  orca_json worktree ps --limit 500 || return 2
   printf '%s' "$ORCA_OUT" | jq -r '.result.worktrees[]? | select((.agents // []) | length > 0) | .path' 2>/dev/null || true
 }
 
 # spoke_agent_live -> rc 0 when at least one spoke worktree has a live agent per Orca (i.e. a
-# spoke is running), else rc 1. Paths are canonicalized on both sides (wt_realpath, falling
-# back to the literal when a path can't be resolved) so a symlinked worktree root still
-# correlates. Best-effort: no spokes, no agents, or no orca all read as "no spoke live".
+# spoke is running), rc 1 when none is, rc 2 when Orca did not answer. Paths are canonicalized
+# on both sides (wt_realpath, falling back to the literal when a path can't be resolved) so a
+# symlinked worktree root still correlates.
 spoke_agent_live() {
-  local spokes canon="" s agent rp
+  local spokes canon="" s agent rp agents
   spokes="$(_spoke_worktree_paths)"
   [ -n "$spokes" ] || return 1
+  agents="$(_agent_paths)" || return 2
   while IFS= read -r s; do
     [ -n "$s" ] || continue
     rp="$(wt_realpath "$s")"; canon+="${rp:-$s}"$'\n'
@@ -92,7 +94,7 @@ spoke_agent_live() {
     [ -n "$agent" ] || continue
     rp="$(wt_realpath "$agent")"; rp="${rp:-$agent}"
     grep -qxF "$rp" <<<"$canon" && return 0
-  done < <(_agent_paths)
+  done <<<"$agents"
   return 1
 }
 
@@ -191,16 +193,18 @@ _watch_reexec() {
 # _watch_loop -> tick every HUB_OTEL_WATCH_INTERVAL seconds (default 30): on a
 # live tick run the same ensure path as the one-shot main (recovery output —
 # "→ started lf-collector…" — flows through to the caller/logfile, which is what
-# makes a recovery observable); on an idle tick count toward the exit grace.
+# makes a recovery observable); on an idle tick count toward the exit grace (an Orca that
+# did not answer is neither: the count is left alone).
 # Exits 0 after HUB_OTEL_WATCH_IDLE_TICKS consecutive idle ticks (default 3 —
 # grace for transient tmux blips and the spawn race); a live tick resets the
 # counter. Never fatal: ensure failures are best-effort and the loop keeps going.
 _watch_loop() {
-  local baseline="${1:-}" cur
+  local baseline="${1:-}" cur live
   local interval="${HUB_OTEL_WATCH_INTERVAL:-30}" max_idle="${HUB_OTEL_WATCH_IDLE_TICKS:-3}" idle=0
   _watch_log "watch loop started (pid $$, interval ${interval}s, idle grace ${max_idle} ticks)"
   while :; do
-    if spoke_agent_live; then
+    live=0; spoke_agent_live || live=$?
+    if [ "$live" -eq 0 ]; then
       idle=0
       _ensure_or_notice
       # #190: a land rewrote our own source on disk → re-exec into it so the ensure
@@ -213,6 +217,9 @@ _watch_loop() {
       if [ -n "$baseline" ] && [ -n "$cur" ] && [ "$cur" != "$baseline" ]; then
         _watch_reexec  # exec's into fresh code; returns only if it won't parse
       fi
+    elif [ "$live" -eq 2 ]; then
+      # Orca did not answer: unknown is not idle, so the watch (and the idle count) stays put.
+      _watch_log "Orca did not answer — keeping the watch, idle count unchanged"
     else
       idle=$((idle + 1))
       if [ "$idle" -ge "$max_idle" ]; then
