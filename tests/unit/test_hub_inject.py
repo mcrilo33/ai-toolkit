@@ -266,6 +266,30 @@ def test_approve_permission_counts_a_new_state_start_as_the_dialog_consumed(
     assert len(_sends(orca_bin)) == 1
 
 
+def test_approve_permission_never_types_into_a_dialog_that_is_already_gone(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    wt = _wt(tmp_path)
+    orca_park(orca_bin, wt, state="working")
+
+    result = _call(f'approve_permission "{wt}"')
+
+    assert result.returncode == 1
+    assert _sends(orca_bin) == [], "a stray `1` would land in the next prompt"
+
+
+def test_approve_permission_survives_a_non_numeric_settle_budget(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    wt = _wt(tmp_path)
+    orca_park(orca_bin, wt, state="waiting", tool="Bash", tool_input="git status")
+
+    result = _call(f'approve_permission "{wt}"', env={"AFK_APPROVE_SETTLE_SECONDS": "abc"})
+
+    assert result.returncode == 0, result.stderr
+    assert "integer expression" not in result.stderr
+
+
 def test_approve_permission_that_leaves_the_dialog_up_is_rc1_and_never_resent(
     tmp_path: Path, orca_bin: Path
 ) -> None:
@@ -282,7 +306,15 @@ def test_approve_permission_that_leaves_the_dialog_up_is_rc1_and_never_resent(
 
 def test_approve_permission_silence_is_rc1_and_never_resent(tmp_path: Path, orca_bin: Path) -> None:
     wt = _wt(tmp_path)
-    _scenario(orca_bin, wt, **{"terminal send": [_send(None, accepted=False)]})
+    orca_park(
+        orca_bin,
+        wt,
+        state="waiting",
+        tool="Bash",
+        tool_input="x",
+        resumes=False,
+        extra={"terminal send": [_send(None, accepted=False)]},
+    )
     state = tmp_path / "sd"
 
     result = _call(f'approve_permission "{wt}"', env={"AFK_STATE_DIR": str(state)})

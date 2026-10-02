@@ -4810,6 +4810,59 @@ def test_afk_retry_worker_takes_no_action_on_an_unverifiable_worker(
     assert not ready_log.exists()
 
 
+def test_the_crash_ladder_never_counts_or_escalates_on_an_unverifiable_worker(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # No-op "attempts" must not burn the resume budget toward a blocked escalation (principle 6):
+    # five cadences on an unverifiable worker leave no warned-lane count, no marker, no blocked.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="unverifiable")
+    _expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+    env = {**env, "AFK_WARN_BACKOFF_BASE": "0"}
+
+    for _ in range(5):
+        _call(f"_afk_crash_reresume_or_escalate '{spoke}' 5 'crashed again' _revive_spoke", env=env)
+
+    assert _recovery_trail(orca_bin) == []
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+    assert not (statedir / "warned-state-5").exists(), "a skipped retry advances no backoff/count"
+    assert (statedir / "unknown-5").exists(), "but the unknown state is WARNED about, not silent"
+
+
+def test_a_skipped_revive_warns_once_per_window_of_time_not_every_tick(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    orca_park(orca_bin, spoke, liveness="unverifiable")
+    _expr, env, _ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    first = _call(f"_revive_spoke '{spoke}' 5", env=env)
+    stamp = (statedir / "unknown-5").read_text()
+    second = _call(f"_revive_spoke '{spoke}' 5", env=env)
+
+    assert first.returncode == 0 and second.returncode == 0
+    assert (statedir / "unknown-5").read_text() == stamp, (
+        "rate-limited: not re-stamped inside the gap"
+    )
+
+
+def test_afk_record_dispatch_falls_back_to_a_loud_single_key_rewrite(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    identity = spoke / ".ai-toolkit" / "identity"
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_text("issue=5\norca_dispatch_id=ctx_old\n")
+    broken = tmp_path / "provision-worktree.sh"
+    broken.write_text("#!/bin/sh\nexit 1\n")
+
+    result = _call(
+        f"_afk_record_dispatch '{spoke}' ctx_new", env={"PROVISION_WORKTREE": str(broken)}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "WARNING" in result.stderr
+    assert identity.read_text().splitlines() == ["issue=5", "orca_dispatch_id=ctx_new"]
+
+
 def test_afk_retry_worker_refuses_a_second_live_dispatch_on_the_worktree(
     tmp_path: Path, orca_bin: Path
 ) -> None:
@@ -9983,11 +10036,12 @@ def _crash_ready_env(tmp_path: Path, spoke: Path, statedir: Path) -> dict[str, s
     }
 
 
-def test_crash_reresume_retries_within_budget(tmp_path: Path) -> None:
+def test_crash_reresume_retries_within_budget(tmp_path: Path, orca_bin: Path) -> None:
     # AC1: while the warned-retry attempt count is under AFK_WARN_ESCALATE_ATTEMPTS and the backoff
     # is due, the crash terminus genuinely RE-ATTEMPTS the revival (a transient crash self-heals)
     # and advances the backoff — it does not warn-park-forever.
     spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     (statedir / "warned-state-5").write_text("1\t1\n")  # attempt 1 (< bound 3), next-due long past
@@ -10026,11 +10080,14 @@ def test_crash_reresume_silent_inside_backoff(tmp_path: Path) -> None:
     assert not retry_log.exists(), "inside the backoff -> parked LAST silently, no retry"
 
 
-def test_crash_reresume_escalates_past_budget_without_dependents(tmp_path: Path) -> None:
+def test_crash_reresume_escalates_past_budget_without_dependents(
+    tmp_path: Path, orca_bin: Path
+) -> None:
     # AC2 (the #302 replay): once the resume budget is spent, a mode=afk crash park escalates
     # blocked/<issue> + notification EVEN WITH ZERO scope-blocked dependents — the parked issue is
     # itself the stalled work. This is what #302 never did.
     spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
     statedir = tmp_path / "statedir"
     env = _crash_ready_env(tmp_path, spoke, statedir)
     (statedir / "warned-state-5").write_text("3\t1\n")  # attempt 3 (>= bound), due
@@ -10105,10 +10162,11 @@ def test_crash_escalate_journals_the_decision(tmp_path: Path) -> None:
     assert "resume budget exhausted" in journal, "the escalation decision is journaled"
 
 
-def test_crash_reresume_message_names_the_scheduled_action(tmp_path: Path) -> None:
+def test_crash_reresume_message_names_the_scheduled_action(tmp_path: Path, orca_bin: Path) -> None:
     # AC4 message honesty: while retrying, the reason names the scheduled retry (attempt k/N), not a
     # bare "retried at low frequency" that may never happen.
     spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     (statedir / "warned-state-5").write_text("0\t1\n")
@@ -10125,11 +10183,12 @@ def test_crash_reresume_message_names_the_scheduled_action(tmp_path: Path) -> No
     )
 
 
-def test_reap_or_resume_302_replay_reaches_terminal(tmp_path: Path) -> None:
+def test_reap_or_resume_302_replay_reaches_terminal(tmp_path: Path, orca_bin: Path) -> None:
     # AC3 replay pin: #302's exact state — a crashed pane that was ALREADY resumed this window, with
     # its resume budget spent and NO dependents — reaches a terminal blocked/<issue> (silencing the
     # watchdog's dead-pane race) instead of an eternal warn-park.
     spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
     statedir = tmp_path / "statedir"
     env = _crash_ready_env(tmp_path, spoke, statedir)
     (statedir / "resumed-5").write_text("1\n")  # already resumed this window (#302)
