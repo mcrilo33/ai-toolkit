@@ -505,3 +505,31 @@ def test_provision_worktree_source_exists_and_is_executable() -> None:
         "scripts/provision-worktree.sh missing — sync would copy nothing"
     )
     assert os.access(PROVISION_WORKTREE, os.X_OK), "scripts/provision-worktree.sh is not executable"
+
+
+# ── identity.sh registration (issue #361, S2b) ──────────────────────────────────
+# The hub-side readers (hub-status, hub-inject, the gate-broker modules) source identity.sh as a
+# co-located sibling in a synced target's .ai-toolkit/scripts/. Unregistered, a synced drain
+# silently reverts to branch-slug inference. It lives under shared/hooks/lib/ so it takes the
+# same source case as telemetry.sh / base-branch.sh / enabled.sh.
+IDENTITY_LIB = REPO_ROOT / "shared" / "hooks" / "lib" / "identity.sh"
+
+
+def test_identity_lib_registered_in_sync_loop() -> None:
+    assert "identity.sh" in _for_name_list(), (
+        "identity.sh is not registered in sync_workflow_scripts() — the hub-side identity "
+        "readers would never find the record reader in a synced target"
+    )
+
+
+def test_identity_lib_takes_the_hooks_lib_source_case() -> None:
+    body = _sync_workflow_scripts_body()
+    lib_case = re.search(r"\n\s*([\w.|-]*identity\.sh[\w.|-]*)\)\s+src=\"\$SHARED_DIR/hooks/lib/", body)
+    assert lib_case is not None, (
+        "identity.sh must map to shared/hooks/lib/ "
+        '(src="$SHARED_DIR/hooks/lib/$name") next to telemetry.sh|base-branch.sh|enabled.sh'
+    )
+
+
+def test_identity_lib_source_exists() -> None:
+    assert IDENTITY_LIB.is_file(), "shared/hooks/lib/identity.sh missing — sync would copy nothing"
