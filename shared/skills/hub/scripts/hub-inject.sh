@@ -170,7 +170,7 @@ deliver_reply() {
 # deliver_text <wt> <text> [proof=turn_started] [esc=0] -> type <text> + Enter into the agent's
 # terminal. esc=1 sends Escape first: it cancels a stray AskUserQuestion menu that ignores typed
 # text (#74, D1). rc 0 only when Orca observed <proof> (a permission answer resumes a turn, so it
-# asks for input_accepted); the text is sent ONCE, whatever the outcome.
+# asks for another stage); the text is sent ONCE, whatever the outcome.
 deliver_text() {
   local wt="$1" text="$2" proof="${3:-turn_started}" esc="${4:-0}" h stages rc=1
   # Never type into a worker Orca reports exited: its terminal may have fallen back to a shell (#301).
@@ -194,18 +194,30 @@ deliver_answer() {
 }
 
 # approve_permission <wt> -> select "Yes" (option 1, this once, NEVER "don't ask again") on the
-# waiting permission dialog. Counts only on Orca's input_accepted; silence is retried next tick,
-# never resent. Records approval_injected with the delivered verdict (the permission broker threads
+# waiting permission dialog: a bare `1` keypress (no Enter, which would land on whatever dialog
+# follows). Orca's prompt stages never fire for a menu key, so delivery is proven by Orca's own
+# agent state: the agent LEFT `waiting` (or its stateStartedAt moved, a new state) within
+# AFK_APPROVE_SETTLE_SECONDS (default 10). Silence is rc 1, retried next tick and NEVER resent here.
+# Records approval_injected with the delivered verdict (the permission broker threads
 # AFK_TLOG_LANE / AFK_TLOG_EPISODE).
 approve_permission() {
-  local rc=0 since ms
-  since="$(orca_agent_field "$1" stateStartedAt 2>/dev/null)"
-  deliver_text "$1" 1 input_accepted || rc=$?
-  if [ "$rc" -eq 0 ]; then   # a human `permission` span: waiting -> the acked approval
-    ms="$(_hi_wait_ms "$since")"
-    [ -z "$ms" ] || _hi_span "$1" --kind human --name orca-permission-wait --human-type permission --human-wait-ms "$ms"
+  local wt="$1" rc=1 h since now st waited=0 budget="${AFK_APPROVE_SETTLE_SECONDS:-10}" ms
+  since="$(orca_agent_field "$wt" stateStartedAt 2>/dev/null)"
+  if [ "$(orca_worker_liveness "$wt" 2>/dev/null)" != exited ] && h="$(_hi_terminal "$wt")" \
+     && orca_send_text "$h" 1 0 0 >/dev/null; then
+    while :; do
+      orca_tick_reset
+      st="$(orca_agent_state "$wt" 2>/dev/null)"; now="$(orca_agent_field "$wt" stateStartedAt 2>/dev/null)"
+      if { [ "$st" != waiting ] && [ "$st" != unknown ]; } || { [ -n "$since" ] && [ -n "$now" ] && [ "$now" != "$since" ]; }; then rc=0; break; fi
+      [ "$waited" -ge "$budget" ] && break
+      sleep 1; waited=$(( waited + 1 ))
+    done
   fi
-  _hi_tlog_delivery "$1" approval_injected permission \
+  if [ "$rc" -eq 0 ]; then   # a human `permission` span: waiting -> the consumed approval
+    ms="$(_hi_wait_ms "$since")"
+    [ -z "$ms" ] || _hi_span "$wt" --kind human --name orca-permission-wait --human-type permission --human-wait-ms "$ms"
+  fi
+  _hi_tlog_delivery "$wt" approval_injected permission \
     "{\"delivered\":$([ "$rc" -eq 0 ] && printf true || printf false)}"
   return "$rc"
 }
