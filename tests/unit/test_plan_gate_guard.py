@@ -20,7 +20,7 @@ It STILL ALLOWS everything that lets the spoke present its plan and park:
   segment the gate cares about).
 
 The wait is self-clearing with NO new machinery: the gate answer path already
-deletes the tag (``_consume_gate_tag``), and once the tip advances past the gate
+deletes the tag (spoke-ready.sh --gate on an approve), and once the tip advances past the gate
 commit the tag is no longer at the tip — either un-blocks. On the hub (branch
 ``main`` → non-numeric slug) and in any spoke with no gate tag at the tip it is
 a pure no-op (fail-open — a deny guard must never false-block real work).
@@ -260,7 +260,7 @@ def test_allows_writes_when_no_gate_tag(spoke: Path) -> None:
 
 
 def test_allows_writes_when_tag_consumed(parked_spoke: Path) -> None:
-    # The gate answer path deletes the tag (_consume_gate_tag) → un-blocked.
+    # spoke-ready.sh --gate deletes the tag on an approve → un-blocked.
     _git(parked_spoke, "tag", "-d", f"gate/{ISSUE}")
 
     assert run_guard(_edit_payload("Write"), parked_spoke).returncode == ALLOW

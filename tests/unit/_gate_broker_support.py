@@ -263,7 +263,7 @@ def _seed_task_output(tasks_root: Path, wt_path: Path, mtime: int) -> Path:
 # The gate park hands its plan to the broker through a scripted artifact
 # (<wt>/.ai-toolkit/gate-<N>.md, written by spoke-ready.sh --gate) rather than the
 # transcript heuristic. The gate route PREFERS the artifact when present (transcript
-# fallback intact); _consume_gate_tag removes it alongside the tag.
+# fallback intact); spoke-ready.sh --gate removes it alongside the tag on an approve.
 
 
 def _gate_park_transcript(plan: str) -> str:
@@ -336,7 +336,7 @@ def _gate_broker_env(spoke_repo: Path, tmp_path: Path, *, prompt_log: Path) -> d
 
 
 # ── issue #204: consume a stale gate tag when the answer already landed ─────────
-# _consume_gate_tag ran ONLY on the broker's confirmed-inject path. An answer that
+# The hub no longer consumes the gate tag (the spoke does, on an approve). An answer that
 # registered late, a wedge respawn started outside the broker, or an attended/manual
 # reply in the pane left gate/<N> at the tip — re-read as "waiting" and re-answered,
 # and (with the #204 guard) wedging the resumed spoke. The broker now self-heals: when
