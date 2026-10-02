@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from _orca_stub import install_forbidden_stubs, orca_calls, orca_scenario
+from _orca_stub import install_forbidden_stubs, orca_calls, orca_park, orca_scenario
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin", reason="hub-inject.sh targets the macOS BSD-stat control plane"
@@ -221,11 +221,11 @@ def test_deliver_text_with_escape_cancels_the_menu_before_the_text(
     assert text[text.index("--text") + 1] == "pick Redis"
 
 
-def test_approve_permission_sends_one_and_counts_input_accepted(
+def test_approve_permission_sends_a_bare_one_and_counts_the_agent_leaving_waiting(
     tmp_path: Path, orca_bin: Path
 ) -> None:
     wt = _wt(tmp_path)
-    _scenario(orca_bin, wt, **{"terminal send": [_send(["input_accepted"])]})
+    orca_park(orca_bin, wt, state="waiting", tool="Bash", tool_input="git status")
     state = tmp_path / "sd"
 
     result = _call(f'approve_permission "{wt}"', env={"AFK_STATE_DIR": str(state)})
@@ -233,7 +233,51 @@ def test_approve_permission_sends_one_and_counts_input_accepted(
     assert result.returncode == 0, result.stderr
     (call,) = _sends(orca_bin)
     assert call[call.index("--text") + 1] == "1"
+    assert "--enter" not in call, "an Enter would land on whatever dialog comes next"
+    assert "--wait-submit" not in call
     assert '"delivered":true' in _tlog(state, 311)
+
+
+def test_approve_permission_counts_a_new_state_start_as_the_dialog_consumed(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # The first dialog was answered and the agent raised ANOTHER one at once: still `waiting`, but
+    # with a new stateStartedAt -- the approval was consumed, never a reason to send again.
+    wt = _wt(tmp_path)
+    nxt = {"state": "waiting", "toolName": "Bash", "toolInput": "ls", "stateStartedAt": 3_000}
+    after = {
+        "worktree ps": [
+            {"out": {"ok": True, "result": {"worktrees": [{"path": str(wt), "agents": [nxt]}]}}}
+        ]
+    }
+    orca_park(
+        orca_bin,
+        wt,
+        state="waiting",
+        tool="Bash",
+        tool_input="git status",
+        resumes=False,
+        extra={"_after_send": after},
+    )
+
+    result = _call(f'approve_permission "{wt}"')
+
+    assert result.returncode == 0, result.stderr
+    assert len(_sends(orca_bin)) == 1
+
+
+def test_approve_permission_that_leaves_the_dialog_up_is_rc1_and_never_resent(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    wt = _wt(tmp_path)
+    orca_park(orca_bin, wt, state="waiting", tool="Bash", tool_input="git status", resumes=False)
+    state = tmp_path / "sd"
+
+    result = _call(f'approve_permission "{wt}"', env={"AFK_STATE_DIR": str(state)})
+
+    assert result.returncode == 1
+    assert len(_sends(orca_bin)) == 1
+    assert '"delivered":false' in _tlog(state, 311)
 
 
 def test_approve_permission_silence_is_rc1_and_never_resent(tmp_path: Path, orca_bin: Path) -> None:

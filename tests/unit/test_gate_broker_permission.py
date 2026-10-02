@@ -21,7 +21,7 @@ from _gate_broker_support import (
     _perm,
     _run_hook,
 )
-from _orca_stub import ok_reply, orca_calls, orca_park
+from _orca_stub import orca_calls, orca_park
 
 
 @pytest.fixture(autouse=True)
@@ -778,28 +778,11 @@ def test_danger_guard_registered_like_permission_hook() -> None:
 # tick, never resent within this one. Consumption is provable, so there is no served marker.
 
 
-def _stages(*names: str) -> dict:
-    return {
-        "terminal send": [
-            {"out": ok_reply({"send": {"accepted": True, "prompt": {"stages": list(names)}}})}
-        ]
-    }
-
-
-@pytest.mark.parametrize(
-    ("stages", "delivered"),
-    [
-        (("input_accepted", "turn_started"), True),
-        (("input_accepted",), True),
-        (("turn_started",), False),
-        ((), False),
-    ],
-    ids=["both", "accepted", "turn-only", "silence"],
-)
-def test_approve_counts_only_input_accepted_and_sends_once(
-    spoke_repo: Path, orca_bin: Path, tmp_path: Path, stages: tuple[str, ...], delivered: bool
+@pytest.mark.parametrize("resumes", [True, False], ids=["agent-leaves-waiting", "dialog-stays-up"])
+def test_approve_counts_only_when_the_agent_leaves_waiting_and_sends_once(
+    spoke_repo: Path, orca_bin: Path, tmp_path: Path, resumes: bool
 ) -> None:
-    _park_perm(orca_bin, spoke_repo, _AUTO_APPROVABLE, extra=_stages(*stages))
+    _park_perm(orca_bin, spoke_repo, _AUTO_APPROVABLE, resumes=resumes)
     env = _gate_env(tmp_path, "printf 'ANSWER: APPROVE'")
     state = Path(env["AFK_STATE_DIR"])
 
@@ -808,9 +791,9 @@ def test_approve_counts_only_input_accepted_and_sends_once(
     assert result.returncode == 0, result.stderr
     assert _sent_texts(orca_bin) == ["1"], "exactly ONE terminal send, never resent in the tick"
     injected = _events_named(state, 5, "approval_injected")
-    assert [e["evidence"]["delivered"] for e in injected] == [delivered], injected
+    assert [e["evidence"]["delivered"] for e in injected] == [resumes], injected
     # An unconfirmed delivery warns and stays retryable (never parks, never reads as served).
-    assert bool(_events_named(state, 5, "escalated")) is not delivered
+    assert bool(_events_named(state, 5, "escalated")) is not resumes
 
 
 def test_decide_permission_leaves_no_served_marker(

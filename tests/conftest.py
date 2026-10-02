@@ -109,6 +109,10 @@ for _var in [_k for _k in os.environ if _k.startswith("GIT_CONFIG_")]:
 for _var in ("WT_SPOKE", "ORCA_TERMINAL_HANDLE", "ORCA_DISPATCH_CAPABILITY"):
     os.environ.pop(_var, None)
 
+# approve_permission polls Orca for the agent leaving `waiting`; tests script that transition
+# (orca_park resumes), so a silent approve must fail on the first check, not after the 10 s budget.
+os.environ["AFK_APPROVE_SETTLE_SECONDS"] = "0"
+
 # Hermetic commit identity (issue #295, the third CI-red-on-main incident). Many tests
 # `git commit` inside a throwaway repo. Once the isolation above scrubs GIT_CONFIG_*, git
 # falls back to ~/.gitconfig for the committer identity — PRESENT on the dev machine, ABSENT

@@ -109,6 +109,15 @@ def remove(row, repo, rm):
                        capture_output=True)
 
 
+if key == "terminal send":
+    state["sent"] = True  # persisted by emit(); flips `worktree ps` to scenario["_after_send"]
+if key == "worktree ps" and state.get("sent") and "worktree ps" in scenario.get("_after_send", {}):
+    _seq = scenario["_after_send"]["worktree ps"]
+    _i = state["n"].get("ps-after", 0)
+    state["n"]["ps-after"] = _i + 1
+    _r = _seq[min(_i, len(_seq) - 1)]
+    emit(_r.get("rc", 0), _r.get("out", {}), _r.get("stderr", ""))
+
 for snap in scenario.get("_snapshot", []):
     if snap["key"] == key:
         f = Path(snap["path"])
@@ -335,6 +344,7 @@ def orca_park(
     liveness: str = "live",
     handle: str = "term_w",
     dispatch: str = "ctx_1",
+    resumes: bool = True,
     extra: dict | None = None,
 ) -> None:
     """Script the Orca replies the drain reads for ONE spoke at `wt` (replaces the scenario).
@@ -342,6 +352,8 @@ def orca_park(
     `state` is the agent state in `worktree ps` (`waiting` + `tool`/`tool_input` is a permission
     dialog); `question` is an unread inbox `question` from the spoke's terminal (a PLAN gate or any
     worker `ask`; the agent reads `working` meanwhile); `liveness` is the worker-list verdict.
+    A `waiting` agent RESUMES (reads `working`) once anything is typed into a terminal, like a real
+    dialog consumed by a keypress; `resumes=False` keeps it waiting (an approval that never lands).
     `extra` merges more canned replies keyed like `install_orca_stub`'s scenario.
     """
     agent: dict = {"state": state, "stateStartedAt": 1_000}
@@ -367,9 +379,18 @@ def orca_park(
         "resource": {"worktreeId": f"stub-repo::{wt}"},
         "projection": {"liveness": {"verdict": liveness}},
     }
+    after: dict = {}
+    if state == "waiting" and resumes:
+        moved = {"state": "working", "stateStartedAt": 2_000}
+        after = {
+            "worktree ps": [
+                {"out": ok_reply({"worktrees": [{"path": str(wt), "agents": [moved]}]})}
+            ]
+        }
     orca_scenario(
         bindir,
         {
+            **({"_after_send": after} if after else {}),
             "worktree ps": [
                 {"out": ok_reply({"worktrees": [{"path": str(wt), "agents": [agent]}]})}
             ],
