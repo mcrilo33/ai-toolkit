@@ -1397,6 +1397,58 @@ def test_waived_gates_negative_limit_never_hides_a_waive(
     assert "+3 older waives" in section, f"3 waives exist, so all 3 must be accounted: {section}"
 
 
+# ── issue #361 (S2b): the issue column reads the identity record ──────────────
+# Identity first, then the branch slug's leading digits. The fixture's `chore/adhoc-slug` worktree
+# is a bare branch (no leading digits): with a record it now carries its issue, without one the
+# row is unchanged.
+
+
+def _record_identity(worktree: Path, text: str) -> None:
+    (worktree / ".ai-toolkit").mkdir(exist_ok=True)
+    (worktree / ".ai-toolkit" / "identity").write_text(text)
+
+
+def test_row_shows_the_recorded_issue_for_a_bare_branch_worktree(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    _record_identity(tmp_path / "adhoc", "issue=361\nlane=spoke\n")
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, issue_state="OPEN")
+
+    line = next(ln for ln in out.splitlines() if "chore/adhoc-slug" in ln)
+    assert "#361 OPEN" in line
+
+
+def test_row_prefers_the_recorded_issue_over_the_branch_slug(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    _record_identity(tmp_path / "pushed", "issue=361\n")
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, issue_state="OPEN")
+
+    line = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
+    assert "#361 OPEN" in line
+    assert "#1 " not in line
+
+
+def test_row_without_a_record_leaves_a_bare_branch_issue_column_blank(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    out = _run_hub_status(hub_with_spokes, tmp_path, issue_state="OPEN")
+
+    line = next(ln for ln in out.splitlines() if "chore/adhoc-slug" in ln)
+    assert "#" not in line
+
+
+def test_row_ignores_a_non_numeric_record(hub_with_spokes: Path, tmp_path: Path) -> None:
+    _record_identity(tmp_path / "pushed", "issue=fix-typo\n")
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, issue_state="OPEN")
+
+    line = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
+    assert "#1 OPEN" in line
+
+
 # --- the Worktrees table reads Orca's issue column (#364) ---------------------------
 
 

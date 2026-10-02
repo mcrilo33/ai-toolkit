@@ -1,92 +1,13 @@
 #!/usr/bin/env bash
 # hub-afk-supervise.sh -- split out of hub-afk.sh (issue #307).
 #
-# The runtime-SUPERVISION lane of the /afk supervisor: the sleep inhibitor (caffeinate), the
-# watchdog + respawn, the self-update / self-deploy protocol (deploy the supervisor's own
-# landed code), the respawn crash-loop guard + kill-wedged, the restart-survival re-arm, and
-# the #243 hang-forensics capture (proc-tree + fingerprint before a kill; called by recover's
-# revive path).
+# The runtime-SUPERVISION lane of the /afk supervisor: the keeper (watchdog + respawn), the
+# self-update / self-deploy protocol (deploy the supervisor's own landed code), the respawn
+# crash-loop guard + kill-wedged, and the restart-survival re-arm.
 # A pure function-definition module sourced by the entry lib hub-afk.sh AFTER worktree-lib /
 # gate-broker / log / afk_now and hub-afk-state.sh's state/time primitives, and BEFORE any
 # function is called, so every cross-module helper resolves at call time. Not run on its own.
 set -uo pipefail
-
-# --- sleep inhibitor (issue #242) ---------------------------------------------
-# While a drain is armed the Mac must not sleep: system sleep freezes the supervisor,
-# every spoke, tmux, and the OTel stack mid-run, and wall-clock timers (reap ceilings,
-# staleness checks) misfire on wake. So arming ties a `caffeinate -is -w <supervisor pid>`
-# to the supervisor's LIFETIME: `caffeinate -w <pid>` self-exits the instant that pid dies,
-# so /afk off (and any crash) needs NO teardown. AFK_CAFFEINATE_BIN wins
-# for tests. On a non-macOS host (no caffeinate) the ensure is a SILENT no-op so arming never
-# fails; the loud battery/lid and missing-caffeinate warnings are surfaced separately at arm.
-#
-# The pidfile records "<caffeinate pid> <supervisor pid>" under the per-run state dir (so the
-# tests' AFK_STATE_DIR pin isolates it); AFK_INHIBITOR_FILE overrides it directly.
-_afk_inhibitor_file() {
-  if [ -n "${AFK_INHIBITOR_FILE:-}" ]; then printf '%s\n' "$AFK_INHIBITOR_FILE"; return; fi
-  printf '%s\n' "$(_afk_state_dir)/sleep-inhibit"
-}
-# _afk_inhibitor_pid -> the recorded caffeinate pid (first field), for --status.
-_afk_inhibitor_pid() {
-  local f rec; f="$(_afk_inhibitor_file)"; [ -f "$f" ] || return 0
-  rec="$(head -n1 "$f" 2>/dev/null)"; printf '%s\n' "${rec%% *}"
-}
-
-# _afk_arm_inhibitor <supervisor pid> -> ensure EXACTLY ONE `caffeinate -is -w <pid>` is
-# tied to <pid>. Idempotent: the supervisor calls it each tick (tied to $$) and the watchdog
-# each interval (tied to the live heartbeat pid), so a killed caffeinate is re-armed and a
-# respawn re-ties to the new pid. A non-numeric pid or an absent caffeinate is a silent no-op,
-# never a failure that would abort arming (the non-macOS warning is surfaced once at arm time).
-#
-# Concurrency (supervisor tick vs watchdog tick both arming at once): the fast path no-ops
-# when a live inhibitor already ties to THIS pid, so a spawn only happens when there is none.
-# When one is needed each caller spawns then CLAIMS the pidfile with a noclobber (O_EXCL)
-# create — the first creator wins, every loser reads the winner's live entry and kills its own
-# double, so exactly one survives even under real two-process concurrency (not just the
-# single-process tests). A stale incumbent (dead caffeinate, or an OLD supervisor pid) is
-# dropped and re-claimed.
-_afk_arm_inhibitor() {
-  local sup_pid="$1" bin f rec cpid spid mine tries
-  case "$sup_pid" in '' | *[!0-9]*) return 0 ;; esac
-  bin="${AFK_CAFFEINATE_BIN:-caffeinate}"
-  command -v "$bin" >/dev/null 2>&1 || return 0
-  f="$(_afk_inhibitor_file)"
-  # Fast path: a live inhibitor already tied to THIS supervisor pid — no spawn (exactly one).
-  if [ -f "$f" ]; then
-    rec="$(head -n1 "$f" 2>/dev/null)"; cpid="${rec%% *}"; spid="${rec##* }"
-    [ "$spid" = "$sup_pid" ] && _afk_pid_alive "$cpid" && return 0
-  fi
-  mkdir -p "$(dirname "$f")" 2>/dev/null || true
-  "$bin" -is -w "$sup_pid" >/dev/null 2>&1 &
-  mine=$!
-  # Converge on a single pidfile entry. Bounded: no caller writes a stale entry (each writes
-  # its own live pid), so once any caller claims, everyone else takes the "peer's live" branch;
-  # only the initial pre-existing stale file forces a re-claim, so this settles in <=2 rounds.
-  tries=0
-  while [ "$tries" -lt 5 ]; do
-    tries=$(( tries + 1 ))
-    if ( set -C; printf '%s %s\n' "$mine" "$sup_pid" > "$f" ) 2>/dev/null; then
-      return 0   # claimed the pidfile — my inhibitor is the one
-    fi
-    rec="$(head -n1 "$f" 2>/dev/null)"; cpid="${rec%% *}"; spid="${rec##* }"
-    # A blank / partial record: a peer won the O_EXCL create microseconds ago but its content
-    # bytes have not landed yet (create and printf are two steps). Do NOT delete it — re-read
-    # next round; its pid converges and the peer's-live branch below then fires (#242 review).
-    case "$spid" in '' | *[!0-9]*) continue ;; esac
-    if [ "$spid" = "$sup_pid" ] && _afk_pid_alive "$cpid"; then
-      [ "$cpid" = "$mine" ] || kill "$mine" 2>/dev/null || true
-      return 0   # a live inhibitor for this supervisor exists (mine or a peer's) — drop my double
-    fi
-    # Genuinely stale incumbent (a real but dead caffeinate, or an OLD supervisor pid i.e. a
-    # respawn re-tie): drop it and re-claim the now-empty pidfile.
-    [ "$cpid" != "$mine" ] && _afk_pid_alive "$cpid" && kill "$cpid" 2>/dev/null || true
-    rm -f "$f" 2>/dev/null || true
-  done
-  # UPGRADE: the bounded loop cannot realistically exhaust (see above); on the impossible
-  # exhaustion, record mine so the machine still stays awake rather than leave it unrecorded.
-  _afk_atomic_write "$f" "$mine $sup_pid" || true
-  return 0
-}
 
 # --- watchdog (auto-restart a crashed supervisor, issue #107) ------------------
 # A silent supervisor crash (exit 0 mid-tick) leaves .afk-state armed with no process
@@ -226,10 +147,7 @@ _afk_exec_self_copy() {
   # Fail LOUD, never silently exec an incomplete runtime (AFK Design Principle 2): cp -R is not
   # atomic, so verify the copy carries every source file before handing the drain to it. On an
   # incomplete copy, run from the ORIGINAL (complete by definition) rather than exec a
-  # config-less copy that would fall to the literal model fallback. This is ORTHOGONAL to the
-  # #296 stale-daemon path: the watchdog proves a daemon stale by hashing the ORIGIN source
-  # bundle (_wd_daemon_is_stale), never the self-copy's contents, so changing what the copy
-  # carries cannot revive that path.
+  # config-less copy that would fall to the literal model fallback.
   # UPGRADE: the gate checks file PRESENCE, not content; a cp truncated mid-file (disk full)
   # could leave a hub-afk.sh that exists yet is corrupt. Add a `bash -n "$copy"` parse-check to
   # the gate if that ever bites -- the old code shared this gap, so it is no regression.
@@ -277,8 +195,8 @@ _afk_watchdog_respawn() {
 #   DEPLOY  — at the NEXT tick boundary (never mid-tick), validate + smoke-test the SOURCE,
 #             re-sync the gitignored .ai-toolkit/scripts the /afk skill launches, then exec
 #             this process in place (a no-arg resume) onto the new code. `exec` preserves
-#             $$ so caffeinate (-w $$, #242) and the heartbeat pid survive untouched, and a
-#             no-arg launch re-adopts the in-flight spokes (dispatch_batch skips them).
+#             $$ so the heartbeat pid survives untouched, and a no-arg launch re-adopts the
+#             in-flight spokes (dispatch_batch skips them).
 #   FAIL SAFE — the source is validated (bash -n) AND smoke-run (`hub-afk.sh --help`) BEFORE
 #             the re-sync, so a broken new version never becomes the synced copy the watchdog
 #             would respawn; on any failure the drain stays on the old code with a loud warn
@@ -290,7 +208,7 @@ _afk_watchdog_respawn() {
 # (.ai-toolkit/scripts/hub-afk.sh), and scripts/worktree-land.sh all hit. AFK_SELFUPDATE_SCOPE
 # overrides the whole set (tests / operator tuning).
 _afk_selfupdate_scope_paths() {
-  printf '%s\n' "${AFK_SELFUPDATE_SCOPE:-hub-afk.sh hub-afk-land.sh hub-afk-dispatch.sh hub-afk-arm.sh hub-afk-supervise.sh hub-afk-recover.sh hub-afk-state.sh hub-watchdog.sh gate-broker.sh hub-notify.sh worktree-lib.sh worktree-land.sh batch-plan.sh afk-answering.md ai-toolkit.yml}"
+  printf '%s\n' "${AFK_SELFUPDATE_SCOPE:-hub-afk.sh hub-afk-land.sh hub-afk-dispatch.sh hub-afk-arm.sh hub-afk-supervise.sh hub-afk-recover.sh hub-afk-state.sh gate-broker.sh hub-notify.sh worktree-lib.sh worktree-land.sh batch-plan.sh afk-answering.md ai-toolkit.yml}"
 }
 
 # _afk_paths_in_scope <newline-separated paths> -> true when ANY path's basename is in the
@@ -369,7 +287,6 @@ _afk_selfupdate_source_scripts() {
     "$root/shared/skills/hub/scripts/hub-afk-supervise.sh" \
     "$root/shared/skills/hub/scripts/hub-afk-recover.sh" \
     "$root/shared/skills/hub/scripts/hub-afk-state.sh" \
-    "$root/shared/skills/hub/scripts/hub-watchdog.sh" \
     "$root/shared/skills/hub/scripts/gate-broker.sh" \
     "$root/shared/skills/hub/scripts/hub-notify.sh" \
     "$root/shared/skills/hub/scripts/batch-plan.sh" \
@@ -435,9 +352,8 @@ _afk_selfupdate_fail() {
 
 # _afk_self_deploy -> the DEPLOY half of the #250 self-update protocol, run at a tick boundary
 # (never mid-tick). Validate + smoke the source, re-sync the synced scripts, journal, then EXEC
-# this process in place onto the new code as a no-arg resume: `exec` preserves $$ so caffeinate
-# (-w $$, #242) and the heartbeat pid survive untouched (the watchdog keeps reading `live`), and
-# a no-arg launch re-adopts the in-flight spokes (dispatch_batch skips them). On success the exec
+# this process in place onto the new code as a no-arg resume: `exec` preserves $$ so the
+# heartbeat pid survives untouched (the keeper keeps reading `live`), and a no-arg launch re-adopts the in-flight spokes (dispatch_batch skips them). On success the exec
 # never returns; every failure path falls back to the old code via _afk_selfupdate_fail.
 # A version that passes --help but dies only in the drain loop is caught downstream by the
 # watchdog crash-loop guard (_afk_watchdog_guarded_respawn), which halts respawns + escalates
@@ -481,7 +397,7 @@ _afk_self_deploy() {
   log "/afk: self-update — code validated + re-synced; re-execing the supervisor in place (resume)"
   if [ -n "${AFK_SELF_DEPLOY_EXEC_CMD:-}" ]; then bash -c "$AFK_SELF_DEPLOY_EXEC_CMD"; return $?; fi
   # env -u AFK_RUNNING_COPY forces a fresh self-copy of the (now re-synced) original; no window
-  # arg ⇒ resume. `exec` keeps $$ so the caffeinate -w tie and the heartbeat pid are preserved.
+  # arg ⇒ resume. `exec` keeps $$ so the heartbeat pid is preserved.
   exec env -u AFK_RUNNING_COPY bash "$(_afk_self)"
 }
 
@@ -566,11 +482,6 @@ watchdog_tick() {
         _afk_kill_wedged_supervisor
         if _afk_watchdog_guarded_respawn wedged; then printf 'respawned\n'; else printf 'crashloop\n'; fi
       else
-        # Re-check the sleep inhibitor each interval alongside the supervisor (#242): re-arm a
-        # killed caffeinate, tied to the live supervisor's (heartbeat) pid. Idempotent — a
-        # no-op when it is already armed for that pid.
-        local hb pid; hb="$(afk_read_heartbeat)"; pid="${hb%% *}"
-        _afk_arm_inhibitor "$pid"
         printf 'live\n'
       fi ;;
     stale)
@@ -596,31 +507,6 @@ _afk_watchdog_alive() {
 # _afk_spawn_watchdog -> launch a background watchdog UNLESS one is already alive (so a
 # re-arm, or a no-arg resume, never stacks keepers). AFK_WATCHDOG_SPAWN_CMD overrides the
 # launch for tests. Best-effort; never aborts the caller.
-# _afk_arm_hub_watchdog -> co-arm the tier-2 hub-watchdog (issue #251) alongside the keeper so
-# it runs "OS-level alongside the drain" (AC#1) and is re-armed if it died — the drain keeper
-# and the tier-2 watchdog cross-check each other. `hub-watchdog.sh --arm` is singleton-guarded
-# (idempotent) and detaches its own nohup daemon, so this is cheap when one already runs.
-# Best-effort: a missing script or a failed launch never aborts the drain. Opt-out
-# HUB_WATCHDOG_COARM=0; HUB_WATCHDOG_ARM_CMD overrides the launch (the tests' seam), and
-# HUB_WATCHDOG_BIN pins the script path.
-# We normally run from OUR OWN frozen self-copy (#133), so _afk_find_script resolves $wd to
-# hub-watchdog.sh's copy in that SAME tmp dir — a bundle no land ever rewrites. Hand over the
-# ORIGIN sibling as HUB_WATCHDOG_ORIG_SCRIPT (mirroring AFK_ORIG_SCRIPT, the same contract we
-# carry for ourselves), derived from AFK_ORIG_SCRIPT's directory since it and hub-watchdog.sh
-# live side by side in the real checkout; without this the watchdog's #296 self-recycle hashes
-# the frozen copy forever, structurally dead exactly like before that fix.
-_afk_arm_hub_watchdog() {
-  [ "${HUB_WATCHDOG_COARM:-1}" = "1" ] || return 0
-  if [ -n "${HUB_WATCHDOG_ARM_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_ARM_CMD" >/dev/null 2>&1 || true; return 0; fi
-  local wd orig
-  wd="$(_afk_find_script "${HUB_WATCHDOG_BIN:-}" hub-watchdog.sh)" || return 0
-  orig="$wd"
-  if [ -n "${AFK_ORIG_SCRIPT:-}" ] && [ -f "$(dirname "$AFK_ORIG_SCRIPT")/hub-watchdog.sh" ]; then
-    orig="$(dirname "$AFK_ORIG_SCRIPT")/hub-watchdog.sh"
-  fi
-  HUB_WATCHDOG_ORIG_SCRIPT="$orig" bash "$wd" --arm >/dev/null 2>&1 || true
-}
-
 _afk_spawn_watchdog() {
   _afk_watchdog_alive && return 0
   if [ -n "${AFK_WATCHDOG_SPAWN_CMD:-}" ]; then bash -c "$AFK_WATCHDOG_SPAWN_CMD"; return 0; fi
@@ -630,7 +516,6 @@ _afk_spawn_watchdog() {
   # Record the child pid immediately so the next tick's dedup check sees it alive before
   # the watchdog itself writes the pidfile (closes the launch→pidfile startup race).
   printf '%s\n' "$!" > "$(_afk_watchdog_file)" 2>/dev/null || true
-  _afk_arm_hub_watchdog   # tier-2 (#251): co-arm the OS-level hub-watchdog alongside the keeper
   return 0
 }
 
@@ -675,14 +560,11 @@ afk_reconcile() {
     return 1
   fi
   # NO #279 liveness self-check here, deliberately. Reconcile looks like a re-arm, but it is
-  # the RECOVERY path: hub-watchdog.sh's _wd_intervene_rearm recovers a crashed drain with
-  # `bash hub-afk.sh --reconcile >/dev/null 2>&1 || true`, discarding both the output and the
-  # exit code. Gating that on live judge/claude/gh round trips would mean a transient outage
-  # (the very thing most likely to be happening around a crash) SILENTLY blocks recovery: the
-  # watchdog records the intervention, the refusal log goes to /dev/null, .afk-state stays
-  # armed, and every in-flight spoke strands with no answerer or lander — the ~10h overnight
-  # strand this function exists to prevent (#202 A). It would also block each watchdog tick for
-  # up to ~4 minutes of probes before the per-spoke detectors run.
+  # the RECOVERY path.
+  # Gating it on live judge/claude/gh round trips would mean a transient outage (the very thing
+  # most likely to be happening around a crash) SILENTLY blocks recovery: .afk-state stays
+  # armed and every in-flight spoke strands with no answerer or lander — the ~10h overnight
+  # strand this function exists to prevent (#202 A).
   #
   # Refusing to resume is strictly worse than resuming degraded: a dead judge still leaves the
   # lander and reaper working, and #268's judge halt plus #241 §9's auth halt already catch a
@@ -697,120 +579,3 @@ afk_reconcile() {
   log "/afk reconcile: re-armed — supervisor resumed, watchdog ensured"
   return 0
 }
-
-
-# --- #243: hang-forensics capture before the reaper's revival kills the pane --------
-# A live-but-frozen claude spoke (idle>AFK_IDLE_MINUTES with a live pane) is REVIVED by
-# _revive_spoke — which kills the pane and relaunches (#241), DESTROYING the evidence a hang
-# autopsy / upstream Claude Code report needs (process state, pane content, the wedged-input
-# symptom). So just before the kill, capture a best-effort, BOUNDED bundle. A spoke whose tmux
-# window is gone (no pane to observe) has nothing to capture and skips gracefully. Evidence
-# collection ONLY — the revive itself is #241's job; this is the microscope, not the fix.
-#
-# Bundles intentionally OUTLIVE the drain: unlike per-window state (dispatch epochs, resume
-# markers, warned records — all cleared on a fresh arm), a bundle is evidence the operator triages
-# later, so it is NOT cleared on re-arm and afk_hang_forensics_status counts every bundle on disk.
-# UPGRADE: add an age- or count-capped retention/prune policy if the bundle root grows unwieldy —
-# each bundle holds a full pane scrollback (capture-pane -S -, itself bounded by tmux's own
-# history-limit) plus a sample, so a long unattended run with many revives accumulates disk.
-
-# _afk_hang_forensics_dir -> the bundle root <git-common-dir>/hang-forensics. AFK_HANG_FORENSICS_DIR
-# overrides it for tests (mirrors _afk_state_dir).
-_afk_hang_forensics_dir() {
-  if [ -n "${AFK_HANG_FORENSICS_DIR:-}" ]; then printf '%s\n' "$AFK_HANG_FORENSICS_DIR"; return; fi
-  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
-  printf '%s\n' "$common/hang-forensics"
-}
-
-# _afk_hang_sample_pid <pane_pid> <descendant_pids...> -> the pid `sample` should profile: the
-# AGENT process, NOT the pane's wrapper shell. The pane is launched as `sh -c "<cmd>; exec zsh"`
-# (see _afk_open_spoke_window), so pane_pid is a shell blocked in wait4() and claude runs as its
-# descendant — sampling pane_pid would only ever show the idle shell's wait loop. Prefer a
-# descendant whose command is claude/node; else the first descendant (the pane shell's direct
-# child is the launched claude); else pane_pid itself when there are no descendants.
-_afk_hang_sample_pid() {
-  local pane_pid="$1"; shift
-  local pid comm first=""
-  for pid in "$@"; do
-    [ -n "$first" ] || first="$pid"
-    comm="$(LC_ALL=C ps -o comm= -p "$pid" 2>/dev/null)"
-    case "$comm" in *[Cc]laude* | *node*) printf '%s\n' "$pid"; return 0 ;; esac
-  done
-  printf '%s\n' "${first:-$pane_pid}"
-}
-
-# _afk_capture_proc_tree <pane_pid> <out> -> write the pane process tree's ps snapshot
-# (pid/stat/etime/wchan) plus, on macOS, a short `sample` of the AGENT descendant, to <out>. The
-# ps read forces LC_ALL=C (the repo's locale trap: parsing localized columns silently strands the
-# fields), and the sample is time-BOUNDED with a tight KILL grace so it can never delay the reap
-# past the ~10s budget even under the coreutils-absent timeout fallback. Both best-effort: an empty
-# pane_pid or a failed probe leaves an empty/partial file, never an error.
-_afk_capture_proc_tree() {
-  local pane_pid="$1" out="$2" pids secs target kids k
-  case "$pane_pid" in '' | *[!0-9]*) return 0 ;; esac
-  kids="$(_afk_descendant_pids "$pane_pid" | tr '\n' ' ')"
-  pids="$pane_pid"
-  for k in $kids; do pids="$pids,$k"; done
-  LC_ALL=C ps -o pid,stat,etime,wchan -p "$pids" > "$out" 2>/dev/null || true
-  command -v sample >/dev/null 2>&1 || return 0
-  secs="${AFK_HANG_SAMPLE_SECONDS:-2}"; case "$secs" in '' | *[!0-9]*) secs=2 ;; esac
-  target="$(_afk_hang_sample_pid "$pane_pid" $kids)"
-  AFK_TIMEOUT_KILL_AFTER=2 _afk_with_timeout "$(( secs + 2 ))" sample "$target" "$secs" >> "$out" 2>/dev/null || true
-}
-
-# _afk_write_fingerprint <issue> <now> <mtime> <jsonl> -> emit the run fingerprint on stdout: the
-# transcript-activity-vs-UI-freeze delta (the hang's tell), elapsed since dispatch, the claude
-# version + model, and the OTEL env (the untested heavy-OTEL-logging correlation the issue flags).
-# The version + model are read from the SPOKE's transcript (each JSONL line carries both), NOT a
-# `claude --version` fork — forking the very binary that may be hung risks wedging the reap tick,
-# and the transcript reflects what the spoke actually ran. All best-effort; a missing field records
-# `unknown` rather than aborting.
-_afk_write_fingerprint() {
-  local issue="$1" now="$2" mtime="$3" jsonl="$4" disp elapsed=unknown silence=unknown ver model
-  disp="$(read_dispatch_epoch "$issue" | tr -d '[:space:]')"
-  case "$disp" in '' | *[!0-9]*) : ;; *) elapsed=$(( now - disp )) ;; esac
-  case "$mtime" in '' | *[!0-9]*) : ;; *) silence=$(( now - mtime )) ;; esac
-  if [ -n "$jsonl" ]; then
-    ver="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$jsonl" 2>/dev/null | tail -1 | sed 's/.*: *"//;s/"$//')"
-    model="$(grep -oE '"model"[[:space:]]*:[[:space:]]*"[^"]*"' "$jsonl" 2>/dev/null | tail -1 | sed 's/.*: *"//;s/"$//')"
-  fi
-  printf 'issue=%s\ncaptured_epoch=%s\ntranscript_mtime=%s\ntranscript_silence_seconds=%s\nelapsed_since_dispatch_seconds=%s\n' \
-    "$issue" "$now" "${mtime:-unknown}" "$silence" "$elapsed"
-  printf 'claude_version=%s\nmodel=%s\n' "${ver:-unknown}" "${model:-unknown}"
-  printf 'AI_TOOLKIT_OTEL=%s\nOTEL_EXPORTER_OTLP_ENDPOINT=%s\nAI_TOOLKIT_OTEL_SPAN_ENDPOINT=%s\nOTEL_RESOURCE_ATTRIBUTES=%s\n' \
-    "${AI_TOOLKIT_OTEL:-}" "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}" "${OTEL_RESOURCE_ATTRIBUTES:-}"
-}
-
-# _afk_capture_hang_forensics <wt> <issue> -> capture the hang bundle (best-effort, bounded) and
-# ECHO its path; echo NOTHING when there is no live pane to capture (a crashed spoke — the AC1
-# clean-reap skip). The bundle lands at <hang-forensics-dir>/<issue>-<epoch>/. Called from
-# _revive_spoke BEFORE the kill, so the frozen pane + its process tree are still observable.
-_afk_capture_hang_forensics() {
-  local wt="$1" issue="$2" target pane_pid dir jsonl now mtime
-  command -v tmux >/dev/null 2>&1 || return 0
-  target="$(_spoke_pane_target "$wt")"
-  [ -n "$target" ] || return 0            # no pane (window gone) — nothing to observe, skip gracefully
-  now="$(afk_now)"
-  dir="$(_afk_hang_forensics_dir)/$issue-$now"
-  mkdir -p "$dir" 2>/dev/null || return 0
-  pane_pid="$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null | tr -d '[:space:]')"
-  _afk_capture_proc_tree "$pane_pid" "$dir/process-tree.txt"
-  tmux capture-pane -p -S - -t "$target" > "$dir/pane.txt" 2>/dev/null || true
-  tmux display-message -p -t "$target" \
-    'pane_in_mode=#{pane_in_mode} pane_current_command=#{pane_current_command}' \
-    > "$dir/pane-meta.txt" 2>/dev/null || true
-  jsonl="$(_spoke_jsonl "$wt")"
-  if [ -n "$jsonl" ]; then
-    tail -n 50 "$jsonl" > "$dir/transcript-tail.jsonl" 2>/dev/null || true
-    # GNU `-c %Y` FIRST, BSD `-f %m` second (#289/#132). Reversed, this breaks on GNU: there
-    # `-f` selects filesystem-status mode and takes no inline format, so `%m` is read as a file
-    # operand -- GNU errors on it yet still PRINTS a multi-line fs block for the real file and
-    # exits nonzero, so the `||` fallback ALSO runs and the capture holds the garbage AND the
-    # epoch. That fails _afk_write_fingerprint's all-digits guard, stranding the silence delta
-    # (the hang's tell) as `unknown`. BSD rejects `-c` cleanly, so GNU-first is safe on both.
-    mtime="$(stat -c %Y "$jsonl" 2>/dev/null || stat -f %m "$jsonl" 2>/dev/null)"
-  fi
-  _afk_write_fingerprint "$issue" "$now" "${mtime:-}" "$jsonl" > "$dir/fingerprint.txt" 2>/dev/null || true
-  printf '%s\n' "$dir"
-}
-

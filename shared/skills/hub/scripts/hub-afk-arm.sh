@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # hub-afk-arm.sh -- split out of hub-afk.sh (issue #307).
 #
-# The ARM-time lane of the /afk supervisor: the telemetry preflight,
-# the sleep-inhibitor / power status warnings, and the arm-time liveness probes +
-# preconditions + the ONE arm verdict + the self-check -- everything that runs ONCE before
-# the supervisor loop starts. A pure function-definition module sourced by the entry lib
+# The ARM-time lane of the /afk supervisor: the telemetry preflight, and the arm-time
+# liveness probes + preconditions + the ONE arm verdict + the self-check -- everything that
+# runs ONCE before the supervisor loop starts. A pure function-definition module sourced by the entry lib
 # hub-afk.sh AFTER worktree-lib / gate-broker / log / afk_now and hub-afk-state.sh's state/time
 # primitives, and BEFORE any function is called, so every cross-module helper resolves at
 # call time. Not run on its own.
@@ -126,48 +125,6 @@ afk_telemetry_status() {
   afk_have_telemetry_auth && a=present || a=missing
   if [ "$c" = up ] && [ "$b" = up ] && [ "$a" = present ]; then overall=OK; else overall=DOWN; fi
   printf '/afk: telemetry %s (collector %s, bridge %s, auth %s)\n' "$overall" "$c" "$b" "$a"
-}
-
-# --- sleep-inhibitor status + arm-time power warnings (issue #242) -------------
-# afk_inhibitor_status -> a one-line, READ-ONLY sleep-inhibitor summary for --status: active
-# with its caffeinate pid, MISSING when the machine may sleep, or unavailable on a host with no
-# caffeinate (non-macOS). Probes only (no launch), so a status read has no side effects.
-afk_inhibitor_status() {
-  local bin cpid; bin="${AFK_CAFFEINATE_BIN:-caffeinate}"
-  if ! command -v "$bin" >/dev/null 2>&1; then
-    printf '/afk: sleep-inhibit: unavailable (no caffeinate — non-macOS; the systemd-inhibit equivalent is unwired)\n'
-    return 0
-  fi
-  cpid="$(_afk_inhibitor_pid)"
-  if _afk_pid_alive "$cpid"; then
-    printf '/afk: sleep-inhibit: active (pid %s)\n' "$cpid"
-  else
-    printf '/afk: sleep-inhibit: MISSING — machine may sleep\n'
-  fi
-}
-
-# afk_warn_power -> WARN at arm time when on BATTERY: the `-s` in the inhibitor's `caffeinate
-# -is` holds sleep off only on AC power, and a lid-close sleeps regardless — name BOTH limits so
-# the operator plugs in and keeps the lid open. Guarded on pmset (absent off macOS) and read
-# under LC_ALL=C (the repo's locale trap: an English-keyword parse of a localized `pmset -g
-# batt` must force the C locale).
-afk_warn_power() {
-  local pm batt; pm="${AFK_PMSET_BIN:-pmset}"
-  command -v "$pm" >/dev/null 2>&1 || return 0
-  batt="$(LC_ALL=C "$pm" -g batt 2>/dev/null)"
-  case "$batt" in
-    *"Battery Power"*)
-      log "/afk: WARNING — on battery power: the sleep inhibitor holds only while on AC power, and a lid-close sleeps regardless; plug in and keep the lid open for an unattended drain" ;;
-  esac
-}
-
-# _afk_warn_no_inhibitor -> WARN once at arm time when caffeinate is absent (non-macOS): arming
-# still PROCEEDS (never fails), but the drain will NOT inhibit sleep — name the Linux equivalent
-# so the limitation is surfaced, not silent.
-_afk_warn_no_inhibitor() {
-  local bin; bin="${AFK_CAFFEINATE_BIN:-caffeinate}"
-  command -v "$bin" >/dev/null 2>&1 && return 0
-  log "/afk: WARNING — 'caffeinate' not found (non-macOS?); the drain will NOT inhibit system sleep — the equivalent here is 'systemd-inhibit --what=sleep'"
 }
 
 # --- arm-time liveness probes (issue #279) ------------------------------------

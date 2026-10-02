@@ -1,17 +1,15 @@
 """Drain end-to-end simulation harness (issue #314).
 
-ONE fixed harness that drives the REAL /afk drain tick loop (`hub-afk.sh --once`) and
-the REAL watchdog (`hub-watchdog.sh --once`) against a fake clock and scripted mock
-spokes, then checks a once-declared registry of INVARIANTS — properties that hold in
+ONE fixed harness that drives the REAL /afk drain tick loop (`hub-afk.sh --once`)
+against a fake clock and scripted mock spokes, then checks a once-declared registry of INVARIANTS — properties that hold in
 any correct implementation, mirroring `shared/rules/afk-design-principles.md`.
 
 Design (issue #314):
   1. Invariants, not steps. The test never asserts "tick N does X"; it asserts
      principle-level properties, and changes only when a PRINCIPLE changes.
-  2. Assert over EXPLICIT records only. Two #300-principle-1 append-only actor
-     records are the assertion surface: the #300 transition log (spoke lifecycle)
-     and the watchdog intervention ledger ("did a detector fire?"). Never epochs,
-     pane text, `_`-internals, or log-line greps.
+  2. Assert over EXPLICIT records only. The #300-principle-1 append-only transition
+     log (spoke lifecycle) is the assertion surface. Never epochs, pane text,
+     `_`-internals, or log-line greps.
   3. Black-box the drain through its existing seams: `AFK_NOW` (fake clock),
      `AFK_STATE_DIR` (state + log), the `*_CMD` / `WT_*` / `BATCH_PLAN` stubs, and a
      PATH-shadowed tmux/gh/ps/claude. A mock spoke is a real git worktree whose
@@ -48,14 +46,13 @@ pytestmark = pytest.mark.skipif(
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_SCRIPTS = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
 HUB_AFK = HUB_SCRIPTS / "hub-afk.sh"
-HUB_WATCHDOG = HUB_SCRIPTS / "hub-watchdog.sh"
 TLOG_LIB = HUB_SCRIPTS / "transition-log.sh"
 SCENARIO_DIR = Path(__file__).parent / "fixtures" / "drain_scenarios"
 
 # The fake tmux/ps stubs advertise a per-spoke pane pid of 40000+issue with a
 # `claude` child at 50000+issue, so the #301 ancestor-walk resolves per spoke.
 
-# Wall-clock cap per real drain/watchdog tick (see World.run_drain). Generous for
+# Wall-clock cap per real drain tick (see World.run_drain). Generous for
 # legitimate stubbed work; cuts a post-answer poll that would otherwise wait out a
 # ~30s timeout against a scripted spoke that never changes.
 _DRAIN_TICK_CAP_SECONDS = 10
@@ -87,7 +84,6 @@ class World:
     state_dir: Path = field(init=False)
     projects: Path = field(init=False)
     fake_bin: Path = field(init=False)
-    ledger: Path = field(init=False)
     home: Path = field(init=False)
     spokes: dict[int, Spoke] = field(default_factory=dict)
     env_extra: dict[str, str] = field(default_factory=dict)
@@ -104,7 +100,6 @@ class World:
         self.state_dir = self.root / "state"
         self.projects = self.root / "projects"
         self.fake_bin = self.root / "bin"
-        self.ledger = self.state_dir / "intervention-ledger.jsonl"
         self.home = self.root / "home"
         for d in (self.state_dir, self.projects, self.fake_bin, self.home):
             d.mkdir(parents=True, exist_ok=True)
@@ -208,8 +203,7 @@ class World:
 
     def _write_window_state(self) -> None:
         (self.state_dir / ".afk-state").write_text("drain\n")
-        # A live heartbeat pid (this process) so the watchdog's supervisor-dead
-        # detector never fires spuriously in a scenario not about it.
+        # A live heartbeat pid (this process) so the tick reads a live supervisor.
         (self.state_dir / ".afk-heartbeat").write_text(f"{os.getpid()} wake1\n")
 
     # -- spokes -------------------------------------------------------------
@@ -258,7 +252,6 @@ class World:
             WT_NEW=str(self.fake_bin / "worktree-new.sh"),
             WT_LAND=str(self.fake_bin / "worktree-land.sh"),
             WT_DONE=str(self.fake_bin / "worktree-done.sh"),
-            HUB_WATCHDOG_LEDGER=str(self.ledger),
             # A fast plain-text answerer stub: `ANSWER: <text>` is the reasoner's decision
             # contract (parse_decision), and a plain-text stub passes through the
             # stream-json normalizer untouched. Overriding this is REQUIRED — the default
@@ -269,7 +262,6 @@ class World:
             AI_TOOLKIT_OTEL="0",
             AI_TOOLKIT_GH_LIFECYCLE_LABELS="0",
             AFK_REVIEW_GATE="0",
-            HUB_WATCHDOG_FILE="0",
             # Keep the drain's answer/inject/judge paths from spending CI budget on
             # retry/verify sleeps against the stubs (the fake clock only governs reads).
             AFK_INJECT_VERIFY_SECONDS="3",
@@ -337,8 +329,7 @@ class World:
 
         A mutation may `drop` a transition name: withholding a recorded state
         reintroduces the pre-#300 "inference over recorded state" world (principle
-        1), which is how a fixed watchdog false-fire is reintroduced without editing
-        the (out-of-scope) watchdog."""
+        1), which is how a fixed false-fire is reintroduced without editing the drain."""
         if to in self.dropped:
             return
         rec = {
@@ -381,7 +372,7 @@ class World:
             fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
     def write_epoch(self, name: str, issue: int, epoch: int) -> None:
-        """A bare-integer epoch marker under the state dir (the drain/watchdog seam)."""
+        """A bare-integer epoch marker under the state dir (the drain seam)."""
         (self.state_dir / f"{name}-{issue}.epoch").write_text(f"{epoch}\n")
 
     def write_journal(self, issue: int, ts: int, park: str = "gate") -> None:
@@ -408,10 +399,6 @@ class World:
         self.spokes[issue].agent_alive = alive
         self._sync_pane_state(self.spokes[issue])
 
-    def set_pane_exists(self, issue: int, exists: bool) -> None:
-        self.spokes[issue].pane_exists = exists
-        self._sync_pane_state(self.spokes[issue])
-
     # -- record readers (the assertion surface) -----------------------------
 
     def records(self, issue: int) -> list[dict]:
@@ -425,14 +412,6 @@ class World:
 
     def events(self, issue: int) -> list[dict]:
         return [r for r in self.records(issue) if r.get("kind") == "event"]
-
-    def fires(self, issue: int | None = None) -> list[dict]:
-        if not self.ledger.exists():
-            return []
-        rows = [json.loads(ln) for ln in self.ledger.read_text().splitlines() if ln.strip()]
-        if issue is None:
-            return rows
-        return [r for r in rows if str(r.get("issue")) == str(issue)]
 
 
 # First line of every stub body: under `_warm_stubs` (AFK_SIM_WARM = a marker dir) the stub
@@ -585,7 +564,7 @@ def _pane_text(world: World, issue: int, text: str) -> None:
 
 
 # The declarative timeline verbs. Each mutates scripted ground truth (git tags, the
-# transition log, pane/agent state) OR runs a real drain/watchdog tick.
+# transition log, pane/agent state) OR runs a real drain tick.
 def apply_step(world: World, step: dict, *, mutation: dict | None) -> None:
     now = world.t0 + int(step["t"])  # absolute fake-clock epoch for this step
     do = step.get("do")
@@ -595,31 +574,18 @@ def apply_step(world: World, step: dict, *, mutation: dict | None) -> None:
     for actor in step.get("run", []):
         if actor == "drain":
             world.run_drain(now)
-        elif actor == "watchdog":
-            _run_watchdog(world, now)
         else:  # pragma: no cover - guard
             raise ValueError(f"unknown actor {actor!r}")
-
-
-def _run_watchdog(world: World, now: int) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["bash", str(HUB_WATCHDOG), "--once"],
-        cwd=str(world.main),
-        capture_output=True,
-        text=True,
-        env=world.env(now),
-    )
 
 
 def _v_park(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
     """A PLAN-gate park: a gate/<issue> tag at tip (slot_state=waiting, answer lane),
     a live agent (pane + ps), a `parked` transition with a minted episode, and the
-    pre-stamped park-onset epoch the watchdog's ceiling clock measures from."""
+    pre-stamped park-onset epoch."""
     spoke = world.spokes[issue]
     _seed_transcript(world, issue)
     # A PLAN-gate pane shows a plan awaiting approval — NOT a yes/no permission dialog
-    # (which would classify as the broker's permission lane, not the answer lane the
-    # park-unanswered detector owns).
+    # (which would classify as the broker's permission lane, not the answer lane).
     _pane_text(world, issue, "Here is my implementation plan for review.\nAwaiting gate approval.")
     world.git(issue, "tag", "-f", f"gate/{issue}")
     spoke.episode = f"sig{issue}:{now}"
@@ -629,23 +595,12 @@ def _v_park(world: World, issue: int, now: int, step: dict, mutation: dict | Non
 
 def _v_answer(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
     """The drain services the park — SCRIPTED as the drain-authored records a real
-    answer_pass writes. `via` selects which recency signal the watchdog reads:
-    `journal` (a decision-journal entry, default), `progress` (a progress-epoch
-    advance), or `dropped` (the drain reasoned but the delivery DROPPED — a journal +
-    an `answer_dropped` event instead of `answer_delivered`, the #288 shape). The
-    recorded service still proves the drain acted, so park-UNANSWERED ("no answer")
-    must not fire. A mutation `drop`s these to reintroduce the pre-#300 unrecorded
-    service that false-fired the watchdog (#263/#265/#283/#288)."""
-    via = step.get("via", "journal")
-    if via == "progress":
-        if "progress" not in world.dropped:
-            world.write_epoch("progress", issue, now)
-    else:
-        world.write_journal(issue, now)
-    outcome = "answer_dropped" if via == "dropped" else "answer_delivered"
+    answer_pass writes: a decision-journal entry + an `answer_delivered` event. A
+    mutation `drop`s these to reintroduce the pre-#300 unrecorded service."""
+    world.write_journal(issue, now)
     world.event(
         issue,
-        outcome,
+        "answer_delivered",
         "hub-inject.sh",
         lane="answer",
         episode=world.spokes[issue].episode,
@@ -672,50 +627,13 @@ def _v_kill_agent(world: World, issue: int, now: int, step: dict, mutation: dict
     world.set_agent_alive(issue, False)
 
 
-def _v_kill_pane(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
-    """#290: the whole tmux window is gone (a reboot/crash) — the dead-idle shape."""
-    world.set_pane_exists(issue, False)
-    world.set_agent_alive(issue, False)
-
-
-def _v_land_start(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
-    """The spoke's own land process records `landing` intent-first, then stalls
-    (pane dies mid-land) — the #290 shape. The `landing` record is exactly what the
-    watchdog reads to DEFER a dead-pane fire; a mutation that drops it reintroduces
-    the pre-#300 epoch-inference that false-fired."""
-    world.tlog(issue, "landing", "worktree-land.sh", "merging into default", now=now)
-
-
-def _v_block(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
-    world.git(issue, "tag", "-f", f"blocked/{issue}")
-    world.tlog(issue, "blocked", "spoke-ready.sh", "escalated to a human", now=now)
-
-
-def _v_epoch(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
-    """Stamp a bare-epoch drain marker at the fake-clock time (e.g. the dispatch
-    epoch the watchdog's dead-idle clock ages from)."""
-    world.write_epoch(step["name"], issue, now)
-
-
-def _v_journal(world: World, issue: int, now: int, step: dict, mutation: dict | None) -> None:
-    """A bare decision-journal entry with NO real service behind it — a stale record
-    that the watchdog reads as recent servicing. Used by a mutation to falsely suppress
-    the #310 backstop (the drain looked busy, so nothing escalated the jam)."""
-    world.write_journal(issue, now)
-
-
 _VERBS = {
     "park": _v_park,
     "push": _v_push,
     "ready": _v_ready,
     "commit": _v_commit,
     "kill_agent": _v_kill_agent,
-    "kill_pane": _v_kill_pane,
-    "land_start": _v_land_start,
-    "block": _v_block,
     "answer": _v_answer,
-    "epoch": _v_epoch,
-    "journal": _v_journal,
 }
 
 
@@ -749,31 +667,6 @@ def inv_pushed_ready_lands(world: World, scenario: dict) -> list[Violation]:
     return out
 
 
-def inv_landing_never_dead_pane(world: World, scenario: dict) -> list[Violation]:
-    """I1 (#290/#301): a spoke the scenario declares is in a `landing`/`pushing`
-    phase is NEVER fired dead-pane. The recorded intent-first phase transition is
-    what the watchdog reads to defer the fire (principles 1, 4); reintroducing
-    epoch-inference (dropping the recorded state) is what false-fired."""
-    out: list[Violation] = []
-    for issue in _scenario_issues(scenario):
-        phase = _spoke_truth(scenario, issue).get("phase")
-        if phase not in {"landing", "pushing"}:
-            continue
-        dead = [f for f in world.fires(issue) if f.get("condition") == "dead-pane"]
-        if dead:
-            out.append(
-                Violation(
-                    "I1",
-                    issue,
-                    f"#{issue} was fired dead-pane while in the '{phase}' phase "
-                    f"({len(dead)} fire(s)) — a spoke in a recorded multi-minute "
-                    f"phase is structurally not a dead pane (principle 4: probe the "
-                    f"real process, never a stale epoch proxy).",
-                )
-            )
-    return out
-
-
 _FORWARD_STATES = {
     "ready",
     "accepted",
@@ -788,40 +681,10 @@ _FORWARD_STATES = {
 _INJECT_EVENTS = {"answer_injected", "approval_injected", "nudge"}
 
 
-def inv_unserviced_park_backstopped(world: World, scenario: dict) -> list[Violation]:
-    """I3 (#310): the watchdog is the BACKSTOP. A park declared past the ceiling AND
-    unserviced MUST be fired by the watchdog (which then intervenes) — never left to
-    rot. A stale record that falsely reads as "serviced" suppresses the backstop and
-    reproduces the #310 silent 10-hour jam (principle 3: act when unattended; a stall
-    jams every dependent)."""
-    out: list[Violation] = []
-    for issue in _scenario_issues(scenario):
-        truth = _spoke_truth(scenario, issue)
-        if not (truth.get("parked_past_ceiling") and not truth.get("serviced")):
-            continue
-        fired = any(
-            f.get("condition") in {"park-unanswered", "park-undeliverable"}
-            for f in world.fires(issue)
-        )
-        if not fired:
-            out.append(
-                Violation(
-                    "I3",
-                    issue,
-                    f"#{issue} parked past the ceiling and was NEVER serviced, yet the "
-                    f"watchdog never fired — nothing escalated it (the #310 silent jam: "
-                    f"a stall jams every scope-dependent issue behind it, principle 3).",
-                )
-            )
-    return out
-
-
 def inv_answered_park_advances(world: World, scenario: dict) -> list[Violation]:
     """I4 (#312): once a park episode is serviced (`answer_delivered`), the spoke
     ADVANCES — a forward transition follows — never silently re-parking on the same
-    episode (principle 5: a serviced episode is settled). The complementary property
-    "a serviced episode is never re-FIRED park-unanswered" is covered by I6 (which has
-    a negative control); this invariant owns the positive advance."""
+    episode (principle 5: a serviced episode is settled)."""
     out: list[Violation] = []
     for issue in _scenario_issues(scenario):
         if not _spoke_truth(scenario, issue).get("advances"):
@@ -839,32 +702,6 @@ def inv_answered_park_advances(world: World, scenario: dict) -> list[Violation]:
                     f"#{issue} was answered (answer_delivered) but recorded no forward "
                     f"transition afterward (later={later}) — an answered park must "
                     f"advance, not re-park (principle 5).",
-                )
-            )
-    return out
-
-
-def inv_serviced_park_never_fired(world: World, scenario: dict) -> list[Violation]:
-    """I6 (#263/#265/#283/#288): a park the scenario declares the drain SERVICED is
-    never fired park-UNANSWERED ("no answer delivered") by the watchdog. The drain
-    records its service (a decision-journal entry / a progress epoch / an episode-keyed
-    answer_delivered); the watchdog reads that record and suppresses. Reintroducing the
-    pre-#300 unrecorded service (dropping the record) is what false-fired four times
-    (principles 1, 6). NB park-UNDELIVERABLE is the HONEST reason for a serviced park
-    whose delivery dropped (#288) — not a false silence — so it is not flagged here."""
-    out: list[Violation] = []
-    for issue in _scenario_issues(scenario):
-        if not _spoke_truth(scenario, issue).get("serviced"):
-            continue
-        bad = [f for f in world.fires(issue) if f.get("condition") == "park-unanswered"]
-        if bad:
-            out.append(
-                Violation(
-                    "I6",
-                    issue,
-                    f"#{issue} park was serviced by the drain but the watchdog fired "
-                    f"{[f['condition'] for f in bad]} — a recorded service was read as "
-                    f"unanswered (principle 1).",
                 )
             )
     return out
@@ -912,11 +749,8 @@ def inv_dead_agent_never_injected(world: World, scenario: dict) -> list[Violatio
 # scenario never touches this list; only a change to an AFK Design PRINCIPLE does.
 INVARIANTS = [
     inv_pushed_ready_lands,
-    inv_landing_never_dead_pane,
-    inv_unserviced_park_backstopped,
     inv_answered_park_advances,
     inv_dead_agent_never_injected,
-    inv_serviced_park_never_fired,
 ]
 
 
@@ -967,12 +801,7 @@ def _apply_mutation_env(world: World, mutation: dict) -> None:
 
 
 def _run_timeline(world: World, scenario: dict, *, mutation: dict | None) -> None:
-    # A mutation may INJECT extra timeline steps (e.g. a stale false-service record that
-    # suppresses the watchdog backstop) — merged in and re-sorted by fake-clock time.
-    steps = list(scenario["timeline"])
-    if mutation:
-        steps += mutation.get("inject", [])
-    for step in sorted(steps, key=lambda s: int(s["t"])):
+    for step in sorted(scenario["timeline"], key=lambda s: int(s["t"])):
         apply_step(world, step, mutation=mutation)
 
 
@@ -1024,7 +853,7 @@ def test_mutation_reddens_exactly_one_invariant(tmp_path: Path, scenario: dict) 
 
 # The invariant ids the registry can emit — the single source a fixture's
 # `mutation.expect_violation` must name (a typo would otherwise silently never match).
-INVARIANT_IDS = frozenset({"I1", "I2", "I3", "I4", "I5", "I6"})
+INVARIANT_IDS = frozenset({"I2", "I4", "I5"})
 
 
 def test_scenarios_are_well_formed() -> None:

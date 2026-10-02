@@ -1656,10 +1656,23 @@ def test_chain_merge_lint_survives_for_a_blocked_chain() -> None:
     assert "merge candidates" in proc.stderr
 
 
+# ── _batch_inflight_issue_nums stays standalone and LC_ALL=C (#361/#364) ──────────────
+
+
+def test_inflight_nums_helper_is_locale_pinned_and_sources_no_lib() -> None:
+    text = BATCH_PLAN.read_text()
+    body = text[text.index("_batch_inflight_issue_nums() {") :].split("\n}\n", 1)[0]
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+    assert body.count("LC_ALL=C") >= 2, "git and awk must both run under LC_ALL=C (#189/#194)"
+    assert "identity.sh" not in code and "worktree-lib" not in code
+    assert not re.search(r"^\s*(source|\.)\s", code, re.MULTILINE), "must stay dependency-free"
+
+
 # --- the in-flight issue set comes from Orca, not a slug parse (#364) ----------------
 
 
-def _inflight_nums(cwd: Path) -> subprocess.CompletedProcess[str]:
+def _orca_inflight_nums(cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["bash", "-c", f'source "{BATCH_PLAN}"; _batch_inflight_issue_nums'],
         cwd=cwd,
@@ -1679,7 +1692,7 @@ def test_inflight_nums_use_the_orca_linked_issue_of_a_bare_branch(
 ) -> None:
     hub = _hub_with_worktree(tmp_path, orca_bin, "scratch-lane", 361)
 
-    result = _inflight_nums(hub)
+    result = _orca_inflight_nums(hub)
 
     assert result.stdout.split() == ["361"], "the main checkout is skipped, the bare branch counts"
 
@@ -1689,7 +1702,7 @@ def test_inflight_nums_ignore_a_leading_number_in_the_branch_when_unlinked(
 ) -> None:
     hub = _hub_with_worktree(tmp_path, orca_bin, "feature/223-slug", None)
 
-    assert _inflight_nums(hub).stdout == ""
+    assert _orca_inflight_nums(hub).stdout == ""
 
 
 def test_inflight_nums_warn_and_drop_attribution_when_orca_fails(
@@ -1698,7 +1711,7 @@ def test_inflight_nums_warn_and_drop_attribution_when_orca_fails(
     hub = _hub_with_worktree(tmp_path, orca_bin, "scratch-lane", 361)
     orca_scenario(orca_bin, {"worktree list": [{"rc": 1, "stderr": "runtime down"}]})
 
-    result = _inflight_nums(hub)
+    result = _orca_inflight_nums(hub)
 
     assert result.returncode == 0
     assert result.stdout == ""

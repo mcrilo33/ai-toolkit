@@ -1,9 +1,9 @@
 """Mirror tests for hub-afk-arm.sh (issue #307 split).
 
-The ARM-time lane extracted from hub-afk.sh: the telemetry preflight,
-the sleep-inhibitor/power status warnings, and the arm-time liveness probes + preconditions
-+ the ONE arm verdict + the self-check. A behaviour-neutral MOVE, so these tests assert the
-functions are reachable through the entry and physically located in the module file.
+The ARM-time lane extracted from hub-afk.sh: the telemetry preflight, and the arm-time
+liveness probes + preconditions + the ONE arm verdict + the self-check. A behaviour-neutral
+MOVE, so these tests assert the functions are reachable through the entry and physically
+located in the module file.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ ARM_FUNCTIONS = [
     "afk_telemetry_preflight",
     "afk_arm_preconditions",
     "afk_arm_selfcheck",
-    "afk_warn_power",
     "_afk_arm_judge_check",
     "_afk_arm_gh_check",
     "afk_arm_orca_guard",
