@@ -1219,7 +1219,6 @@ def test_queue_gate_outranks_an_unmet_precondition(spoke: Path, tmp_path: Path) 
 # `gh run list --json` output (see _make_ci_gh). --local-gate is the offline escape hatch.
 
 
-
 def _ci_env(tmp_path: Path, runs_json: str, **extra: str) -> tuple[dict[str, str], Path]:
     """An env whose `gh run list` answers `runs_json`; polls fast, waits briefly."""
     log = tmp_path / "gh-calls.log"
@@ -1315,8 +1314,12 @@ def test_ready_polls_until_a_pending_run_turns_green(
         f'printf \'[{{"status":"%s","conclusion":"%s","url":"{_CI_URL}","databaseId":1}}]\' "$s" "$k"\n'
     )
     (ghdir / "gh").chmod(0o755)
-    env = {**_GIT_ENV, "PATH": f"{ghdir}:{os.environ['PATH']}", "WT_CI_POLL": "1",
-           "WT_READY_CI_WAIT": "30"}
+    env = {
+        **_GIT_ENV,
+        "PATH": f"{ghdir}:{os.environ['PATH']}",
+        "WT_CI_POLL": "1",
+        "WT_READY_CI_WAIT": "30",
+    }
 
     result = _run(spoke, "45", env=env)
 
@@ -1330,8 +1333,25 @@ def test_ready_refused_when_gh_is_unavailable_and_points_at_local_gate(
 ) -> None:
     sandbox = tmp_path / "nogh"
     sandbox.mkdir()
-    for tool in ("git", "bash", "python3", "mktemp", "tee", "rm", "dirname", "sort", "tr",
-                 "awk", "sed", "head", "date", "stat", "cat", "grep", "uname"):
+    for tool in (
+        "git",
+        "bash",
+        "python3",
+        "mktemp",
+        "tee",
+        "rm",
+        "dirname",
+        "sort",
+        "tr",
+        "awk",
+        "sed",
+        "head",
+        "date",
+        "stat",
+        "cat",
+        "grep",
+        "uname",
+    ):
         found = shutil.which(tool)
         if found:
             os.symlink(found, sandbox / tool)
@@ -1354,10 +1374,16 @@ def test_ready_force_skips_the_ci_gate(spoke: Path, remote: Path, tmp_path: Path
     assert _remote_has_ref(remote, "refs/tags/ready/45")
 
 
-def test_ci_gate_does_not_apply_to_the_other_markers(spoke: Path, remote: Path, tmp_path: Path) -> None:
+def test_ci_gate_does_not_apply_to_the_other_markers(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
     env, _ = _ci_env(tmp_path, _FAILED)
 
-    for flag, ref in (("--gate", "gate/45"), ("--accept", "accept/45"), ("--blocked", "blocked/45")):
+    for flag, ref in (
+        ("--gate", "gate/45"),
+        ("--accept", "accept/45"),
+        ("--blocked", "blocked/45"),
+    ):
         result = _run(spoke, flag, "45", env=env)
         assert result.returncode == 0, result.stdout + result.stderr
         assert _remote_has_ref(remote, f"refs/tags/{ref}")
@@ -1379,7 +1405,7 @@ def _install_prepush_hook(
         'echo "test-select: running custom suite (TEST_SELECT_CMD)" >&2' if announce else ":"
     )
     hook.write_text(
-        f'#!/bin/sh\ncat >/dev/null\n{announce_line}\n'
+        f"#!/bin/sh\ncat >/dev/null\n{announce_line}\n"
         f'printf "%s" "${{TEST_SELECT_CMD-UNSET}}" >> "{seen}"\nexit {exit_code}\n'
     )
     hook.chmod(0o755)
@@ -1463,7 +1489,11 @@ def test_local_gate_still_runs_the_other_preconditions(spoke: Path, tmp_path: Pa
 
 @pytest.mark.parametrize(
     "args",
-    [("--local-gate", "--no-wait", "45"), ("--gate", "--local-gate", "45"), ("--accept", "--no-wait", "45")],
+    [
+        ("--local-gate", "--no-wait", "45"),
+        ("--gate", "--local-gate", "45"),
+        ("--accept", "--no-wait", "45"),
+    ],
     ids=["gate-vs-wait", "gate-marker", "accept-marker"],
 )
 def test_ci_flags_are_usage_errors_when_misapplied(spoke: Path, args: tuple[str, ...]) -> None:
@@ -1713,3 +1743,15 @@ def test_a_timed_out_ask_is_kept_bound_to_its_dispatch_and_a_failed_one_is_dropp
     assert kept == ["m_pending", "ctx_9"]
     assert failed.returncode == 1
     assert not (spoke / ".ai-toolkit" / "gate-45.ask").exists()
+
+
+def test_a_ci_refusal_sends_no_worker_done(spoke: Path, tmp_path: Path, orca_bin: Path) -> None:
+    # worker_done tells the coordinator the work is READY: a ready refused by the CI gate (#378) exits
+    # before the tag, so nothing may be announced.
+    _record_dispatch(spoke)
+    env, _ = _ci_env(tmp_path, _PENDING, WT_SPOKE="45", ORCA_TERMINAL_HANDLE="term_w")
+
+    result = _run(spoke, "45", env=env)
+
+    assert result.returncode != 0
+    assert _sends(orca_bin) == []
