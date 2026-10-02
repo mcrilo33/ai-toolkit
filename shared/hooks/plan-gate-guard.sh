@@ -46,6 +46,8 @@ set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
+# shellcheck source=lib/identity.sh
+source "$HOOK_DIR/lib/identity.sh"
 
 # is_gated_commit <command> — a `git commit` at a command boundary. Same
 # boundary-awareness as utils.sh's is_git_commit (start/`;`/`&`/`|`/backtick/`$(`,
@@ -133,11 +135,9 @@ else
   esac
 fi
 
-# ── Parse the issue number from the branch slug (feature/173-foo → 173) ─
+# ── Resolve the issue number: the identity record, else the branch slug ─
 ROOT=$(project_root_from_payload "$INPUT")
-BRANCH=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
-SLUG="${BRANCH##*/}"
-ISSUE=$(printf '%s' "$SLUG" | sed 's/^\([0-9]*\).*/\1/')
+ISSUE=$(ai_toolkit_identity_issue "$ROOT" || true)
 [ -n "$ISSUE" ] || exit 0
 
 # ── Parked iff gate/<issue> is AT the branch tip ─────────────────────

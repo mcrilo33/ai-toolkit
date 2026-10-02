@@ -12,6 +12,8 @@ set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
+# shellcheck source=lib/identity.sh
+source "$HOOK_DIR/lib/identity.sh"
 
 INPUT=$(read_stdin)
 COMMAND=$(get_shell_command "$INPUT")
@@ -143,17 +145,9 @@ fi
 # $CURSOR_PROJECT_DIR) so the branch lookup does not depend on cwd.
 BRANCH=$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 
-# An issue ID in the branch is a tracker key (PROJ-12) anywhere, OR a bare
-# number that is the FIRST segment right after the type prefix
-# (feature/142-x, fix/142). Anchoring the bare number to the post-"/" segment
-# avoids matching incidental numbers inside a slug (oauth-2-factor, utf-8) or
-# version/year tokens (release-2024, go-1-21).
+# The issue anchor comes from the identity record, else the branch (lib/identity.sh).
 BRANCH_HAS_ISSUE=0
-if echo "$BRANCH" | grep -qE '(^|[/_-])[A-Z][A-Z0-9]+-[0-9]+([/_-]|$)' \
-   || echo "$BRANCH" | grep -qE '/[0-9]+([/_-]|$)' \
-   || echo "$BRANCH" | grep -qE '^[0-9]+([/_-]|$)'; then
-  BRANCH_HAS_ISSUE=1
-fi
+ai_toolkit_identity_has_issue_anchor "$PROJECT_ROOT" && BRANCH_HAS_ISSUE=1
 
 # An anchor in the message: Closes/Close/Closed/Fixes/Fix/Fixed/Resolves/
 # Resolved/Refs/Ref followed by #N or a tracker key. The leading
