@@ -32,6 +32,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from _orca_stub import install_dispatch_env
 from _stubs import write_stub
 
 WORKTREE_NEW = Path(__file__).resolve().parents[2] / "scripts" / "worktree-new.sh"
@@ -123,9 +124,11 @@ def test_worktree_new_with_telemetry_on_never_writes_real_default(tmp_path: Path
     env = {**_GIT_ENV, "AI_TOOLKIT_TELEMETRY": "1", "HOME": str(home)}
     for var in ("TMUX", "WT_SPOKE"):
         env.pop(var, None)
+    (tmp_path / "bin").mkdir()
+    env = install_dispatch_env(tmp_path / "bin", env)
 
     res = subprocess.run(
-        ["bash", str(WORKTREE_NEW), "7", "bare", "--no-code", "--no-terminal"],
+        ["bash", str(WORKTREE_NEW), "7", "bare"],
         cwd=str(hub),
         capture_output=True,
         text=True,
@@ -221,7 +224,5 @@ def test_conftest_pins_langfuse_auth_resolution() -> None:
     )
     assert not os.environ.get("LANGFUSE_HOST"), "conftest must strip LANGFUSE_HOST"
     conf = os.environ.get("AFK_TELEMETRY_CONF")
-    assert conf, (
-        "conftest must pin AFK_TELEMETRY_CONF so the resolver never reads ~/.afk-telemetry"
-    )
+    assert conf, "conftest must pin AFK_TELEMETRY_CONF so the resolver never reads ~/.afk-telemetry"
     assert not Path(conf).exists(), "the pinned conf must not exist (sandbox no-such-conf)"

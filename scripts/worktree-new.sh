@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 #
-# worktree-new.sh — create an isolated git worktree for one task and wire it into
-# a "multiple terminals + one review window" workflow:
-#   - folds the worktree into your single VS Code review window (`code --add`)
-#   - opens a tmux window cd'd into it in the project's session, launching `claude`
+# worktree-new.sh — dispatch ONE task into an Orca-managed worktree with a Claude agent on it.
 #
-# One task = one issue = one branch = one checkout = its own staging area, hooks,
-# and .review/ approval artifacts (the isolation solo-cycle/close-task assume).
+# One task = one issue = one branch = one checkout = its own staging area, hooks, and
+# .review/ approval artifacts (the isolation solo-cycle/close-task assume). The sequence
+# (docs/orca-migration/03-spike.md, Round 4):
+#   1. `orca worktree create --setup skip` (Orca owns the path), then rename the branch to
+#      <type>/<n>-<slug> (Orca sanitises `/` in --name);
+#   2. provision-worktree.sh, synchronously, with the mode/lane/branch/run-id Orca's own setup
+#      hook cannot receive (so an afk spoke never starts as attended);
+#   3. `orca terminal create --command "<OTel env> claude ..."` — a launch WE own, because
+#      Claude only honours the OTel pairs as real process env (not settings.local.json);
+#   4. `orca orchestration worker-start --terminal` delivers the seed prompt behind Orca's
+#      worker preamble.
+# Prerequisites: Orca >= 1.4.218 with this repo registered, run from an Orca terminal with a
+# bound Run (`orca orchestration run-create --objective ...`), and the Orca workspaces dir
+# trusted by Claude once (docs/parallel-worktrees.md).
 #
 # Usage:
 #   scripts/worktree-new.sh <issue> [slug] [type] [flags]
@@ -15,25 +24,20 @@
 #   [slug]   short branch slug; derived from the issue title when omitted (needs gh)
 #   [type]   feature | fix | chore   (default: feature)
 #
-#   -t, --type <t>   branch type (feature|fix|chore) — unambiguous, beats the
-#                    positional [type] slot
-#   --prompt <text>  seed the spawned claude with this first message (e.g. /source
-#                    or a task kickoff) — used by the start-task skill to dispatch
-#   --mode <m>       execution mode stamped on the trace (attended|afk; default
-#                    attended) — hub-afk.sh passes `afk` for drain-driven spokes (#102)
-#   --new-window     open a SEPARATE VS Code window instead of code --add
-#   --no-code        don't touch VS Code
-#   --no-terminal    don't spawn a tmux/terminal window
-#   --no-agent       spawn the terminal but don't launch `claude` in it
+#   -t, --type <t>   branch type (feature|fix|chore) — unambiguous, beats the positional
+#                    [type] slot
+#   --prompt <text>  seed prompt for the agent (required for an ad-hoc slug; a numbered issue
+#                    defaults to "read .ai-toolkit/task.md")
+#   --mode <m>       execution mode stamped on the trace (attended|afk; default attended)
+#   --subtasks N,M   extra issues this ONE spoke ships on the same branch (#278)
 #
-# Env: WT_AGENT_MODEL / WT_AGENT_EFFORT pin the spawned agent's model and effort
-#      (defaults: opus / max).
+# Env: WT_AGENT_MODEL / WT_AGENT_EFFORT pin the agent's model and effort (otherwise
+#      spoke-model.env / settings/ai-toolkit.yml decide).
 #
 # Examples:
-#   scripts/worktree-new.sh 42                          # feature/42-<title>, review window + tmux
+#   scripts/worktree-new.sh 42                          # feature/42-<title>
 #   scripts/worktree-new.sh 57 null-pointer fix
-#   scripts/worktree-new.sh refactor-sync -t chore      # chore/refactor-sync (ad-hoc + type)
-#   scripts/worktree-new.sh 42 --prompt "/source"       # spoke starts anchored to the issue
+#   scripts/worktree-new.sh refactor-sync -t chore --prompt "tidy sync"   # chore/refactor-sync
 #
 set -euo pipefail
 
@@ -47,10 +51,7 @@ WT_T0="$(wt_now_ms)"
 
 # --- parse flags vs positionals ----------------------------------------------
 POSITIONAL=()
-OPEN_MODE="add"        # add | new-window | none
-SPAWN_TERMINAL=1
-LAUNCH_AGENT=1
-PROMPT=""              # seed the spawned claude with this first message
+PROMPT=""              # seed prompt for the agent
 TYPE_FLAG=""           # --type overrides the positional type (no footgun)
 MODE="attended"        # execution mode stamped on the trace (attended | afk); #102
 # --subtasks N,M: extra issues this ONE spoke ships (#278). NOT named SUBTASKS: that name is
@@ -59,10 +60,6 @@ MODE="attended"        # execution mode stamped on the trace (attended | afk); #
 SUBTASK_ARG=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --new-window)  OPEN_MODE="new-window"; shift ;;
-    --no-code)     OPEN_MODE="none"; shift ;;
-    --no-terminal) SPAWN_TERMINAL=0; shift ;;
-    --no-agent)    LAUNCH_AGENT=0; shift ;;
     -t|--type)     [ "$#" -ge 2 ] || wt_die "--type needs a value"; TYPE_FLAG="$2"; shift 2 ;;
     --type=*)      TYPE_FLAG="${1#--type=}"; shift ;;
     --prompt)      [ "$#" -ge 2 ] || wt_die "--prompt needs a value"; PROMPT="$2"; shift 2 ;;
@@ -94,6 +91,19 @@ esac
 git rev-parse --git-dir >/dev/null 2>&1 || wt_die "run this from inside your checkout (cd into the repo first)"
 REPO_ROOT="$(wt_main_root)" || wt_die "could not locate the main worktree"
 cd "$REPO_ROOT"
+
+# --- preflight: Orca, a coordinator terminal, a bound Run ----------------------
+# worker-start needs a live Orca coordinator terminal with a Run bound to it (spike (c)); from
+# any other shell it fails consumer_fenced. Fail loud here, before anything is created.
+orca_require_version || exit 1
+[ -n "${ORCA_TERMINAL_HANDLE:-}" ] \
+  || wt_die "dispatch must run from an Orca terminal (ORCA_TERMINAL_HANDLE is unset): worker-start needs a live coordinator terminal"
+RUN_ID="$(orca_run_id)" \
+  || wt_die "no Orca Run is bound to this terminal; run: orca orchestration run-create --objective '<what this session coordinates>'"
+if [[ ! "$ISSUE" =~ ^[0-9]+$ ]] && [ -z "$PROMPT" ]; then
+  wt_die "an ad-hoc dispatch needs --prompt (there is no task contract to seed the agent from)"
+fi
+
 
 # --- derive slug + branch ----------------------------------------------------
 # An explicitly-passed slug is still slugified, so spaces or odd characters can
@@ -187,11 +197,9 @@ if [ -z "${WT_AGENT_MODEL:-}" ] && [[ "$ISSUE" =~ ^[0-9]+$ ]] && command -v gh >
   fi
 fi
 
-WT_DIR="$(dirname "$REPO_ROOT")/$(basename "$REPO_ROOT")-${WT_TAG}"
+WT_NAME="${BRANCH##*/}"   # Orca sanitises `/` in --name, so the branch is renamed below
 
-# --- create the worktree -----------------------------------------------------
-git worktree prune                       # drop stale registrations first
-[ -e "$WT_DIR" ] && wt_die "path already exists: $WT_DIR (open it, or remove it first)"
+# --- create the worktree through Orca ----------------------------------------
 git fetch origin --quiet 2>/dev/null || true
 
 if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
@@ -209,9 +217,19 @@ BASE_BRANCH="$(wt_base_branch "$REPO_ROOT")"
 BASE_START="$(wt_base_start_point "$REPO_ROOT")" \
   || wt_die "base branch '$BASE_BRANCH' has no ref (neither origin/$BASE_BRANCH nor local) — fix git config ai-toolkit.base-branch / AI_TOOLKIT_BASE_BRANCH"
 
-echo "→ creating worktree  $WT_DIR"
-echo "→ new branch         $BRANCH (from $BASE_START)"
-git worktree add "$WT_DIR" -b "$BRANCH" "$BASE_START"
+ISSUE_ARGS=()
+[[ "$ISSUE" =~ ^[0-9]+$ ]] && ISSUE_ARGS=(--issue "$ISSUE")
+echo "→ creating worktree  $WT_NAME (via Orca, from $BASE_START)"
+_wt_probe() { orca_worktree_by_name "$WT_NAME" "path:$REPO_ROOT"; }
+orca_call_settled _wt_probe worktree create --repo "path:$REPO_ROOT" --name "$WT_NAME" --setup skip \
+  --no-parent --base-branch "$BASE_START" --comment "$BRANCH ($MODE)" ${ISSUE_ARGS[@]+"${ISSUE_ARGS[@]}"} \
+  || wt_die "orca worktree create failed: ${ORCA_ERR:-$ORCA_OUT}"
+WT_DIR="$(orca_wt_path)"; WT_ID="$(orca_wt_id)"
+[ -d "$WT_DIR" ] || wt_die "orca returned no usable worktree path: $ORCA_OUT"
+git -C "$WT_DIR" branch -m "$BRANCH" || wt_die "could not rename the Orca branch to $BRANCH in $WT_DIR"
+orca_json worktree set --worktree "id:$WT_ID" --workspace-status in-progress \
+  || wt_warn "could not mark the Orca worktree in-progress"
+echo "→ new branch         $BRANCH"
 
 # Resolve the marker-emitter dir that EXISTS in the freshly-created worktree (#271): `scripts`
 # in the ai-toolkit checkout (tracked, so it is checked out), `.ai-toolkit/scripts` in a synced
@@ -220,172 +238,31 @@ git worktree add "$WT_DIR" -b "$BRANCH" "$BASE_START"
 MARKER_DIR="$(wt_marker_script_dir "$WT_DIR")"
 
 # --- provision the worktree's policy layer (issue #359) -----------------------
-# Everything that makes this checkout a GATED spoke — the git exclude entries (.ai-toolkit/,
-# .claude/, .testmondata*), the test venv + .testmondata pre-warm, .ai-toolkit/{spoke-run-id,
-# lane,mode,task.md,ledger-skeleton.md}, the copied .claude/ tree and the seeded
-# settings.local.json allow/deny rules — lives in provision-worktree.sh, the SAME script
-# Orca's setup hook runs, so a worktree is gated identically whichever host created it.
-#
-# The spoke_run_id (<branch>+<spawn-epoch>) is minted here and handed over: every
-# hook/script emitting telemetry inside this worktree reads it, so all spans of one spoke
-# share it across sessions and resumes. Minting is INDEPENDENT of AI_TOOLKIT_TELEMETRY —
-# the spoke's identity must exist even if telemetry is enabled later mid-run.
-#
+# Everything that makes this checkout a GATED spoke — git excludes, test venv, .ai-toolkit/
+# {spoke-run-id,lane,mode,identity,task.md,...}, the copied .claude/ tree and the seeded
+# settings.local.json — lives in provision-worktree.sh, the SAME script Orca's setup hook runs.
+# The spoke_run_id (<branch>+<spawn-epoch>) is minted here: every hook/script emitting telemetry
+# in this worktree reads it, so all spans of one spoke share it across sessions and resumes.
 # TITLE / ISSUE_BODY (fetched above, when they were) ride along so the provisioner does not
 # pay a second `gh` round-trip per field; unset means "not fetched", so it fetches itself.
 SPOKE_RUN_ID="${BRANCH}+$(date +%s)"
 PROVISION_ENV=()
 [ -n "${TITLE+x}" ] && PROVISION_ENV+=("PROVISION_TASK_TITLE=$TITLE")
 [ -n "${ISSUE_BODY+x}" ] && PROVISION_ENV+=("PROVISION_TASK_BODY=$ISSUE_BODY")
-env -u PROVISION_TASK_TITLE -u PROVISION_TASK_BODY ${PROVISION_ENV[@]+"${PROVISION_ENV[@]}"} bash "$SCRIPT_DIR/provision-worktree.sh" \
-  --worktree "$WT_DIR" --repo-root "$REPO_ROOT" --issue "$ISSUE" --lane "$LANE" \
-  --mode "$MODE" --branch "$BRANCH" --spoke-run-id "$SPOKE_RUN_ID" \
-  --otel-body-dir "$WT_DIR/.ai-toolkit/raw-bodies" --repo-name "$(wt_repo_name "$REPO_ROOT")" \
-  || wt_die "provisioning $WT_DIR failed — the worktree is NOT gated; fix the error above, then re-run: bash $SCRIPT_DIR/provision-worktree.sh --worktree $WT_DIR --repo-root $REPO_ROOT --issue $ISSUE --lane $LANE --mode $MODE"
+_wt_provision() {
+  env -u PROVISION_TASK_TITLE -u PROVISION_TASK_BODY ${PROVISION_ENV[@]+"${PROVISION_ENV[@]}"} \
+    bash "$SCRIPT_DIR/provision-worktree.sh" \
+    --worktree "$WT_DIR" --repo-root "$REPO_ROOT" --issue "$WT_TAG" --lane "$LANE" \
+    --mode "$MODE" --branch "$BRANCH" --spoke-run-id "$SPOKE_RUN_ID" \
+    --otel-body-dir "$WT_DIR/.ai-toolkit/raw-bodies" --repo-name "$(wt_repo_name "$REPO_ROOT")" \
+    --orca-worktree-id "$WT_ID" --run-id "$RUN_ID" "$@"
+}
+_wt_provision \
+  || wt_die "provisioning $WT_DIR failed — the worktree is NOT gated; fix the error above, then re-run: bash $SCRIPT_DIR/provision-worktree.sh --worktree $WT_DIR --repo-root $REPO_ROOT --issue $WT_TAG --lane $LANE --mode $MODE --branch $BRANCH --orca-worktree-id $WT_ID"
 SPOKE_RUN_ID="$(cat "$WT_DIR/.ai-toolkit/spoke-run-id")"
-
-# #300 writer: record `dispatched` — the actor that CAUSES the transition (this
-# spawn) records it at the instant it happens. Shadow-only: the drain still reads
-# dispatch-<issue>.epoch and nothing decides on the log yet. AFK_TLOG_RUN stamps
-# the freshly-minted spoke_run_id onto the record, so a spoke's whole lifecycle is
-# greppable by run even across a relaunch. Best-effort (wt_tlog_* no-op without the
-# lib, and skip an ad-hoc slug with no issue number).
-AFK_TLOG_RUN="$SPOKE_RUN_ID" wt_tlog_transition "$ISSUE" dispatched worktree-new.sh \
-  "spawn --mode $MODE" "{\"branch\":\"$BRANCH\",\"lane\":\"$LANE\",\"mode\":\"$MODE\"}"
 
 # The task contract path (written by provision-worktree.sh) the default seed prompt points at.
 TASK_MD="$WT_DIR/.ai-toolkit/task.md"
-
-
-echo
-echo "✓ worktree ready: $WT_DIR"
-echo "  branch:         $BRANCH"
-
-# --- 1. fold into the single VS Code review window ---------------------------
-# The review window is a saved workspace file, so `add` edits its `folders`
-# array directly (issue #134): `code --add` targets the *last-focused* window
-# and routinely never lands the folder. VS Code hot-reloads the file. The CLI
-# call survives strictly as the fallback when the file is missing or
-# unparseable (wt_workspace_add returns 1 — call kept in a conditional, a bare
-# call would abort this set -e script before the fallback).
-if [ "$OPEN_MODE" != none ]; then
-  case "$OPEN_MODE" in
-    add)
-      WS_FILE="$(wt_workspace_file "$REPO_ROOT")"
-      if wt_workspace_add "$WS_FILE" "$WT_DIR"; then
-        echo "→ added to your review workspace file: $WS_FILE (VS Code hot-reloads it)"
-      elif command -v code >/dev/null 2>&1; then
-        echo "→ adding to your VS Code review window (code --add)"
-        code --add "$WT_DIR" \
-          || wt_warn "no VS Code window to add to — open one, then run: code --add \"$WT_DIR\""
-      else
-        wt_warn "'code' CLI not found — in VS Code run: Shell Command: Install 'code' in PATH"
-      fi
-      ;;
-    new-window)
-      if command -v code >/dev/null 2>&1; then
-        echo "→ opening a separate VS Code window"
-        code "$WT_DIR"
-      else
-        wt_warn "'code' CLI not found — in VS Code run: Shell Command: Install 'code' in PATH"
-      fi
-      ;;
-  esac
-fi
-
-# --- 2. spawn a terminal/tmux window for the agent ---------------------------
-# Build the launch command, optionally seeded with a first prompt that claude
-# receives as its initial message (e.g. "/source", or a task kickoff).
-# Model+effort are pinned at dispatch time so spokes stay deterministic even
-# when user-global settings change; override via WT_AGENT_MODEL / WT_AGENT_EFFORT.
-# WT_SPOKE marks the session's ROLE, not its directory (issue #26): every command
-# the spoke runs inherits it, so worktree-land.sh / worktree-done.sh refuse a
-# spoke that cd's to the hub and tries to land or tear down its own worktree.
-# Native OpenTelemetry trace export (issue #83) — strictly opt-in via
-# AI_TOOLKIT_OTEL=1, a SEPARATE gate from the custom push layer's
-# AI_TOOLKIT_TELEMETRY. When on, prefix the launch with Claude Code's native-OTel
-# trace env so the interactive claude streams ONE nested trace per spoke, grouped
-# by the spoke_run_id minted above (carried as an OTEL_RESOURCE_ATTRIBUTES key, so
-# it tags every span/sub-agent/tool of the run). The secret boundary is the AUTH
-# HEADER, not the endpoint: OTEL_EXPORTER_OTLP_HEADERS carries the Langfuse
-# credential and is NEVER wired — it stays in the environment claude inherits, kept
-# off the command line (visible in `ps`/tmux) and out of the manual-fallback advice.
-# The connection ENDPOINTS are non-secret URLs, so to auto-populate Langfuse with no
-# manual step they ARE wired: defaulted to the local collector when the operator
-# left them unset, and an operator override is preserved verbatim (see below).
-# The same treatment covers AI_TOOLKIT_OTEL_SPAN_ENDPOINT (#126): telemetry.sh's
-# workflow-span fan-out (cycle step:/script/hook spans) POSTs to it over OTLP-HTTP,
-# so it defaults to the collector's :4318 listener and rides the same gate.
-#
-# Off-box CONTENT (auto-populate): OTEL_LOG_USER_PROMPTS / OTEL_LOG_TOOL_DETAILS /
-# OTEL_LOG_TOOL_CONTENT ship the user prompts and per-tool input/output off the
-# machine so Langfuse renders conversation + per-tool I/O. They send content off-box,
-# so they ride strictly behind this same AI_TOOLKIT_OTEL opt-in.
-#
-# Beyond traces, the same gate lights up two probe-proven signals (issue #88):
-#   - METRICS (OTEL_METRICS_EXPORTER) — token-by-type/skill/agent + cost_usd; they
-#     flush reliably and carry no content. Langfuse is NOT a metrics store, so the
-#     operator routes them to a metrics sink (Prometheus/console) — see
-#     dashboard/langfuse/otelcol.yaml. account_uuid is forced OFF for metrics
-#     (OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false) since PII rides every datapoint.
-#   - DETAILED TRACING (ENABLE_BETA_TRACING_DETAILED) — adds response.model_output
-#     and system_reminders span attrs. Its destination, BETA_TRACING_ENDPOINT, is a
-#     non-secret URL wired like the OTLP endpoint (defaulted, override preserved).
-#     FOOTGUN: it MUST hit a different host:port than the normal OTLP endpoint, or it
-#     silently kills ALL trace+log export (metrics still flow) — the defaults honour
-#     the split: normal gRPC on :4317, beta HTTP on :4418.
-# The normal stream exports over gRPC (OTEL_EXPORTER_OTLP_PROTOCOL=grpc): the beta
-# detailed exporter is HTTP-only, so normal takes gRPC and beta takes HTTP — the
-# arrangement proven to land response.model_output end-to-end in Langfuse (final
-# verification pending on a live interactive spoke, free of the `-p` flush confound
-# the probe ran under).
-#
-# Raw request bodies in FILE mode (issue #87): OTEL_LOG_RAW_API_BODIES=file:<dir>
-# makes Claude Code dump each outgoing request, untruncated (no 60KB inline cap),
-# to <dir>/<uuid>.request.json — the full tools array + system/messages prefix —
-# so the post-run spoke-tree builder can itemize loaded context by name + exact
-# size. The dir lives under the gitignored .ai-toolkit/ (bodies hold conversation
-# content and stay local — only a body_ref path rides the OTLP logs signal) and is
-# exported as AI_TOOLKIT_OTEL_BODY_DIR for the builder to find.
-#
-# OTEL_LOGS_EXPORTER=otlp is wired explicitly (not left to inheritance): the logs
-# signal carries both the message bridge's source and the api_request_body log
-# events whose body_refs point at the FILE-mode dumps — without it they are lost.
-# DEFAULT-ON (issue: otel-default): native OTel is enabled unless the operator
-# explicitly opts out with AI_TOOLKIT_OTEL=0. Setting it once here covers BOTH the
-# prefix gate below AND wt_otel_bridge_preflight (worktree-lib.sh) — they read the
-# same variable, and the lib is sourced into this shell, so the default propagates.
-# AI_TOOLKIT_OTEL=0 is a clean, full opt-out: the prefix collapses, no body dir is
-# created, and the preflight returns early (no bridge) — there is no half-on state.
-#
-# !!! PRIVACY — LOUD NOTE !!!  Default-on means EVERY spoke now ships CONTENT off-box
-# by default: OTEL_LOG_USER_PROMPTS + OTEL_LOG_TOOL_DETAILS + OTEL_LOG_TOOL_CONTENT
-# send the user's prompts and per-tool input/output to the collector/Langfuse, and
-# OTEL_LOG_RAW_API_BODIES=file:<dir> dumps each FULL, untruncated outgoing request
-# (system prompt + entire conversation + tools array) to disk under .ai-toolkit/.
-# This is conversation content leaving the box for every run, not just metadata.
-# To opt out entirely, launch the spoke with AI_TOOLKIT_OTEL=0.
-# Client-side telemetry defaults from settings/ai-toolkit.yml (issue #228): sets
-# AI_TOOLKIT_OTEL_DEFAULT / AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT (and the langfuse
-# host/project/public-key defaults) so the toggle + endpoint below layer as
-# env -> config -> hardcoded default. Best-effort; a telemetry-less config no-ops.
-wt_resolve_telemetry_config "${AI_TOOLKIT_CONFIG:-$REPO_ROOT/settings/ai-toolkit.yml}"
-AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"
-OTEL_PREFIX=""
-if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
-  OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
-  mkdir -p "$OTEL_BODY_DIR"
-  # The launch-prefix endpoints (normal gRPC :4317, beta HTTP :4418) are defaulted inside
-  # wt_native_otel_prefix (worktree-lib.sh) — the SINGLE source shared with spoke-relaunch.sh
-  # (#233) so spawn and relaunch never drift. But the span-sink endpoint must ALSO be set in
-  # THIS shell: the wt_emit_lifecycle/wt_emit_script calls below run telemetry.sh's emit, whose
-  # OTLP sink (telemetry.sh, gated on AI_TOOLKIT_OTEL_SPAN_ENDPOINT) fires only when it is set —
-  # the helper's own defaulting happens in a command-substitution subshell and cannot leak back.
-  wt_default_span_endpoint
-  # repo=<name> (issue #343): the cross-project dimension, resolved from the main checkout's
-  # origin so it matches the #231 land-time repo: tag; the collector lifts it onto live spans.
-  OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$OTEL_BODY_DIR" "$(wt_repo_name "$REPO_ROOT")")"
-fi
 
 # Resolve the spoke driver's default model/effort via the shared helper (issue #142,
 # #233): sync-emitted spoke-model.env -> hub config -> literal defaults. An explicit
@@ -394,10 +271,31 @@ fi
 WT_CONFIG="${AI_TOOLKIT_CONFIG:-$REPO_ROOT/settings/ai-toolkit.yml}"
 wt_resolve_agent_model "$SCRIPT_DIR" "$WT_CONFIG"
 
+# --- native-OTel launch env (issues #83, #126, #228, #343) -------------------
+# DEFAULT-ON unless the operator opts out with AI_TOOLKIT_OTEL=0 (a clean, full opt-out; the
+# preflights below read the same variable). The pair set is wt_native_otel_env_pairs, the single
+# source shared with provision-worktree.sh and spoke-relaunch.sh. Claude only honours these as
+# real PROCESS env, so they ride the launch command (spike (b)). The auth header
+# (OTEL_EXPORTER_OTLP_HEADERS) is never wired: it stays in the inherited environment, off the
+# command line (visible in `ps`/the terminal).
+#
+# !!! PRIVACY !!!  Default-on means EVERY spoke ships CONTENT off-box: user prompts and per-tool
+# input/output (OTEL_LOG_*) and, to .ai-toolkit/raw-bodies (local), each full request body.
+# AI_TOOLKIT_OTEL=0 opts out entirely.
+wt_resolve_telemetry_config "${AI_TOOLKIT_CONFIG:-$REPO_ROOT/settings/ai-toolkit.yml}"
+AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"
+OTEL_PREFIX=""
+if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
+  # The span-sink endpoint must ALSO be set in THIS shell: wt_emit_* below run telemetry.sh,
+  # whose OTLP sink fires only when it is set (the prefix helper defaults it in a subshell).
+  wt_default_span_endpoint
+  OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$WT_DIR/.ai-toolkit/raw-bodies" "$(wt_repo_name "$REPO_ROOT")")"
+fi
+
 # Default seed prompt (issue #177): with no caller-supplied --prompt, seed the
 # spoke to READ its on-disk task contract instead of anchoring via an LLM
 # /source-task round-trip. An explicit --prompt (start-task, hub-afk's
-# kickoff_for) still wins; ad-hoc slugs (no task.md) keep the unseeded launch.
+# kickoff_for) still wins; an ad-hoc slug has no task.md and must pass --prompt.
 if [ -z "$PROMPT" ] && [ -f "$TASK_MD" ]; then
   # A packed spoke (#278) owns a CHAIN, not one issue. Without this the spoke reads task.md,
   # sees a single issue, and has no idea the queue is waiting on it — so name the queued
@@ -405,6 +303,9 @@ if [ -z "$PROMPT" ] && [ -f "$TASK_MD" ]; then
   # (spoke-ready.sh refuses ready/${ISSUE} while it is non-empty); this is the heads-up that
   PROMPT="Read your task contract at .ai-toolkit/task.md (issue #${ISSUE}, fetched at spawn -- no need to run /source-task). Break it into a task ledger (one entry per subtask x the solo-cycle steps ANCHOR/RED/GREEN/REVIEW/PUSH, exactly one in_progress) -- a skeleton is pre-seeded at .ai-toolkit/ledger-skeleton.md; seed your ledger from its rows so your entries match the '#<issue>.<slug> - <STEP> - <label>' schema. Honor its Gate: line: plan (the default for non-trivial work, and whenever no Gate: line is present) means the PLAN gate comes first -- explore, print the full implementation plan, emit 'bash ${MARKER_DIR}/spoke-ready.sh --gate ${ISSUE}', and WAIT for approval before GREEN; only Gate: none runs autonomous straight through. Then implement via the solo-cycle (/cycle: RED -> GREEN -> REVIEW -> PUSH). Push your own branch each subtask; when the acceptance criteria are all met, push the final subtask and emit 'bash ${MARKER_DIR}/spoke-push.sh --ready ${ISSUE}'. Do NOT self-land. If task.md is missing, or the issue was edited after spawn, run /source-task ${ISSUE} to re-anchor from the live issue."
 fi
+# A numbered issue whose contract fetch failed (no task.md) still needs a seed: re-anchor from
+# the live issue, exactly as the default prompt's own fallback sentence says.
+[ -n "$PROMPT" ] || PROMPT="/source-task ${ISSUE}"
 
 # A packed spoke (#278) owns a CHAIN, not one issue: untold, it reads task.md, sees a single
 # issue, and has no idea a queue is waiting on it — then hits an unexplained ready/${ISSUE}
@@ -444,27 +345,51 @@ PYEOF
   printf '%s\n' "worktree-new: WARNING (afk): $settings has $n permissions.ask rule(s) -- an ask RULE pierces bypassPermissions (rules > mode) and can strand this spoke on a dialog. Remove global ask rules (or use an afk-aware machine-local hook) for a dialog-free drain." >&2
 }
 
-AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "$WT_AGENT_EFFORT") claude --model $(printf '%q' "$WT_AGENT_MODEL")"
-# afk spokes launch under bypassPermissions (#261): the bypass MODE suppresses the routine
-# prompt-then-approve dialogs, moving safety to a PreToolUse deny-hook WALL (afk-danger-guard)
-# that still fires and can DENY even under bypass. But the mode is NOT absolute: a user-global
-# `permissions.ask` RULE outranks the permission mode (rules > mode), so such a rule PIERCES
-# bypassPermissions and still raises a dialog -- #238 proved this stranded a live afk run. The
-# afk_ask_rule_preflight below warns when one exists; the operator must remove global ask rules
-# (or replace them with an afk-aware machine-local hook) for a dialog-free drain. afk-ONLY:
-# attended/quick lanes keep default prompting (the human is the wall), so their launch is
-# unchanged. The flag precedes the seeded prompt below, which stays the trailing arg. The wall's
-# own gate is .ai-toolkit/mode == afk (written above), so it stays authoritative for the whole
-# bypass lifetime independent of supervisor liveness.
-[ "$MODE" = afk ] && AGENT_CMD="$AGENT_CMD --permission-mode bypassPermissions"
 [ "$MODE" = afk ] && afk_ask_rule_preflight
-# Best-effort in-process budget cap for unattended spokes. A caller may set
-# WT_AGENT_BUDGET_ARGS (e.g. "--max-budget-usd 5"); it is a pre-formed multi-arg
-# string appended verbatim (NOT %q-quoted), so leave it unset for ordinary attended
-# spokes to keep the launch unchanged. The supervisor-side wall-clock reap is the
-# reliable ceiling; this is a backstop.
-[ -n "${WT_AGENT_BUDGET_ARGS:-}" ] && AGENT_CMD="$AGENT_CMD ${WT_AGENT_BUDGET_ARGS}"
-[ -n "$PROMPT" ] && AGENT_CMD="$AGENT_CMD $(printf '%q' "$PROMPT")"
+# WT_SPOKE marks the session's ROLE, not its directory (issue #26): every command the spoke runs
+# inherits it, so the land and done scripts refuse a spoke that cd's to the hub and tries to land
+# or tear down its own worktree. --dangerously-skip-permissions mirrors Orca's own new-agent-tab
+# default (Q2: no extra permission mechanism; the hooks stay the cage).
+AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") claude --model $(printf '%q' "$WT_AGENT_MODEL") --effort $(printf '%q' "$WT_AGENT_EFFORT") --dangerously-skip-permissions"
+
+# Bring up the otelcol collector, then the Langfuse message bridge, before the
+# spoke starts streaming, so an opted-in (AI_TOOLKIT_OTEL=1) spoke auto-populates
+# Langfuse with no manual step. Order matters: the collector (:4317, what CC
+# exports to) forks to the bridge (:4319), so it must be up first. Both are
+# idempotent (never a second instance) and best-effort (warn, never fail the spawn).
+wt_otel_collector_preflight "$REPO_ROOT"
+wt_otel_bridge_preflight "$REPO_ROOT"
+
+# --- launch: a terminal we own, then the seed through worker-start ------------
+# The agent must be RUNNING before worker-start types the prompt, or the text would reach a bare
+# shell (spike (f)). A claude parked on its workspace-trust dialog defaults to "No, exit", so a
+# blocked launch fails loud and is never auto-answered.
+_wt_die_if_trust_blocked() {
+  [ "$(orca_blocked_reason)" = agent-trust-workspace ] || return 0
+  wt_die "Claude is blocked on its workspace-trust dialog (terminal ${TERM_H:-?}). One-time fix: set projects[\"$(dirname "$WT_DIR")\"].hasTrustDialogAccepted to true in ~/.claude.json (docs/orca-migration/03-spike.md Q1); nothing was auto-answered"
+}
+orca_json terminal create --worktree "path:$WT_DIR" --title "$WT_NAME" --command "$AGENT_CMD" \
+  || wt_die "orca terminal create failed: ${ORCA_ERR:-$ORCA_OUT} (worktree kept at $WT_DIR)"
+TERM_H="$(orca_terminal_handle)"
+orca_wait_agent "$TERM_H" || wt_die "claude did not start in Orca terminal $TERM_H (worktree kept at $WT_DIR)"
+orca_json terminal wait --terminal "$TERM_H" --for tui-idle --timeout-ms 20000 || true
+_wt_die_if_trust_blocked
+# Re-check: the shell prompt satisfies tui-idle too, so claude may have exited during that wait.
+orca_wait_agent "$TERM_H" || wt_die "claude is no longer running in Orca terminal $TERM_H (worktree kept at $WT_DIR)"
+orca_call_settled "" orchestration worker-start --run "$RUN_ID" --terminal "$TERM_H" \
+  --worktree "path:$WT_DIR" --task-title "$WT_NAME" --spec "$PROMPT" \
+  || { _wt_die_if_trust_blocked; wt_die "orca worker-start failed (never re-issued): ${ORCA_ERR:-$ORCA_OUT} — terminal $TERM_H, worktree $WT_DIR"; }
+DISPATCH_ID="$(orca_dispatch_id)"
+echo "→ launched claude in Orca terminal $TERM_H (dispatch ${DISPATCH_ID:-?}, run $RUN_ID)"
+
+# #300 writer: record `dispatched` — the actor that CAUSES the transition (this
+# spawn) records it once the launch has succeeded. Shadow-only: the drain still reads
+# dispatch-<issue>.epoch and nothing decides on the log yet. AFK_TLOG_RUN stamps
+# the freshly-minted spoke_run_id onto the record, so a spoke's whole lifecycle is
+# greppable by run even across a relaunch. Best-effort (wt_tlog_* no-op without the
+# lib, and skip an ad-hoc slug with no issue number).
+AFK_TLOG_RUN="$SPOKE_RUN_ID" wt_tlog_transition "$ISSUE" dispatched worktree-new.sh \
+  "spawn --mode $MODE" "{\"branch\":\"$BRANCH\",\"lane\":\"$LANE\",\"mode\":\"$MODE\"}"
 
 # --- seed the queued-subtask channel (issue #278) ----------------------------
 # The packed group's extra issues become this spoke's subtask queue. Seeded HERE, at spawn,
@@ -472,11 +397,10 @@ AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(print
 # drain running, so a packed spoke would otherwise find an empty queue, emit ready/<primary>,
 # and silently drop its subtasks on the floor.
 #
-# Placed THIS LATE on purpose — after every fallible setup step (task.md, the allowlist
-# merge, model resolution, the gh label mirror), immediately before the launch. This dir is
-# keyed by ISSUE and SHARED, not worktree-local, so a spawn that dies after seeding would
-# strand it: a later, unrelated spoke for the same issue would inherit the entries and be
-# refused at ready/<primary> forever. Nothing before this point can now leave that behind.
+# Placed AFTER the launch has succeeded on purpose: this dir is keyed by ISSUE and SHARED, not
+# worktree-local, so a spawn that dies after seeding would strand it — a later, unrelated spoke
+# for the same issue would inherit the entries and be refused at ready/<primary> forever. The
+# launch is the last step that can fail; the spoke only reads the queue at ready time.
 #
 # The path contract (<git-common-dir>/ai-toolkit-afk/queued-<spoke>/<issue>, one empty file
 # per queued issue) is INLINED rather than sourced: its owner, gate-broker-markers.sh, is a
@@ -499,87 +423,36 @@ if [ "${#SUBTASK_LIST[@]}" -gt 0 ]; then
   unset _q_common _q_dir _st
 fi
 
-# Bring up the otelcol collector, then the Langfuse message bridge, before the
-# spoke starts streaming, so an opted-in (AI_TOOLKIT_OTEL=1) spoke auto-populates
-# Langfuse with no manual step. Order matters: the collector (:4317, what CC
-# exports to) forks to the bridge (:4319), so it must be up first. Both are
-# idempotent (never a second instance) and best-effort (warn, never fail the spawn).
-wt_otel_collector_preflight "$REPO_ROOT"
-wt_otel_bridge_preflight "$REPO_ROOT"
-
-if [ "$SPAWN_TERMINAL" -eq 1 ]; then
-  SPAWNED=0
-  if command -v tmux >/dev/null 2>&1; then
-    win_name="${BRANCH##*/}"
-    # one tmux session per project (issue #39): derive it from the repo root so
-    # spokes nest under their project and 'tmux ls' reads as a portfolio.
-    sess="$(wt_tmux_session "$REPO_ROOT")"
-    # ensure the project session exists, detached if need be; '=' pins the
-    # target to an exact session name so e.g. '<sess>-foo' can never match
-    if tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$REPO_ROOT" 2>/dev/null; then
-      # The launch command is the window's own shell command, not keystrokes:
-      # typing it via send-keys raced interactive-zsh init (eaten Enter, zvm) —
-      # issue #15. `exec $SHELL` keeps the window alive after claude exits.
-      if [ "$LAUNCH_AGENT" -eq 1 ]; then
-        win="$(tmux new-window -t "=$sess:" -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR" \
-               "$AGENT_CMD; exec ${SHELL:-zsh}")"
-      else
-        win="$(tmux new-window -t "=$sess:" -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR")"
-      fi
-      # pin name so the running process can't clobber it
-      tmux set-window-option -t "$win" automatic-rename off
-      tmux set-window-option -t "$win" allow-rename off
-      echo "→ opened tmux window '$win_name' ($win) in session $sess"
-      if [ "$LAUNCH_AGENT" -eq 1 ]; then
-        [ -n "$PROMPT" ] && echo "  launched: claude (seeded with first prompt)" || echo "  launched: claude"
-      fi
-      # print the exact jump command so the caller can copy-paste
-      if [ -n "${TMUX:-}" ]; then
-        echo "  tmux switch-client -t '${sess}:${win_name}'"
-      else
-        echo "  tmux attach -t '${sess}' \\; select-window -t '${sess}:${win_name}'"
-      fi
-      SPAWNED=1
-    fi
-  fi
-  if [ "$SPAWNED" -eq 0 ]; then
-    echo
-    echo "  Start the agent in a new terminal window:"
-    [ "$LAUNCH_AGENT" -eq 1 ] && echo "    cd \"$WT_DIR\" && $AGENT_CMD" || echo "    cd \"$WT_DIR\""
-  fi
+# The spoke is live: recording its dispatch id is best-effort and never fails the spawn.
+if [ -n "$DISPATCH_ID" ]; then
+  _wt_provision --identity-only --orca-dispatch-id "$DISPATCH_ID" \
+    || wt_warn "could not record the dispatch id in .ai-toolkit/identity"
+else
+  wt_warn "worker-start reported no dispatch id; .ai-toolkit/identity keeps it empty"
 fi
 
 # The one-shot preflights above only cover the spawn instant; the watchdog
 # daemon keeps the collector+bridge alive for the whole spoke lifetime (machine
-# sleep/wake, #138) and exits itself when the last spoke pane closes. Armed
-# AFTER the tmux spawn so its first tick can already see the new pane;
+# sleep/wake, #138) and exits itself when the last spoke agent is gone. Armed
+# AFTER the launch so its first tick already sees the live agent;
 # best-effort and self-gating (no-op unless AI_TOOLKIT_OTEL=1, singleton).
 wt_otel_watch_arm "$REPO_ROOT"
 
 # --- GitHub lifecycle-label mirror: dispatch (issue #236) --------------------
 # Stamp the issue so its GitHub list entry shows the spoke is live: status:in-progress
 # + mode:<attended|afk> + lane:spoke, plus a one-time dispatch comment linking the
-# issue back to the branch / worktree / tmux window / spoke_run_id (and thus its
+# issue back to the branch / worktree / Orca worktree id / spoke_run_id (and thus its
 # Langfuse session). Numbered issues only — an ad-hoc slug carries no issue, so the
 # express/quick/micro lanes mirror nothing by construction. Every write is
 # best-effort and time-bounded inside the wt_gh_* helpers, so a failed / hung /
-# absent / opted-out gh never fails the spawn. LANE is "spoke" for numbered issues
-# (derived above). The tmux window (if one was spawned) links the live pane.
+# absent / opted-out gh never fails the spawn.
 # UPGRADE: correcting the mode label of an ALREADY-attended spoke when a drain
 # arms mid-run is left to a follow-up — dispatch stamps mode once, and hub-afk
 # passes --mode afk for drain-dispatched spokes so those are correct at spawn.
 if [[ "$ISSUE" =~ ^[0-9]+$ ]]; then
-  # Name the tmux window ONLY when one was actually spawned (SPAWNED=1): a tmux
-  # present-but-failed spawn still leaves win_name/sess assigned, so gate on SPAWNED
-  # to avoid naming a window that doesn't exist.
-  if [ "${SPAWNED:-0}" -eq 1 ] && [ -n "${win_name:-}" ]; then
-    DISPATCH_WINDOW="${sess:-}:${win_name}"
-  else
-    DISPATCH_WINDOW="(no tmux window)"
-  fi
   wt_gh_apply_dispatch_labels "$ISSUE" "$MODE" "$LANE"
-  wt_gh_dispatch_comment "$ISSUE" "$(printf 'Dispatched — spoke is live (issue #236 lifecycle mirror).\n- branch: %s\n- worktree: %s\n- tmux window: %s\n- spoke_run_id: %s' \
-    "$BRANCH" "$WT_DIR" "$DISPATCH_WINDOW" "$SPOKE_RUN_ID")"
+  wt_gh_dispatch_comment "$ISSUE" "$(printf 'Dispatched — spoke is live (issue #236 lifecycle mirror).\n- branch: %s\n- worktree: %s\n- orca worktree: %s\n- spoke_run_id: %s' \
+    "$BRANCH" "$WT_DIR" "$WT_ID" "$SPOKE_RUN_ID")"
 fi
 
 # --- telemetry: spawn lifecycle marker + script run-node ---------------------
@@ -591,9 +464,6 @@ wt_emit_lifecycle "worktree-new" "spawn" "success" "$WT_T0" "$WT_DIR"
 wt_emit_script "worktree-new" "success" "$WT_T0" "$WT_DIR"
 
 echo
-if [ -f "$TASK_MD" ]; then
-  echo "  Task contract on disk:  .ai-toolkit/task.md  (the spoke reads it, then /cycle)"
-  echo "  Crash re-anchor:        /source-task $ISSUE"
-else
-  echo "  Then in that session, run:  /source-task   (anchor to the issue, then /cycle)"
-fi
+echo "✓ dispatched: $WT_DIR"
+echo "  branch:     $BRANCH"
+echo "  Task contract on disk:  .ai-toolkit/task.md  (crash re-anchor: /source-task $ISSUE)"

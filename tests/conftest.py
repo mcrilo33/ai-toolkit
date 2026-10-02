@@ -70,7 +70,10 @@ oddly-placed ``TMPDIR``. The regression guard is ``tests/unit/test_post_land_swe
 
 from __future__ import annotations
 
+import atexit
+import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -111,6 +114,39 @@ os.environ.setdefault("GIT_AUTHOR_NAME", "ai-toolkit-tests")
 os.environ.setdefault("GIT_AUTHOR_EMAIL", "tests@ai-toolkit.invalid")
 os.environ.setdefault("GIT_COMMITTER_NAME", "ai-toolkit-tests")
 os.environ.setdefault("GIT_COMMITTER_EMAIL", "tests@ai-toolkit.invalid")
+
+# The `orca` CLI PATH stub (issue #364). Worktree lookup and teardown go through Orca, and the
+# host really has an Orca runtime, so a script run by ANY test -- unit or integration, with a
+# snapshot of os.environ taken at import or not -- must reach this stub and never the real CLI.
+# It is installed here, at import time, before any test module snapshots os.environ; the
+# autouse `orca_bin` fixture below wipes its recorded calls / scenario / worktree metadata
+# between tests. The stub itself lives in tests/unit/_orca_stub.py (see its docstring).
+_STUB_FILE = Path(__file__).parent / "unit" / "_orca_stub.py"
+_ORCA_BIN: Path | None = None
+if _STUB_FILE.is_file():  # a child pytest that copies only this conftest has no stub to install
+    _spec = importlib.util.spec_from_file_location("_orca_stub", _STUB_FILE)
+    assert _spec is not None and _spec.loader is not None
+    _orca_stub = importlib.util.module_from_spec(_spec)
+    sys.modules["_orca_stub"] = _orca_stub
+    _spec.loader.exec_module(_orca_stub)
+    _ORCA_BIN = Path(tempfile.mkdtemp(prefix="orca-stub-"))
+    _orca_stub.install_orca_stub(_ORCA_BIN)
+    os.environ["PATH"] = f"{_ORCA_BIN}:{os.environ['PATH']}"
+    atexit.register(shutil.rmtree, _ORCA_BIN, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def orca_bin() -> Path | None:
+    """The shared `orca` stub's bin dir, with its calls, scenario and worktree metadata reset."""
+    if _ORCA_BIN is None:
+        return None
+    home = _ORCA_BIN / ".orca-stub"
+    for name in ("state.json", "meta.json", "snapshots.jsonl"):
+        (home / name).unlink(missing_ok=True)
+    (home / "calls.jsonl").write_text("")
+    (home / "scenario.json").write_text("{}")
+    return _ORCA_BIN
+
 
 # Ready-gate bypass isolation (issue #206). AI_TOOLKIT_READY_FORCE=1 makes spoke-ready.sh
 # skip the whole #172 ready-gate precondition check (clean tree / pushed tip / review

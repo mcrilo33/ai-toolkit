@@ -29,6 +29,9 @@ ALLOWLIST: dict[str, str] = {
     "unit/test_commit_hooks.py::test_docs_executable_md_still_requires_anchor": (
         "the fixture IS an executable markdown file, not a stub"
     ),
+    "unit/_orca_stub.py::install_orca_stub": (
+        "a python-shebang stub; write_stub's warm guard is shell syntax (follow-up: python-aware warm)"
+    ),
     "unit/test_install_git_hooks.py::_foreign": (
         "a foreign hook the installer must preserve byte-for-byte; the warm guard would alter it"
     ),

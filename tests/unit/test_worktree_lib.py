@@ -9,13 +9,13 @@ helpers. These tests source the lib and call the helpers directly, pinning
 from __future__ import annotations
 
 import datetime
-import json
 import os
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
+from _orca_stub import add_worktree, make_hub, orca_scenario
 from _stubs import write_stub
 
 WT_LIB = Path(__file__).resolve().parents[2] / "scripts" / "worktree-lib.sh"
@@ -1412,297 +1412,6 @@ def test_resolve_langfuse_auth_env_project_wins_over_conf(tmp_path: Path) -> Non
     assert "C_PROJ=proj-from-env" in result.stdout
 
 
-# --- review workspace file management (issue #134) ----------------------------
-# The review "window" is a saved .code-workspace file; `code --add/--remove`
-# target the last-focused window and routinely miss, so worktree-new/-done edit
-# the file's `folders` array directly (VS Code hot-reloads it). The lib owns the
-# three primitives: wt_workspace_file (location resolution), wt_workspace_add,
-# and wt_workspace_remove (which also sweeps entries whose path is gone from
-# disk — self-healing for past misses). A missing or unparseable file returns 1
-# so callers fall back to the legacy `code` CLI path, file left untouched.
-
-
-def _ws_env_call(fn_call: str, *, home: Path) -> subprocess.CompletedProcess[str]:
-    """Source the lib with HOME pinned to a per-test dir and run an expression."""
-    return subprocess.run(
-        ["bash", "-c", f'source "{WT_LIB}"; {fn_call}'],
-        capture_output=True,
-        text=True,
-        env={
-            **os.environ,
-            "TZ": "UTC",
-            "HOME": str(home),
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_SYSTEM": "/dev/null",
-        },
-    )
-
-
-def _write_workspace(ws: Path, folders: list[dict], settings: dict | None = None) -> str:
-    """Write a VS Code-shaped workspace file (tab indent) and return its text."""
-    ws.parent.mkdir(parents=True, exist_ok=True)
-    doc = {"folders": folders, "settings": settings if settings is not None else {}}
-    text = json.dumps(doc, indent="\t") + "\n"
-    ws.write_text(text)
-    return text
-
-
-def _make_dirs(repos: Path, *names: str) -> list[Path]:
-    """Create sibling worktree-like directories under a Repos/ parent."""
-    made = []
-    for name in names:
-        d = repos / name
-        d.mkdir(parents=True, exist_ok=True)
-        made.append(d)
-    return made
-
-
-def test_workspace_file_defaults_to_home_claude_repo_basename(tmp_path: Path) -> None:
-    # No git config override → ~/.claude/<repo-basename>.code-workspace.
-    repo = tmp_path / "myrepo"
-    repo.mkdir()
-    home = tmp_path / "home"
-    home.mkdir()
-
-    result = _ws_env_call(f'wt_workspace_file "{repo}"', home=home)
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == str(home / ".claude" / "myrepo.code-workspace")
-
-
-def test_workspace_file_honors_git_config_override(tmp_path: Path) -> None:
-    # `git config ai-toolkit.workspace-file` wins over the default, so synced
-    # target repos can keep their own review workspace.
-    repo = tmp_path / "myrepo"
-    home = tmp_path / "home"
-    home.mkdir()
-    subprocess.run(
-        ["git", "init", "-q", str(repo)],
-        check=True,
-        capture_output=True,
-        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"},
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "ai-toolkit.workspace-file", "/x/review.code-workspace"],
-        check=True,
-        capture_output=True,
-        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"},
-    )
-
-    result = _ws_env_call(f'wt_workspace_file "{repo}"', home=home)
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "/x/review.code-workspace"
-
-
-def test_workspace_file_expands_leading_tilde_in_override(tmp_path: Path) -> None:
-    # A `~/...` config value must resolve against HOME (git stores it verbatim).
-    repo = tmp_path / "myrepo"
-    home = tmp_path / "home"
-    home.mkdir()
-    subprocess.run(
-        ["git", "init", "-q", str(repo)],
-        check=True,
-        capture_output=True,
-        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"},
-    )
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo),
-            "config",
-            "ai-toolkit.workspace-file",
-            "~/ws/review.code-workspace",
-        ],
-        check=True,
-        capture_output=True,
-        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"},
-    )
-
-    result = _ws_env_call(f'wt_workspace_file "{repo}"', home=home)
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == str(home / "ws" / "review.code-workspace")
-
-
-def test_workspace_add_appends_relative_entry(tmp_path: Path) -> None:
-    # New worktree → one appended {"name", "path"} entry, path relative to the
-    # workspace file's directory; unrelated entries, settings, and the tab
-    # indent VS Code writes are all preserved.
-    ws = tmp_path / "claude" / "review.code-workspace"
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit", "ai-toolkit-42")
-    main_entry = {"name": "ai-toolkit", "path": "../Repos/ai-toolkit"}
-    _write_workspace(ws, [main_entry], settings={"files.exclude": {"**/.git": True}})
-
-    result = _call(f'wt_workspace_add "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 0, result.stderr
-    text = ws.read_text()
-    doc = json.loads(text)
-    assert doc["folders"] == [
-        main_entry,
-        {"name": "ai-toolkit-42", "path": "../Repos/ai-toolkit-42"},
-    ]
-    assert doc["settings"] == {"files.exclude": {"**/.git": True}}
-    assert '\t"folders"' in text, "tab indentation (VS Code's own format) must be kept"
-
-
-def test_workspace_add_stores_resolvable_path_under_symlinked_ancestor(
-    tmp_path: Path,
-) -> None:
-    # The workspace file addressed THROUGH a symlinked ancestor (NFS/corp homes):
-    # the stored relative path must round-trip to the worktree via the physical
-    # layout — a lexical relpath against the unresolved dir produces a `..`-chain
-    # that resolves nowhere (and the next sweep would drop the live entry).
-    # The link is SHALLOWER than the physical tree: a lexical `..`-count computed
-    # from the unresolved side overshoots after the symlink is followed.
-    phys = tmp_path / "a" / "b" / "phys"
-    (phys / "claude").mkdir(parents=True)
-    repos = phys / "Repos"
-    _make_dirs(repos, "ai-toolkit-42")
-    link = tmp_path / "link"
-    link.symlink_to(phys)
-    ws = link / "claude" / "review.code-workspace"
-    _write_workspace(ws, [])
-
-    result = _call(f'wt_workspace_add "{ws}" "{link / "Repos" / "ai-toolkit-42"}"')
-
-    assert result.returncode == 0, result.stderr
-    (entry,) = json.loads(ws.read_text())["folders"]
-    resolved = (ws.parent / entry["path"]).resolve()
-    assert resolved == (repos / "ai-toolkit-42").resolve()
-
-
-def test_workspace_add_is_noop_when_entry_already_present(tmp_path: Path) -> None:
-    # An entry already resolving to the worktree — even a name-less one — must
-    # not be duplicated, and the file must not be rewritten.
-    ws = tmp_path / "claude" / "review.code-workspace"
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit", "ai-toolkit-42")
-    before = _write_workspace(
-        ws,
-        [
-            {"name": "ai-toolkit", "path": "../Repos/ai-toolkit"},
-            {"path": "../Repos/ai-toolkit-42"},
-        ],
-    )
-
-    result = _call(f'wt_workspace_add "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 0, result.stderr
-    assert ws.read_text() == before, "a duplicate add must leave the file byte-identical"
-
-
-def test_workspace_add_missing_file_signals_fallback(tmp_path: Path) -> None:
-    # No workspace file → rc 1 (caller falls back to `code --add`) and the file
-    # must NOT be conjured into existence.
-    ws = tmp_path / "claude" / "review.code-workspace"
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit-42")
-
-    result = _call(f'wt_workspace_add "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 1, result.stderr
-    assert not ws.exists()
-
-
-def test_workspace_add_invalid_json_leaves_file_and_signals_fallback(tmp_path: Path) -> None:
-    # A JSONC file (comments — VS Code tolerates them) fails strict parsing:
-    # warn-and-fallback, never abort, never truncate or rewrite the file.
-    ws = tmp_path / "claude" / "review.code-workspace"
-    ws.parent.mkdir(parents=True)
-    before = '{\n\t// hand-edited review window\n\t"folders": []\n}\n'
-    ws.write_text(before)
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit-42")
-
-    result = _call(f'wt_workspace_add "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 1
-    assert ws.read_text() == before, "an unparseable file must be left untouched"
-    assert "workspace" in result.stderr, "the parse failure must be surfaced as a warning"
-
-
-def test_workspace_remove_drops_target_entry(tmp_path: Path) -> None:
-    # Teardown removes exactly the target's entry; live siblings and the main
-    # checkout stay, name-less entries stay name-less, settings survive.
-    ws = tmp_path / "claude" / "review.code-workspace"
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit", "ai-toolkit-42", "ai-toolkit-57")
-    main_entry = {"name": "ai-toolkit", "path": "../Repos/ai-toolkit"}
-    live_entry = {"path": "../Repos/ai-toolkit-57"}
-    _write_workspace(
-        ws,
-        [main_entry, {"name": "ai-toolkit-42", "path": "../Repos/ai-toolkit-42"}, live_entry],
-        settings={"window.title": "review"},
-    )
-
-    result = _call(f'wt_workspace_remove "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 0, result.stderr
-    doc = json.loads(ws.read_text())
-    assert doc["folders"] == [main_entry, live_entry]
-    assert doc["settings"] == {"window.title": "review"}
-
-
-def test_workspace_remove_sweeps_dead_paths(tmp_path: Path) -> None:
-    # Entries whose path no longer exists on disk — relative or absolute — are
-    # swept in the same pass (self-healing for past `code --remove` misses).
-    # A path-less entry cannot be resolved and is conservatively kept.
-    ws = tmp_path / "claude" / "review.code-workspace"
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit", "ai-toolkit-42", "ai-toolkit-57")
-    main_entry = {"name": "ai-toolkit", "path": "../Repos/ai-toolkit"}
-    live_entry = {"name": "ai-toolkit-57", "path": "../Repos/ai-toolkit-57"}
-    pathless = {"name": "weird"}
-    _write_workspace(
-        ws,
-        [
-            main_entry,
-            {"path": "../Repos/ai-toolkit-99"},
-            {"path": str(tmp_path / "gone-abs")},
-            {"name": "ai-toolkit-42", "path": "../Repos/ai-toolkit-42"},
-            live_entry,
-            pathless,
-        ],
-    )
-
-    result = _call(f'wt_workspace_remove "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 0, result.stderr
-    doc = json.loads(ws.read_text())
-    assert doc["folders"] == [main_entry, live_entry, pathless]
-
-
-def test_workspace_remove_missing_file_signals_fallback(tmp_path: Path) -> None:
-    ws = tmp_path / "claude" / "review.code-workspace"
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit-42")
-
-    result = _call(f'wt_workspace_remove "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 1, result.stderr
-
-
-def test_workspace_remove_invalid_json_leaves_file_and_signals_fallback(
-    tmp_path: Path,
-) -> None:
-    ws = tmp_path / "claude" / "review.code-workspace"
-    ws.parent.mkdir(parents=True)
-    before = '{\n\t"folders": [\n\t\t{"path": "../Repos/x"},\n\t],\n}\n'  # trailing commas
-    ws.write_text(before)
-    repos = tmp_path / "Repos"
-    _make_dirs(repos, "ai-toolkit-42")
-
-    result = _call(f'wt_workspace_remove "{ws}" "{repos / "ai-toolkit-42"}"')
-
-    assert result.returncode == 1
-    assert ws.read_text() == before, "an unparseable file must be left untouched"
-    assert "workspace" in result.stderr, "the parse failure must be surfaced as a warning"
-
-
 # --- gh lifecycle-label mirror (issue #236) -----------------------------------
 # worktree-lib.sh grows a small, best-effort, time-bounded gh mirror layer so the
 # spoke lifecycle (dispatch / gate / ready / blocked / land) shows up on the
@@ -2249,3 +1958,102 @@ def test_otel_prefix_is_empty_when_otel_is_off() -> None:
 
     assert result.returncode == 0
     assert result.stdout == ""
+
+
+# --- worktree lookup through Orca (issue #364) ---------------------------------
+# wt_task_worktrees / wt_resolve read `orca worktree list` (the PATH stub builds its rows from
+# the real `git worktree list`), so the issue is a column, not a slug re-parsed from a branch.
+
+
+def _lookup(hub: Path, expr: str) -> subprocess.CompletedProcess[str]:
+    return _call(f'cd "{hub}" && main="$(wt_main_root)" && {expr}')
+
+
+def test_task_worktrees_prints_path_branch_and_issue_for_every_non_main_row(
+    orca_bin: Path, tmp_path: Path
+) -> None:
+    hub = make_hub(tmp_path / "hub")
+    linked = add_worktree(orca_bin, hub, "361-identity-hub-side", issue=361)
+    recorded = add_worktree(orca_bin, hub, "bare-branch", identity_issue=77)  # Orca: no link
+    bare = add_worktree(orca_bin, hub, "scratch-lane")
+
+    result = _lookup(hub, 'wt_task_worktrees "$main"')
+
+    assert result.returncode == 0, result.stderr
+    assert sorted(result.stdout.splitlines()) == sorted(
+        [
+            f"{linked}\t361-identity-hub-side\t361",
+            f"{recorded}\tbare-branch\t77",
+            f"{bare}\tscratch-lane\t",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param({"rc": 1, "stderr": "repo not registered"}, id="unregistered-repo"),
+        pytest.param({"rc": 127, "stderr": "orca: command not found"}, id="cli-missing"),
+        pytest.param({"out": "not json at all"}, id="garbage-json"),
+    ],
+)
+def test_task_worktrees_fails_closed_never_an_empty_success(
+    orca_bin: Path, tmp_path: Path, reply: dict
+) -> None:
+    hub = make_hub(tmp_path / "hub")
+    add_worktree(orca_bin, hub, "361-identity-hub-side", issue=361)
+    orca_scenario(orca_bin, {"worktree list": [reply]})
+
+    result = _lookup(hub, 'wt_task_worktrees "$main"')
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "orca" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "target"),
+    [
+        pytest.param({"issue": 361}, "361", id="issue-from-linkedIssue"),
+        pytest.param({"identity_issue": 77}, "77", id="issue-from-identity-when-unlinked"),
+        pytest.param({}, "feature/refactor-sync", id="full-branch"),
+        pytest.param({}, "refactor-sync", id="branch-leaf"),
+        pytest.param({}, "Refactor_Sync", id="slugified-leaf"),
+        pytest.param({"name": "Pretty Name"}, "Pretty Name", id="display-name"),
+        pytest.param({}, "PATH", id="canonical-path"),
+    ],
+)
+def test_resolve_finds_the_one_matching_worktree(
+    orca_bin: Path, tmp_path: Path, kwargs: dict, target: str
+) -> None:
+    hub = make_hub(tmp_path / "hub")
+    wt = add_worktree(orca_bin, hub, "feature/refactor-sync", dirname="elsewhere", **kwargs)
+
+    result = _lookup(hub, f'wt_resolve "{str(wt) if target == "PATH" else target}" "$main"')
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(wt)
+
+
+@pytest.mark.parametrize("target", ["999", "sometag", "hub-sometag"])
+def test_resolve_returns_1_for_no_match_and_a_bare_repo_tag_dirname(
+    orca_bin: Path, tmp_path: Path, target: str
+) -> None:
+    hub = make_hub(tmp_path / "hub")
+    add_worktree(orca_bin, hub, "feature/unrelated", dirname="hub-sometag", issue=361)
+
+    result = _lookup(hub, f'wt_resolve "{target}" "$main"')
+
+    assert (result.returncode, result.stdout) == (1, "")
+
+
+def test_resolve_returns_1_when_two_worktrees_match(orca_bin: Path, tmp_path: Path) -> None:
+    hub = make_hub(tmp_path / "hub")
+    add_worktree(orca_bin, hub, "feature/same-leaf")
+    add_worktree(orca_bin, hub, "fix/same-leaf")
+
+    result = _lookup(hub, 'wt_resolve same-leaf "$main"')
+
+    assert (result.returncode, result.stdout) == (1, "")
+
+

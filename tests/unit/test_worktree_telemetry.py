@@ -26,6 +26,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _orca_stub import install_dispatch_env
 from _stubs import write_stub
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -106,6 +107,9 @@ def _run(script: Path, hub: Path, env: dict[str, str], *args: str) -> subprocess
     home = hub.parent / "home"
     home.mkdir(exist_ok=True)
     env = {**env, "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")}
+    if script == WORKTREE_NEW:  # dispatch runs against the stubbed orca (#363)
+        (hub.parent / "bin").mkdir(exist_ok=True)
+        env = install_dispatch_env(hub.parent / "bin", env)
     return subprocess.run(
         ["bash", str(script), *args],
         cwd=str(hub),
@@ -138,11 +142,9 @@ def _make_spoke(hub: Path, tmp_path: Path, issue: str, slug: str) -> Path:
         _tele_env(None, enabled=False),
         issue,
         slug,
-        "--no-code",
-        "--no-terminal",
     )
     assert res.returncode == 0, res.stderr
-    return tmp_path / f"{hub.name}-{issue}"
+    return tmp_path / "orca-ws" / f"{issue}-{slug}"
 
 
 # ── worktree-new: mint + spawn span ────────────────────────
@@ -156,11 +158,9 @@ class TestWorktreeNewSpoke:
             _tele_env(None, enabled=False),
             "42",
             "alpha",
-            "--no-code",
-            "--no-terminal",
         )
 
-        srid = tmp_path / f"{hub.name}-42" / ".ai-toolkit" / "spoke-run-id"
+        srid = tmp_path / "orca-ws" / "42-alpha" / ".ai-toolkit" / "spoke-run-id"
         assert srid.is_file()
         content = srid.read_text().strip()
         assert re.fullmatch(r"feature/42-alpha\+\d+", content), content
@@ -175,11 +175,9 @@ class TestWorktreeNewSpoke:
             _tele_env(telemetry_dir, enabled=False),
             "42",
             "alpha",
-            "--no-code",
-            "--no-terminal",
         )
 
-        srid = tmp_path / f"{hub.name}-42" / ".ai-toolkit" / "spoke-run-id"
+        srid = tmp_path / "orca-ws" / "42-alpha" / ".ai-toolkit" / "spoke-run-id"
         assert srid.is_file()
         assert not (telemetry_dir / "events.jsonl").exists()
 
@@ -190,8 +188,6 @@ class TestWorktreeNewSpoke:
             _tele_env(telemetry_dir),
             "42",
             "alpha",
-            "--no-code",
-            "--no-terminal",
         )
 
         spans = _spans(telemetry_dir, name="worktree-new", kind="lifecycle")
@@ -210,11 +206,11 @@ class TestWorktreeNewSpoke:
             _tele_env(telemetry_dir),
             "42",
             "alpha",
-            "--no-code",
-            "--no-terminal",
         )
 
-        srid = (tmp_path / f"{hub.name}-42" / ".ai-toolkit" / "spoke-run-id").read_text().strip()
+        srid = (
+            (tmp_path / "orca-ws" / "42-alpha" / ".ai-toolkit" / "spoke-run-id").read_text().strip()
+        )
         span = _spans(telemetry_dir, name="worktree-new", kind="lifecycle")[0]
         assert span["spoke_run_id"] == srid
         assert span["branch"] == "feature/42-alpha"
@@ -228,12 +224,10 @@ class TestWorktreeNewSpoke:
             _tele_env(telemetry_dir),
             "42",
             "alpha",
-            "--no-code",
-            "--no-terminal",
         )
 
         content = (telemetry_dir / "events.jsonl").read_text()
-        wt_dir = str(tmp_path / f"{hub.name}-42")
+        wt_dir = str(tmp_path / "orca-ws" / "42-alpha")
         assert wt_dir not in content
 
 
@@ -247,7 +241,7 @@ class TestWorktreeDoneSpoke:
         wt = _make_spoke(hub, tmp_path, "7", "beta")
         srid = (wt / ".ai-toolkit" / "spoke-run-id").read_text().strip()
 
-        res = _run(WORKTREE_DONE, hub, _tele_env(telemetry_dir), "7", "--no-code", "--force")
+        res = _run(WORKTREE_DONE, hub, _tele_env(telemetry_dir), "7", "--force")
 
         assert res.returncode == 0, res.stderr
         spans = _spans(telemetry_dir, name="worktree-done", kind="lifecycle")
@@ -290,12 +284,10 @@ class TestWorktreeDoneSpoke:
             _tele_env(None, enabled=False),
             "5",
             "delta",
-            "--no-code",
-            "--no-terminal",
         )
         assert new.returncode == 0, new.stderr
 
-        done = _run(WORKTREE_DONE, hub, _tele_env(None, enabled=False), "5", "--no-code")
+        done = _run(WORKTREE_DONE, hub, _tele_env(None, enabled=False), "5")
         assert done.returncode == 0, done.stderr
 
 
@@ -350,8 +342,6 @@ class TestWorktreeScriptSpans:
             _tele_env(telemetry_dir),
             "42",
             "alpha",
-            "--no-code",
-            "--no-terminal",
         )
 
         spans = _spans(telemetry_dir, name="worktree-new", kind="script")
@@ -365,7 +355,7 @@ class TestWorktreeScriptSpans:
     ) -> None:
         _make_spoke(hub, tmp_path, "7", "beta")
 
-        res = _run(WORKTREE_DONE, hub, _tele_env(telemetry_dir), "7", "--no-code", "--force")
+        res = _run(WORKTREE_DONE, hub, _tele_env(telemetry_dir), "7", "--force")
 
         assert res.returncode == 0, res.stderr
         spans = _spans(telemetry_dir, name="worktree-done", kind="script")

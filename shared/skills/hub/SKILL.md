@@ -194,10 +194,10 @@ For the triage heuristic and lane definitions see `shared/rules/workflow.md`.
    `--local` skips upstream guards (micro-spokes never push). It accepts a bare local
    branch whose temp worktree may already be gone, refuses any branch that has an
    upstream (that is not a micro-spoke), and refuses the default branch itself. No issue
-   to close. `--keep-branch` is honored if you need the branch for follow-up.
+   to close.
 
 4. **Verify cleanup.** A landed micro-spoke leaves nothing behind: no branch, no
-   worktree, no tmux window (none were created beyond the temp worktree).
+   worktree (none were created beyond the temp worktree).
 
 ## Rules of thumb
 

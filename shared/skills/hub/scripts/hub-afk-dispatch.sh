@@ -71,7 +71,8 @@ _afk_scope_line_of() {
 # EVERY ready issue until it lands — failing CLOSED under unattended /afk (#74) rather than
 # co-dispatching into an unknown-scope collision.
 _inflight_scope_args() {
-  local issue body scope
+  local issue body scope issues
+  issues="$(inflight_issues)" || { log "  in-flight set unknown (orca) — treating it as exclusive (#364)"; printf -- '--inflight\n*\n'; return 0; }
   while IFS= read -r issue; do
     [ -n "$issue" ] || continue
     # Bound the gh call (#170 ST1): a hung `gh issue view` used to freeze the tick. A
@@ -83,7 +84,7 @@ _inflight_scope_args() {
     fi
     scope="$(_afk_scope_line_of "$body")"   # #356/#5: the one shared Scope-line extractor
     printf -- '--inflight\n%s\n' "${scope:-*}"
-  done < <(inflight_issues)
+  done <<<"$issues"
 }
 
 # _afk_scope_blocked_behind <issue> -> #305: the space-joined `#N` list of OPEN issues batch-plan
@@ -301,7 +302,7 @@ dispatch_batch() {
   local raw units="" route_lines="" line unit primary subtasks member chain_max
   bp="$(_afk_find_script "${BATCH_PLAN:-}" batch-plan.sh)" || { log "batch-plan.sh not found — skipping dispatch"; return 0; }
   wt_new="$(_afk_find_script "${WT_NEW:-}" worktree-new.sh)" || { log "worktree-new.sh not found — skipping dispatch"; return 0; }
-  inflight="$(inflight_issues)"
+  inflight="$(inflight_issues)" || { log "in-flight set unknown (orca) — skipping dispatch this tick"; return 0; }
   while IFS= read -r line; do args+=("$line"); done < <(_inflight_scope_args)
   # Bound total live spokes: batch-plan truncates so (in-flight + dispatched) ≤ cap.
   cap="$(_afk_dispatch_cap)"
@@ -446,8 +447,9 @@ afk_sync_status_labels() {
   # Desired: `<num>\t<afk:label|->` per open issue, seeded with the live in-flight set so a
   # running spoke's issue is labelled afk:in-flight. A planner failure means "unknown" —
   # skip this tick rather than strip every label on a transient blip.
-  local ifargs=() n desired
-  while IFS= read -r n; do [ -n "$n" ] && ifargs+=("--inflight-issue" "$n"); done < <(inflight_issues)
+  local ifargs=() n desired inflight
+  inflight="$(inflight_issues)" || { log "  afk labels: in-flight set unknown (orca) — skipping label sync this tick"; return 0; }
+  while IFS= read -r n; do [ -n "$n" ] && ifargs+=("--inflight-issue" "$n"); done <<<"$inflight"
   if ! desired="$(_afk_with_timeout "$AFK_PLANNER_TIMEOUT" bash "$bp" --explain-labels ${ifargs[@]+"${ifargs[@]}"} 2>/dev/null)"; then
     log "  afk labels: batch-plan --explain-labels failed — skipping label sync this tick"
     return 0

@@ -1077,3 +1077,143 @@ def test_permission_lane_events_carry_the_episode(spoke_repo: Path, tmp_path: Pa
     assert decided, "sanity: a decision was recorded"
     episode = decided[-1].get("episode", "")
     assert episode and ":" in episode, f"expected a <sig>:<onset> episode, got {episode!r}"
+
+
+# ── issue #361 (S2b): the afk lanes read the identity record first ─────────────
+# An Orca-created worktree can carry a bare branch (`orca-migration`) with no leading digits. The
+# permission allow-lane and the danger wall used to read ONLY the branch slug, so such a spoke was
+# exempt from both. They now read `<wt>/.ai-toolkit/identity` first and fall back to the slug, so a
+# worktree with NO record behaves byte-for-byte as before.
+
+
+def _bare_branch_spoke(
+    spoke_repo: Path, tmp_path: Path, *, issue: str | None
+) -> tuple[Path, dict[str, str]]:
+    env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t"}
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "orca-migration"],
+        cwd=spoke_repo,
+        check=True,
+        env=env_git,
+        capture_output=True,
+    )
+    (spoke_repo / ".ai-toolkit").mkdir(exist_ok=True)
+    if issue is not None:
+        (spoke_repo / ".ai-toolkit" / "identity").write_text(f"issue={issue}\nlane=spoke\n")
+    heartbeat = tmp_path / "heartbeat"
+    heartbeat.write_text(f"{os.getpid()} 1000 wake1\n")
+    (tmp_path / "afk-state").mkdir(exist_ok=True)
+    return spoke_repo, {
+        "AFK_HEARTBEAT": str(heartbeat),
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "AFK_TASKS_ROOT": str(tmp_path / "tasks"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_NOW": "1000",
+        "AFK_JUDGE_CMD": "printf 'VERDICT: safe\\n'",
+    }
+
+
+def test_permission_hook_allows_a_bare_branch_spoke_with_an_identity_record(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    wt, env = _bare_branch_spoke(spoke_repo, tmp_path, issue="361")
+    (wt / "x.sh").write_text("#!/bin/sh\necho hi\n")
+
+    result = _run_hook(_hook_payload("Bash", wt, command="chmod +x ./x.sh && ./x.sh"), env)
+
+    assert result.returncode == 0, result.stderr
+    assert '"permissionDecision":"allow"' in result.stdout, result.stdout + result.stderr
+
+
+def test_permission_hook_reads_the_record_from_a_subdirectory_cwd(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    wt, env = _bare_branch_spoke(spoke_repo, tmp_path, issue="361")
+    (wt / "sub").mkdir()
+    (wt / "sub" / "x.sh").write_text("#!/bin/sh\necho hi\n")
+
+    result = _run_hook(_hook_payload("Bash", wt / "sub", command="chmod +x ./x.sh && ./x.sh"), env)
+
+    assert '"permissionDecision":"allow"' in result.stdout, result.stdout + result.stderr
+
+
+def test_permission_hook_stays_silent_on_a_bare_branch_with_no_identity_record(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # No record => today's behaviour: a non-issue branch is not a spoke, the hook stays silent.
+    wt, env = _bare_branch_spoke(spoke_repo, tmp_path, issue=None)
+    (wt / "x.sh").write_text("#!/bin/sh\necho hi\n")
+
+    result = _run_hook(_hook_payload("Bash", wt, command="chmod +x ./x.sh && ./x.sh"), env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", result.stdout
+
+
+def test_danger_wall_covers_a_bare_branch_spoke_with_an_identity_record(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # No .ai-toolkit/mode file (ambiguous mode): the fail-safe gate falls to the issue anchor,
+    # which the record now supplies for a branch with no leading digits.
+    wt, env = _bare_branch_spoke(spoke_repo, tmp_path, issue="361")
+
+    result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
+
+    assert _perm(result.stdout) == "deny", result.stdout + result.stderr
+
+
+def test_danger_wall_stays_inert_on_a_bare_branch_with_no_identity_record(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    wt, env = _bare_branch_spoke(spoke_repo, tmp_path, issue=None)
+
+    result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
+
+    assert _perm(result.stdout) == "(silent)", result.stdout + result.stderr
+
+
+def test_danger_wall_mode_first_still_walls_a_detached_head_with_no_identity_record(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The mode-first ordering is unchanged: afk mode walls with no record and no issue branch.
+    wt, env = _bare_branch_spoke(spoke_repo, tmp_path, issue=None)
+    (wt / ".ai-toolkit" / "mode").write_text("afk\n")
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=wt, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", sha], cwd=wt, check=True, capture_output=True)
+
+    result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
+
+    assert _perm(result.stdout) == "deny", result.stdout + result.stderr
+
+
+def _journal_issues(env: dict[str, str]) -> set[str]:
+    journal = Path(env["AFK_STATE_DIR"]) / "decision-journal.jsonl"
+    rows = [json.loads(ln) for ln in journal.read_text().splitlines() if ln.strip()]
+    return {str(r.get("issue")) for r in rows}
+
+
+def test_permission_hook_journals_under_the_record_issue_not_the_branch_slug(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Identity first: the record names 361 even though the branch slug leads with 5.
+    wt, env = _bare_branch_spoke(spoke_repo, tmp_path, issue="361")
+    subprocess.run(["git", "branch", "-m", "feature/5-x"], cwd=wt, check=True)
+
+    result = _run_hook(_hook_payload("Bash", wt, command="git add x.py"), env)
+
+    assert '"permissionDecision":"allow"' in result.stdout, result.stdout + result.stderr
+    assert _journal_issues(env) == {"361"}
+
+
+def test_danger_wall_journals_under_the_record_issue_not_the_branch_slug(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    wt, env = _bare_branch_spoke(spoke_repo, tmp_path, issue="361")
+    subprocess.run(["git", "branch", "-m", "feature/5-x"], cwd=wt, check=True)
+
+    result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
+
+    assert _perm(result.stdout) == "deny", result.stdout + result.stderr
+    assert _journal_issues(env) == {"361"}

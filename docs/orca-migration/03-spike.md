@@ -92,3 +92,47 @@ Scratch repo (git, `orca.yaml` with `setup`, `issueCommand`, `worktree.sharedDir
 > The scratch-repo cleanup (`orca worktree rm` for `spike-issue`, `orca project setup-delete`, removing `.ai-toolkit/spike-scratch`) and the
 > post-venv worktree creation were blocked by the `afk-danger-guard` judge (verdict `dangerous` for writes under `~/orca/`), so
 > the scratch repo `e6dd1f84-f82d-4420-92be-5968ef55ddcd` and worktree `spike-issue` still need removing by hand.
+
+## Round 4 — S4 spikes (#363, 2026-10-02)
+
+Orca 1.4.218, Claude Code 2.1.286. Disposable `spike363-*` worktrees on the real ai-toolkit repo, a local OTLP-HTTP sink
+standing in for the collector, `claude-haiku-4-5` at `--effort low` for the worker. Every worktree, terminal and sink was
+removed afterwards (`orca worktree rm --force`); the inert `Run` rows they created remain in `orchestration.db`.
+
+| Spike | Outcome | Evidence |
+|---|---|---|
+| (a) `--spec` delivery | **Passes.** The preamble comes first, then the whole `--spec` (the real `worktree-new.sh` default seed plus the packed-subtask note, ~2 KB, plus a sentinel on the last line). The agent echoed the sentinel from the tail, so nothing was truncated, and ran the in-prompt Bash command and `worker_done`. `--model/--effort` reach the agent: the receipt's `launch.effective` matched and the agent reported `claude-haiku-4-5-20251001`. | `worker-read --source transcript` clips the oversized first message (`contentComplete: false`); that is a read limit, not a delivery one. |
+| (b) `env` block in `.claude/settings.local.json` | **Splits.** `WT_SPOKE` **is** honoured: it is visible to the agent's Bash tool. The **OTel pairs are not**: with the same keys in `settings.local.json` or in project `settings.json`, `claude -p` exported **0** spans/metrics/logs; the identical keys as process env exported all three signals with `spoke_run_id` and `repo` as resource attributes. Claude initialises telemetry before project-scope settings env is applied. The agent's Bash env does not show `OTEL_*` either. | A launch that gives Claude the OTel pairs as real process env works: `orca terminal create --worktree path:<wt> --command "<prefix> claude …"` followed by `worker-start --terminal <handle>` exported traces, metrics and logs grouped by `spoke_run_id`, with `WT_SPOKE` visible and `worker_done` delivered. |
+| (c) `worker-start` from a non-Orca shell | **A live Orca coordinator terminal and a bound `Run` are required.** With neither: `consumer_fenced` ("requires the coordinator terminal currently bound to the Task Run") / `no_active_sender_terminal`. With `--run <id> --from <live handle>` it works from `env -i`. A depth-1 worker cannot dispatch (`nested_worker_depth_exceeded`, max 1), so spikes need their own scratch coordinator terminal and scratch Run; never `run-use` (or `run-create --from`) a terminal onto another session's Run, which fences the real coordinator. `ready` means `state: ready`, `stage: input_accepted`; `turnStart` is `observed` or `unsupported` depending on the provider hook, so it is **not** a proof the turn began. | A shell *inside* Orca attests its own terminal, so `--from` another handle is `consumer_fenced`. |
+| (d) request id after `runtime_unavailable` | **Available, not reproduced.** A success carries `result.mutation.requestId`; a refused call carries `error.data.orchestrationRequestId` (and the message ends `Orchestration mutation request ID: <uuid>`). `orchestration request-show --request <id>` answers `completed` (with the full receipt, including `dispatchId`), `pending` or `absent` — read-only. I could not force the ~30 s CLI drop (a 10 s provisioning setup returned normally), so whether a dropped connection still hands the CLI an id is **unverified**; `absent` is explicitly "not proof nothing happened". The settle path therefore falls back to `worktree list --json` by name. Side finding: repeating the same `--retry-request <uuid>` replays (`replayed: true`) rather than re-running. | Not adopted: the decision stays "never re-issue the mutation". |
+| (e) `--worktree path:<existing>` | **Passes.** Setup is `not_applicable` / `source: existing_worktree`, the worktree effect is `reused`, nothing re-runs, and the agent starts with the `--spec`. With `--terminal` the receipt has no `launch` (agent/model/effort are whatever that terminal's command line set). | |
+| (f) readiness before `--terminal` | **The agent must exist first.** `terminal show` reports `agentIdentity: claude` about 1 s after the command is typed; `worker-start --terminal` issued at that point delivered the prompt and the agent answered. Before it, the text would reach a bare shell. A fresh Claude in a trusted parent starts with no `blockedReason`. | `terminal wait --for tui-idle` is satisfied by the shell prompt too, so it cannot gate the launch alone. |
+
+### Decision (2026-10-02, coordinator): launch with `terminal create`, dispatch with `worker-start --terminal`
+
+(b) invalidates "the settings env replaces the launch prefix": with `worker-start --agent claude` Orca owns the command line, so
+spokes would stop tracing to Langfuse. S4 therefore launches the agent itself —
+`orca terminal create --worktree path:<wt> --command "<OTel prefix> WT_SPOKE=<tag> claude --model <m> --effort <e> --dangerously-skip-permissions"`
+— waits for `agentIdentity: claude`, and delivers the seed with `worker-start --terminal <handle> --worktree path:<wt> --spec …`.
+
+- `wt_native_otel_prefix` stays the single source of the prefix; `WT_SPOKE` lives in **both** the prefix and the settings env block.
+- Q2 is resolved by passing `--dangerously-skip-permissions` explicitly in the command we now own: it mirrors Orca's new-agent-tab
+  default and adds no permission mechanism. `--permission-mode bypassPermissions` and `WT_AGENT_BUDGET_ARGS` are deleted.
+- Dispatching needs a live Orca coordinator terminal with a bound `Run` (prerequisite; `worktree-new.sh` fails loud without it).
+
+### S4 line accounting (main @ `2598b69b` vs the S4 branch)
+
+The issue's deletion table assumed the launch prefix disappears. Decision (b) keeps it, and
+the S4 sequence adds the Run/readiness/settle machinery, so the code delta is smaller than the
+issue's `-250` target; the net is still negative and tests shrink by far more.
+
+| Code | before | after | delta |
+|---|---:|---:|---:|
+| `scripts/orca-lib.sh` (new) | 0 | 102 | +102 |
+| `scripts/worktree-new.sh` | 599 | 469 | -130 |
+| `scripts/worktree-quick.sh` | 162 | 125 | -37 |
+| `scripts/worktree-lib.sh` (review-workspace add helper, module loop) | 844 | 837 | -7 |
+| `scripts/provision-worktree.sh` (flags, `--identity-only`, `WT_SPOKE`) | 581 | 612 | +31 |
+| `hub-afk-arm.sh` (Orca guard) | 531 | 546 | +15 |
+| `hub-otel-watch.sh` | 270 | 268 | -2 |
+| **Net code** | 2987 | 2959 | **-28** |

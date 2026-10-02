@@ -984,16 +984,23 @@ main()
 PYEOF
 }
 
-# _batch_inflight_issue_nums — the issue number leading each task worktree's branch slug
-# (e.g. feature/223-slug → 223), one per line. Used to seed the --explain view with the
-# live in-flight set so it can attribute blocked-by-scope collisions to a running spoke.
-# The main checkout (branch `main`) and detached worktrees carry no leading digits and
-# are skipped. A best-effort standalone parse (no worktree-lib dependency). LC_ALL=C forces
-# a byte-stable locale for the system-tool parse, matching this repo's locale-hardening
-# discipline (#189/#194) even though worktree branch refs are ASCII.
+# _batch_inflight_issue_nums — the issue of each task worktree, one per line, from `orca worktree list`
+# (its `linkedIssue`; the main checkout is skipped), to seed the --explain view's in-flight set so it
+# can attribute blocked-by-scope collisions to a running spoke. Standalone (no worktree-lib
+# dependency); LC_ALL=C keeps it byte-stable (#189/#194). If Orca cannot answer it warns and prints
+# nothing: the view loses its attribution, it never guesses.
 _batch_inflight_issue_nums() {
-  LC_ALL=C git worktree list --porcelain 2>/dev/null | LC_ALL=C awk '
-    /^branch /{ slug = $2; sub(/.*\//, "", slug); if (match(slug, /^[0-9]+/)) print substr(slug, RSTART, RLENGTH) }'
+  local out
+  out="$(LC_ALL=C orca worktree list --repo "path:$(git rev-parse --show-toplevel 2>/dev/null || pwd)" --json 2>/dev/null)" || {
+    echo "batch-plan: orca worktree list failed -- in-flight attribution dropped from the explain view" >&2
+    return 0
+  }
+  printf '%s' "$out" | LC_ALL=C python3 -c '
+import json, sys
+for row in json.load(sys.stdin)["result"]["worktrees"]:
+    if not row.get("isMainWorktree") and row.get("linkedIssue") is not None:
+        print(row["linkedIssue"])' 2>/dev/null \
+    || echo "batch-plan: unparseable orca worktree list reply -- in-flight attribution dropped" >&2
 }
 
 # main — fetch the open backlog and print the next concurrent batch. Pass through any

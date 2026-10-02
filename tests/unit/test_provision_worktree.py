@@ -306,11 +306,25 @@ def _run_with_otel(
     return _run(wt, stubs, *flags, env=env)
 
 
-def test_otel_off_writes_no_env_block(hub: Path, wt: Path, stubs: Path) -> None:
+def _spoke_env(pairs: dict[str, str]) -> dict[str, str]:
+    """The settings env block: WT_SPOKE (the issue tag) plus the launch-prefix pairs."""
+    return {"WT_SPOKE": "359", **pairs}
+
+
+def test_otel_off_writes_only_wt_spoke_to_the_env_block(hub: Path, wt: Path, stubs: Path) -> None:
     result = _run(wt, stubs, env={**_orca_env(hub, wt), "AI_TOOLKIT_OTEL": "0"})
 
     assert result.returncode == 0, result.stderr
-    assert "env" not in _settings(wt)
+    assert _settings(wt)["env"] == {"WT_SPOKE": "359"}
+
+
+def test_an_express_lane_tags_wt_spoke_with_its_slug(hub: Path, wt: Path, stubs: Path) -> None:
+    args = ["--worktree", str(wt), "--repo-root", str(hub), "--issue", "fix-typo"]
+
+    result = _run(wt, stubs, *args, "--lane", "express")
+
+    assert result.returncode == 0, result.stderr
+    assert _settings(wt)["env"]["WT_SPOKE"] == "fix-typo"
 
 
 def test_env_block_holds_exactly_the_launch_prefix_pairs(hub: Path, wt: Path, stubs: Path) -> None:
@@ -319,7 +333,7 @@ def test_env_block_holds_exactly_the_launch_prefix_pairs(hub: Path, wt: Path, st
     assert result.returncode == 0, result.stderr
     run_id = (wt / ".ai-toolkit" / "spoke-run-id").read_text().strip()
     expected = _prefix_pairs(run_id, wt / ".ai-toolkit" / "raw-bodies", "remote", _otel_env())
-    assert _settings(wt)["env"] == expected
+    assert _settings(wt)["env"] == _spoke_env(expected)
     assert _settings(wt)["env"]["OTEL_RESOURCE_ATTRIBUTES"] == f"spoke_run_id={run_id},repo=remote"
     assert (wt / ".ai-toolkit" / "raw-bodies").is_dir()
 
@@ -334,7 +348,7 @@ def test_env_block_matches_the_prefix_with_overridden_endpoints(
     expected = _prefix_pairs(
         run_id, wt / ".ai-toolkit" / "raw-bodies", "remote", _otel_env(_OTEL_OVERRIDES)
     )
-    assert _settings(wt)["env"] == expected
+    assert _settings(wt)["env"] == _spoke_env(expected)
     assert _settings(wt)["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://x:1"
 
 
@@ -350,7 +364,7 @@ def test_explicit_body_dir_and_repo_are_honoured_and_created(
     assert result.returncode == 0, result.stderr
     run_id = (wt / ".ai-toolkit" / "spoke-run-id").read_text().strip()
     assert body_dir.is_dir()
-    assert _settings(wt)["env"] == _prefix_pairs(run_id, body_dir, "named", _otel_env())
+    assert _settings(wt)["env"] == _spoke_env(_prefix_pairs(run_id, body_dir, "named", _otel_env()))
 
 
 def test_an_empty_repo_name_is_omitted_never_written_empty(
@@ -377,7 +391,7 @@ def test_env_block_never_carries_secrets(hub: Path, wt: Path, stubs: Path) -> No
     raw = (wt / ".claude" / "settings.local.json").read_text()
     assert "hunter2" not in raw
     assert not set(secrets) & set(_settings(wt)["env"])
-    assert len(_settings(wt)["env"]) == 17
+    assert len(_settings(wt)["env"]) == 18
 
 
 def test_env_merge_is_additive_and_idempotent(hub: Path, wt: Path, stubs: Path) -> None:
@@ -632,7 +646,11 @@ def test_identity_record_leaves_absent_orca_ids_and_run_id_empty(
     assert _run(wt, stubs, *_explicit(hub, wt)).returncode == 0
 
     record = _identity(wt)
-    assert (record["orca_worktree_id"], record["orca_dispatch_id"], record["run_id"]) == ("", "", "")
+    assert (record["orca_worktree_id"], record["orca_dispatch_id"], record["run_id"]) == (
+        "",
+        "",
+        "",
+    )
 
 
 def test_identity_record_takes_orca_ids_from_the_environment(
@@ -679,3 +697,181 @@ def test_identity_record_rewrite_is_byte_identical_and_leaves_no_temp_files(
 
     assert (wt / ".ai-toolkit" / "identity").read_bytes() == first
     assert sorted(p.name for p in (wt / ".ai-toolkit").glob("identity*")) == ["identity"]
+
+
+def test_quick_lane_is_accepted_and_recorded(hub: Path, wt: Path, stubs: Path) -> None:
+    args = ["--worktree", str(wt), "--repo-root", str(hub), "--issue", "tweak", "--lane", "quick"]
+
+    result = _run(wt, stubs, *args)
+
+    assert result.returncode == 0, result.stderr
+    assert (wt / ".ai-toolkit" / "lane").read_text() == "quick\n"
+    assert _identity(wt)["lane"] == "quick"
+
+
+def test_dispatch_flags_are_recorded_and_beat_the_environment(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    env = {**_orca_env(hub, wt), "ORCA_WORKTREE_ID": "from-env"}
+    flags = ["--orca-worktree-id", "wt-9", "--orca-dispatch-id", "ctx_9", "--run-id", "run_9"]
+
+    result = _run(wt, stubs, *flags, env=env)
+
+    assert result.returncode == 0, result.stderr
+    record = _identity(wt)
+    assert (record["orca_worktree_id"], record["orca_dispatch_id"], record["run_id"]) == (
+        "wt-9",
+        "ctx_9",
+        "run_9",
+    )
+
+
+def test_identity_only_adds_the_dispatch_id_and_changes_nothing_else(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    first = [*_explicit(hub, wt, "afk"), "--orca-worktree-id", "wt-9", "--run-id", "run_9"]
+    assert _run(wt, stubs, *first).returncode == 0
+    shutil.rmtree(wt / ".claude" / "skills")  # a full re-run would restore it
+    settings = (wt / ".claude" / "settings.local.json").read_bytes()
+
+    result = _run(wt, stubs, *first, "--orca-dispatch-id", "ctx_9", "--identity-only")
+
+    assert result.returncode == 0, result.stderr
+    record = _identity(wt)
+    assert (record["orca_worktree_id"], record["orca_dispatch_id"], record["run_id"]) == (
+        "wt-9",
+        "ctx_9",
+        "run_9",
+    )
+    assert not (wt / ".claude" / "skills").exists()
+    assert (wt / ".claude" / "settings.local.json").read_bytes() == settings
+
+
+def test_a_rerun_keeps_the_ids_no_flag_names(hub: Path, wt: Path, stubs: Path) -> None:
+    flags = ["--orca-worktree-id", "wt-9", "--orca-dispatch-id", "ctx_9", "--run-id", "run_9"]
+    assert _run(wt, stubs, *_explicit(hub, wt), *flags).returncode == 0
+
+    assert _run(wt, stubs, *_explicit(hub, wt), "--identity-only").returncode == 0
+
+    record = _identity(wt)
+    assert (record["orca_worktree_id"], record["orca_dispatch_id"], record["run_id"]) == (
+        "wt-9",
+        "ctx_9",
+        "run_9",
+    )
+
+
+# The spoke command allowlist and the afk deny-wall (issues #11, #37, #38, #149, #259, #281):
+# worktree-new.sh used to be the only place these were pinned, one rule list at a time.
+_SEEDED_RULES = [
+    "Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)",
+    "Bash(bash .ai-toolkit/scripts/spoke-ready.sh:*)",
+    *(
+        f"Bash({c})"
+        for c in (
+            "git status:*",
+            "git diff:*",
+            "git log:*",
+            "git show:*",
+            "git rev-parse:*",
+            "git branch --show-current",
+            "ls:*",
+            "cat:*",
+            "head:*",
+            "tail:*",
+            "wc:*",
+            "grep:*",
+            "rg:*",
+            "find:*",
+            "echo:*",
+            "tree:*",
+            "git fetch:*",
+            "git remote -v",
+            "git stash list",
+            "gh issue view:*",
+            "gh pr view:*",
+            "python -m pytest:*",
+            ".venv/bin/python -m pytest:*",
+            "pytest:*",
+            "chmod +x:*",
+            "git add:*",
+            "git reset",
+            "git reset -q",
+            "git reset HEAD:*",
+            "git reset -q HEAD:*",
+            "./:*",
+        )
+    ),
+]
+# Each would hand over a destructive verb or arbitrary code execution; none may ever be seeded.
+_FORBIDDEN_RULES = [
+    f"Bash({c})"
+    for c in (
+        "git branch:*",
+        "git tag:*",
+        "git push:*",
+        "git checkout:*",
+        "git reset:*",
+        "git reset --hard",
+        "git reset --hard:*",
+        "git clean:*",
+        "python:*",
+        "python -c:*",
+        "chmod:*",
+        "rm:*",
+        "mv:*",
+    )
+]
+
+
+def test_seeded_allowlist_has_every_tier_and_no_destructive_wildcard(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    assert _run(wt, stubs, *_explicit(hub, wt)).returncode == 0
+
+    allow = _settings(wt)["permissions"]["allow"]
+    assert [r for r in _SEEDED_RULES if r not in allow] == []
+    assert [r for r in _FORBIDDEN_RULES if r in allow] == []
+    assert not any(r.startswith("Bash(git push origin") for r in allow)
+    assert allow[-1] == f"Read(/{hub}/**)"
+
+
+def test_merge_into_an_existing_settings_file_keeps_its_rules_and_order(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    (wt / ".claude").mkdir()
+    (wt / ".claude" / "settings.local.json").write_text(
+        json.dumps(
+            {"permissions": {"allow": ["Bash(mine:*)", "Bash(git status:*)"], "deny": ["X"]}}
+        )
+    )
+
+    assert _run(wt, stubs, *_explicit(hub, wt, "afk")).returncode == 0
+
+    perms = _settings(wt)["permissions"]
+    assert perms["allow"][:2] == ["Bash(mine:*)", "Bash(git status:*)"]
+    assert perms["allow"].count("Bash(git status:*)") == 1
+    assert perms["deny"] == ["X", "AskUserQuestion"]
+
+
+@pytest.mark.parametrize(("mode", "denied"), [("afk", True), ("attended", False)])
+def test_askuserquestion_is_denied_for_afk_spokes_only(
+    hub: Path, wt: Path, stubs: Path, mode: str, denied: bool
+) -> None:
+    assert _run(wt, stubs, *_explicit(hub, wt, mode)).returncode == 0
+
+    assert ("AskUserQuestion" in _settings(wt)["permissions"].get("deny", [])) is denied
+
+
+def test_a_foreign_orca_worktree_id_in_the_environment_never_overwrites_the_record(
+    hub: Path, wt: Path, stubs: Path, tmp_path: Path
+) -> None:
+    # Every Orca terminal exports ORCA_WORKTREE_ID for ITS worktree (the dispatching hub's); it
+    # only describes this worktree when ORCA_WORKTREE_PATH names it (Orca's setup hook).
+    assert _run(wt, stubs, *_explicit(hub, wt), "--orca-worktree-id", "wt-9").returncode == 0
+    hub_terminal = {"ORCA_WORKTREE_ID": "the-hubs-id", "ORCA_WORKTREE_PATH": str(hub)}
+
+    result = _run(tmp_path, stubs, *_explicit(hub, wt), "--identity-only", env=hub_terminal)
+
+    assert result.returncode == 0, result.stderr
+    assert _identity(wt)["orca_worktree_id"] == "wt-9"
