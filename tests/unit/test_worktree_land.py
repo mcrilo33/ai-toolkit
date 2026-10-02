@@ -24,11 +24,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from _ci_gh_support import CI_URL, FAILED_RUNS, GREEN_RUNS, PENDING_RUNS
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKTREE_LAND = _REPO_ROOT / "scripts" / "worktree-land.sh"
 WORKTREE_LIB = _REPO_ROOT / "scripts" / "worktree-lib.sh"
-GATE_STAMP_LIB = _REPO_ROOT / "shared" / "hooks" / "lib" / "gate-stamp.sh"
 
 # Pin git config to nothing: a host's global/system config (core.hooksPath,
 # init.templateDir, protocol settings) must not reach the commits/pushes the
@@ -129,6 +129,9 @@ def _run_land(
     stub_python312: bool = False,
     stub_curl: bool = False,
     issue_state: str = "OPEN",
+    ci_runs: str = GREEN_RUNS,
+    ci_green_only_for: str | None = None,
+    no_gh: bool = False,
     pytest_exit: int = 0,
     pytest_side_effect: str = "",
 ) -> tuple[subprocess.CompletedProcess, dict[str, Path]]:
@@ -164,15 +167,29 @@ def _run_land(
     code_stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["code"]}"\nexit 0\n')
     code_stub.chmod(0o755)
     # `gh` logs every call AND answers `issue view --json state` with `issue_state`,
-    # so the resume finalize's OPEN-check (issue #151) can be steered per test.
+    # so the resume finalize's OPEN-check (issue #151) can be steered per test. `run list`
+    # (the CI-gate query, #378) answers `ci_runs` and is unaffected by `gh_exit`, which
+    # models a failing issue-close / label call.
     gh_stub = bindir / "gh"
+    # `ci_green_only_for=<sha>`: `run list --commit <sha>` is green, any other SHA is pending
+    # (models CI that has not caught up with a freshly pushed merge commit).
+    only_for = (
+        f"case \"$*\" in *\"--commit {ci_green_only_for} \"*) ;; "
+        f"*\"run list\"*) printf '%s' '{PENDING_RUNS}'; exit 0 ;; esac\n"
+        if ci_green_only_for
+        else ""
+    )
     gh_stub.write_text(
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{logs["gh"]}"\n'
+        f"{only_for}"
+        f"case \"$*\" in *\"run list\"*) printf '%s' '{ci_runs}'; exit 0 ;; esac\n"
         f'case "$*" in *"issue view"*state*) printf "%s\\n" "{issue_state}" ;; esac\n'
         f"exit {gh_exit}\n"
     )
     gh_stub.chmod(0o755)
+    if no_gh:
+        gh_stub.unlink()
     tmux = bindir / "tmux"
     tmux.write_text(
         f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["tmux"]}"\n'
@@ -209,6 +226,8 @@ def _run_land(
     for var in ("LANGFUSE_BASIC_AUTH", "LANGFUSE_HOST", "AI_TOOLKIT_OTEL_SPAN_ENDPOINT"):
         env.pop(var, None)
     env["AFK_TELEMETRY_CONF"] = str(tmp_path / "no-such-conf")
+    # CI polls fast and gives up fast: a stubbed `gh` never changes its answer mid-test.
+    env.update({"WT_CI_POLL": "1", "WT_CI_NONE_GRACE": "0", "LAND_CI_WAIT_MAX": "2"})
     # The host's own spoke marker must never steer the guard; set it explicitly
     # only when a test means to model a spoke session (issue #26).
     env.pop("WT_SPOKE", None)
@@ -642,15 +661,10 @@ def test_local_micro_spoke_exempt_from_marker(hub: Path, tmp_path: Path) -> None
 
 
 def test_default_land_runs_no_land_side_pytest(hub: Path, tmp_path: Path) -> None:
-    # Landing no longer runs the suite itself; the pre-push hook tests once on the
-    # main push. A diverged merge takes the gate path (a clean-FF land instead
-    # auto-skips it — see test_clean_ff_land_skips_redundant_gate). With the hook
-    # installed (the fixture default), the land delegates the gate to it and never
-    # invokes pytest land-side.
+    # CI is the gate (#378): landing never runs the suite itself — not even for a diverged
+    # land, where the hub's merge used to build an untested tree.
     _make_spoke(hub, tmp_path, "feature/1-nopytest", push=True)
-    (hub / "hub-only.txt").write_text("hub moved on\n")
-    _git(hub, "add", "hub-only.txt")
-    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
+    _diverge_hub(hub)
 
     proc, logs = _run_land(hub, tmp_path, "1")
 
@@ -659,141 +673,261 @@ def test_default_land_runs_no_land_side_pytest(hub: Path, tmp_path: Path) -> Non
     assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
 
 
-# --- skip the redundant gate on a clean fast-forward land (issue #96) ------------
-# A clean-FF land of an already-gated branch re-tests an identical tree: the spoke
-# already ran the gate on its push (ready/N marker == tip == upstream). Thread
-# TEST_SELECT_SKIP=1 in that case only; any diverged/merge-commit land — whose
-# combined tree was never tested as a unit — still runs the full gate.
+# --- CI is the gate (issue #378) ------------------------------------------------------
+# The full suite runs in CI on every branch push. A pushed spoke lands only on a green CI
+# run for the exact SHA it ships: a fast-forward of the CI-green ready SHA lands directly
+# (the main push skips the local hook), and when main moved the land merges main INTO the
+# spoke on the spoke, pushes it, waits for CI on the new SHA, then fast-forwards main.
+# `gh` is stubbed with realistic `gh run list --json` output (see _ci_gh_support).
 
 
-def test_clean_ff_land_skips_redundant_gate(hub: Path, tmp_path: Path) -> None:
-    # Clean fast-forward (nothing landed since the branch's base) of a branch whose
-    # ready/1 marker sits at the tip → the merged tree is identical to the already-
-    # gated tip, so the gate is skipped by threading TEST_SELECT_SKIP=1 to the push.
-    _make_spoke(hub, tmp_path, "feature/1-ffskip", push=True, ready=True)
-    env_log = tmp_path / "prepush-env.log"
-    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
-
-    proc, _ = _run_land(hub, tmp_path, "1")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "TEST_SELECT_SKIP=1" in _log_text(env_log)
-    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
-
-
-def test_diverged_merge_still_runs_gate(hub: Path, tmp_path: Path) -> None:
-    # main gained a commit since the branch's base, so landing creates a merge
-    # commit whose combined tree was never tested as a unit — the gate MUST still
-    # run (no TEST_SELECT_SKIP threaded), even though the branch carries a marker.
-    _make_spoke(hub, tmp_path, "feature/1-divgate", push=True, ready=True)
+def _diverge_hub(hub: Path) -> None:
+    """Advance the hub's main (locally) so the spoke no longer fast-forwards."""
     (hub / "hub-only.txt").write_text("hub moved on\n")
     _git(hub, "add", "hub-only.txt")
     _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
+
+
+def test_ff_of_a_green_sha_lands_without_the_hook_or_pytest(hub: Path, tmp_path: Path) -> None:
+    wt = _make_spoke(hub, tmp_path, "feature/1-ffskip", push=True, ready=True)
+    tip = _git(wt, "rev-parse", "HEAD").strip()
     env_log = tmp_path / "prepush-env.log"
     _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+
+    proc, logs = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _git(hub, "rev-parse", "HEAD").strip() == tip  # a pure fast-forward
+    assert _remote_sha(hub, "main") == tip
+    assert "TEST_SELECT_SKIP=1" in _log_text(env_log)  # CI proved this SHA: hook skipped
+    assert _log_text(logs["pytest"]) == ""
+    assert "CI green" in proc.stdout  # the land log names what gated it
+    assert f"--commit {tip}" in _log_text(logs["gh"])  # asked CI about the exact SHA
+
+
+def test_land_refuses_while_ci_is_pending(hub: Path, tmp_path: Path) -> None:
+    wt = _make_spoke(hub, tmp_path, "feature/1-pending", push=True)
+    before = _remote_sha(hub, "main")
+
+    proc, _ = _run_land(hub, tmp_path, "1", ci_runs=PENDING_RUNS)
+
+    assert proc.returncode == 1  # transient: the drain retries
+    assert f"CI pending ({CI_URL})" in proc.stderr
+    assert _remote_sha(hub, "main") == before and wt.exists()
+
+
+def test_land_refuses_a_red_ci_with_the_precondition_exit(hub: Path, tmp_path: Path) -> None:
+    wt = _make_spoke(hub, tmp_path, "feature/1-red", push=True)
+    before = _remote_sha(hub, "main")
+
+    proc, _ = _run_land(hub, tmp_path, "1", ci_runs=FAILED_RUNS)
+
+    # Only the spoke can fix a red run, so auto_land must escalate it, not retry (#354).
+    assert proc.returncode == _WT_LAND_PRECONDITION_EXIT
+    assert f"CI failed ({CI_URL}" in proc.stderr
+    assert _remote_sha(hub, "main") == before and wt.exists()
+
+
+def test_land_refuses_when_no_ci_run_exists_for_the_sha(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/1-norun", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1", ci_runs="[]")
+
+    assert proc.returncode == 1
+    assert "no CI run for this SHA (was it pushed?)" in proc.stderr
+
+
+def test_land_refuses_without_gh_and_points_at_local_gate(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/1-nogh", push=True)
+    # `gh` may be installed on the host: a PATH holding only the stubs hides it.
+    env_path = {"PATH": f"{tmp_path / 'bin'}:{_basic_path()}"}
+
+    proc, _ = _run_land(hub, tmp_path, "1", no_gh=True, extra_env=env_path)
+
+    assert proc.returncode == 1
+    assert "--local-gate" in proc.stderr
+
+
+def _basic_path() -> str:
+    """System dirs without a Homebrew `gh`: enough for git/bash/coreutils/python3."""
+    return os.pathsep.join(d for d in ("/usr/bin", "/bin", "/usr/sbin", "/sbin") if Path(d).is_dir())
+
+
+def test_skip_tests_does_not_bypass_the_ci_gate(hub: Path, tmp_path: Path) -> None:
+    # The drain lands with --skip-tests; CI must still be green (it is the gate now).
+    _make_spoke(hub, tmp_path, "feature/1-skipci", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--skip-tests", ci_runs=PENDING_RUNS)
+
+    assert proc.returncode == 1
+    assert "CI pending" in proc.stderr
+
+
+def test_force_land_without_marker_still_requires_ci(hub: Path, tmp_path: Path) -> None:
+    # --force-land waives the ready marker, not the gate: the SHA must still be CI-green.
+    _make_spoke(hub, tmp_path, "feature/1-forcedci", push=True, ready=False)
+
+    red, _ = _run_land(hub, tmp_path, "1", "--force-land", ci_runs=FAILED_RUNS)
+    green, logs = _run_land(hub, tmp_path, "1", "--force-land")
+
+    assert red.returncode == _WT_LAND_PRECONDITION_EXIT
+    assert green.returncode == 0, green.stderr
+    assert _log_text(logs["pytest"]) == ""
+
+
+def test_non_ff_land_merges_main_into_the_spoke_waits_for_ci_then_fast_forwards(
+    hub: Path, tmp_path: Path
+) -> None:
+    wt = _make_spoke(hub, tmp_path, "feature/1-diverged", push=True, ready=True)
+    tip = _git(wt, "rev-parse", "HEAD").strip()
+    _diverge_hub(hub)
+    hub_tip = _git(hub, "rev-parse", "HEAD").strip()
+    ref_log = tmp_path / "pre-receive-refs.log"
+    _install_pre_receive(tmp_path, ref_log)
+
+    proc, logs = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr
+    final = _git(hub, "rev-parse", "HEAD").strip()
+    assert _remote_sha(hub, "main") == final
+    # The merge commit was built ON THE SPOKE (parents: the spoke tip + the hub's main) and
+    # main fast-forwarded to it — the hub never builds an untested combined tree.
+    assert _git(hub, "rev-list", "--parents", "-n1", final).split()[1:] == [tip, hub_tip]
+    # The spoke branch reached origin BEFORE main did.
+    pushed = [r for r in _log_text(ref_log).splitlines() if r.startswith("refs/heads/")]
+    assert pushed.index("refs/heads/feature/1-diverged") < pushed.index("refs/heads/main")
+    # CI was consulted for the ready SHA and again for the new merged SHA.
+    gh = _log_text(logs["gh"])
+    assert f"--commit {tip}" in gh and f"--commit {final}" in gh
+    assert _log_text(logs["pytest"]) == ""  # still no local test run
+
+
+def test_non_ff_land_waits_for_green_on_the_new_sha_before_touching_main(
+    hub: Path, tmp_path: Path
+) -> None:
+    wt = _make_spoke(hub, tmp_path, "feature/1-newsha", push=True, ready=True)
+    tip = _git(wt, "rev-parse", "HEAD").strip()
+    _diverge_hub(hub)
+    before = _remote_sha(hub, "main")
+
+    # CI is green for the ORIGINAL ready SHA only; the merged SHA never goes green.
+    proc, _ = _run_land(hub, tmp_path, "1", ci_green_only_for=tip)
+
+    assert proc.returncode == 1
+    assert "CI pending" in proc.stderr
+    assert _remote_sha(hub, "main") == before  # main is only fast-forwarded to a green SHA
+    assert wt.exists()
+    assert _remote_sha(hub, "feature/1-newsha") != tip  # the merge was pushed for CI to see
+
+
+def test_non_ff_spoke_side_conflict_exits_the_conflict_code(hub: Path, tmp_path: Path) -> None:
+    wt = _make_spoke(hub, tmp_path, "feature/1-clash", push=True, ready=True)
+    (wt / "shared.txt").write_text("spoke side\n")
+    _git(wt, "add", "shared.txt")
+    _git(wt, "commit", "-qm", "feat: shared", "-m", "Refs #1")
+    _git(wt, "push", "-q", "origin", "feature/1-clash")
+    _git(wt, "tag", "-f", "ready/1")
+    _git(wt, "push", "-qf", "origin", "ready/1")
+    (hub / "shared.txt").write_text("hub side\n")
+    _git(hub, "add", "shared.txt")
+    _git(hub, "commit", "-qm", "chore: shared", "-m", "Refs #0")
+    hub_tip = _git(hub, "rev-parse", "HEAD").strip()
 
     proc, _ = _run_land(hub, tmp_path, "1")
 
-    assert proc.returncode == 0, proc.stderr
-    assert "TEST_SELECT_SKIP" not in _log_text(env_log)
+    assert proc.returncode == 4  # WT_LAND_CONFLICT_EXIT: the resolution lane, not a retry
+    assert "CONFLICT shared.txt" in proc.stderr
+    assert _git(hub, "rev-parse", "HEAD").strip() == hub_tip
+    assert _git(wt, "status", "--porcelain").strip() == ""  # the spoke merge was aborted
 
 
-# --- reuse a fresh green stamp on a tree-identical (FF) non-numbered land (issue #270) -
-# A /quick express land uses a non-numbered `quick/` branch that carries NO ready
-# marker, so GATED_TREE is empty and the #96 clean-FF auto-skip never fires — the
-# identical FF tree re-runs the whole gate. When the merged HEAD^{tree} already has a
-# RECENT green stamp (the spoke's push minted it moments ago on the shared common
-# dir), the land reuses it: threads TEST_SELECT_SKIP=1 with a DISTINCT #270 witness.
-# A stale stamp or a diverged merge (new combined tree) still runs the gate.
+# --- --local-gate: the offline escape hatch (issue #378) ------------------------------
 
 
-def _write_green_stamp(hub: Path, tree: str, *, age_seconds: int = 0) -> Path:
-    """Write a green-tree stamp for `tree` under <git-common-dir>/.gate-stamps/.
-
-    `age_seconds` back-dates the stamp mtime (0 = fresh/now) so a test can model a
-    just-minted proof vs one older than the land's freshness bound.
-    """
-    common = Path(_git(hub, "rev-parse", "--git-common-dir").strip())
-    if not common.is_absolute():
-        common = hub / common
-    stamps = common / ".gate-stamps"
-    stamps.mkdir(parents=True, exist_ok=True)
-    stamp = stamps / tree
-    stamp.write_text("tier=selected-set\nenv=test\n")
-    if age_seconds:
-        when = time.time() - age_seconds
-        os.utime(stamp, (when, when))
-    return stamp
-
-
-def test_nonnumbered_ff_land_with_fresh_stamp_skips_gate(hub: Path, tmp_path: Path) -> None:
-    _make_spoke(hub, tmp_path, "quick/dedup", push=True)  # non-numbered, no marker
-    # A clean FF lands the branch tip tree unchanged; stamp THAT tree, freshly.
-    tree = _git(hub, "rev-parse", "quick/dedup^{tree}").strip()
-    _write_green_stamp(hub, tree)
+def test_local_gate_runs_the_full_suite_through_the_hook_and_never_asks_ci(
+    hub: Path, tmp_path: Path
+) -> None:
+    _make_spoke(hub, tmp_path, "feature/1-localgate", push=True, ready=True)
     env_log = tmp_path / "prepush-env.log"
     _install_prepush_stub(hub, exit_code=0, env_log=env_log)
 
-    proc, _ = _run_land(hub, tmp_path, "dedup")
+    # CI is red: the escape hatch must not consult it.
+    proc, logs = _run_land(hub, tmp_path, "1", "--local-gate", ci_runs=FAILED_RUNS)
 
     assert proc.returncode == 0, proc.stderr
-    assert "TEST_SELECT_SKIP=1" in _log_text(env_log)  # fresh stamp → gate skipped
-    assert "green-tree stamp reused" in proc.stdout  # the distinct #270 witness ...
-    assert "issue #270" in proc.stdout  # ... in SUITE_RESULT, not a normal gated land
+    cmd = _log_text(env_log)
+    assert '-n auto -m "not serial"' in cmd and "-m serial" in cmd  # the former full suite
+    assert "TEST_SELECT_SKIP" not in cmd  # the hook (and so the suite) really runs
+    assert "run list" not in _log_text(logs["gh"])
+    assert "--local-gate" in proc.stdout  # recorded in the land log ...
+    assert "--local-gate" in _log_text(logs["gh"])  # ... and in the issue-close comment
 
 
-def test_nonnumbered_ff_land_with_stale_stamp_runs_gate(hub: Path, tmp_path: Path) -> None:
-    _make_spoke(hub, tmp_path, "quick/stale", push=True)
-    tree = _git(hub, "rev-parse", "quick/stale^{tree}").strip()
-    _write_green_stamp(hub, tree, age_seconds=100000)  # older than the 24h bound
+def test_local_gate_works_with_gh_absent(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/1-offline", push=True, ready=True)
+    env_path = {"PATH": f"{tmp_path / 'bin'}:{_basic_path()}"}
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--local-gate", no_gh=True, extra_env=env_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert (hub / "feature-1-offline.txt").exists()
+    assert "gh not found" in proc.stderr  # the close is left to the operator, loudly
+
+
+def test_local_gate_failure_rolls_the_merge_back(hub: Path, tmp_path: Path) -> None:
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
+    wt = _make_spoke(hub, tmp_path, "feature/1-lgred", push=True, ready=True)
+    _install_prepush_stub(hub, exit_code=1)
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--local-gate")
+
+    assert proc.returncode != 0
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # rolled back
+    assert _remote_sha(hub, "main") == pre_sha
+    assert wt.exists()
+
+
+def test_local_gate_with_a_diverged_main_merges_on_the_hub_and_gates_locally(
+    hub: Path, tmp_path: Path
+) -> None:
+    # Offline there is no CI SHA to fast-forward to: the former behavior (hub merge commit,
+    # then the local gate on the merged tree) is the escape hatch.
+    _make_spoke(hub, tmp_path, "feature/1-lgdiv", push=True, ready=True)
+    _diverge_hub(hub)
     env_log = tmp_path / "prepush-env.log"
     _install_prepush_stub(hub, exit_code=0, env_log=env_log)
 
-    proc, _ = _run_land(hub, tmp_path, "stale")
+    proc, _ = _run_land(hub, tmp_path, "1", "--local-gate")
 
     assert proc.returncode == 0, proc.stderr
-    assert "TEST_SELECT_SKIP" not in _log_text(env_log)  # stale → gate still runs
+    assert len(_git(hub, "rev-list", "--parents", "-n1", "HEAD").split()) == 3  # hub merge commit
+    assert "TEST_SELECT_CMD" in _log_text(env_log)
 
 
-def test_nonnumbered_diverged_land_with_stamp_runs_gate(hub: Path, tmp_path: Path) -> None:
-    _make_spoke(hub, tmp_path, "quick/div", push=True)
-    # main moves on → the land builds a NEW merge commit (not a fast-forward), whose
-    # combined tree was never proven; even a fresh stamp for the branch tip tree must
-    # not license a skip.
-    (hub / "hub-only.txt").write_text("hub moved on\n")
-    _git(hub, "add", "hub-only.txt")
-    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
-    tree = _git(hub, "rev-parse", "quick/div^{tree}").strip()
-    _write_green_stamp(hub, tree)  # fresh, but for the pre-merge branch tree
-    env_log = tmp_path / "prepush-env.log"
-    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+def test_local_gate_conflicts_with_test_cmd(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/1-both", push=True)
 
-    proc, _ = _run_land(hub, tmp_path, "div")
+    proc, _ = _run_land(hub, tmp_path, "1", "--local-gate", "--test-cmd", "x")
 
-    assert proc.returncode == 0, proc.stderr
-    assert "TEST_SELECT_SKIP" not in _log_text(env_log)  # diverged → no FF skip
+    assert proc.returncode != 0
+    assert "conflict" in proc.stderr
 
 
-# --- a required gate with no executable pre-push hook aborts the land (issue #196) -
-# The pre-push hook is the single test gate (issue #19). If a gate is REQUIRED (not a
-# --skip-tests / auto-skip land) and no executable hook is installed, the push runs
-# NOTHING — the #187 fail-open shape. Landing must ABORT with the install command,
-# never warn-and-push untested code to main.
+# --- a required local gate with no executable pre-push hook aborts the land (issue #196) -
+# --local-gate/--test-cmd/--local lands are gated by the pre-push hook, the single executor
+# of local tests. If it is missing the push would run NOTHING — the #187 fail-open shape.
+# Landing must ABORT with the install command, never warn-and-push untested code to main.
 
 
-def test_missing_prepush_hook_aborts_required_gate_land(hub: Path, tmp_path: Path) -> None:
-    # Diverged merge → gate required. The hook exists but is not executable (a fresh
-    # checkout, a botched install, or a chmod -x): the land must roll the merge back
-    # and abort before pushing main, telling the operator how to install the hook.
+def test_missing_prepush_hook_aborts_a_local_gate_land(hub: Path, tmp_path: Path) -> None:
+    # The hook exists but is not executable (a fresh checkout, a botched install, a
+    # chmod -x): the land must roll the merge back and abort before pushing main.
     pre_main = _remote_sha(hub, "main")
     wt = _make_spoke(hub, tmp_path, "feature/1-nohook", push=True)
-    (hub / "hub-only.txt").write_text("hub moved on\n")
-    _git(hub, "add", "hub-only.txt")
-    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
-    pre_sha = _git(hub, "rev-parse", "HEAD").strip()  # hub tip the merge builds on
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
     (hub / ".git" / "hooks" / "pre-push").chmod(0o644)  # fixture hook made non-executable
 
-    proc, _ = _run_land(hub, tmp_path, "1")
+    proc, _ = _run_land(hub, tmp_path, "1", "--local-gate")
 
     assert proc.returncode != 0
     assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # merge rolled back
@@ -802,449 +936,43 @@ def test_missing_prepush_hook_aborts_required_gate_land(hub: Path, tmp_path: Pat
     assert wt.exists()  # teardown never ran
 
 
-def test_missing_prepush_hook_skip_tests_still_lands(hub: Path, tmp_path: Path) -> None:
-    # The escape hatch stays a VISIBLE flag: --skip-tests lands ungated even with no
-    # executable hook, because the operator explicitly asked for no gate.
-    wt = _make_spoke(hub, tmp_path, "feature/1-skipnohook", push=True)
-    (hub / "hub-only.txt").write_text("hub moved on\n")
-    _git(hub, "add", "hub-only.txt")
-    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
-    (hub / ".git" / "hooks" / "pre-push").chmod(0o644)  # fixture hook made non-executable
+def test_ci_green_land_needs_no_prepush_hook(hub: Path, tmp_path: Path) -> None:
+    # CI already proved the SHA, so the hook is irrelevant to a CI-gated land.
+    wt = _make_spoke(hub, tmp_path, "feature/1-ciok", push=True)
+    (hub / ".git" / "hooks" / "pre-push").chmod(0o644)
 
-    proc, _ = _run_land(hub, tmp_path, "1", "--skip-tests")
+    proc, _ = _run_land(hub, tmp_path, "1")
 
     assert proc.returncode == 0, proc.stderr
-    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()  # landed
-    assert not wt.exists()  # teardown ran
-
-
-# --- merge-sanity on a diverged --skip-tests land (issue #174) --------------------
-# auto_land trusts the ready-marker green and lands with --skip-tests — correct
-# per-branch, but a DIVERGED land builds a merge commit whose combined tree nobody
-# ever tested. For that one case (--skip-tests AND not a fast-forward) landing runs
-# a bounded merge-sanity check on the merged tree BEFORE pushing: pytest
-# --collect-only (import/collection health) plus the test-select-mapped tests for
-# the merged diff — NEVER the full suite. A failure aborts the land (rolls the merge
-# back); a fast-forward --skip-tests land and manual (no --skip-tests) lands are
-# unchanged.
-
-
-def test_ff_skip_tests_land_runs_no_merge_sanity(hub: Path, tmp_path: Path) -> None:
-    # Fast-forward + --skip-tests: the merged tree IS the already-gated branch tip,
-    # so no merge-sanity check runs — landing invokes no land-side pytest.
-    _make_spoke(hub, tmp_path, "feature/1-ffsane", push=True, ready=True)
-    _install_prepush_stub(hub, exit_code=0)
-
-    proc, logs = _run_land(hub, tmp_path, "1", "--skip-tests")
-
-    assert proc.returncode == 0, proc.stderr
-    assert _log_text(logs["pytest"]) == ""  # no merge-sanity on a fast-forward
-    assert "merge-sanity" not in proc.stdout
-
-
-def test_diverged_skip_tests_land_runs_merge_sanity_and_lands(hub: Path, tmp_path: Path) -> None:
-    # main advanced since the branch's base, so --skip-tests lands a merge commit
-    # whose combined tree was never tested — the bounded merge-sanity check MUST run
-    # (pytest --collect-only) and, on success, the land completes and pushes main.
-    _make_spoke(hub, tmp_path, "feature/1-divsane", push=True, ready=True)
-    _diverge_hub(hub)
-    env_log = tmp_path / "prepush-env.log"
-    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
-
-    proc, logs = _run_land(hub, tmp_path, "1", "--skip-tests")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "--collect-only" in _log_text(logs["pytest"])  # import/collection health ran
-    # The sanity check is land-side and separate from the hook: --skip-tests still
-    # threads TEST_SELECT_SKIP=1 to the push (the hook stays skipped).
-    assert "TEST_SELECT_SKIP=1" in _log_text(env_log)
     assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+    assert not wt.exists()
 
 
-def test_diverged_skip_tests_merge_sanity_failure_aborts(hub: Path, tmp_path: Path) -> None:
-    # A red merge-sanity run (pytest exits non-zero) aborts the land: the merge is
-    # rolled back, nothing is pushed, and the worktree survives for a re-run.
-    wt = _make_spoke(hub, tmp_path, "feature/1-divred", push=True, ready=True)
-    _diverge_hub(hub)
-    pre_sha = _git(hub, "rev-parse", "HEAD").strip()  # hub tip the land starts from
-    pre_main = _remote_sha(hub, "main")
-    _install_prepush_stub(hub, exit_code=0)
-
-    proc, logs = _run_land(hub, tmp_path, "1", "--skip-tests", pytest_exit=1)
-
-    assert proc.returncode != 0
-    assert "--collect-only" in _log_text(logs["pytest"])  # the sanity check ran
-    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # merge rolled back
-    assert _remote_sha(hub, "main") == pre_main  # nothing pushed
-    assert wt.exists()  # teardown never ran
-
-
-# --- merge-sanity tripwire scoped to the land's own refs (issue #205) -------------
-# The merge-sanity pytest runs INSIDE the shared hub ref store. The pre-#205 check
-# wrapped it in the WHOLE-repo tripwire, which snapshots every ref: a sibling spoke
-# pushing a ready/<N> tag (or advancing a remote-tracking ref) mid-check read as a
-# REPO-INTEGRITY BREACH — aborting the land, and worse, its restore DELETED the
-# sibling's freshly-pushed ref. The tripwire must be scoped to the refs the land
-# itself owns (refs/heads/<default>), so concurrent sibling ref moves are ignored
-# while a real escape onto the base branch is still caught.
-
-
-def test_diverged_skip_tests_merge_sanity_ignores_concurrent_sibling_ref(
-    hub: Path, tmp_path: Path
-) -> None:
-    # An /afk sibling pushing a ready/<N> tag during the merge-sanity window moves a
-    # shared ref the land does not own — it must NOT read as a breach: the land still
-    # lands, and the sibling's freshly-pushed tag SURVIVES (pre-#205 the whole-repo
-    # tripwire aborted the land and its restore deleted the tag).
-    _make_spoke(hub, tmp_path, "feature/1-sibref", push=True, ready=True)
-    _diverge_hub(hub)
-    _install_prepush_stub(hub, exit_code=0)
-
-    proc, logs = _run_land(
-        hub,
-        tmp_path,
-        "1",
-        "--skip-tests",
-        pytest_side_effect="git tag ready/99 HEAD 2>/dev/null || true",
-    )
-
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "--collect-only" in _log_text(logs["pytest"])  # the sanity check ran
-    assert "REPO-INTEGRITY BREACH" not in proc.stderr  # not a spurious breach
-    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()  # landed
-    assert "ready/99" in _local_tags(hub)  # the sibling ref was NOT rolled back
-
-
-def test_diverged_skip_tests_merge_sanity_still_catches_base_branch_escape(
-    hub: Path, tmp_path: Path
-) -> None:
-    # Scoping the tripwire (issue #205) must NOT gut its core job: a test that
-    # escapes and moves refs/heads/main — the ref the land is about to push — is
-    # still a breach that aborts the land and rolls the merge back.
-    wt = _make_spoke(hub, tmp_path, "feature/1-escape", push=True, ready=True)
-    _diverge_hub(hub)
-    pre_main = _remote_sha(hub, "main")
-    _install_prepush_stub(hub, exit_code=0)
-
-    proc, _logs = _run_land(
-        hub,
-        tmp_path,
-        "1",
-        "--skip-tests",
-        pytest_side_effect="git update-ref refs/heads/main HEAD~1 2>/dev/null || true",
-    )
-
-    assert proc.returncode != 0
-    assert "REPO-INTEGRITY BREACH" in proc.stderr  # the escape was caught
-    assert _remote_sha(hub, "main") == pre_main  # nothing pushed
-    assert wt.exists()  # land aborted before teardown
-
-
-# --- SSH keepalive + retry-once-after-green on the ship push (issue #119) --------
-# The ship push runs the ~6-minute gate INSIDE `git push`; GitHub reaps the idle
-# SSH connection mid-gate and the post-gate transfer dies on a fully green tree.
-# Two lines of defense: the push routes through wt_git_push (keepalive), and when
-# the gate demonstrably passed but the transport still died, worktree-land retries
-# exactly once with TEST_SELECT_SKIP=1 — loudly, and never after a failed gate.
-
-
-def _install_counting_gate(
-    hub: Path,
-    log: Path,
-    *,
-    exit_code: int = 0,
-    stderr: str = "",
-    mint_stamp: bool = False,
-) -> None:
-    """A hub pre-push hook logging one `INVOKED skip=[…]` line per invocation.
-
-    `stderr` simulates gate (pytest) output; `exit_code` non-zero models a
-    failing gate. The skip value records the threaded TEST_SELECT_SKIP so a
-    test can tell a first attempt from a skip-retry.
-
-    `mint_stamp` models a green gate (test-select.sh, issue #122): it writes a
-    green-tree stamp for HEAD^{tree} under <git-common-dir>/.gate-stamps/ before
-    exiting, exactly as the real gate does on a PASSING run — the positive proof
-    worktree-land now requires before honoring the transport retry (issue #214).
-    A killed gate never reaches its mint, so leaving `mint_stamp` False models
-    that.
-    """
-    hook = hub / ".git" / "hooks" / "pre-push"
-    lines = ["#!/bin/sh", f'echo "INVOKED skip=[${{TEST_SELECT_SKIP:-}}]" >> "{log}"']
-    if stderr:
-        lines.append(f"cat >&2 <<'GATEEOF'\n{stderr}\nGATEEOF")
-    if mint_stamp:
-        lines.append(_MINT_STAMP_FN)
-        lines.append("_mint_green_stamp")
-    lines.append(f"exit {exit_code}")
-    hook.write_text("\n".join(lines) + "\n")
-    hook.chmod(0o755)
-
-
-# Shared sh snippet: write a green-tree stamp for HEAD^{tree} under
-# <git-common-dir>/.gate-stamps/, mirroring gate-stamp.sh's placement contract
-# (issue #122). wt_gate_green_stamped only checks the file's existence, so a
-# minimal body suffices. Sourced into the git shim and the counting-gate hook.
-_MINT_STAMP_FN = r"""
-_mint_green_stamp() {
-  _t=$(git rev-parse "HEAD^{tree}") || return 0
-  _c=$(git rev-parse --git-common-dir) || return 0
-  case "$_c" in /*) ;; *) _c="$PWD/$_c" ;; esac
-  mkdir -p "$_c/.gate-stamps"
-  printf 'tier=full\nenv=test\n' > "$_c/.gate-stamps/$_t"
-}
-"""
-
-
-def _push141_git_shim(tmp_path: Path, *, mint_stamp: bool) -> None:
-    """PATH-front `git` shim: the FIRST ship push (`git push origin main`) exits
-    141 (SIGPIPE) — the transfer-phase death the keepalive lane retries (#119) —
-    and every other git call (including the retry push) delegates to real git.
-
-    With `mint_stamp`, the shim writes a green-tree stamp for HEAD^{tree} before
-    dying, modeling a gate that ran green and stamped THEN lost the transport (a
-    real post-green transport death). Without it, no stamp is left — the killed-
-    gate shape (#214): exit 141 with the suite never proven for this tree."""
-    real_git = shutil.which("git")
-    assert real_git is not None
-    bindir = tmp_path / "bin"
-    bindir.mkdir(exist_ok=True)
-    marker = tmp_path / "ship-push-died-once"
-    mint = "_mint_green_stamp" if mint_stamp else ":"
-    shim = bindir / "git"
-    shim.write_text(
-        "#!/bin/sh\n"
-        f'GIT_REAL="{real_git}"\n'
-        f'git() {{ "$GIT_REAL" "$@"; }}\n'
-        f"{_MINT_STAMP_FN}\n"
-        f'if [ "$1" = push ] && [ "$2" = origin ] && [ "$3" = main ] && [ ! -e "{marker}" ]; then\n'
-        f'  touch "{marker}"\n'
-        f"  {mint}\n"
-        "  exit 141\n"
-        "fi\n"
-        f'exec "$GIT_REAL" "$@"\n'
-    )
-    shim.chmod(0o755)
+# --- ship push: keepalive + rollback (issues #119, #19) --------------------------------
 
 
 def _install_pre_receive(
-    tmp_path: Path, log: Path, *, fail_first: bool = False, stderr_line: str = ""
+    tmp_path: Path, log: Path, *, decline: str = "", stderr_line: str = ""
 ) -> None:
     """A pre-receive hook on the bare origin logging each pushed ref.
 
-    With `fail_first`, the FIRST invocation emits `stderr_line` and rejects —
-    modeling a transport-death/rejection after the local gate ran — and every
-    later one succeeds, so a retry can land.
+    With `decline`, it also rejects every push (printing `stderr_line`) — a server-side
+    policy refusal, which a re-fetch can never fix.
     """
-    marker = tmp_path / "pre-receive-failed-once"
     hook = tmp_path / "remote.git" / "hooks" / "pre-receive"
     body = f'#!/bin/sh\nwhile read -r _o _n ref; do echo "$ref" >> "{log}"; done\n'
-    if fail_first:
-        body += (
-            f'if [ ! -e "{marker}" ]; then\n'
-            f'  touch "{marker}"\n'
-            f'  echo "{stderr_line}" >&2\n'
-            "  exit 1\n"
-            "fi\n"
-        )
+    if decline:
+        body += f'echo "{stderr_line}" >&2\nexit 1\n'
     body += "exit 0\n"
     hook.write_text(body)
     hook.chmod(0o755)
 
 
-def _diverge_hub(hub: Path) -> None:
-    """Advance the hub's main so the land is a real merge and the gate runs."""
-    (hub / "hub-only.txt").write_text("hub moved on\n")
-    _git(hub, "add", "hub-only.txt")
-    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
-
-
-def test_green_gate_transport_death_retries_once_with_skip(hub: Path, tmp_path: Path) -> None:
-    # Gate green (and stamps the tree, issue #122), then the transfer dies with a
-    # transport signature → retry EXACTLY once with TEST_SELECT_SKIP=1 (the gate
-    # already ran green and left a positive green-tree stamp, issue #214), loudly,
-    # and the land completes.
-    _make_spoke(hub, tmp_path, "feature/1-transport", push=True, ready=True)
-    _diverge_hub(hub)
-    gate_log = tmp_path / "gate-calls.log"
-    _install_counting_gate(hub, gate_log, mint_stamp=True)
-    ref_log = tmp_path / "pre-receive-refs.log"
-    _install_pre_receive(
-        tmp_path,
-        ref_log,
-        fail_first=True,
-        stderr_line="Connection to ssh.github.com closed by remote host.",
-    )
-
-    proc, _ = _run_land(hub, tmp_path, "1")
-
-    assert proc.returncode == 0, proc.stderr
-    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
-    # Ship attempts: gated first try, then exactly one skip-retry. Later entries
-    # are the post-land maintenance pushes (ready-tag delete, branch delete),
-    # which fire the same hub hook gate-free — pre-existing behavior.
-    gate_calls = _log_text(gate_log).splitlines()
-    assert gate_calls[:2] == ["INVOKED skip=[]", "INVOKED skip=[1]"], gate_calls
-    assert gate_calls.count("INVOKED skip=[1]") == 1, gate_calls
-    # Exactly two transfers reached the remote for main: the dying one + the retry.
-    main_refs = [ln for ln in _log_text(ref_log).splitlines() if ln == "refs/heads/main"]
-    assert len(main_refs) == 2, _log_text(ref_log)
-    # The retry is loud about what it is doing and why it may skip the gate.
-    assert "retry" in proc.stderr.lower()
-    assert "TEST_SELECT_SKIP" in proc.stderr
-    # The skip is witnessed: the suite result records the transport-retry so the
-    # issue-close comment does not read as a normal, fully-gated land (issue #214).
-    assert "TEST_SELECT_SKIP=1" in proc.stdout
-    assert "transport" in proc.stdout.lower()
-
-
-def test_transport_141_with_green_stamp_still_retries(hub: Path, tmp_path: Path) -> None:
-    # A ship push exiting 141 (SIGPIPE) whose gate DID run green and left a green-
-    # tree stamp is a real post-green transport death (issue #119): the retry
-    # still fires and the land completes. This proves the #214 fix does not gut
-    # the keepalive 141 lane — it only requires the positive stamp.
-    _make_spoke(hub, tmp_path, "feature/1-stamp141", push=True, ready=True)
-    _diverge_hub(hub)
-    _push141_git_shim(tmp_path, mint_stamp=True)
-
-    proc, _ = _run_land(hub, tmp_path, "1")
-
-    assert proc.returncode == 0, proc.stderr
-    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
-    # Loud about the retry, and the skip is recorded in the suite witness.
-    assert "TEST_SELECT_SKIP" in proc.stderr
-    assert "TEST_SELECT_SKIP=1" in proc.stdout
-
-
-def test_killed_gate_no_stamp_rolls_back_without_skip_retry(hub: Path, tmp_path: Path) -> None:
-    # THE #214 fix: a gate KILLED mid-run (SIGPIPE/OOM) makes the ship push exit
-    # 141 with no pytest summary and — because it never finished — no green-tree
-    # stamp. That is NOT a post-green transport death: it must roll back, never
-    # auto-retry with the suite skipped (which would ship a tree whose suite
-    # never finished).
-    _make_spoke(hub, tmp_path, "feature/1-killed", push=True, ready=True)
-    _diverge_hub(hub)
-    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
-    remote_before = _remote_sha(hub, "main")
-    _push141_git_shim(tmp_path, mint_stamp=False)
-
-    proc, _ = _run_land(hub, tmp_path, "1")
-
-    assert proc.returncode != 0
-    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # rolled back
-    assert _remote_sha(hub, "main") == remote_before  # origin/main untouched
-    # The refusal names the missing green proof, not a generic push rejection.
-    assert "stamp" in proc.stderr.lower()
-    # No skip-retry was attempted (the suite was never proven for this tree).
-    assert "TEST_SELECT_SKIP" not in proc.stderr
-
-
-def test_gate_green_stamped_reads_a_real_writer_stamp(hub: Path) -> None:
-    # Parity guard against placement drift: wt_gate_green_stamped reimplements
-    # gate-stamp.sh's <git-common-dir>/.gate-stamps/<HEAD^{tree}> contract WITHOUT
-    # sourcing it. Drive the REAL writer (gate_stamp_mint) and assert the reader
-    # agrees — before the mint it must be false, after it true. A future change to
-    # the writer's placement/key that the reader does not track fails here.
-    def _reads_stamp() -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["bash", "-c", f'. "{WORKTREE_LIB}"; wt_gate_green_stamped'],
-            cwd=str(hub),
-            capture_output=True,
-            text=True,
-            env=_GIT_ENV,
-        )
-
-    assert _reads_stamp().returncode != 0  # no stamp yet
-    # Mint via the authoritative writer for exactly this tree.
-    mint = subprocess.run(
-        [
-            "bash",
-            "-c",
-            f'. "{GATE_STAMP_LIB}"; '
-            'gate_stamp_mint "$(git rev-parse "HEAD^{tree}")" full "pytest-x.y"',
-        ],
-        cwd=str(hub),
-        capture_output=True,
-        text=True,
-        env=_GIT_ENV,
-    )
-    assert mint.returncode == 0, mint.stderr
-
-    assert _reads_stamp().returncode == 0  # reader now agrees the tree is proven
-
-
-def test_failed_gate_rolls_back_without_retry(hub: Path, tmp_path: Path) -> None:
-    # The gate itself fails → exactly ONE attempt, rollback as today, no retry.
-    _make_spoke(hub, tmp_path, "feature/1-redgate", push=True, ready=True)
-    _diverge_hub(hub)
-    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
-    gate_log = tmp_path / "gate-calls.log"
-    _install_counting_gate(hub, gate_log, exit_code=1)
-    ref_log = tmp_path / "pre-receive-refs.log"
-    _install_pre_receive(tmp_path, ref_log)
-
-    proc, _ = _run_land(hub, tmp_path, "1")
-
-    assert proc.returncode != 0
-    assert _log_text(gate_log).splitlines() == ["INVOKED skip=[]"]
-    assert "refs/heads/main" not in _log_text(ref_log)  # push aborted locally
-    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # rolled back
-    assert _remote_sha(hub, "main") != ""  # origin/main untouched
-
-
-def test_failed_gate_with_transport_prose_never_retries(hub: Path, tmp_path: Path) -> None:
-    # A FAILING gate whose pytest output quotes a transport signature (this very
-    # repo's tests embed those literals) must still read as a failed gate: the
-    # pytest failure summary is the tiebreaker, and no skip-retry may ship the
-    # red tree.
-    _make_spoke(hub, tmp_path, "feature/1-prose", push=True, ready=True)
-    _diverge_hub(hub)
-    gate_log = tmp_path / "gate-calls.log"
-    gate_output = (
-        "FAILED tests/unit/test_x.py::test_y - assert 'Connection to "
-        "ssh.github.com closed by remote host.' in caplog.text\n"
-        "=== 1 failed, 12 passed in 340.12s ==="
-    )
-    _install_counting_gate(hub, gate_log, exit_code=1, stderr=gate_output)
-
-    proc, _ = _run_land(hub, tmp_path, "1")
-
-    assert proc.returncode != 0
-    assert _log_text(gate_log).splitlines() == ["INVOKED skip=[]"]
-
-
-def test_failed_collection_with_transport_prose_never_retries(hub: Path, tmp_path: Path) -> None:
-    # A gate failing at COLLECTION time prints "Interrupted: N errors during
-    # collection" and never a "N failed" summary — with a transport literal in
-    # the traceback (importing a literal-bearing test file that broke) it must
-    # STILL read as a failed gate: no skip-retry may ship a non-importing tree.
-    _make_spoke(hub, tmp_path, "feature/1-collect", push=True, ready=True)
-    _diverge_hub(hub)
-    gate_log = tmp_path / "gate-calls.log"
-    gate_output = (
-        "ERROR tests/unit/test_worktree_lib.py - ImportError while importing; source "
-        "quotes 'Connection to ssh.github.com closed by remote host.'\n"
-        "!!!!!!!! Interrupted: 1 error during collection !!!!!!!!\n"
-        "=== 1 error in 2.31s ==="
-    )
-    _install_counting_gate(hub, gate_log, exit_code=1, stderr=gate_output)
-
-    proc, _ = _run_land(hub, tmp_path, "1")
-
-    assert proc.returncode != 0
-    assert _log_text(gate_log).splitlines() == ["INVOKED skip=[]"]
-
-
-def test_remote_rejection_after_green_gate_rolls_back_without_retry(
-    hub: Path, tmp_path: Path
-) -> None:
-    # Green gate but the remote rejects for a POLICY reason (no transport
-    # signature) → a retry would just fail again: roll back exactly as today.
+def test_remote_policy_rejection_rolls_back_without_retry(hub: Path, tmp_path: Path) -> None:
+    # CI green but the remote declines the main push for a POLICY reason (no non-ff
+    # signature) → a retry would just fail again: roll back, never loop.
     _make_spoke(hub, tmp_path, "feature/1-policy", push=True, ready=True)
-    _diverge_hub(hub)
     pre_sha = _git(hub, "rev-parse", "HEAD").strip()
-    gate_log = tmp_path / "gate-calls.log"
-    _install_counting_gate(hub, gate_log)
     ref_log = tmp_path / "pre-receive-refs.log"
     hook = tmp_path / "remote.git" / "hooks" / "pre-receive"
     hook.write_text(
@@ -1258,8 +986,8 @@ def test_remote_rejection_after_green_gate_rolls_back_without_retry(
     proc, _ = _run_land(hub, tmp_path, "1")
 
     assert proc.returncode != 0
-    assert _log_text(gate_log).splitlines() == ["INVOKED skip=[]"]
     assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # rolled back
+    assert _log_text(ref_log).count("refs/heads/main") == 1  # exactly one attempt
 
 
 def test_ship_push_carries_keepalive(hub: Path, tmp_path: Path) -> None:
@@ -1288,40 +1016,14 @@ def test_ship_push_carries_keepalive(hub: Path, tmp_path: Path) -> None:
     assert f"GIT_SSH_COMMAND=[ssh {keepalive}]" in main_pushes[0]
 
 
-def test_force_gate_env_overrides_ff_skip(hub: Path, tmp_path: Path) -> None:
-    # LAND_FORCE_GATE=1 is the escape hatch: run the full gate even on a clean-FF
-    # already-gated land, for when the redundant run is wanted anyway.
-    _make_spoke(hub, tmp_path, "feature/1-forcegate", push=True, ready=True)
-    env_log = tmp_path / "prepush-env.log"
-    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
-
-    proc, _ = _run_land(hub, tmp_path, "1", extra_env={"LAND_FORCE_GATE": "1"})
-
-    assert proc.returncode == 0, proc.stderr
-    assert "TEST_SELECT_SKIP" not in _log_text(env_log)
-
-
-def test_force_land_without_marker_still_runs_ff_gate(hub: Path, tmp_path: Path) -> None:
-    # --force-land lands a markerless branch: without a marker we cannot prove the
-    # tip was gated, so even a clean FF must still run the gate (no auto-skip).
-    _make_spoke(hub, tmp_path, "feature/1-forcedff", push=True, ready=False)
-    env_log = tmp_path / "prepush-env.log"
-    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
-
-    proc, _ = _run_land(hub, tmp_path, "1", "--force-land")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "TEST_SELECT_SKIP" not in _log_text(env_log)
-
-
 def test_push_gate_failure_rolls_back(hub: Path, tmp_path: Path) -> None:
-    # A pre-push rejection (the test gate failing) must roll the merged hub back
+    # A pre-push rejection (the local gate failing) must roll the merged hub back
     # and ship nothing — the clean-hub invariant the old land-side gate held.
     pre_sha = _git(hub, "rev-parse", "HEAD").strip()
     wt = _make_spoke(hub, tmp_path, "feature/1-broken", push=True)
     _install_prepush_stub(hub, exit_code=1)
 
-    proc, _ = _run_land(hub, tmp_path, "1")
+    proc, _ = _run_land(hub, tmp_path, "1", "--test-cmd", "my-suite")
 
     assert proc.returncode != 0
     assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # rolled back
@@ -1331,8 +1033,8 @@ def test_push_gate_failure_rolls_back(hub: Path, tmp_path: Path) -> None:
 
 
 def test_skip_tests_threads_skip_env(hub: Path, tmp_path: Path) -> None:
-    # --skip-tests bypasses the suite by threading TEST_SELECT_SKIP to the push,
-    # not by a land-side run — the hook stays the single executor.
+    # --skip-tests skips the hook's fast tier on the main push by threading
+    # TEST_SELECT_SKIP, not by a land-side run — the hook stays the single executor.
     _make_spoke(hub, tmp_path, "feature/1-untested", push=True)
     env_log = tmp_path / "prepush-env.log"
     _install_prepush_stub(hub, exit_code=0, env_log=env_log)
@@ -1345,17 +1047,17 @@ def test_skip_tests_threads_skip_env(hub: Path, tmp_path: Path) -> None:
 
 
 def test_test_cmd_threads_cmd_env(hub: Path, tmp_path: Path) -> None:
-    # --test-cmd overrides the suite by threading TEST_SELECT_CMD to the push, so
-    # the hook runs the custom command instead of the tiered selection.
+    # --test-cmd gates the land with a custom command, threaded as TEST_SELECT_CMD so the
+    # hook runs it on the merged tree instead of CI being consulted.
     _make_spoke(hub, tmp_path, "feature/1-custom", push=True)
     env_log = tmp_path / "prepush-env.log"
     _install_prepush_stub(hub, exit_code=0, env_log=env_log)
 
-    proc, _ = _run_land(hub, tmp_path, "1", "--test-cmd", "my-suite --fast")
+    proc, logs = _run_land(hub, tmp_path, "1", "--test-cmd", "my-suite --fast")
 
     assert proc.returncode == 0, proc.stderr
     assert "TEST_SELECT_CMD=my-suite --fast" in _log_text(env_log)
-    assert "test gate will NOT run" not in proc.stderr  # hook present → no warning
+    assert "run list" not in _log_text(logs["gh"])
 
 
 # --- ship and teardown -----------------------------------------------------------
@@ -1886,178 +1588,6 @@ def test_land_emits_no_span_when_auth_unresolvable(hub: Path, tmp_path: Path) ->
     assert _log_text(logs["curl"]) == "", "no span POST may fire without resolved auth"
 
 
-# --- conditional post-land background sweep (issue #124) --------------------------
-# After a successful land + teardown, the land script calls gate-sweep.sh --spawn
-# with the merged commit: a PRUNED green-tree stamp (testmon/selected, issue #122)
-# on the landed tree launches exactly one detached full-suite sweep; a `full`
-# stamp or no stamp launches none. Best-effort like the rest of the land tail:
-# the land's exit code and duration are unaffected in all cases, and a sweep
-# that fails to launch warns without failing the land.
-
-
-def _mint_stamp(hub: Path, ref: str, tier: str) -> None:
-    """Write a #122 green-tree stamp for `ref`'s tree into the hub's stamp store."""
-    tree = _git(hub, "rev-parse", f"{ref}^{{tree}}").strip()
-    stamps = hub / ".git" / ".gate-stamps"
-    stamps.mkdir(parents=True, exist_ok=True)
-    (stamps / tree).write_text(f"tier={tier}\nenv=test\n")
-
-
-def _wait_for_file(path: Path, timeout: float = 10.0) -> bool:
-    """Poll for a file the detached sweep worker writes; True when it appears."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if path.exists():
-            return True
-        time.sleep(0.05)
-    return False
-
-
-def test_land_launches_one_sweep_for_pruned_gated_tree(hub: Path, tmp_path: Path) -> None:
-    _make_spoke(hub, tmp_path, "feature/1-sweep", push=True)
-    _mint_stamp(hub, "feature/1-sweep", "testmon")
-    runner_log = tmp_path / "sweep-runner.log"
-
-    proc, _ = _run_land(
-        hub, tmp_path, "1", extra_env={"GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"'}
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert "launching background full-suite sweep" in proc.stdout
-    assert _wait_for_file(runner_log), "the detached sweep worker never ran"
-    time.sleep(0.5)  # grace: a wrongly-spawned second worker would land by now
-    assert runner_log.read_text().count("RUN") == 1  # exactly one sweep
-
-
-def test_land_refreshes_baseline_for_full_gated_tree(hub: Path, tmp_path: Path) -> None:
-    # A FULL-tier land needs no safety-net sweep, but it must still refresh the pre-warmed
-    # baseline so the next spoke seeds cheap (issue #327) — a detached refresh that rebuilds
-    # the baseline WITHOUT re-running the suite.
-    _make_spoke(hub, tmp_path, "feature/1-fullswp", push=True)
-    _mint_stamp(hub, "feature/1-fullswp", "full")
-    runner_log = tmp_path / "sweep-runner.log"
-    baseline = hub / ".git" / ".testmondata-baseline"
-
-    proc, _ = _run_land(
-        hub,
-        tmp_path,
-        "1",
-        extra_env={
-            "GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"',
-            "GATE_SWEEP_TESTMON_CMD": 'printf "DB" > "$TESTMON_DATAFILE"',
-        },
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert "launching background testmon baseline refresh" in proc.stdout
-    assert _wait_for_file(baseline), "a full-tier land must refresh the baseline"
-    assert baseline.read_text() == "DB"
-    time.sleep(0.5)  # grace: a wrongly-spawned suite worker would have written by now
-    assert not runner_log.exists(), "a full-tier land must NOT re-run the gate suite"
-
-
-def test_land_launches_no_sweep_without_stamp(hub: Path, tmp_path: Path) -> None:
-    # No stamp: docs-only skip or --skip-tests — the gate certified nothing
-    # pruned, so there is no selection miss to backstop.
-    _make_spoke(hub, tmp_path, "feature/1-nostamp", push=True)
-    runner_log = tmp_path / "sweep-runner.log"
-
-    proc, _ = _run_land(
-        hub, tmp_path, "1", extra_env={"GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"'}
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert "no gate stamp" in proc.stdout
-    time.sleep(0.8)
-    assert not runner_log.exists()
-
-
-def test_land_returns_while_slow_sweep_still_runs(hub: Path, tmp_path: Path) -> None:
-    # The land's duration is unaffected: it returns while the (slow) suite is
-    # still running in the detached worker.
-    _make_spoke(hub, tmp_path, "feature/1-slowswp", push=True)
-    _mint_stamp(hub, "feature/1-slowswp", "testmon")
-    start_log = tmp_path / "sweep-start.log"
-
-    t0 = time.monotonic()
-    proc, _ = _run_land(
-        hub,
-        tmp_path,
-        "1",
-        extra_env={"GATE_SWEEP_CMD": f'echo START >> "{start_log}"; sleep 30'},
-    )
-    elapsed = time.monotonic() - t0
-
-    assert proc.returncode == 0, proc.stderr
-    assert elapsed < 20, f"land blocked on the sweep ({elapsed:.1f}s)"
-    assert _wait_for_file(start_log)  # the worker is alive past the land's return
-
-
-def test_land_warns_but_succeeds_when_sweep_launch_fails(hub: Path, tmp_path: Path) -> None:
-    # Best-effort like the rest of the land tail: an unlaunchable sweep script
-    # (e.g. a synced repo missing it) warns and never fails the land.
-    _make_spoke(hub, tmp_path, "feature/1-noswp", push=True)
-    _mint_stamp(hub, "feature/1-noswp", "testmon")
-
-    proc, _ = _run_land(
-        hub, tmp_path, "1", extra_env={"GATE_SWEEP_BIN": str(tmp_path / "no-such-sweep.sh")}
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert "post-land sweep failed to launch" in proc.stderr
-    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()  # still landed
-
-
-def test_land_spawns_sweep_only_after_main_is_pushed(hub: Path, tmp_path: Path) -> None:
-    # Placement guard: the sweep must fire AFTER the ship push — a spawn before
-    # a rejected push would sweep (and possibly file an issue for) a tree that
-    # rolls back. The stub records origin/main at spawn time; it must already
-    # equal the merged commit.
-    _make_spoke(hub, tmp_path, "feature/1-ordswp", push=True)
-    _mint_stamp(hub, "feature/1-ordswp", "testmon")
-    spawn_log = tmp_path / "sweep-spawn.log"
-    stub = tmp_path / "sweep-stub.sh"
-    stub.write_text(
-        "#!/bin/sh\n"
-        f'printf "ARGS %s\\nORIGIN %s\\n" "$*" "$(git rev-parse origin/main)" >> "{spawn_log}"\n'
-    )
-    stub.chmod(0o755)
-
-    proc, _ = _run_land(hub, tmp_path, "1", extra_env={"GATE_SWEEP_BIN": str(stub)})
-
-    assert proc.returncode == 0, proc.stderr
-    merged = _git(hub, "rev-parse", "HEAD").strip()
-    text = spawn_log.read_text()
-    assert f"--spawn {merged}" in text  # spawned for the merged commit…
-    assert f"ORIGIN {merged}" in text  # …and only after main reached origin
-
-
-def test_diverged_merge_land_sweeps_from_gate_minted_stamp(hub: Path, tmp_path: Path) -> None:
-    # A diverged land builds a NEW merge tree that only the land's own push
-    # gate stamps; the spawn decision must see that stamp — pinning both the
-    # after-the-push ordering and the merge-commit path in one scenario.
-    _make_spoke(hub, tmp_path, "feature/1-divswp", push=True)
-    _diverge_hub(hub)
-    runner_log = tmp_path / "sweep-runner.log"
-    stamps = hub / ".git" / ".gate-stamps"
-    hook = hub / ".git" / "hooks" / "pre-push"
-    hook.write_text(
-        "#!/bin/sh\n"
-        f'mkdir -p "{stamps}"\n'
-        f'printf "tier=testmon\\nenv=test\\n" > "{stamps}/$(git rev-parse "HEAD^{{tree}}")"\n'
-        "exit 0\n"
-    )
-    hook.chmod(0o755)
-
-    proc, _ = _run_land(
-        hub, tmp_path, "1", extra_env={"GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"'}
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert "launching background full-suite sweep" in proc.stdout
-    assert _wait_for_file(runner_log), "diverged-merge land never swept its gate-stamped tree"
-
-
 # --- resilient / idempotent re-land (issue #151) --------------------------------
 # A land can be killed by a caller timeout AFTER the push succeeded but mid-teardown.
 # Re-invoking the land on that partially-landed spoke must COMPLETE it, not abort.
@@ -2571,6 +2101,7 @@ def _stub_bindir(bindir: Path, sandbox: Path) -> dict[str, str]:
     for name in ("gh", "tmux", "code", "pytest"):
         body = "#!/bin/sh\n"
         if name == "gh":
+            body += f"case \"$*\" in *\"run list\"*) printf '%s' '{GREEN_RUNS}' ;; esac\n"
             body += 'case "$*" in *"issue view"*state*) printf "OPEN\\n" ;; esac\n'
         body += "exit 0\n"
         (bindir / name).write_text(body)
@@ -2622,24 +2153,20 @@ def test_two_concurrent_lands_serialize_main_never_rewound(hub: Path, tmp_path: 
     assert (hub / "feature-2-beta.txt").exists()
 
 
-def test_nonff_push_rejection_recovers_and_reruns_gate(hub: Path, tmp_path: Path) -> None:
-    # AC2 recovery clause: if a push still races (origin advances DURING our gate, despite the
-    # lock — e.g. a non-honoring pusher), the land must AUTOMATICALLY re-fetch + re-merge + retry
-    # under the lock, not die with the hub behind. The re-merge is a NEW combined DIVERGED tree,
-    # so the retry must RE-RUN its gate — NOT reuse a clean-FF skip. This land is a clean-FF land
-    # with a ready marker (AUTO_SKIP): the FIRST push threads TEST_SELECT_SKIP=1, but the recovery
-    # push must run the gate for real (TEST_SELECT_SKIP unset) on the diverged tree.
-    _make_spoke(hub, tmp_path, "feature/1-racy", push=True)
-    invocations = tmp_path / "prepush-invocations"
+def test_nonff_push_rejection_recovers_by_re_syncing_the_spoke_and_re_waiting_for_ci(
+    hub: Path, tmp_path: Path
+) -> None:
+    # AC2 recovery clause: if a push still races (origin advances DURING the push, despite the
+    # lock — e.g. a non-honoring pusher), the land must AUTOMATICALLY re-fetch, merge the NEW
+    # main into the spoke, wait for CI on that merge, and re-push — not die with the hub behind.
+    wt = _make_spoke(hub, tmp_path, "feature/1-racy", push=True, ready=True)
+    tip = _git(wt, "rev-parse", "HEAD").strip()
     advanced = tmp_path / "origin-advanced"
     remote = tmp_path / "remote.git"
     hook = hub / ".git" / "hooks" / "pre-push"
     hook.write_text(
         "#!/bin/sh\n"
-        # Record the threaded skip flag per invocation so the test can prove the recovery push
-        # actually re-gated (skip empty) rather than riding the stale clean-FF skip.
-        'printf "skip=[%s]\\n" "${TEST_SELECT_SKIP:-}" >> "' + str(invocations) + '"\n'
-        # On the FIRST push only, a sibling wins the race by advancing origin/main out-of-band.
+        # On the FIRST main push only, a sibling wins the race by advancing origin/main.
         f'if [ ! -f "{advanced}" ]; then\n'
         f'  touch "{advanced}"\n'
         "  d=$(mktemp -d)\n"
@@ -2655,14 +2182,58 @@ def test_nonff_push_rejection_recovers_and_reruns_gate(hub: Path, tmp_path: Path
     )
     hook.chmod(0o755)
 
-    proc, _ = _run_land(hub, tmp_path, "1")
+    # The first push is skipped (CI-proven), so the hook only races a LOCAL-gated land.
+    proc, logs = _run_land(hub, tmp_path, "1", "--local-gate")
 
     assert proc.returncode == 0, proc.stderr + "\n---\n" + proc.stdout
-    invs = invocations.read_text().splitlines()
-    assert len(invs) >= 2, f"the gate must re-run on the re-merged tree: {invs}"
-    assert invs[-1] == "skip=[]", (
-        f"recovery must RE-GATE the diverged tree, not ride the clean-FF skip: {invs}"
-    )
     head = _git(hub, "rev-parse", "HEAD").strip()
     assert _remote_sha(hub, "main") == head, "the hub must end at origin, not behind it"
     assert (hub / "feature-1-racy.txt").exists(), "the spoke's work landed after recovery"
+    assert (hub / "sib.txt").exists(), "the sibling's commit is an ancestor (re-synced forward)"
+    assert tip != head
+    assert "advanced under the land" in proc.stderr  # the recovery path really ran
+    assert "run list" not in _log_text(logs["gh"])  # --local-gate never asks CI
+
+
+def test_nonff_push_rejection_in_ci_mode_re_syncs_and_re_checks_ci(
+    hub: Path, tmp_path: Path
+) -> None:
+    # The same race in the default CI mode: origin advances between the CI-green check and the
+    # main push (a non-honoring pusher advancing main out-of-band right before the push). The
+    # recovery merges the new main into the spoke, pushes it, re-checks CI on the NEW sha, and
+    # fast-forwards — the SHA that reaches main is still one CI passed.
+    wt = _make_spoke(hub, tmp_path, "feature/1-racyci", push=True, ready=True)
+    tip = _git(wt, "rev-parse", "HEAD").strip()
+    remote = tmp_path / "remote.git"
+    advanced = tmp_path / "origin-advanced"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    sib = tmp_path / "sib-clone"
+    # A git shim that advances origin/main out-of-band just before the FIRST `push origin main`.
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = push ] && [ "$2" = origin ] && [ "$3" = main ] && [ ! -f "' + str(advanced) + '" ]; then\n'
+        f'  touch "{advanced}"\n'
+        f'  "{real_git}" clone -q "{remote}" "{sib}" >/dev/null 2>&1\n'
+        f'  ( cd "{sib}" && "{real_git}" config user.email t@t.t && "{real_git}" config user.name t \\\n'
+        f'    && "{real_git}" config commit.gpgsign false && printf "sib\\n" > sib.txt \\\n'
+        f'    && "{real_git}" add sib.txt && "{real_git}" commit -qm "feat: sibling" -m "Refs #0" \\\n'
+        f'    && "{real_git}" push -q origin main ) >/dev/null 2>&1\n'
+        "fi\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+
+    proc, logs = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr + "\n---\n" + proc.stdout
+    head = _git(hub, "rev-parse", "HEAD").strip()
+    assert _remote_sha(hub, "main") == head
+    assert "advanced under the land" in proc.stderr  # the recovery path really ran
+    assert (hub / "sib.txt").exists() and (hub / "feature-1-racyci.txt").exists()
+    gh = _log_text(logs["gh"])
+    assert f"--commit {tip}" in gh and f"--commit {head}" in gh  # CI re-checked on the new SHA
+    assert _log_text(logs["pytest"]) == ""
