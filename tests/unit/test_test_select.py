@@ -86,7 +86,7 @@ def _make_pytest_stub(
     testmon: bool,
     xdist: bool = True,
     exit_code: int = 0,
-    collect_nodes: int = 0,
+    collect_nodes: int = 3,
     collect_exit: int = 0,
 ) -> None:
     """Install a `pytest` stub on PATH.
@@ -113,14 +113,18 @@ def _make_pytest_stub(
         f'    echo "{STUB_ENV_FINGERPRINT}"\n'
         "    exit 0 ;;\n"
         "esac\n"
-        f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
-        # A `--collect-only` pass (the testmon impact probe) lists `collect_nodes` node ids.
+        # A `--collect-only` pass (the testmon impact probe) is logged as PROBE, never RUN, so
+        # it cannot satisfy an assertion about the real leg. It lists `collect_nodes` node ids
+        # — but only at `--verbosity=-1`, like real pytest whose `-q`/`-v` addopts reformat it.
         'for a in "$@"; do\n'
         '  if [ "$a" = "--collect-only" ]; then\n'
+        f'    printf "PROBE %s\\n" "$*" >> "{runlog}"\n'
+        '    case " $* " in *" --verbosity=-1 "*) ;; *) echo "tests/t.py: 9"; exit 0 ;; esac\n'
         f'    i=0; while [ "$i" -lt {collect_nodes} ]; do echo "tests/t.py::test_$i"; i=$((i+1)); done\n'
         f"    exit {collect_exit}\n"
         "  fi\n"
         "done\n"
+        f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         f'printf "GITDIR=[%s]\\n" "${{GIT_DIR-UNSET}}" >> "{runlog}"\n'
         f"exit {exit_code}\n"
     )
@@ -147,6 +151,7 @@ def _make_python_module_stub(bindir: Path, runlog: Path, *, testmon: bool) -> No
         'echo "  -n numprocesses"; exit 0 ;;\n'
         f'    --version) echo "{STUB_ENV_FINGERPRINT}"; exit 0 ;;\n'
         "  esac\n"
+        '  case " $* " in *" --collect-only "*) echo "tests/t.py::test_0"; exit 0 ;; esac\n'
         f'  printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         "  exit 0\n"
         "fi\n"
@@ -181,13 +186,14 @@ def _make_testmon_modeling_stub(bindir: Path, runlog: Path, *, impact: list[str]
         'echo "  -n numprocesses"; exit 0 ;;\n'
         f'  --version) echo "{STUB_ENV_FINGERPRINT}"; exit 0 ;;\n'
         "esac\n"
-        f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         'for a in "$@"; do\n'
         '  if [ "$a" = "--collect-only" ]; then\n'
+        f'    printf "PROBE %s\\n" "$*" >> "{runlog}"\n'
         f'    for f in {impact_words}; do echo "$f::test_x"; done\n'
         "    exit 0\n"
         "  fi\n"
         "done\n"
+        f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         "testmon=0\n"
         'ignored=" "\n'
         'for a in "$@"; do\n'
@@ -1459,8 +1465,8 @@ def test_testmon_selecting_most_of_the_suite_is_skipped(repo: Path, tmp_path: Pa
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "--testmon --collect-only" in log  # the impact was probed ...
-    assert not [ln for ln in log.splitlines() if "--testmon" in ln and "--collect-only" not in ln]
+    assert "PROBE --testmon --collect-only --verbosity=-1" in log  # the impact was probed ...
+    assert not [ln for ln in log.splitlines() if ln.startswith("RUN") and "--testmon" in ln]
     assert "testmon would select 5800 tests" in proc.stderr  # ... and the skip is loud
     assert "CI is the full gate" in proc.stderr
 
@@ -1499,7 +1505,7 @@ def test_testmon_leg_skipped_when_its_impact_cannot_be_established(
     base = _rev(repo)
     tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
     runlog = tmp_path / "run.log"
-    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_exit=2)
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_exit=3)
 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
@@ -1524,4 +1530,62 @@ def test_a_tests_only_python_push_never_runs_an_unbounded_testmon_leg(
     runs = [ln for ln in _runlog(runlog).splitlines() if ln.startswith("RUN ")]
     # only the meta node (parallel) and the testmon impact probe — never a serial testmon run
     assert f"RUN -n auto {META_NODE}" in runs
-    assert all("--collect-only" in r or META_NODE in r for r in runs), runs
+    assert all(META_NODE in r for r in runs), runs
+
+
+def test_testmon_probe_is_immune_to_host_pytest_verbosity(repo: Path, tmp_path: Path) -> None:
+    # A host's addopts / PYTEST_ADDOPTS change the listing format; the probe pins it with
+    # --verbosity=-1 (the stub prints an uncountable `file: N` summary without it), so a big
+    # impact set can never read as zero and slip into an unbounded serial run.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_nodes=5800)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert "testmon would select 5800 tests" in proc.stderr
+    assert "RUN --testmon\n" not in _runlog(runlog)
+
+
+def test_testmon_probe_with_no_countable_nodes_is_skipped_not_run(
+    repo: Path, tmp_path: Path
+) -> None:
+    # rc 0 and zero node ids is an unreadable listing — never a licence to run the leg.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_nodes=0)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN --testmon\n" not in _runlog(runlog)
+    assert "could not be established" in proc.stderr
+
+
+def test_testmon_collection_error_blocks_the_push(repo: Path, tmp_path: Path) -> None:
+    # A broken import is a definite failure; the unbounded leg used to block on it.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_exit=2)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 2
+    assert "collection failed" in proc.stderr
+
+
+def test_testmon_probe_tripwire_breach_blocks_the_push(repo: Path, tmp_path: Path) -> None:
+    # Collection imports every test module, so an isolation escape can fire during the probe;
+    # the tripwire's abort code must reach the hook's exit, not be read as "unknown".
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, collect_exit=97)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 97  # the tripwire's abort code reaches the hook's exit
+    assert "RUN --testmon\n" not in _runlog(runlog)

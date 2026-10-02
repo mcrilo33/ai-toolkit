@@ -133,7 +133,9 @@ To skip that seed, a maintained baseline `.testmondata` lives at
   `requirements-dev.txt` bump) is invalidated and testmon would re-select the whole suite.
   The fast tier therefore **probes first**: `pytest --testmon --collect-only -q` lists what
   testmon would run, and past `TEST_SELECT_TESTMON_MAX` tests (default 200) — or if the count
-  cannot be established — the leg is skipped with a loud note and CI covers it. (A tests-only
+  cannot be established — the leg is skipped with a loud note and CI covers it. A collection
+  error blocks the push outright. The probe runs no tests but, like any testmon invocation, may
+  update the database (it can only widen later selections, never produce a false green). (A tests-only
   push once ran ~5800 tests serially for 34 minutes: testmon cannot use xdist.) Rebuild the
   baseline after a dependency bump to get incremental selection back.
 
