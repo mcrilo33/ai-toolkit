@@ -5,15 +5,15 @@
 # (:4319) must be up the WHOLE time any spoke runs, or that spoke's traces are lost
 # (issue #115). worktree-new.sh only ensures them once, at spawn — nothing restarts a
 # collector that crashes mid-run, and a spoke relaunched outside worktree-new.sh (a
-# manual dead-pane relaunch) runs no preflight and streams into a dead port.
+# manual dead-agent relaunch) runs no preflight and streams into a dead port.
 #
 # This is the hub-side watchdog (sibling of hub-ready-watch.sh): each run, when ≥1
-# spoke pane is live, it ensures both are up — RECYCLING a dead/stale one via
+# spoke agent is live (per Orca, #363), it ensures both are up — RECYCLING a dead/stale one via
 # worktree-lib's ensure paths (wt_otel_collector_preflight now removes an
 # Exited/Created/Dead lf-collector before relaunching, #115) — and otherwise does
 # nothing. One-shot by default (run it on the hub, e.g. on a /loop); with
 # `--daemon` it self-loops for the spoke lifetime and exits when the last spoke
-# pane closes — worktree-new.sh arms that mode automatically at spawn (#138), so
+# agent is gone — worktree-new.sh arms that mode automatically at spawn (#138), so
 # a machine sleep/wake no longer needs a human to re-arm capture.
 #
 # Best-effort and idempotent: it reuses the SAME ensure paths as worktree-new.sh, so
@@ -57,7 +57,7 @@ MAIN_ROOT="${MAIN_ROOT:-$(wt_main_root 2>/dev/null || git rev-parse --show-tople
 # _spoke_worktree_paths -> the linked (spoke) worktree paths, one per line: every
 # `git worktree` EXCEPT the hub main checkout itself (compared canonically so a
 # symlinked root — /tmp → /private/tmp on macOS — doesn't misclassify the hub as a
-# spoke). Split out so spoke_pane_live is unit-testable without a real repo.
+# spoke). Split out so spoke_agent_live is unit-testable without a real repo.
 _spoke_worktree_paths() {
   local main_rp p
   main_rp="$(wt_realpath "$MAIN_ROOT")"; main_rp="${main_rp:-$MAIN_ROOT}"
@@ -69,32 +69,30 @@ _spoke_worktree_paths() {
       done
 }
 
-# _pane_paths -> the current path of every tmux pane across all sessions, one per
-# line (empty when tmux is absent). Split out so spoke_pane_live is testable with no
-# real tmux.
-_pane_paths() {
-  command -v tmux >/dev/null 2>&1 || return 0
-  tmux list-panes -a -F '#{pane_current_path}' 2>/dev/null
+# _agent_paths -> the path of every worktree Orca reports a live agent in, one per line (empty
+# when orca is absent or unreachable). Split out so spoke_agent_live is testable with no real Orca.
+_agent_paths() {
+  orca_json worktree ps --limit 500 || return 0
+  printf '%s' "$ORCA_OUT" | jq -r '.result.worktrees[]? | select((.agents // []) | length > 0) | .path' 2>/dev/null || true
 }
 
-# spoke_pane_live -> rc 0 when at least one tmux pane sits inside a spoke worktree
-# (i.e. a spoke is running), else rc 1. Paths are canonicalized on both sides
-# (wt_realpath, falling back to the literal when a path can't be resolved) so a
-# symlinked worktree root still correlates its pane. Best-effort: no spokes, no
-# panes, or no tmux all read as "no spoke live".
-spoke_pane_live() {
-  local spokes canon="" s pane rp
+# spoke_agent_live -> rc 0 when at least one spoke worktree has a live agent per Orca (i.e. a
+# spoke is running), else rc 1. Paths are canonicalized on both sides (wt_realpath, falling
+# back to the literal when a path can't be resolved) so a symlinked worktree root still
+# correlates. Best-effort: no spokes, no agents, or no orca all read as "no spoke live".
+spoke_agent_live() {
+  local spokes canon="" s agent rp
   spokes="$(_spoke_worktree_paths)"
   [ -n "$spokes" ] || return 1
   while IFS= read -r s; do
     [ -n "$s" ] || continue
     rp="$(wt_realpath "$s")"; canon+="${rp:-$s}"$'\n'
   done <<<"$spokes"
-  while IFS= read -r pane; do
-    [ -n "$pane" ] || continue
-    rp="$(wt_realpath "$pane")"; rp="${rp:-$pane}"
+  while IFS= read -r agent; do
+    [ -n "$agent" ] || continue
+    rp="$(wt_realpath "$agent")"; rp="${rp:-$agent}"
     grep -qxF "$rp" <<<"$canon" && return 0
-  done < <(_pane_paths)
+  done < <(_agent_paths)
   return 1
 }
 
@@ -133,7 +131,7 @@ _ensure_or_notice() {
 # otherwise. Always returns 0: the watchdog must never error out the /loop that
 # drives it.
 main() {
-  spoke_pane_live || return 0
+  spoke_agent_live || return 0
   _ensure_or_notice
   return 0
 }
@@ -142,8 +140,8 @@ main() {
 # Machine sleep kills the collector out from under live spokes and nothing
 # re-arms on wake unless a human remembers to /loop this script. `--daemon` makes
 # the loop self-driving: worktree-new.sh arms it at every spoke spawn
-# (wt_otel_watch_arm), it re-ensures the stack each tick while ≥1 spoke pane is
-# live, and it tears itself down once the last spoke pane has been gone for the
+# (wt_otel_watch_arm), it re-ensures the stack each tick while ≥1 spoke agent is
+# live, and it tears itself down once the last spoke agent has been gone for the
 # idle grace. A nohup-detached loop is suspended across sleep and resumes on
 # wake, so the first post-wake tick recycles a dead collector with no human in
 # the loop.
@@ -202,7 +200,7 @@ _watch_loop() {
   local interval="${HUB_OTEL_WATCH_INTERVAL:-30}" max_idle="${HUB_OTEL_WATCH_IDLE_TICKS:-3}" idle=0
   _watch_log "watch loop started (pid $$, interval ${interval}s, idle grace ${max_idle} ticks)"
   while :; do
-    if spoke_pane_live; then
+    if spoke_agent_live; then
       idle=0
       _ensure_or_notice
       # #190: a land rewrote our own source on disk → re-exec into it so the ensure
@@ -218,7 +216,7 @@ _watch_loop() {
     else
       idle=$((idle + 1))
       if [ "$idle" -ge "$max_idle" ]; then
-        _watch_log "no spoke pane live for ${max_idle} ticks — exiting"
+        _watch_log "no spoke agent live for ${max_idle} ticks — exiting"
         return 0
       fi
     fi
