@@ -1,14 +1,15 @@
 # Parallel worktrees workflow
 
 Run several Claude Code sessions at once — one git worktree per task — so concurrent
-edits never collide, while reviewing everything from a single VS Code window. The
-`scripts/worktree-*.sh` helpers automate creation, config propagation, and teardown.
+edits never collide, with [Orca](https://github.com/stablyai/orca) as the surface that
+shows every worktree and agent. The `scripts/worktree-*.sh` helpers automate creation,
+config propagation, and teardown.
 
 ## The model
 
 One invariant makes the whole flow clean: **the main checkout always stays on `main`
 and never holds task work.** It is your launcher and merge hub. Every task lives in its
-own worktree, on its own branch, driven by its own Claude in its own tmux window.
+own worktree, on its own branch, driven by its own Claude in its own Orca terminal.
 
 The mirror invariant governs pushes: **a spoke pushes only its own branch** — its
 `origin/<branch>` is ephemeral staging, deleted at teardown once merged — and **`main`
@@ -18,18 +19,18 @@ directions (hard deny on Cursor, advisory elsewhere).
 ```
 ~/Repos/ai-toolkit          MAIN CHECKOUT — always on `main`. Launch + merge here.
 │
-├── one VS Code window  ◄──── `code --add` folds every worktree in (your review surface)
+├── Orca  ◄──── `orca worktree create` registers every worktree (your review surface)
 │
-├─ ai-toolkit-42  feature/42-…  ◄─ tmux window "42-…" → claude   ┐
-├─ ai-toolkit-57  feature/57-…  ◄─ tmux window "57-…" → claude   │ N isolated tasks
-└─ ai-toolkit-63  feature/63-…  ◄─ tmux window "63-…" → claude   ┘
+├─ 42-…  feature/42-…  ◄─ Orca terminal → claude   ┐
+├─ 57-…  feature/57-…  ◄─ Orca terminal → claude   │ N isolated tasks
+└─ 63-…  feature/63-…  ◄─ Orca terminal → claude   ┘
 ```
 
 | Concept | Maps to |
 |---------|---------|
-| One task | one issue → one branch → one worktree dir → one tmux window → one Claude |
+| One task | one issue → one branch → one Orca worktree → one Orca terminal → one Claude |
 | Isolation unit | a git worktree (separate working tree, staging area, `.claude/` gates) |
-| Review surface | a single VS Code window, one Source Control group per worktree |
+| Review surface | Orca: every worktree, its agent state and its diff |
 | Merge hub | the main checkout, kept on `main` |
 
 ## Planning hub and execution spokes
@@ -43,7 +44,7 @@ issues. Each spoke is a worktree session that implements one issue under the gat
  PLANNING HUB  (main checkout, one persistent session)   think → decide → write issue
         │  hands off via an issue + start-task
         ▼
- worktree-new.sh N → SPOKE N  (worktree + tmux window + seeded claude)  /source → /cycle
+ worktree-new.sh N → SPOKE N  (Orca worktree + terminal + seeded claude)  /source → /cycle
 ```
 
 | Aspect | Planning hub | Execution spoke |
@@ -60,14 +61,23 @@ issue, then runs `worktree-new.sh <id> --prompt …` to spawn the spoke and seed
 message. The `source-task` guard nudges you back to this split if you start coding on the
 hub.
 
-## One-time setup
+## Orca prerequisites
 
-```bash
-# 1. Open your single review window — keep just this ONE VS Code window open
-code ~/Repos/ai-toolkit
+Orca is a prerequisite of this repo and of every synced repo: `worktree-new.sh` and
+`worktree-quick.sh` create worktrees with the `orca` CLI and there is no tmux fallback.
 
-# 2. Be in a tmux session in the main-checkout terminal (see "tmux" below)
-```
+- Orca **>= 1.4.218** (`orca --version`); the scripts refuse older versions.
+- This repo is registered in Orca (`orca repo add`), and its `orca.yaml` setup hook runs
+  `provision-worktree.sh`.
+- Orca's **branch prefix is `none`** and **auto-rename is off**, so the branch the script
+  renames to `<type>/<n>-<slug>` stays put.
+- Claude **trusts the Orca workspaces dir** once: set
+  `projects["<workspaces dir>"].hasTrustDialogAccepted` to `true` in `~/.claude.json`
+  (trust cascades from a non-home parent; a worktree-by-worktree dialog would block every
+  agent, so the script fails loud on `agent-trust-workspace` and never auto-answers it).
+- Dispatch runs from an **Orca terminal** with a **bound Run**:
+  `orca orchestration run-create --objective "<what this session coordinates>"`. The seed
+  prompt is delivered by `orca orchestration worker-start`, which refuses any other caller.
 
 > [!NOTE]
 > The skills and the `planning-hub` rule invoke the helpers at the canonical
@@ -81,8 +91,9 @@ code ~/Repos/ai-toolkit
 
 | Script | Role |
 |--------|------|
-| `scripts/worktree-new.sh` | Create a worktree + branch, copy `.claude/`, fold into VS Code, open a tmux window running `claude` |
-| `scripts/provision-worktree.sh` | Provision a worktree's policy layer (git exclude, `.testmondata` pre-warm, `.ai-toolkit/*`, `.claude/`, `settings.local.json` allow/deny + spoke OTel env); shared by `worktree-new.sh` and Orca's setup hook (`ORCA_*` env or explicit flags), idempotent, fail-loud |
+| `scripts/worktree-new.sh` | Dispatch one task: `orca worktree create`, rename the branch, provision, launch `claude` in an Orca terminal, deliver the seed with `orca orchestration worker-start` |
+| `scripts/orca-lib.sh` | The only caller of the `orca` CLI: version floor, `--json` capture, settle-after-timeout (never re-issues a mutation), field extractors |
+| `scripts/provision-worktree.sh` | Provision a worktree's policy layer (git exclude, `.testmondata` pre-warm, `.ai-toolkit/*`, `.claude/`, `settings.local.json` allow/deny + spoke OTel env); shared by `worktree-new.sh`, `worktree-quick.sh` and Orca's setup hook (`ORCA_*` env or explicit flags), idempotent, fail-loud |
 | `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → CI green → merge → push → teardown → issue close |
 | `scripts/worktree-done.sh` | Resolve a worktree by issue / slug / branch / path and tear it down safely |
 | `scripts/worktree-lib.sh` | Shared slugify + main-root + worktree-resolution helpers (sourced by the others) |
@@ -107,7 +118,8 @@ path, which resolves identically in the ai-toolkit checkout and in the synced ta
 so no sync-time path rewrite is needed.
 
 The scripts locate the main checkout by git introspection (`wt_main_root` via
-`git worktree list`) and source their siblings by their own directory, so they run
+`git worktree list`), look task worktrees up through `orca worktree list` (identity.sh
+rides along for the issue column), and source their siblings by their own directory, so they run
 unmodified from `.ai-toolkit/scripts/` in a foreign repo. After a sync, run `/hub` in
 `my-project` and the dashboard, dispatch, and land commands work there directly.
 
@@ -162,24 +174,23 @@ scripts/worktree-new.sh fix-parser      # ad-hoc: the first arg IS the slug → 
 
 Each run automatically:
 
-1. creates `~/Repos/ai-toolkit-<tag>` on branch `feature/<id>-<slug>`,
-2. copies the gitignored `.claude/` runtime config (skills + hooks + gates) into it,
-3. seeds `.claude/settings.local.json` with the two narrow allow rules for the
-   spoke's own-branch push (`git push [-u] origin <branch>`) — the ship push is
-   enforced by the push gates, so it skips the permission ask; every other push
-   stays gated,
-4. runs `code --add` to fold the worktree into your single VS Code window,
-5. opens a new tmux window in the project's session (named after the repo — see
-   [tmux](#tmux)), named after the branch leaf (e.g. `42-fix-crash`), pinned against
-   renames, running `claude` in the worktree — and prints the exact jump command.
+1. creates an Orca worktree (`orca worktree create --setup skip`) from the resolved base
+   and renames its branch to `feature/<id>-<slug>`,
+2. provisions it (`provision-worktree.sh`): the gitignored `.claude/` runtime config
+   (skills + hooks + gates), the spoke's command allowlist, `WT_SPOKE` and the OTel env,
+   and the identity record (mode, lane, Orca worktree/dispatch/run ids),
+3. launches `claude` in an Orca terminal with the model/effort pinned and the OTel env
+   as real process env (Claude ignores it in `settings.local.json`),
+4. delivers the seed prompt with `orca orchestration worker-start --terminal` and prints
+   the terminal handle.
 
-Paste the printed jump command (or switch with `prefix` + number inside the project
-session) and drive Claude — typically `/source` then `/cycle`.
+Open the worktree in Orca (or `orca terminal show --terminal <handle>`) and drive
+Claude — typically `/source` then `/cycle`.
 
 ### 2. Work and review
 
 Each session is fully isolated: its own files, branch, staging area, and `.claude/`
-gates. In the one VS Code window, the Source Control panel shows **one group per
+gates. In Orca, the worktree list shows **one entry per
 worktree**, so you review every task's diff without leaving the window.
 
 ### 3. Land
@@ -223,11 +234,10 @@ clean on `main` and the spoke is clean, fully pushed, marked ready and CI-green;
 push rolls `main` back (`git reset --keep`) with nothing pushed. Pushes the worktree scripts
 perform carry SSH keepalive options (`ServerAliveInterval`, issue #119) — the
 completion-marker tag push stays plain, since tag-only pushes skip the gate. On success it
-calls
-`worktree-done.sh` for the teardown mirror of creation — `code --remove` drops the
-folder from the review window, and the now-merged branch is pruned local + origin
-(`--keep-branch` to keep it). An unmerged branch is never pruned. It then closes the
-issue via `gh` and kills the task's stranded tmux window.
+releases the spoke's Orca worker (`worker-release`, which closes its terminal) and calls
+`worktree-done.sh --no-hooks` — an `orca worktree rm` — then the now-merged branch is
+pruned local + origin. An unmerged branch is never pruned. It then closes the issue via
+`gh`. Orca refusing the removal exits 3 (shipped, cleanup incomplete), never 1.
 
 Landing is hub-owned by **role**, not directory. `worktree-new.sh` stamps each spoke
 session with a `WT_SPOKE=<issue-or-slug>` env var that rides every command it runs, so
@@ -251,14 +261,12 @@ scripts/worktree-new.sh <issue> [slug] [type] [flags]
 | Flag | Effect |
 |------|--------|
 | `-t, --type <t>` | branch type (`feature`/`fix`/`chore`) — unambiguous, beats the positional `[type]` slot |
-| `--prompt <text>` | seed the spawned `claude` with this first message (e.g. `/source` or a task kickoff) |
-| `--new-window` | open a separate VS Code window instead of `code --add` |
-| `--no-code` | do not touch VS Code |
-| `--no-terminal` | do not spawn a tmux/terminal window |
-| `--no-agent` | spawn the terminal but do not launch `claude` |
+| `--prompt <text>` | the seed prompt (e.g. `/source` or a task kickoff); required for an ad-hoc slug, defaults to "read `.ai-toolkit/task.md`" for a numbered issue |
+| `--mode <m>` | `attended` (default) or `afk`, stamped on the identity record and the trace |
+| `--subtasks N,M` | extra issues this one spoke ships on the same branch (#278) |
 
 The spawned agent's model and effort are pinned at dispatch time
-(`CLAUDE_EFFORT=high claude --model claude-sonnet-5-5` by default) so a spoke stays
+(`claude --model claude-sonnet-5-5 --effort high` by default) so a spoke stays
 deterministic even when user-global settings change. The default comes from the
 declarative config (`settings/ai-toolkit.yml`, key `model.spoke`): sync emits it into
 `.ai-toolkit/scripts/spoke-model.env`, which `worktree-new.sh` sources, falling back to
@@ -293,29 +301,36 @@ dropped. `[type]` must be `feature` (default), `fix`, or `chore`.
 ## `worktree-done.sh` reference
 
 ```
-scripts/worktree-done.sh <issue|slug|branch|path> [--force] [--no-code] [--keep-branch]
+scripts/worktree-done.sh <issue|slug|branch|path> [--force] [--no-hooks]
 ```
 
-Resolves the target against the live `git worktree list` — by issue number, slug,
-branch name, or path — and removes it. On no match or an ambiguous match it **lists the
-existing worktrees** instead of failing with a dead-end error.
+Resolves the target against `orca worktree list` — by issue (Orca's `linkedIssue`, else the
+identity record), full branch, branch leaf, Orca display name, or path — and removes it with
+`orca worktree rm`. On no match or an ambiguous match it **lists the existing worktrees**
+instead of failing with a dead-end error. If Orca cannot answer (missing, unreachable, repo
+unregistered) it stops loudly: an empty list is never assumed.
 
-Teardown then mirrors `worktree-new.sh`: it folds the folder out of the VS Code review
-window (`code --remove`) and prunes the worktree's branch. The branch is pruned **only
-when it is fully merged** into the hub's current branch — local *and* `origin/<branch>`
-are deleted automatically. An unmerged branch is kept untouched, with a push/merge-first
-hint. `code` and remote failures warn but never abort: the worktree removal still
-succeeds.
+The branch is pruned **only when it is fully merged** into the hub's base branch — local
+*and* `origin/<branch>` are deleted. Orca may delete the local branch of its own accord, so
+the tip and merged-ness are recorded before the removal and an unmerged branch is put back
+afterwards, with a push/merge-first hint. If Orca refuses the removal the script exits
+non-zero with Orca's error; a CLI drop (`runtime_unavailable`) is settled by checking that the
+worktree is gone, never by re-issuing the removal.
 
 | Flag | Effect |
 |------|--------|
 | `--force` | remove a worktree with uncommitted or untracked changes |
-| `--no-code` | don't fold the folder out of VS Code (`code --remove`) |
-| `--keep-branch` | keep the branch even when it is fully merged |
+| `--no-hooks` | skip Orca's archive hook (`worktree-land.sh` passes it: land ingested already) |
 
-All three flags are position-independent.
+Both flags are position-independent. Removals outside a land (abandoning a spoke) run the
+archive hook, which spools the spoke's raw bodies for the telemetry consumer.
 
 ## tmux
+
+> [!NOTE]
+> Dispatch no longer uses tmux (#363): `worktree-new.sh` launches in an Orca terminal. The
+> section below describes the legacy hub tooling that S6 (#365) migrates (`hub-agent.sh`,
+> `hub-inject.sh`, the drain's pane lanes).
 
 Each project gets **one tmux session**, and every spoke lives as a window of it.
 The session name is derived from the repo root — the parent directory plus the repo
@@ -353,10 +368,6 @@ tmux send-keys -t '<sess>:<window>' Enter          # separate Enter, not a trail
 - **`.worktreeinclude` does not apply here.** Claude Code's native `.worktreeinclude`
   only runs for native `claude -w` worktrees, not the `git worktree add` these scripts
   use — hence the explicit copy.
-- **`code --add` targets the last-active VS Code window.** Keep a single review window
-  open so new worktrees always fold into the right place.
-- **Window, not pane.** The script opens a tmux *window* per task (switch with `prefix`
-  + number), not a split pane.
 - **Removal needs `--force` only when dirty.** Because `.claude/` is gitignored, a copied
   config does not make the worktree dirty, so a clean task removes without `--force`.
 
@@ -444,13 +455,14 @@ rules. This is the sanctioned path for lanes 1 and 2.
 
 The express-interactive lane builds a small fix *conversationally from the hub session*
 on its own branch/worktree — keeping the push gates, dropping the spoke process ceremony
-(no issue, no `source-task`, no tmux session, no PLAN gate, no RED-first, no review
+(no issue, no `source-task`, no Orca terminal, no PLAN gate, no RED-first, no review
 artifact). `main` is never edited directly.
 
-1. From the hub: `scripts/worktree-quick.sh <slug>` (or `-t chore`). It creates a worktree
-   on `quick/<slug>` (or `chore/<slug>`), copies `.claude/`, mints the `spoke_run_id`, sets
-   the `.ai-toolkit/` exclude, and drops a `hub-guard-allow` marker in the common git-dir —
-   then prints the worktree path. No issue, prompt, tmux window, or separate agent.
+1. From the hub: `scripts/worktree-quick.sh <slug>` (or `-t chore`). It creates an Orca
+   worktree (`orca worktree create`, no agent) on `quick/<slug>` (or `chore/<slug>`) with
+   no upstream, provisions it as `lane=quick`, and drops a `hub-guard-allow` marker in the
+   common git-dir — then prints the worktree path. No issue, prompt, terminal, or separate
+   agent.
 2. The **current session** `cd`s into the printed path and iterates: edit, run
    lint/typecheck/tests, commit. The marker lets the hub session commit into the worktree
    (hub-guard otherwise denies a commit run with the hub's cwd on the default branch).

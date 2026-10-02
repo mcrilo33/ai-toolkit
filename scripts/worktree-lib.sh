@@ -475,130 +475,6 @@ wt_marker_script_dir() {
   fi
 }
 
-# --- review workspace file (issue #134) ----------------------------------------
-# The VS Code review "window" is a saved .code-workspace file. `code --add` /
-# `code --remove` target the *last-focused* window and routinely miss (landed
-# spokes ghosting in the Explorer, live spokes never added), so creation and
-# teardown edit the file's `folders` array directly — VS Code hot-reloads it.
-# The editors return 1 on a missing or unparseable file (e.g. hand-edited JSONC:
-# strict JSON is the price of a safe rewrite) so callers fall back to the legacy
-# `code` CLI path; in that case the file is never rewritten or truncated.
-
-# wt_workspace_file <repo_root> -> path of the review workspace file.
-# `git config ai-toolkit.workspace-file` wins (leading ~ expanded — git stores
-# the value verbatim); default ~/.claude/<repo-basename>.code-workspace so
-# synced target repos each get their own review workspace.
-wt_workspace_file() {
-  local cfg
-  cfg="$(git -C "$1" config ai-toolkit.workspace-file 2>/dev/null || true)"
-  if [ -z "$cfg" ]; then
-    printf '%s/.claude/%s.code-workspace\n' "$HOME" "$(basename "$1")"
-  else
-    case "$cfg" in
-      "~/"*) printf '%s/%s\n' "$HOME" "${cfg#\~/}" ;;
-      *)     printf '%s\n' "$cfg" ;;
-    esac
-  fi
-}
-
-# Shared driver for the two editors below. Entries resolve against the
-# workspace file's directory (relative paths are relative to it); the rewrite
-# is atomic (unique tmp + rename), serialized across concurrent worktree ops by
-# an flock on a sidecar .lock (spawns/teardowns overlap under /next-batch and
-# /afk — a bare read-modify-write loses entries), tab-indented like VS Code's
-# own writes, and skipped entirely when nothing changed.
-wt_workspace_edit() {
-  python3 - "$1" "$2" "$3" <<'PY'
-import fcntl
-import json
-import os
-import sys
-import tempfile
-
-op, ws_file, wt_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-if not os.path.isfile(ws_file):
-    sys.exit(1)
-
-# One lock for every editor of this workspace file. A sidecar (never replaced)
-# rather than the file itself: os.replace swaps the inode, so a waiter holding
-# the old fd would lock an orphan and read stale content.
-lock_fd = os.open(ws_file + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
-fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
-text = open(ws_file).read()
-try:
-    doc = json.loads(text)
-    folders = doc["folders"]
-    if not isinstance(folders, list):
-        raise ValueError("'folders' is not a list")
-except (ValueError, KeyError, TypeError) as e:
-    print(f"worktree: unparseable workspace file {ws_file} ({e}) — "
-          "falling back to the `code` CLI, file left untouched", file=sys.stderr)
-    sys.exit(1)
-
-# Canonicalize BOTH ends before relpath: with only the target realpath'd, a
-# symlinked ancestor of the workspace file (NFS/corp homes) yields a lexical
-# `..`-chain that resolves to a nonexistent physical path — VS Code shows a
-# broken folder and the next sweep would drop the live entry.
-ws_dir = os.path.dirname(os.path.realpath(ws_file))
-target = os.path.realpath(wt_dir)
-
-
-def resolve(entry):
-    """Absolute, canonical path of a folder entry; None when it has no path."""
-    p = entry.get("path") if isinstance(entry, dict) else None
-    if not isinstance(p, str) or not p:
-        return None
-    p = os.path.expanduser(p)
-    if not os.path.isabs(p):
-        p = os.path.join(ws_dir, p)
-    return os.path.realpath(p)
-
-
-if op == "add":
-    if any(resolve(e) == target for e in folders):
-        sys.exit(0)  # already present — never duplicate, never rewrite
-    folders.append(
-        {"name": os.path.basename(target), "path": os.path.relpath(target, ws_dir)}
-    )
-else:  # remove — and sweep ghosts of past misses in the same pass
-    kept = []
-    for e in folders:
-        resolved = resolve(e)
-        if resolved is None:
-            kept.append(e)  # path-less entry — cannot judge, conservatively kept
-        elif resolved == target or not os.path.exists(resolved):
-            continue
-        else:
-            kept.append(e)
-    if kept == folders:
-        sys.exit(0)  # nothing to drop — don't churn the file
-    doc["folders"] = kept
-
-fd, tmp = tempfile.mkstemp(prefix=os.path.basename(ws_file) + ".", dir=ws_dir)
-try:
-    with os.fdopen(fd, "w") as f:
-        json.dump(doc, f, indent="\t", ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, ws_file)
-except BaseException:
-    if os.path.exists(tmp):
-        os.unlink(tmp)
-    raise
-PY
-}
-
-# wt_workspace_add <ws_file> <wt_dir> -> 0 entry present (appended or already
-# there); 1 missing/unparseable file (caller falls back to `code --add`).
-# Call in a conditional (`if`/`||`) — a bare call aborts a `set -e` caller
-# before the fallback can run.
-wt_workspace_add() { wt_workspace_edit add "$1" "$2"; }
-
-# wt_workspace_remove <ws_file> <wt_dir> -> 0 entry absent (removed, swept, or
-# never there); 1 missing/unparseable file (caller falls back to `code --remove`).
-# Same `set -e` caveat as wt_workspace_add: only call in a conditional.
-wt_workspace_remove() { wt_workspace_edit remove "$1" "$2"; }
-
 # --- slug ---------------------------------------------------------------------
 
 # Lowercase, collapse non-alphanumeric runs to '-', strip edges, keep <=4 segments.
@@ -625,85 +501,75 @@ wt_tmux_session() {
   printf '%s-%s' "$parent" "$base" | tr '.:' '-'
 }
 
-# --- worktree enumeration / resolution ---------------------------------------
+# --- worktree enumeration / resolution (Orca, #364) ----------------------------
+# Orca lists every git worktree of a registered repo and carries the issue as `linkedIssue`, so
+# lookup never re-parses a branch slug; what Orca lacks falls back to the identity record.
 
-# Emit "path<TAB>branch" (branch without refs/heads/) for every worktree EXCEPT
-# the main one. Detached worktrees emit an empty branch field. Handles the
-# porcelain stream's lack of a trailing blank line by flushing at EOF.
-# Args: $1 = canonical main root.
+# _wt_orca_rows <main> -> one US(0x1f)-separated "path branch issue displayName" row per non-main
+# worktree (not TAB: `read` collapses whitespace IFS runs, shifting an empty field). FAILS CLOSED:
+# Orca missing, repo unregistered or a bad reply returns 1 loudly -- never an empty "nothing in flight".
+_wt_orca_rows() {
+  local main="$1" rows wt br iss disp
+  orca_json worktree list --repo "path:$main" \
+    || { wt_warn "orca: cannot list worktrees of $main (rc ${ORCA_RC:-?}): ${ORCA_ERR:-$ORCA_OUT}"; return 1; }
+  rows="$(printf '%s' "$ORCA_OUT" | jq -r '.result.worktrees[] | select(.isMainWorktree | not)
+    | [.path, ((.branch // "") | sub("^refs/heads/"; "")), ((.linkedIssue // "") | tostring), .displayName]
+    | join("\u001f")' 2>/dev/null)" \
+    || { wt_warn "orca: unparseable 'worktree list' reply for $main: $ORCA_OUT"; return 1; }
+  while IFS=$'\x1f' read -r wt br iss disp; do
+    [ -n "$wt" ] || continue
+    [ -n "$iss" ] || iss="$(ai_toolkit_identity_issue "$wt" 2>/dev/null || true)"
+    printf '%s\x1f%s\x1f%s\x1f%s\n' "$wt" "$br" "$iss" "$disp"
+  done <<<"$rows"
+}
+
+# wt_task_worktrees <main> -> "path<TAB>branch<TAB>issue" per non-main worktree (detached: empty
+# branch; no issue: empty). Callers read `read -r wt br iss`. Returns 1 when Orca cannot answer.
 wt_task_worktrees() {
-  local main="$1" wt="" br=""
-  while IFS= read -r line; do
-    case "$line" in
-      "worktree "*) wt="${line#worktree }"; br="" ;;
-      "branch "*)   br="${line#branch }"; br="${br#refs/heads/}" ;;
-      "")
-        if [ -n "$wt" ] && [ "$(wt_realpath "$wt")" != "$main" ]; then
-          printf '%s\t%s\n' "$wt" "$br"
-        fi
-        wt=""; br=""
-        ;;
-    esac
-  done < <(git worktree list --porcelain 2>/dev/null)
-  if [ -n "$wt" ] && [ "$(wt_realpath "$wt")" != "$main" ]; then
-    printf '%s\t%s\n' "$wt" "$br"
-  fi
+  local rows wt br iss
+  rows="$(_wt_orca_rows "$1")" || return 1
+  while IFS=$'\x1f' read -r wt br iss _; do
+    if [ -n "$wt" ]; then printf '%s\t%s\t%s\n' "$wt" "$br" "$iss"; fi
+  done <<<"$rows"
+  return 0
+}
+
+# wt_branch_of <path> <main> -> the branch of the task worktree at <path> (empty when detached).
+wt_branch_of() {
+  wt_task_worktrees "$2" | awk -F'\t' -v p="$1" '$1 == p { b = $2 } END { print b }'
 }
 
 # Pretty-print the task worktrees to stderr (path + branch), for error recovery.
-# Args: $1 = canonical main root.
 wt_print_worktrees() {
-  local main="$1" any="" wt br
-  while IFS=$'\t' read -r wt br; do
+  local rows wt br any=""
+  rows="$(wt_task_worktrees "$1")" || { printf '    (could not list worktrees)\n' >&2; return 0; }
+  while IFS=$'\t' read -r wt br _; do
     [ -n "$wt" ] || continue
     any=1
     printf '    %-50s %s\n' "$wt" "${br:-(detached)}" >&2
-  done < <(wt_task_worktrees "$main")
+  done <<<"$rows"
   [ -n "$any" ] || printf '    (none)\n' >&2
 }
 
-# Resolve a user-supplied target to exactly one task-worktree path.
-# Matches a target against each worktree by, in order of intent:
-#   - canonical path equality (target is/locates a worktree dir)
-#   - directory basename, or its tag (basename with the "<repo>-" prefix stripped)
-#   - the slugified target vs that tag (so raw "Refactor_Sync" finds "refactor-sync")
-#   - the full branch name, or the branch's trailing slug
-#   - the leading issue number of the branch slug (so "42" finds feature/42-foo)
-# Prints the single match on stdout and returns 0. On zero or multiple matches it
-# returns 1 — the caller is expected to list candidates and exit.
-# Args: $1 = target, $2 = canonical main root.
+# wt_resolve <target> <main> -> the path of the ONE task worktree <target> names: its canonical
+# path, issue (Orca's linkedIssue, else identity), full branch, branch leaf (raw or slugified) or
+# Orca displayName. Zero or several matches return 1 -- the caller lists the candidates.
 wt_resolve() {
-  local target="$1" main="$2"
-  local tslug repo trp wt br base tag bslug bnum
+  local target="$1" rows tslug trp wt br iss disp matches=()
+  rows="$(_wt_orca_rows "$2")" || return 1
   tslug="$(wt_slugify "$target")"
-  repo="$(basename "$main")"
   trp="$(wt_realpath "$target")"
-
-  local matches=() seen=""
-  while IFS=$'\t' read -r wt br; do
+  while IFS=$'\x1f' read -r wt br iss disp; do
     [ -n "$wt" ] || continue
-    base="$(basename "$wt")"
-    tag="${base#"${repo}-"}"
-    bslug="${br##*/}"
-    bnum="${bslug%%-*}"
     if { [ -n "$trp" ] && [ "$trp" = "$(wt_realpath "$wt")" ]; } \
-       || [ "$target" = "$base" ] \
-       || [ "$target" = "$tag" ] || [ "$tslug" = "$tag" ] \
-       || { [ -n "$br" ] && [ "$target" = "$br" ]; } \
-       || { [ -n "$bslug" ] && { [ "$target" = "$bslug" ] || [ "$tslug" = "$bslug" ]; }; } \
-       || { [ -n "$bnum" ] && [ "$bnum" != "$bslug" ] && [ "$target" = "$bnum" ]; }; then
-      case "$seen" in
-        *"|$wt|"*) ;;            # already collected
-        *) matches+=("$wt"); seen="${seen}|$wt|" ;;
-      esac
+       || { [ -n "$iss" ] && [ "$target" = "$iss" ]; } \
+       || { [ -n "$br" ] && { [ "$target" = "$br" ] || [ "$target" = "${br##*/}" ] || [ "$tslug" = "${br##*/}" ]; }; } \
+       || [ "$target" = "$disp" ]; then
+      matches+=("$wt")
     fi
-  done < <(wt_task_worktrees "$main")
-
-  if [ "${#matches[@]}" -eq 1 ]; then
-    printf '%s\n' "${matches[0]}"
-    return 0
-  fi
-  return 1
+  done <<<"$rows"
+  [ "${#matches[@]}" -eq 1 ] || return 1
+  printf '%s\n' "${matches[0]}"
 }
 
 # --- daemon source-hash stamp (issue #190) -----------------------------------
@@ -792,7 +658,7 @@ wt_ps_start_epoch() {
 # --- native-OTel preflight + gh lifecycle-label mirror (extracted modules) ----
 # Issue #353 split this lib behind a thin entry: the native-OTel bridge/collector
 # preflight machinery moved to worktree-otel-lib.sh and the gh lifecycle-label
-# mirror to worktree-gh-lib.sh, so a change to either stops serializing the drain
+# mirror to worktree-gh-lib.sh (and orca-lib.sh, the only caller of the `orca` CLI, #363), so a change to any stops serializing the drain
 # on this file's Scope: token (AFK Design Principle 7). Both are co-located siblings
 # (this checkout's scripts/, a synced target's .ai-toolkit/scripts/), so the single
 # $_WT_LIB_DIR candidate resolves in both. They carry functions consumers call
@@ -801,16 +667,24 @@ wt_ps_start_epoch() {
 # silent skip telemetry.sh/transition-log.sh use for their genuinely-optional libs.
 # The [ -r ] guard is load-bearing: `. ` of a missing file is a special builtin that
 # can exit the sourcing shell, escaping into every consumer that sources this lib.
-for _wt_mod in otel gh; do
-  _wt_modfile="$_WT_LIB_DIR/worktree-$_wt_mod-lib.sh"
-  if [ -r "$_wt_modfile" ]; then
+for _wt_modfile in worktree-otel-lib.sh worktree-gh-lib.sh orca-lib.sh; do
+  if [ -r "$_WT_LIB_DIR/$_wt_modfile" ]; then
     # shellcheck source=/dev/null
-    . "$_wt_modfile"
+    . "$_WT_LIB_DIR/$_wt_modfile"
   else
-    wt_warn "required module worktree-$_wt_mod-lib.sh missing/unreadable at $_WT_LIB_DIR — OTel preflight / gh lifecycle labels unavailable"
+    wt_warn "required module $_wt_modfile missing/unreadable at $_WT_LIB_DIR — OTel preflight / gh lifecycle labels / Orca dispatch unavailable"
   fi
 done
-unset _wt_mod _wt_modfile
+unset _wt_modfile
+
+# --- spoke identity reader (#360/#364): fills wt_task_worktrees' issue column when Orca has no
+# linkedIssue. Beside this lib in a synced target, shared/hooks/lib/ in the source tree.
+for _c in "$_WT_LIB_DIR/identity.sh" "$_WT_LIB_DIR/../shared/hooks/lib/identity.sh"; do
+  if [ -r "$_c" ]; then . "$_c"; break; fi
+done
+command -v ai_toolkit_identity_issue >/dev/null 2>&1 \
+  || wt_warn "identity.sh not found beside $_WT_LIB_DIR -- worktrees without an Orca linkedIssue show no issue"
+unset _c
 
 # --- #300 lifecycle transition log ------------------------------------------
 # The four lifecycle ACTORS (worktree-new, spoke-ready, spoke-push,

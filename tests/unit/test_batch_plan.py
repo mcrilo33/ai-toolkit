@@ -30,6 +30,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _orca_stub import add_worktree, make_hub, orca_scenario
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BATCH_PLAN = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.sh"
@@ -1653,3 +1654,65 @@ def test_chain_merge_lint_survives_for_a_blocked_chain() -> None:
     proc = _run_plan([_node(1, "a.py"), _node(2, "a.py", blocked_by=[(1, "OPEN")])])
 
     assert "merge candidates" in proc.stderr
+
+
+# ── _batch_inflight_issue_nums stays standalone and LC_ALL=C (#361/#364) ──────────────
+
+
+def test_inflight_nums_helper_is_locale_pinned_and_sources_no_lib() -> None:
+    text = BATCH_PLAN.read_text()
+    body = text[text.index("_batch_inflight_issue_nums() {") :].split("\n}\n", 1)[0]
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+    assert body.count("LC_ALL=C") >= 2, "git and awk must both run under LC_ALL=C (#189/#194)"
+    assert "identity.sh" not in code and "worktree-lib" not in code
+    assert not re.search(r"^\s*(source|\.)\s", code, re.MULTILINE), "must stay dependency-free"
+
+
+# --- the in-flight issue set comes from Orca, not a slug parse (#364) ----------------
+
+
+def _orca_inflight_nums(cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", f'source "{BATCH_PLAN}"; _batch_inflight_issue_nums'],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _hub_with_worktree(tmp_path: Path, orca_bin: Path, branch: str, issue: int | None) -> Path:
+    hub = make_hub(tmp_path / "hub")
+    add_worktree(orca_bin, hub, branch, issue=issue)
+    return hub
+
+
+def test_inflight_nums_use_the_orca_linked_issue_of_a_bare_branch(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    hub = _hub_with_worktree(tmp_path, orca_bin, "scratch-lane", 361)
+
+    result = _orca_inflight_nums(hub)
+
+    assert result.stdout.split() == ["361"], "the main checkout is skipped, the bare branch counts"
+
+
+def test_inflight_nums_ignore_a_leading_number_in_the_branch_when_unlinked(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    hub = _hub_with_worktree(tmp_path, orca_bin, "feature/223-slug", None)
+
+    assert _orca_inflight_nums(hub).stdout == ""
+
+
+def test_inflight_nums_warn_and_drop_attribution_when_orca_fails(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    hub = _hub_with_worktree(tmp_path, orca_bin, "scratch-lane", 361)
+    orca_scenario(orca_bin, {"worktree list": [{"rc": 1, "stderr": "runtime down"}]})
+
+    result = _orca_inflight_nums(hub)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert "in-flight attribution dropped" in result.stderr

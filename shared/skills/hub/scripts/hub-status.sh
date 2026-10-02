@@ -259,28 +259,27 @@ fi
 
 # --- Worktrees -------------------------------------------------------------
 bold "Worktrees"
-# Collect branches that have a worktree so we can cross-reference issues later.
-worktree_branches=""
-while IFS= read -r line; do
-  path="$(awk '{print $1}' <<<"$line")"
-  branch="$(sed -n 's/.*\[\(.*\)\].*/\1/p' <<<"$line")"
-  [ -z "$branch" ] && branch="(detached)"
-  worktree_branches+="$branch"$'\n'
-
-  if [ "$branch" = "$default_branch" ]; then
-    printf '  %-28s %s  (hub)\n' "$branch" "$path"
-    continue
-  fi
+# The hub first, then the task worktrees from `orca worktree list` (its issue column replaces the
+# slug parse). Orca unreachable => a loud line, never a silent empty table.
+hub_branch="$(git -C "$main_root" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "(detached)")"
+printf '  %-28s %s  (hub)\n' "$hub_branch" "$main_root"
+# Issues that have a worktree, to cross-reference the open-issues list below.
+worktree_issues=""
+if ! command -v wt_task_worktrees >/dev/null 2>&1; then
+  wt_rows=""; echo "  (worktree-lib.sh not found -- cannot list task worktrees)"
+elif ! wt_rows="$(wt_task_worktrees "$main_root")"; then
+  wt_rows=""; echo "  (could not list task worktrees: orca is unavailable -- see the error above)"
+fi
+while IFS=$'\037' read -r path branch issue_num; do
+  [ -n "$path" ] || continue
+  [ -n "$branch" ] || branch="(detached)"
+  worktree_issues+="$issue_num"$'\n'
 
   # ahead/behind vs default branch
   counts="$(git -C "$path" rev-list --left-right --count "$default_branch...HEAD" 2>/dev/null)"
   behind="$(awk '{print $1}' <<<"$counts")"; ahead="$(awk '{print $2}' <<<"$counts")"
   dirty=""
   [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ] && dirty="dirty"
-
-  # Extract leading digits from branch slug (e.g. feature/1-pushed → 1)
-  slug="${branch##*/}"
-  issue_num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
 
   # Push state is measured against the branch's own UPSTREAM (not the default
   # branch): a branch can be fully pushed yet still carry commits ahead of the
@@ -349,7 +348,7 @@ while IFS= read -r line; do
   # Task ledger sub-line (Tasks system or TodoWrite)
   todos_out="$(todos_for_path "$path")"
   [ -n "$todos_out" ] && printf "      ↳ todos: %s\n" "$todos_out"
-done < <(git -C "$main_root" worktree list 2>/dev/null)
+done <<<"${wt_rows//$'\t'/$'\037'}"
 echo
 
 # --- Hub agents (issue #245) -------------------------------------------------
@@ -451,7 +450,7 @@ if command -v gh >/dev/null 2>&1; then
     --template '{{range .}}{{printf "  #%v  %s\n" .number .title}}{{end}}' 2>/dev/null \
   | while IFS= read -r row; do
       num="$(sed -n 's/^  #\([0-9]*\).*/\1/p' <<<"$row")"
-      if [ -n "$num" ] && grep -q "/${num}-" <<<"$worktree_branches"; then
+      if [ -n "$num" ] && grep -qxF "$num" <<<"$worktree_issues"; then
         printf '%s  ⟶ worktree active\n' "$row"
       else
         printf '%s  ⟶ no worktree\n' "$row"

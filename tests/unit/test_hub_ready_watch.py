@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _orca_stub import orca_link
 
 WATCH = (
     Path(__file__).resolve().parents[2]
@@ -330,3 +331,30 @@ def test_ready_watch_drives_hub_notify_status_label_mirror(hub: Path, tmp_path: 
     assert proc.returncode == 0, proc.stderr
     edits = [c for c in _gh_calls(tmp_path) if c.startswith("issue edit 1")]
     assert len(edits) == 1 and "--add-label status:ready" in edits[0]
+
+
+# --- the worktree for an issue comes from Orca, not a slug parse (#364) ---------------
+
+
+@pytest.mark.parametrize("how", ["orca-linkedIssue", "identity-record"])
+def test_ready_marker_finds_a_bare_branch_worktree_by_issue(
+    hub: Path, tmp_path: Path, orca_bin: Path, how: str
+) -> None:
+    spoke = tmp_path / "bare"
+    _git(hub, "worktree", "add", "-q", "-b", "scratch-lane", str(spoke))
+    (spoke / "b.txt").write_text("b\n")
+    _git(spoke, "add", "b.txt")
+    _git(spoke, "commit", "-qm", "feat: b", "-m", "Refs #361")
+    _git(spoke, "push", "-q", "-u", "origin", "scratch-lane")
+    _git(hub, "tag", "ready/361", "scratch-lane")
+    if how == "orca-linkedIssue":
+        orca_link(orca_bin, spoke, issue=361)
+    else:
+        (spoke / ".ai-toolkit").mkdir()
+        (spoke / ".ai-toolkit" / "identity").write_text("issue=361\n")
+
+    result = _run(hub, tmp_path)
+
+    line = next(ln for ln in result.stdout.splitlines() if "#361" in ln)
+    assert "/land 361" in line
+    assert "scratch-lane" in line

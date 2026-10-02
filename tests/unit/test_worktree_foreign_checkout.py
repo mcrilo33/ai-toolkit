@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _orca_stub import install_dispatch_env
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 HOOKS_LIB_DIR = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "lib"
@@ -30,12 +31,14 @@ WORKTREE_SCRIPTS = (
     "worktree-lib.sh",
     "worktree-otel-lib.sh",
     "worktree-gh-lib.sh",
+    "orca-lib.sh",
     # worktree-new.sh runs it as a sibling to gate every spawn (issue #359).
     "provision-worktree.sh",
 )
 # Co-located next to the scripts by sync-to-repo.sh (like telemetry.sh) so
-# worktree-lib.sh finds it as a sibling in a synced target (issue #117).
-COLOCATED_LIBS = ("base-branch.sh",)
+# worktree-lib.sh finds it as a sibling in a synced target (issue #117); identity.sh
+# likewise feeds the issue column of the Orca-backed worktree lookup (#364).
+COLOCATED_LIBS = ("base-branch.sh", "identity.sh")
 
 # Isolate from the host's git config (this repo ships installable git hooks).
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
@@ -79,10 +82,12 @@ def synced_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _run(repo: Path, script: str, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    repo: Path, script: str, *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     # Drop the host's spoke marker so worktree-{land,done}.sh aren't refused by
     # the issue #26 role guard when these tests happen to run inside a spoke.
-    env = {**_GIT_ENV}
+    env = {**_GIT_ENV, **(env or {})}
     env.pop("WT_SPOKE", None)
     return subprocess.run(
         ["bash", str(repo / ".ai-toolkit" / "scripts" / script), *args],
@@ -93,12 +98,17 @@ def _run(repo: Path, script: str, *args: str) -> subprocess.CompletedProcess[str
     )
 
 
+def _dispatch_env(synced_repo: Path) -> dict[str, str]:
+    (synced_repo.parent / "bin").mkdir(exist_ok=True)
+    return install_dispatch_env(synced_repo.parent / "bin", dict(_GIT_ENV))
+
+
 def test_worktree_new_runs_from_ai_toolkit_scripts(synced_repo: Path) -> None:
-    """worktree-new.sh creates the worktree+branch when run from .ai-toolkit/scripts/."""
-    proc = _run(synced_repo, "worktree-new.sh", "42", "demo", "--no-code", "--no-terminal")
+    """worktree-new.sh dispatches through the stubbed orca when run from .ai-toolkit/scripts/."""
+    proc = _run(synced_repo, "worktree-new.sh", "42", "demo", env=_dispatch_env(synced_repo))
 
     assert proc.returncode == 0, proc.stderr
-    wt_dir = synced_repo.parent / f"{synced_repo.name}-42"
+    wt_dir = synced_repo.parent / "orca-ws" / "42-demo"
     assert wt_dir.is_dir(), f"worktree not created at {wt_dir}"
     branches = _git(synced_repo, "branch", "--list", "feature/42-demo")
     assert "feature/42-demo" in branches
@@ -106,10 +116,10 @@ def test_worktree_new_runs_from_ai_toolkit_scripts(synced_repo: Path) -> None:
 
 def test_worktree_done_resolves_sibling_lib(synced_repo: Path) -> None:
     """worktree-done.sh sources worktree-lib.sh from its own dir and tears down."""
-    _run(synced_repo, "worktree-new.sh", "42", "demo", "--no-code", "--no-terminal")
+    _run(synced_repo, "worktree-new.sh", "42", "demo", env=_dispatch_env(synced_repo))
 
-    proc = _run(synced_repo, "worktree-done.sh", "42", "--no-code", "--force")
+    proc = _run(synced_repo, "worktree-done.sh", "42", "--force")
 
     assert proc.returncode == 0, proc.stderr
-    wt_dir = synced_repo.parent / f"{synced_repo.name}-42"
+    wt_dir = synced_repo.parent / "orca-ws" / "42-demo"
     assert not wt_dir.exists(), f"worktree still present at {wt_dir}"

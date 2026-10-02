@@ -9,9 +9,12 @@ located in the module file.
 from __future__ import annotations
 
 import os
+from pathlib import Path
+from typing import Any
 
 import pytest
 from _hub_afk_support import HUB_SCRIPTS_DIR, _call, function_source_file
+from _orca_stub import install_orca_stub
 
 MODULE = "hub-afk-arm.sh"
 
@@ -23,6 +26,7 @@ ARM_FUNCTIONS = [
     "afk_arm_selfcheck",
     "_afk_arm_judge_check",
     "_afk_arm_gh_check",
+    "afk_arm_orca_guard",
 ]
 
 
@@ -61,3 +65,53 @@ def test_arm_claude_check_default_probe_runs_on_haiku() -> None:
 
     assert "claude-haiku-4-5" in src
     assert "claude-opus-4-8" not in src
+
+
+# --- Orca arm guard (#363) ------------------------------------------------------
+# Dispatch is Orca-only since #363, but the drain still supervises tmux panes:
+# recover_dead_panes would treat a pane-less Orca spoke as crashed and tear it down or
+# relaunch it in tmux. So arming is refused, naming #365 (S6), until the supervisor moves to Orca.
+
+
+def _orca_env(tmp_path: Path, **kw: Any) -> dict[str, str]:
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    env = install_orca_stub(bindir, **kw)
+    return {**env, "PATH": f"{bindir}:{os.environ['PATH']}"}
+
+
+def test_arm_refuses_with_a_message_naming_365_even_with_a_healthy_orca(tmp_path: Path) -> None:
+    result = _call("afk_arm_orca_guard; echo RC=$?", env=_orca_env(tmp_path))
+
+    assert "RC=1" in result.stdout
+    assert "#365" in result.stderr
+
+
+@pytest.mark.parametrize("version", ["1.4.217", "0.9.0"])
+def test_arm_refuses_on_an_orca_below_the_floor_before_the_interim_guard(
+    tmp_path: Path, version: str
+) -> None:
+    result = _call("afk_arm_orca_guard; echo RC=$?", env=_orca_env(tmp_path, version=version))
+
+    assert "RC=1" in result.stdout
+    assert "1.4.218" in result.stderr
+
+
+def test_arm_refuses_when_the_orca_runtime_does_not_answer(tmp_path: Path) -> None:
+    scenario = {
+        "worktree list": [{"rc": 1, "out": {"ok": False, "error": {"code": "runtime_unavailable"}}}]
+    }
+
+    result = _call("afk_arm_orca_guard; echo RC=$?", env=_orca_env(tmp_path, scenario=scenario))
+
+    assert "RC=1" in result.stdout
+    assert "not usable" in result.stderr
+    assert "#365" not in result.stderr, "an unusable Orca refuses before the interim guard speaks"
+
+
+def test_arm_guard_honours_the_precheck_opt_out(tmp_path: Path) -> None:
+    result = _call(
+        "afk_arm_orca_guard; echo RC=$?", env={**_orca_env(tmp_path), "AFK_ARM_PRECHECK": "0"}
+    )
+
+    assert "RC=0" in result.stdout

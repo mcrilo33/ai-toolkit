@@ -542,7 +542,8 @@ afk_done() {
   # state keeps ticking regardless of the backlog, so it never self-completes on tick one
   # when the whole backlog is empty / held / poisoned (#222).
   [ "$state" = drain ] || return 1
-  inflight_count="$(inflight_issues | grep -c '^[0-9]' || true)"
+  inflight_count="$(inflight_issues)" || return 1   # #364: Orca down => unknown, never "done"
+  inflight_count="$(printf '%s\n' "$inflight_count" | grep -c '^[0-9]' || true)"
   [ "$inflight_count" -eq 0 ] || return 1
   # #278: a routed-but-unconsumed subtask is real work this window still owes. Declaring the
   # drain complete over it would end the window with an issue queued and never done — and the

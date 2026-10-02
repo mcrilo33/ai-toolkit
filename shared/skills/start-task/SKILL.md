@@ -14,6 +14,11 @@ and lifecycle see `docs/parallel-worktrees.md`.
   (`main` by default; `git config ai-toolkit.base-branch` overrides, issue #117).
 - `gh` is authenticated and `.ai-toolkit/scripts/worktree-new.sh` is installed
   (every synced repo has it; `sync-to-repo.sh` puts it there).
+- You are in an **Orca terminal** with a bound Run (`orca orchestration run-create
+  --objective "<what this session coordinates>"`), Orca >= 1.4.218 has this repo
+  registered, and the Orca workspaces dir is trusted by Claude once
+  (`docs/parallel-worktrees.md`, *Orca prerequisites*). `worktree-new.sh` fails loud
+  otherwise.
 - The scope has been discussed enough to write a clear issue.
 
 ## Workflow
@@ -134,9 +139,9 @@ rationale where the spoke will read it.
 .ai-toolkit/scripts/worktree-new.sh N --type <type> --prompt "<kickoff>"
 ```
 
-This creates `feature/N-<slug>` (or `<type>/N-<slug>`), copies `.claude/`, folds the
-worktree into the VS Code review window, opens a tmux window named `N`, and launches
-`claude` seeded with the kickoff. A good kickoff hands the spoke everything it needs to
+This creates an Orca worktree on `feature/N-<slug>` (or `<type>/N-<slug>`), provisions it
+(`.claude/`, gates, task contract), launches `claude` in an Orca terminal, and delivers
+the kickoff with `orca orchestration worker-start`. A good kickoff hands the spoke everything it needs to
 run on its own:
 
 ```
@@ -175,8 +180,9 @@ worktree. Do NOT self-land — the hub lands #N.
 
 ### 5. Report the handoff
 
-Tell the user: the issue URL, the branch, the worktree path, and the tmux window
-(`prefix` + `N` to switch to it). The spoke is now running on its own.
+Tell the user: the issue URL, the branch, the worktree path, and the Orca terminal
+handle `worktree-new.sh` printed (open that worktree in Orca to watch it). The spoke is
+now running on its own.
 
 ## Rules of thumb
 
@@ -187,8 +193,8 @@ Tell the user: the issue URL, the branch, the worktree path, and the tmux window
   focused context containing just that issue — planning noise doesn't leak in. The
   spoke's task ledger is ephemeral session scratch; the issue stays the durable
   contract.
-- For several **independent** tasks, repeat per task (each its own issue + worktree +
-  tmux window). Sequence dependent tasks instead of fanning out.
+- For several **independent** tasks, repeat per task (each its own issue + Orca
+  worktree). Sequence dependent tasks instead of fanning out.
 - If the user already has an issue number, skip steps 1–3 and dispatch directly.
 
 ## Edge cases

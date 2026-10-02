@@ -780,20 +780,26 @@ _afk_find_script() {
 }
 
 # --- in-flight survey ---------------------------------------------------------
-# "<path>\t<issue>" per task worktree whose branch slug leads with an issue number.
-# Built on worktree-lib's wt_task_worktrees so the hub and these helpers agree on
-# what counts as a task worktree.
+# "<path>\t<issue>" per task worktree that names an issue: Orca's linkedIssue, else the identity
+# record (resolved by wt_task_worktrees; no slug parse). Returns 1 with its loud message when Orca
+# cannot answer: an empty set would over-dispatch, so it must never read as "nothing running".
+# UPGRADE: each call is one local `orca worktree list` (no cache) -- memoize per tick if it shows
+# in a drain profile.
 inflight_worktrees() {
-  local main path br slug num
+  local main rows path br num
   main="$(wt_main_root 2>/dev/null)" || return 0
-  while IFS=$'\t' read -r path br; do
-    [ -n "$path" ] || continue
-    slug="${br##*/}"
-    num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
-    [ -n "$num" ] && printf '%s\t%s\n' "$path" "$num"
-  done < <(wt_task_worktrees "$main")
+  rows="$(wt_task_worktrees "$main")" || return 1
+  # TAB -> US: `read` collapses runs of a whitespace IFS, shifting a detached row's empty branch.
+  while IFS=$'\037' read -r path br num; do
+    if [ -n "$path" ] && [ -n "$num" ]; then printf '%s\t%s\n' "$path" "$num"; fi
+  done <<<"${rows//$'\t'/$'\037'}"
+  return 0
 }
-inflight_issues() { inflight_worktrees | cut -f2; }
+inflight_issues() {
+  local rows
+  rows="$(inflight_worktrees)" || return 1
+  [ -z "$rows" ] || printf '%s\n' "$rows" | cut -f2
+}
 
 
 # _consume_gate_tag <wt_path> <issue> -> drop the gate/<issue> marker once a PLAN-gate

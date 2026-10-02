@@ -11,9 +11,11 @@ from pathlib import Path
 
 import pytest
 from _gate_broker_support import (
+    GATE_BROKER,
     _call,
     _perm_env,
 )
+from _orca_stub import add_worktree, make_hub, orca_link, orca_scenario
 
 
 @pytest.fixture(autouse=True)
@@ -1477,3 +1479,139 @@ def test_read_done_epoch_falls_back_to_the_file_without_a_log(tmp_path: Path) ->
     result = _call("read_done_epoch 5", env={"AFK_STATE_DIR": str(statedir)})
 
     assert result.stdout.strip() == "1699999999", result.stdout + result.stderr
+
+
+# ── issue #361 (S2b): inflight_worktrees reads the identity record ─────────────
+# Identity first, then the branch slug's leading digits. A worktree on a bare branch (Orca's
+# `branchPrefix: none`) was invisible to in-flight detection; a record makes it visible.
+
+_INFLIGHT_GIT_ENV = {
+    **os.environ,
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+}
+
+
+def _inflight_hub(tmp_path: Path, worktrees: dict[str, str | None]) -> Path:
+    """A hub repo with one linked worktree per {branch: identity-record-or-None}."""
+    hub = tmp_path / "hub"
+    hub.mkdir()
+
+    def git(*args: str, cwd: Path = hub) -> None:
+        subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, env=_INFLIGHT_GIT_ENV
+        )
+
+    git("init", "-q", "-b", "main")
+    git("commit", "-q", "--allow-empty", "-m", "init")
+    for i, (branch, record) in enumerate(worktrees.items()):
+        path = tmp_path / f"wt{i}"
+        git("worktree", "add", "-q", str(path), "-b", branch)
+        if record is not None:
+            (path / ".ai-toolkit").mkdir()
+            (path / ".ai-toolkit" / "identity").write_text(record)
+    return hub
+
+
+def _inflight(hub: Path) -> dict[str, str]:
+    # rc is not asserted: the survey's last `[ -n "$num" ] && printf` leaks a 1 when the final
+    # worktree carries no issue (pre-existing; callers read stdout).
+    result = _call(f'cd "{hub}" && inflight_worktrees')
+    rows = [line.split("\t") for line in result.stdout.splitlines() if line]
+    return {Path(path).name: issue for path, issue in rows}
+
+
+def test_inflight_worktrees_lists_a_bare_branch_worktree_with_an_identity_record(
+    tmp_path: Path,
+) -> None:
+    hub = _inflight_hub(tmp_path, {"orca-migration": "issue=361\n"})
+
+    assert _inflight(hub) == {"wt0": "361"}
+
+
+def test_inflight_worktrees_prefers_the_record_over_the_branch_slug(tmp_path: Path) -> None:
+    hub = _inflight_hub(tmp_path, {"feature/5-x": "issue=361\n"})
+
+    assert _inflight(hub) == {"wt0": "361"}
+
+
+def test_inflight_worktrees_without_a_record_keeps_the_branch_slug_survey(tmp_path: Path) -> None:
+    hub = _inflight_hub(tmp_path, {"feature/223-slug": None, "orca-migration": None})
+
+    assert _inflight(hub) == {"wt0": "223"}
+
+
+def test_inflight_worktrees_ignores_a_non_numeric_record(tmp_path: Path) -> None:
+    hub = _inflight_hub(tmp_path, {"orca-migration": "issue=fix-typo\n"})
+
+    assert _inflight(hub) == {}
+
+
+# --- in-flight discovery reads Orca's issue column (#364) ---------------------------
+
+
+def _orca_inflight_hub(tmp_path: Path, orca_bin: Path, *, linked: bool) -> tuple[Path, Path]:
+    """A hub with ONE task worktree on a bare branch (no `<type>/<n>-` slug to parse)."""
+    hub = make_hub(tmp_path / "hub")
+    return hub, add_worktree(
+        orca_bin,
+        hub,
+        "scratch-lane",
+        issue=361 if linked else None,
+        identity_issue=None if linked else 361,
+    )
+
+
+def _in_hub(hub: Path, expr: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", f'source "{GATE_BROKER}"; {expr}'],
+        cwd=hub,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "AFK_STATE_DIR": str(hub.parent / "afk-state")},
+    )
+
+
+@pytest.mark.parametrize("linked", [True, False], ids=["orca-linkedIssue", "identity-record"])
+def test_inflight_worktrees_reports_the_issue_of_a_bare_branch_worktree(
+    tmp_path: Path, orca_bin: Path, linked: bool
+) -> None:
+    hub, wt = _orca_inflight_hub(tmp_path, orca_bin, linked=linked)
+
+    result = _in_hub(hub, "inflight_worktrees; inflight_issues")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [f"{wt}\t361", "361"]
+
+
+def test_inflight_worktrees_fails_closed_when_orca_cannot_answer(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    hub, _ = _orca_inflight_hub(tmp_path, orca_bin, linked=True)
+    orca_scenario(orca_bin, {"worktree list": [{"rc": 1, "stderr": "runtime down"}]})
+
+    result = _in_hub(hub, "inflight_worktrees; echo WT_RC=$?; inflight_issues; echo IS_RC=$?")
+
+    assert "WT_RC=1" in result.stdout
+    assert "IS_RC=1" in result.stdout
+    assert result.stdout.count("361") == 0, "an unreachable Orca must never read as an empty set"
+    assert "orca" in result.stderr
+
+
+def test_inflight_worktrees_keeps_a_detached_row_with_a_linked_issue(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    hub = make_hub(tmp_path / "hub")
+    wt = tmp_path / "rebasing"
+    subprocess.run(
+        ["git", "-C", str(hub), "worktree", "add", "-q", "--detach", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    orca_link(orca_bin, wt, issue=42)
+
+    result = _in_hub(hub, "inflight_worktrees")
+
+    assert result.stdout.splitlines() == [f"{wt}\t42"], "an empty branch must not shift columns"

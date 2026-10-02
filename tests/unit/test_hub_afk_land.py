@@ -330,3 +330,15 @@ def test_auto_land_refuses_to_invoke_land_on_live_sibling_collision(tmp_path: Pa
         f"land log={land_log.read_text() if land_log.exists() else '<none>'}\n{r.stderr}"
     )
     assert "WARNING: #353" in r.stderr, r.stderr
+
+
+def test_live_scopes_owns_every_file_when_the_inflight_set_is_unknown() -> None:
+    # #364: Orca down => inflight_issues fails closed; the guard must refuse, not pass everything.
+    expr = (
+        "inflight_worktrees() { echo 'orca down' >&2; return 1; }; "
+        'map="$(_afk_live_scopes 5)"; _afk_scope_owner any/file.py "$map"; echo RC=$?'
+    )
+
+    result = _call(expr)
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr

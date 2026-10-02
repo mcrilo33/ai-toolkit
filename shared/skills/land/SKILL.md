@@ -59,7 +59,6 @@ a land is a merge plus an irreversible teardown. Then:
 |------|--------|
 | `--skip-tests` | Skip the pre-push hook's fast tier on the main push (threads `TEST_SELECT_SKIP=1`); CI is still required |
 | `--local-gate` | Offline escape hatch: run the former local full suite once instead of waiting for CI; recorded in the land log |
-| `--keep-branch` | Keep the local + remote branch after landing |
 | `--test-cmd <cmd>` | Run `<cmd>` as the gate instead of consulting CI (threads `TEST_SELECT_CMD`) |
 | `--local` | Micro-spoke landing: skips upstream guards; accepts a bare local branch with no upstream; refuses any branch that has an upstream and refuses the default branch itself |
 | `--force-land` | Land a numbered branch that carries no `ready/<issue>` marker (an express/ad-hoc branch that never emits one); the marker guard is otherwise mandatory |
@@ -74,12 +73,12 @@ The script runs, in order, aborting safely at the first failure:
    awaited on the new tip; the hub then only fast-forwards to a CI-green SHA.
 3. **Ship** — `git push origin <default>` (no local tests: CI already proved that SHA).
    A rejected push (a remote refusal, or the local gate of `--local-gate`) rolls back with
-   `git reset --keep` and nothing is pushed. Then `worktree-done.sh` (removes the
-   worktree, prunes the merged branch local + origin) → consume the `ready/<issue>`
-   marker (delete the local + remote tag, so it can't re-flag a future branch) →
-   `gh issue close <id>`.
-4. **tmux** — kills the task's session-0 window when its pane's directory vanished with
-   the worktree; live windows are kept.
+   `git reset --keep` and nothing is pushed. Then the telemetry ingest → release the
+   spoke's Orca worker (`worker-release`, which closes its terminal) → `worktree-done.sh`
+   (`orca worktree rm`, without the archive hook: the ingest already ran; the merged
+   branch is pruned local + origin) → consume the `ready/<issue>` marker (delete the
+   local + remote tag, so it can't re-flag a future branch) → `gh issue close <id>`.
+   A removal Orca refuses exits 3 (shipped, cleanup incomplete), never 1.
 
 ### 3. Handle a refused landing
 
@@ -108,7 +107,6 @@ Then re-run `hub-status.sh` so the next move starts from a fresh picture.
 | Ad-hoc branch (no issue number) | Lands normally; the issue-close step is skipped |
 | `gh` missing or close fails | Warns; close by hand: `gh issue close <id>` |
 | Push succeeded but teardown failed | Work is shipped; re-run `worktree-done.sh <id>` alone and close the issue by hand |
-| Want the branch kept for follow-up | `--keep-branch`, then prune later via `worktree-done.sh` |
 
 ## Related skills
 

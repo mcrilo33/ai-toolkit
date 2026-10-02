@@ -37,6 +37,12 @@ for _cand in "$_script_dir/base-branch.sh" "$_script_dir/../../../hooks/lib/base
   if [ -f "$_cand" ]; then . "$_cand"; break; fi
 done
 unset _cand
+# wt_task_worktrees (branch_for_issue's fallback scan); absent => the `issue:` selector alone.
+for _cand in "$_script_dir/worktree-lib.sh" "$_script_dir/../../../../scripts/worktree-lib.sh" \
+             "$main_root/scripts/worktree-lib.sh" "$main_root/.ai-toolkit/scripts/worktree-lib.sh"; do
+  if [ -f "$_cand" ]; then . "$_cand"; break; fi
+done
+unset _cand
 if command -v wt_base_branch >/dev/null 2>&1; then
   default_branch="$(wt_base_branch "$main_root")"
 else
@@ -57,23 +63,16 @@ case "$common_dir" in
 esac
 seen_file="${HUB_READY_SEEN_FILE:-$common_dir/hub-ready-seen}"
 
-# branch_for_issue <issue> → "<branch>\t<path>" for the worktree whose slug
-# leads with this issue number (mirrors hub-status.sh's slug→issue parse), or
-# non-zero if none. The hub holds the spoke's worktree until landing, so this
-# resolves in the normal case; absence is the degraded (already-torn-down) case.
+# branch_for_issue <issue> → "<branch>\t<path>" for this repo's worktree on that issue (Orca's
+# linkedIssue, else identity), or non-zero if none (the already-torn-down case). A scan of THIS repo,
+# not `orca worktree show issue:<n>`, whose selector spans every registered repo.
 branch_for_issue() {
-  local issue="$1" path branch slug num
-  while IFS= read -r line; do
-    path="$(awk '{print $1}' <<<"$line")"
-    branch="$(sed -n 's/.*\[\(.*\)\].*/\1/p' <<<"$line")"
-    [ -n "$branch" ] || continue
-    slug="${branch##*/}"
-    num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
-    if [ "$num" = "$issue" ]; then
-      printf '%s\t%s\n' "$branch" "$path"
-      return 0
-    fi
-  done < <(git -C "$main_root" worktree list 2>/dev/null)
+  local issue="$1" rows path branch num
+  command -v wt_task_worktrees >/dev/null 2>&1 || return 1
+  rows="$(wt_task_worktrees "$main_root" 2>/dev/null)" || return 1
+  while IFS=$'\037' read -r path branch num; do
+    [ "$num" = "$issue" ] && [ -n "$branch" ] && { printf '%s\t%s\n' "$branch" "$path"; return 0; }
+  done <<<"${rows//$'\t'/$'\037'}"
   return 1
 }
 

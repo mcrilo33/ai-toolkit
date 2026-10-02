@@ -19,6 +19,7 @@
 # API (root defaults to the current directory):
 #   ai_toolkit_identity_get <key> [root]        value + rc 0; empty + rc 1 when unknown
 #   ai_toolkit_identity_issue [root]            record issue, else branch-leaf leading digits
+#   ai_toolkit_identity_issue_at <root>         RECORD-only issue (no branch fallback); rc 1 when unknown
 #   ai_toolkit_identity_is_spoke [root] [fb]    rc 0 for a spoke; fb = any (default) | env | gitdir
 #   ai_toolkit_identity_has_issue_anchor [root] rc 0 when the record or branch names an issue
 
@@ -45,6 +46,14 @@ _ai_toolkit_identity_recorded_issue() {
   v="$(ai_toolkit_identity_get issue "${1:-.}")" || return 1
   case "$v" in *[!0-9]*) return 1 ;; esac
   printf '%s' "$v"
+}
+
+# The recorded numeric issue of ANOTHER worktree at <root> — the hub-side readers' entry (#361).
+# Record-only by design: each hub site keeps its own branch-slug fallback, so no-record output
+# stays byte-identical. Empty + rc 1 for a missing record, key, non-numeric value or a path that
+# has no .ai-toolkit/ at all (never an error, never a git call).
+ai_toolkit_identity_issue_at() {
+  _ai_toolkit_identity_recorded_issue "${1:-.}"
 }
 
 # The issue number: the record, else the leading digits of the branch's last path segment.

@@ -14,6 +14,8 @@ Contract under test:
     git-dir; `env`: WT_SPOKE only; `gitdir`: git-dir only).
   * `ai_toolkit_identity_has_issue_anchor [root]` — record `issue`, else the branch
     carries a tracker key or a bare number right after the type prefix.
+  * `ai_toolkit_identity_issue_at <root>` — the hub-side by-path reader (#361): the record's
+    numeric `issue` ONLY (no branch fallback), empty + rc 1 otherwise, never an error.
 """
 
 from __future__ import annotations
@@ -318,3 +320,56 @@ def test_every_function_is_safe_under_set_euo_pipefail(hub: Path, tmp_path: Path
 
     assert result.stdout.strip().endswith("done"), result.stderr
     assert "unbound" not in result.stderr
+
+
+# --- issue_at (by-path, record-only; #361 S2b) --------------------------------
+
+
+def test_issue_at_reads_another_worktrees_recorded_issue(hub: Path, tmp_path: Path) -> None:
+    linked = _linked(hub, tmp_path, "orca-migration")
+    _record(linked, "issue=361\nlane=spoke\n")
+
+    result = _ok(_call(hub, f'ai_toolkit_identity_issue_at "{linked}"'))
+
+    assert (result.returncode, result.stdout) == (0, "361")
+
+
+@pytest.mark.parametrize(
+    "text", [None, "lane=spoke\n", "issue=\n", "issue=fix-typo\n", "issue=12x\n", "issue=-3\n"]
+)
+def test_issue_at_is_empty_rc1_when_the_record_names_no_numeric_issue(
+    tmp_path: Path, text: str | None
+) -> None:
+    if text is not None:
+        _record(tmp_path, text)
+
+    result = _ok(_call(tmp_path, f'ai_toolkit_identity_issue_at "{tmp_path}"'))
+
+    assert (result.returncode, result.stdout, result.stderr) == (1, "", "")
+
+
+def test_issue_at_tolerates_a_path_that_does_not_exist(tmp_path: Path) -> None:
+    result = _ok(_call(tmp_path, f'ai_toolkit_identity_issue_at "{tmp_path}/nope/at/all"'))
+
+    assert (result.returncode, result.stdout, result.stderr) == (1, "", "")
+
+
+def test_issue_at_never_falls_back_to_the_branch_name(hub: Path, tmp_path: Path) -> None:
+    # Record-only: the hub sites own their branch-slug fallback, so an issue-shaped branch
+    # with no record must read as unknown here, not as 5.
+    linked = _linked(hub, tmp_path, "feature/5-x")
+
+    result = _ok(_call(hub, f'ai_toolkit_identity_issue_at "{linked}"'))
+
+    assert (result.returncode, result.stdout) == (1, "")
+
+
+def test_issue_at_is_safe_under_set_euo_pipefail(tmp_path: Path) -> None:
+    result = _ok(
+        _call(
+            tmp_path,
+            f'set -euo pipefail; ai_toolkit_identity_issue_at "{tmp_path}" || true; echo done',
+        )
+    )
+
+    assert result.stdout.strip() == "done", result.stderr

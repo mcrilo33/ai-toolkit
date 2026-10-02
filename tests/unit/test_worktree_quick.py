@@ -1,19 +1,11 @@
-"""Unit tests for scripts/worktree-quick.sh — the /quick express lane (issue #89).
+"""Unit tests for scripts/worktree-quick.sh — the /quick express lane (issues #89, #363).
 
-worktree-quick.sh is a trimmed worktree-new.sh: it creates an isolated worktree
-on a `quick/<slug>` (or `chore/<slug>`) branch, copies the gitignored `.claude/`
-runtime config, mints the `spoke_run_id`, and sets the `.ai-toolkit/` git exclude
-— exactly like worktree-new.sh — but DOES NOT create an issue, seed a kickoff
-prompt, spawn a tmux window, or launch a separate `claude` agent. The current
-hub session enters the printed worktree path itself.
-
-To let that hub session drive commits into the worktree (the hub-guard otherwise
-denies a commit run with the hub's cwd on the default branch), the script drops
-the explicit `hub-guard-allow` escape-hatch marker in the common git-dir — the
-same file hub-guard.sh honors.
-
-A logging `tmux` stub on PATH keeps the test hermetic and lets us assert the
-script never touches tmux (no window, no kickoff).
+worktree-quick.sh creates an isolated worktree with `orca worktree create` (no agent: the
+current hub session drives it), renames the branch to `quick/<slug>` (or `chore/<slug>`), drops
+its upstream (#120), provisions it synchronously as `lane=quick, mode=attended`, and grants the
+hub-guard escape hatch so the hub session can commit into it. It never creates an issue, seeds
+a prompt, or launches an agent. `orca` is a PATH stub (`_orca_stub.py`); `tmux`, `code` and
+`git worktree add` fail the test if invoked.
 """
 
 from __future__ import annotations
@@ -24,13 +16,14 @@ import time
 from pathlib import Path
 
 import pytest
+from _orca_stub import install_forbidden_stubs, install_orca_stub, orca_calls, stub_env
 
 WORKTREE_QUICK = Path(__file__).resolve().parents[2] / "scripts" / "worktree-quick.sh"
 
-# Pin git config to nothing so a host's global config never reaches the commits
-# the tests drive (this repo itself ships installable git hooks).
+# Pin git config to nothing so a host's global config never reaches the commits the tests drive
+# (this repo itself ships installable git hooks); the host's base-branch override (#117) must
+# never steer the script under test.
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
-# The host's base-branch override (#117) must never steer the script under test.
 _GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
 
 
@@ -42,17 +35,10 @@ def _git(repo: Path, *args: str) -> str:
 
 @pytest.fixture()
 def hub(tmp_path: Path) -> Path:
-    """A main checkout ('hub') on `main` with an `origin` bare remote and a
-    gitignored `.claude/` runtime dir to copy."""
-    base = tmp_path
-    remote = base / "hub-remote.git"
-    hub = base / "hub"
-    subprocess.run(
-        ["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True, env=_GIT_ENV
-    )
-    subprocess.run(
-        ["git", "init", "-q", "-b", "main", str(hub)], check=True, capture_output=True, env=_GIT_ENV
-    )
+    """A main checkout on `main` with an `origin` bare remote and a `.claude/` dir to copy."""
+    remote, hub = tmp_path / "hub-remote.git", tmp_path / "hub"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, env=_GIT_ENV)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(hub)], check=True, env=_GIT_ENV)
     for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
         _git(hub, "config", k, v)
     (hub / "README.md").write_text("seed\n")
@@ -60,7 +46,6 @@ def hub(tmp_path: Path) -> Path:
     _git(hub, "commit", "-qm", "chore: seed", "-m", "Refs #0")
     _git(hub, "remote", "add", "origin", str(remote))
     _git(hub, "push", "-q", "-u", "origin", "main")
-    # A representative .claude/ runtime config (gitignored; copied verbatim).
     (hub / ".claude" / "skills").mkdir(parents=True)
     (hub / ".claude" / "settings.json").write_text("{}\n")
     return hub
@@ -72,31 +57,19 @@ def _run_quick(
     *args: str,
     extra_env: dict[str, str] | None = None,
     stub_curl: bool = False,
-) -> tuple[subprocess.CompletedProcess, Path]:
-    """Run worktree-quick.sh from the hub with a logging `tmux` stub on PATH.
+    version: str = "1.4.218",
+    scenario: dict | None = None,
+) -> subprocess.CompletedProcess:
+    """Run worktree-quick.sh from the hub against the stubbed `orca`.
 
-    The stub records every invocation so a test can assert the script NEVER
-    drives tmux. Returns the completed process and the tmux call-log path.
-
-    Telemetry isolation (issue #127): the script resolves Langfuse auth itself,
-    so the harness pins AFK_TELEMETRY_CONF to a nonexistent sandbox path and
-    strips the LANGFUSE_* / span-endpoint env (belt to the conftest pin); a test
-    that wants auth opts in via `extra_env` with its own tmp conf. `stub_curl`
-    captures OTLP span POSTs (argv, then the stdin payload) into
-    ``tmp_path / "curl-calls.log"`` so nothing is ever sent.
+    Telemetry isolation (#127): the script resolves Langfuse auth itself, so the harness pins
+    AFK_TELEMETRY_CONF to a nonexistent path and strips the LANGFUSE_* / span-endpoint env; a
+    test that wants auth opts in via `extra_env`. `stub_curl` captures OTLP span POSTs (argv,
+    then the stdin payload) into `tmp_path/curl-calls.log` so nothing is ever sent.
     """
     bindir = tmp_path / "bin"
-    bindir.mkdir(exist_ok=True)
-    log = tmp_path / "tmux-calls.log"
-    log.touch()
-    tmux = bindir / "tmux"
-    tmux.write_text(
-        "#!/bin/sh\n"
-        f'printf "%s\\n" "$*" >> "{log}"\n'
-        'if [ "$1" = "new-window" ]; then printf "@1\\n"; fi\n'
-        "exit 0\n"
-    )
-    tmux.chmod(0o755)
+    bindir.mkdir(parents=True, exist_ok=True)
+    install_forbidden_stubs(bindir)
     if stub_curl:
         curl_log = tmp_path / "curl-calls.log"
         curl = bindir / "curl"
@@ -107,147 +80,128 @@ def _run_quick(
             "exit 0\n"
         )
         curl.chmod(0o755)
-    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
-    env.pop("TMUX", None)
-    env.pop("WT_SPOKE", None)
-    for var in ("LANGFUSE_BASIC_AUTH", "LANGFUSE_HOST", "AI_TOOLKIT_OTEL_SPAN_ENDPOINT"):
+    env = {**_GIT_ENV, **install_orca_stub(bindir, version=version, scenario=scenario)}
+    for var in (
+        "TMUX",
+        "WT_SPOKE",
+        "LANGFUSE_BASIC_AUTH",
+        "LANGFUSE_HOST",
+        "AI_TOOLKIT_OTEL_SPAN_ENDPOINT",
+    ):
         env.pop(var, None)
     env["AFK_TELEMETRY_CONF"] = str(tmp_path / "no-such-conf")
-    if extra_env:
-        env.update(extra_env)
-    proc = subprocess.run(
+    env.update(extra_env or {})
+    return subprocess.run(
         ["bash", str(WORKTREE_QUICK), *args],
         cwd=str(hub),
         capture_output=True,
         text=True,
-        env=env,
+        env=stub_env(bindir, env),
     )
-    return proc, log
 
 
-def _branches(hub: Path) -> list[str]:
-    return _git(hub, "branch", "--format=%(refname:short)").split()
+def _wt(tmp_path: Path, slug: str) -> Path:
+    return tmp_path / "orca-ws" / slug
 
 
-def _common_git_dir(hub: Path) -> Path:
-    return Path(_git(hub, "rev-parse", "--absolute-git-dir").strip())
+def _pointer(tmp_path: Path, slug: str, name: str) -> str:
+    return (_wt(tmp_path, slug) / ".ai-toolkit" / name).read_text().strip()
 
 
-def _worktree_dir(hub: Path, slug: str) -> Path:
-    return hub.parent / f"{hub.name}-{slug}"
-
-
-def test_creates_worktree_on_quick_branch(hub: Path, tmp_path: Path) -> None:
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
+def test_creates_the_worktree_through_orca_without_an_agent(hub: Path, tmp_path: Path) -> None:
+    proc = _run_quick(hub, tmp_path, "fix-typo")
 
     assert proc.returncode == 0, proc.stderr
-    assert "quick/fix-typo" in _branches(hub)
-    assert _worktree_dir(hub, "fix-typo").is_dir()
-
-
-def test_chore_type_creates_chore_branch(hub: Path, tmp_path: Path) -> None:
-    proc, _ = _run_quick(hub, tmp_path, "bump-dep", "-t", "chore")
-
-    assert proc.returncode == 0, proc.stderr
-    assert "chore/bump-dep" in _branches(hub)
-
-
-def test_mints_spoke_run_id(hub: Path, tmp_path: Path) -> None:
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
-
-    assert proc.returncode == 0, proc.stderr
-    run_id = (_worktree_dir(hub, "fix-typo") / ".ai-toolkit" / "spoke-run-id").read_text().strip()
-    assert run_id.startswith("quick/fix-typo+")
-
-
-def test_stamps_lane_quick(hub: Path, tmp_path: Path) -> None:
-    # The /quick express lane tags its trace `lane=quick` (issue #102).
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
-
-    assert proc.returncode == 0, proc.stderr
-    lane = (_worktree_dir(hub, "fix-typo") / ".ai-toolkit" / "lane").read_text().strip()
-    assert lane == "quick"
-
-
-def test_stamps_mode_attended(hub: Path, tmp_path: Path) -> None:
-    # /quick is always human-driven, so its mode is `attended` (issue #102).
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
-
-    assert proc.returncode == 0, proc.stderr
-    mode = (_worktree_dir(hub, "fix-typo") / ".ai-toolkit" / "mode").read_text().strip()
-    assert mode == "attended"
-
-
-def test_sets_ai_toolkit_exclude(hub: Path, tmp_path: Path) -> None:
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
-
-    assert proc.returncode == 0, proc.stderr
-    wt = _worktree_dir(hub, "fix-typo")
-    exclude = Path(_git(wt, "rev-parse", "--git-path", "info/exclude").strip())
-    content = exclude.read_text()
-    assert ".ai-toolkit/" in content
-    # .claude/ rides the same exclude: the copied runtime config must never
-    # count as untracked dirt at teardown/land (issue #132).
-    assert ".claude/" in content
-
-
-def test_copies_claude_runtime_config(hub: Path, tmp_path: Path) -> None:
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
-
-    assert proc.returncode == 0, proc.stderr
-    assert (_worktree_dir(hub, "fix-typo") / ".claude" / "settings.json").is_file()
-
-
-def test_drops_hub_guard_allow_marker(hub: Path, tmp_path: Path) -> None:
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
-
-    assert proc.returncode == 0, proc.stderr
-    assert (_common_git_dir(hub) / "hub-guard-allow").exists()
-
-
-def test_does_not_touch_tmux(hub: Path, tmp_path: Path) -> None:
-    # No kickoff, no separate session: the script must never invoke tmux.
-    proc, log = _run_quick(hub, tmp_path, "fix-typo")
-
-    assert proc.returncode == 0, proc.stderr
-    assert log.read_text() == ""
-
-
-def test_does_not_launch_an_agent(hub: Path, tmp_path: Path) -> None:
-    # The current session enters the worktree; no `claude` agent is launched.
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
-
-    assert proc.returncode == 0, proc.stderr
+    create = next(c for c in orca_calls(tmp_path / "bin") if c[:2] == ["worktree", "create"])
+    assert create[create.index("--name") + 1] == "fix-typo"
+    assert create[create.index("--setup") + 1] == "skip"
+    assert "--no-parent" in create
+    assert "--agent" not in create
+    assert (tmp_path / "bin" / "forbidden.log").read_text() == ""
     assert "claude --model" not in proc.stdout
 
 
-def test_prints_worktree_path(hub: Path, tmp_path: Path) -> None:
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
+@pytest.mark.parametrize(
+    ("args", "branch"),
+    [(("fix-typo",), "quick/fix-typo"), (("bump-dep", "-t", "chore"), "chore/bump-dep")],
+)
+def test_branch_is_renamed_to_type_slash_slug(
+    hub: Path, tmp_path: Path, args: tuple, branch: str
+) -> None:
+    proc = _run_quick(hub, tmp_path, *args)
 
     assert proc.returncode == 0, proc.stderr
-    assert str(_worktree_dir(hub, "fix-typo")) in proc.stdout
+    assert _git(_wt(tmp_path, args[0]), "branch", "--show-current").strip() == branch
+
+
+def test_provisions_lane_quick_mode_attended_and_a_run_id(hub: Path, tmp_path: Path) -> None:
+    proc = _run_quick(hub, tmp_path, "fix-typo")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _pointer(tmp_path, "fix-typo", "lane") == "quick"
+    assert _pointer(tmp_path, "fix-typo", "mode") == "attended"
+    assert _pointer(tmp_path, "fix-typo", "spoke-run-id").startswith("quick/fix-typo+")
+    identity = _pointer(tmp_path, "fix-typo", "identity")
+    assert "lane=quick" in identity
+    assert f"orca_worktree_id=stub-repo::{_wt(tmp_path, 'fix-typo')}" in identity
+
+
+def test_sets_the_excludes_and_copies_the_claude_runtime_config(hub: Path, tmp_path: Path) -> None:
+    proc = _run_quick(hub, tmp_path, "fix-typo")
+
+    assert proc.returncode == 0, proc.stderr
+    wt = _wt(tmp_path, "fix-typo")
+    exclude = Path(_git(wt, "rev-parse", "--git-path", "info/exclude").strip()).read_text()
+    assert ".ai-toolkit/" in exclude and ".claude/" in exclude
+    assert (wt / ".claude" / "settings.json").is_file()
+
+
+def test_drops_the_hub_guard_allow_marker(hub: Path, tmp_path: Path) -> None:
+    proc = _run_quick(hub, tmp_path, "fix-typo")
+
+    assert proc.returncode == 0, proc.stderr
+    assert (Path(_git(hub, "rev-parse", "--absolute-git-dir").strip()) / "hub-guard-allow").exists()
+
+
+def test_prints_the_worktree_path_last(hub: Path, tmp_path: Path) -> None:
+    proc = _run_quick(hub, tmp_path, "fix-typo")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines()[-1] == str(_wt(tmp_path, "fix-typo"))
 
 
 def test_rejects_unknown_type(hub: Path, tmp_path: Path) -> None:
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo", "-t", "feature")
+    proc = _run_quick(hub, tmp_path, "fix-typo", "-t", "feature")
 
     assert proc.returncode != 0
     assert "type" in proc.stderr.lower()
 
 
-# --- no inherited upstream (issue #120) ------------------------------------------
+def test_existing_branch_dies_before_asking_orca(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "branch", "quick/fix-typo")
+
+    proc = _run_quick(hub, tmp_path, "fix-typo")
+
+    assert proc.returncode != 0
+    assert not [c for c in orca_calls(tmp_path / "bin") if c[:2] == ["worktree", "create"]]
+
+
+def test_refuses_below_the_orca_version_floor(hub: Path, tmp_path: Path) -> None:
+    proc = _run_quick(hub, tmp_path, "fix-typo", version="1.4.217")
+
+    assert proc.returncode != 0
+    assert "1.4.218" in proc.stderr
+    assert not (tmp_path / "orca-ws").exists()
 
 
 def test_quick_branch_has_no_upstream(hub: Path, tmp_path: Path) -> None:
-    # Branching from origin/<base> must not auto-set it as upstream: a quick
-    # branch is never pushed, and an inherited upstream trips the
-    # worktree-land.sh --local micro-spoke guard (issue #120).
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
+    # An inherited upstream trips the worktree-land.sh --local micro-spoke guard (issue #120).
+    proc = _run_quick(hub, tmp_path, "fix-typo")
 
     assert proc.returncode == 0, proc.stderr
     upstream = subprocess.run(
         ["git", "rev-parse", "--abbrev-ref", "@{upstream}"],
-        cwd=str(_worktree_dir(hub, "fix-typo")),
+        cwd=str(_wt(tmp_path, "fix-typo")),
         capture_output=True,
         text=True,
         env=_GIT_ENV,
@@ -255,12 +209,7 @@ def test_quick_branch_has_no_upstream(hub: Path, tmp_path: Path) -> None:
     assert upstream.returncode != 0, f"expected no upstream, got: {upstream.stdout.strip()}"
 
 
-# --- configurable base branch (issue #117) --------------------------------------
-
-
-def test_quick_branches_from_configured_base(hub: Path, tmp_path: Path) -> None:
-    # The quick lane branches from the resolved base too (origin/<base> when
-    # pushed), not from the hub's current HEAD.
+def test_quick_branches_from_the_configured_base(hub: Path, tmp_path: Path) -> None:
     _git(hub, "checkout", "-q", "-b", "develop")
     (hub / "develop.txt").write_text("develop\n")
     _git(hub, "add", "develop.txt")
@@ -270,28 +219,20 @@ def test_quick_branches_from_configured_base(hub: Path, tmp_path: Path) -> None:
     _git(hub, "checkout", "-q", "main")
     _git(hub, "config", "ai-toolkit.base-branch", "develop")
 
-    proc, _ = _run_quick(hub, tmp_path, "cfg-base")
+    proc = _run_quick(hub, tmp_path, "cfg-base")
 
     assert proc.returncode == 0, proc.stderr
-    wt = hub.parent / f"{hub.name}-cfg-base"
-    assert _git(wt, "rev-parse", "HEAD").strip() == develop_tip
+    assert _git(_wt(tmp_path, "cfg-base"), "rev-parse", "HEAD").strip() == develop_tip
 
 
 # --- hub-side Langfuse auth resolution (issue #127) ------------------------------
-# The quick lane never launches an OTel'd claude, so its only Langfuse footprint
-# is the spawn lifecycle/script span pair emitted at the end of the script. The
-# script resolves auth itself (wt_resolve_langfuse_auth: env wins, then
-# ${AFK_TELEMETRY_CONF:-~/.afk-telemetry}) so those spans get
-# AI_TOOLKIT_OTEL_SPAN_ENDPOINT and reach the collector from any hub session;
-# unresolvable auth leaves the sink dark and the spawn untouched.
+# The quick lane never launches an OTel'd claude, so its only Langfuse footprint is the spawn
+# lifecycle/script span pair. The script resolves auth itself (env wins, then
+# ${AFK_TELEMETRY_CONF:-~/.afk-telemetry}); unresolvable auth leaves the sink dark.
 
 
 def _wait_for_content(log: Path, needle: str, tries: int = 40) -> str:
-    """Poll a detached-writer log until `needle` appears (or ~4s elapse).
-
-    The OTLP span sink runs curl backgrounded and disowned, so its stub may
-    still be writing after the quick script has exited.
-    """
+    """Poll a detached-writer log until `needle` appears (the OTLP sink's curl is disowned)."""
     for _ in range(tries):
         text = log.read_text() if log.exists() else ""
         if needle in text:
@@ -301,38 +242,50 @@ def _wait_for_content(log: Path, needle: str, tries: int = 40) -> str:
 
 
 def test_quick_spawn_span_posted_when_conf_present(hub: Path, tmp_path: Path) -> None:
-    # Conf present + fresh hub env ⇒ the spawn span pair must POST to the
-    # defaulted OTLP endpoint, and the credential must never surface — not on
-    # the curl argv/payload, not in the script's own output.
     conf = tmp_path / "afk-telemetry"
     conf.write_text('LANGFUSE_BASIC_AUTH="Basic-test-127"\n')
 
-    proc, _ = _run_quick(
-        hub,
-        tmp_path,
-        "fix-typo",
-        stub_curl=True,
-        extra_env={"AFK_TELEMETRY_CONF": str(conf)},
+    proc = _run_quick(
+        hub, tmp_path, "fix-typo", stub_curl=True, extra_env={"AFK_TELEMETRY_CONF": str(conf)}
     )
 
     assert proc.returncode == 0, proc.stderr
     curl_log = _wait_for_content(tmp_path / "curl-calls.log", "worktree-quick")
-    assert "/v1/traces" in curl_log, "spawn span must POST to the OTLP traces endpoint"
-    assert "http://localhost:4318" in curl_log, "endpoint defaults to the local collector"
-    assert "worktree-quick" in curl_log, "the quick script span carries its script name"
-    assert "Basic-test-127" not in curl_log, "credential must never reach the curl argv/payload"
-    assert "Basic-test-127" not in proc.stdout + proc.stderr, (
-        "credential must never surface in the script output"
-    )
+    assert "/v1/traces" in curl_log and "http://localhost:4318" in curl_log
+    assert "worktree-quick" in curl_log
+    assert "Basic-test-127" not in curl_log + proc.stdout + proc.stderr
 
 
 def test_quick_emits_no_span_when_auth_unresolvable(hub: Path, tmp_path: Path) -> None:
-    # No conf + no env ⇒ nothing exported, the sink stays dark, and the spawn
-    # still succeeds — resolution is best-effort, never a spawn guard.
-    proc, _ = _run_quick(hub, tmp_path, "fix-typo", stub_curl=True)
+    proc = _run_quick(hub, tmp_path, "fix-typo", stub_curl=True)
 
     assert proc.returncode == 0, proc.stderr
     curl_log = tmp_path / "curl-calls.log"
-    assert not curl_log.exists() or curl_log.read_text() == "", (
-        "no span POST may fire without resolved auth"
-    )
+    assert not curl_log.exists() or curl_log.read_text() == ""
+
+
+def test_a_lost_create_reply_settles_through_a_repo_scoped_listing(
+    hub: Path, tmp_path: Path
+) -> None:
+    # The create really happens (the stub materialises it) but its reply is lost; another repo
+    # may own a worktree of the same name, so the probe must list THIS repo only.
+    wt = _wt(tmp_path, "fix-typo")
+    _git(hub, "worktree", "add", "-q", "-b", "fix-typo", str(wt))
+    listing = {
+        "ok": True,
+        "result": {
+            "worktrees": [{"id": "stub-repo::x", "path": str(wt), "displayName": "fix-typo"}]
+        },
+    }
+    scenario = {
+        "worktree create": [
+            {"rc": 1, "out": {"ok": False, "error": {"code": "runtime_unavailable"}}}
+        ],
+        "worktree list": [{"out": listing}],
+    }
+
+    proc = _run_quick(hub, tmp_path, "fix-typo", scenario=scenario)
+
+    assert proc.returncode == 0, proc.stderr
+    lists = [c for c in orca_calls(tmp_path / "bin") if c[:2] == ["worktree", "list"]]
+    assert lists[0][lists[0].index("--repo") + 1] == f"path:{hub}"

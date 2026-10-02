@@ -3,7 +3,7 @@
 The **express-interactive** lane: build a small fix *conversationally from the hub
 session* on its own branch/worktree, keeping the push-time quality gates
 (lint/typecheck/tests) but dropping the spoke **process** ceremony — no issue, no
-`source-task` kickoff, no separate tmux session, no PLAN gate, no RED-before-green,
+`source-task` kickoff, no separate Orca terminal, no PLAN gate, no RED-before-green,
 no review-artifact requirement.
 
 Drop **process**, keep **quality**. `main` stays the clean launch/integration point:
@@ -28,11 +28,12 @@ From the hub (the main checkout), run:
 .ai-toolkit/scripts/worktree-quick.sh <slug> -t chore # branch chore/<slug>
 ```
 
-This creates a worktree + branch, copies the gitignored `.claude/` runtime config,
-mints the `spoke_run_id`, sets the `.ai-toolkit/` exclude, and drops the
-`hub-guard-allow` marker in the git-dir so the hub session may commit into the
-worktree. It does **not** create an issue, seed a prompt, spawn a tmux window, or
-launch a separate agent. It prints the worktree path on the final line.
+This creates an Orca worktree (`orca worktree create`, no agent) on `quick/<slug>` with no
+upstream, provisions it as `lane=quick` (gitignored `.claude/` copy, `spoke_run_id`,
+`.ai-toolkit/` exclude), and drops the `hub-guard-allow` marker in the git-dir so the hub
+session may commit into the worktree. It does **not** create an issue, seed a prompt,
+open a terminal, or launch a separate agent. It prints the worktree path on the final
+line. Orca >= 1.4.218 must be running with this repo registered.
 
 ### 2. Enter the worktree
 
