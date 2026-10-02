@@ -1197,3 +1197,72 @@ def test_approve_permission_records_approval_injected(tmp_path: Path) -> None:
     _call(f"approve_permission '{wt}'", env=env)
 
     assert '"event":"approval_injected"' in _tlog(state, 311)
+
+
+# ── issue #361 (S2b): _hi_issue_for_wt reads the identity record ──────────────
+# Identity first, then the branch slug. AFK_TLOG_ISSUE still wins over both.
+
+
+def _branch_wt(tmp_path: Path, branch: str, record: str | None = None) -> Path:
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", branch, str(wt)], check=True)
+    if record is not None:
+        (wt / ".ai-toolkit").mkdir()
+        (wt / ".ai-toolkit" / "identity").write_text(record)
+    return wt
+
+
+def _issue_for(wt: Path, *, env: dict[str, str] | None = None) -> str:
+    result = _call(f'out="$(_hi_issue_for_wt "{wt}")"; echo "rc=$? out=[$out]"', env=env)
+    return result.stdout.strip()
+
+
+def test_hi_issue_for_wt_reads_the_record_on_a_non_conforming_branch(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "orca-migration", "issue=361\n")
+
+    assert _issue_for(wt) == "rc=0 out=[361]"
+
+
+def test_hi_issue_for_wt_prefers_the_record_over_the_branch_slug(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "feature/5-x", "issue=361\n")
+
+    assert _issue_for(wt) == "rc=0 out=[361]"
+
+
+def test_hi_issue_for_wt_override_still_beats_the_record(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "orca-migration", "issue=361\n")
+
+    assert _issue_for(wt, env={"AFK_TLOG_ISSUE": "311"}) == "rc=0 out=[311]"
+
+
+def test_hi_issue_for_wt_without_a_record_keeps_the_branch_slug_read(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "feature/223-slug")
+
+    assert _issue_for(wt) == "rc=0 out=[223]"
+
+
+def test_hi_issue_for_wt_without_a_record_is_empty_on_a_bare_branch(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "orca-migration")
+
+    assert _issue_for(wt) == "rc=1 out=[]"
+
+
+def test_hi_issue_for_wt_ignores_a_non_numeric_record(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "feature/223-slug", "issue=quick-slug\n")
+
+    assert _issue_for(wt) == "rc=0 out=[223]"
+
+
+def test_hi_tlog_delivery_logs_a_bare_branch_worktree_against_its_recorded_issue(
+    tmp_path: Path,
+) -> None:
+    wt = _branch_wt(tmp_path, "orca-migration", "issue=361\n")
+    state = tmp_path / "sd"
+
+    _call(
+        f'_hi_tlog_delivery "{wt}" answer_delivered answer \'{{"rc":0}}\'',
+        env={"AFK_STATE_DIR": str(state)},
+    )
+
+    assert '"event":"answer_delivered"' in _tlog(state, 361)
