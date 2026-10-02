@@ -1185,3 +1185,34 @@ def test_danger_wall_mode_first_still_walls_a_detached_head_with_no_identity_rec
     result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
 
     assert _perm(result.stdout) == "deny", result.stdout + result.stderr
+
+
+def _journal_issues(env: dict[str, str]) -> set[str]:
+    journal = Path(env["AFK_STATE_DIR"]) / "decision-journal.jsonl"
+    rows = [json.loads(ln) for ln in journal.read_text().splitlines() if ln.strip()]
+    return {str(r.get("issue")) for r in rows}
+
+
+def test_permission_hook_journals_under_the_record_issue_not_the_branch_slug(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Identity first: the record names 361 even though the branch slug leads with 5.
+    wt, env = _bare_branch_spoke(spoke_repo, tmp_path, issue="361")
+    subprocess.run(["git", "branch", "-m", "feature/5-x"], cwd=wt, check=True)
+
+    result = _run_hook(_hook_payload("Bash", wt, command="git add x.py"), env)
+
+    assert '"permissionDecision":"allow"' in result.stdout, result.stdout + result.stderr
+    assert _journal_issues(env) == {"361"}
+
+
+def test_danger_wall_journals_under_the_record_issue_not_the_branch_slug(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    wt, env = _bare_branch_spoke(spoke_repo, tmp_path, issue="361")
+    subprocess.run(["git", "branch", "-m", "feature/5-x"], cwd=wt, check=True)
+
+    result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
+
+    assert _perm(result.stdout) == "deny", result.stdout + result.stderr
+    assert _journal_issues(env) == {"361"}

@@ -1266,3 +1266,43 @@ def test_hi_tlog_delivery_logs_a_bare_branch_worktree_against_its_recorded_issue
     )
 
     assert '"event":"answer_delivered"' in _tlog(state, 361)
+
+
+@pytest.mark.parametrize(
+    ("scripts_dir", "lib_dir"),
+    [
+        # synced target: identity.sh co-located with hub-inject.sh
+        pytest.param(".ai-toolkit/scripts", ".ai-toolkit/scripts", id="toolkit"),
+        # synced .claude layout: the hook libs live under hooks/scripts/lib
+        pytest.param(".claude/skills/hub/scripts", ".claude/hooks/scripts/lib", id="claude"),
+    ],
+)
+def test_identity_loader_resolves_in_a_synced_target_layout(
+    tmp_path: Path, scripts_dir: str, lib_dir: str
+) -> None:
+    # The permission hook and danger wall run from <target>/.claude/skills/hub/scripts/ with a
+    # CLAUDE_PROJECT_DIR that is NOT the ai-toolkit checkout: the loader must still find the lib.
+    scripts = tmp_path / scripts_dir
+    libs = tmp_path / lib_dir
+    scripts.mkdir(parents=True)
+    libs.mkdir(parents=True, exist_ok=True)
+    (scripts / "hub-inject.sh").write_text(HUB_INJECT.read_text())
+    (libs / "identity.sh").write_text(
+        (REPO_ROOT / "shared" / "hooks" / "lib" / "identity.sh").read_text()
+    )
+    empty_top = tmp_path / "no-toplevel"
+    empty_top.mkdir()
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'cd "{empty_top}" && source "{scripts / "hub-inject.sh"}" && '
+            "declare -F ai_toolkit_identity_issue_at",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "_AFK_TOPLEVEL": str(empty_top)},
+    )
+
+    assert "ai_toolkit_identity_issue_at" in result.stdout, result.stderr
