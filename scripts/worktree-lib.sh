@@ -93,7 +93,9 @@ wt_now_ms() {
 # Emits the exact env prefix a spoke's `claude` launch carries so the run streams
 # one nested trace grouped by its spoke_run_id (carried in OTEL_RESOURCE_ATTRIBUTES).
 # Empty string when native OTel is opted out (AI_TOOLKIT_OTEL != 1) — the full
-# opt-out. The non-secret connection endpoints default to the local collector; an
+# opt-out of THIS prefix (provision-worktree.sh also seeds the same pairs into a worktree's
+# settings.local.json env block at spawn, and that block outlives a later AI_TOOLKIT_OTEL=0
+# relaunch — #359 follow-up). The non-secret connection endpoints default to the local collector; an
 # operator override in the env is preserved (`:=`). The trailing space is
 # load-bearing: it separates this prefix from the WT_SPOKE pin the caller appends.
 # The AUTH header (OTEL_EXPORTER_OTLP_HEADERS) is deliberately NOT emitted — it stays

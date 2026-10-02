@@ -9,7 +9,7 @@
 # Usage:
 #   provision-worktree.sh [--worktree <dir>] [--repo-root <dir>] [--issue <n|slug>]
 #                         [--lane spoke|express] [--mode attended|afk] [--branch <b>]
-#                         [--spoke-run-id <id>]
+#                         [--spoke-run-id <id>] [--otel-body-dir <dir>] [--repo-name <name>]
 #
 # Inputs, in precedence order: the flag, then the Orca setup env (ORCA_WORKTREE_PATH,
 # ORCA_ROOT_PATH, ORCA_WORKSPACE_NAME), then a derivation (cwd, the git common dir, the
@@ -18,6 +18,7 @@
 #
 # Env: PROVISION_TASK_TITLE / PROVISION_TASK_BODY hand over an already-fetched issue so a
 #      caller that fetched them (worktree-new.sh) does not pay a second `gh` round-trip.
+#      PROVISION_ORCA_TIMEOUT bounds the Orca skills probe (seconds, default 20).
 #
 # Idempotent: a second run over a provisioned worktree changes nothing. A genuine
 # provisioning failure exits non-zero (Orca's wait-for-setup must never start an agent on a
@@ -31,7 +32,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/worktree-lib.sh"
 
 # set -e alone dies silently; name the failure so a fail-loud exit is also a legible one.
-trap 'wt_warn "provisioning FAILED (line $LINENO) — the worktree is NOT fully gated"' ERR
+# Main shell only: set -E also fires the trap inside $(...) where a failure is tolerated.
+trap '[ "$BASH_SUBSHELL" -eq 0 ] && wt_warn "provisioning FAILED (line $LINENO) — the worktree is NOT fully gated"' ERR
 
 WT_DIR="${ORCA_WORKTREE_PATH:-}"
 REPO_ROOT="${ORCA_ROOT_PATH:-}"
@@ -101,7 +103,7 @@ case "$MODE" in attended|afk) ;; *) wt_die "mode must be attended or afk (got '$
 
 MARKER_DIR="$(wt_marker_script_dir "$WT_DIR")"
 
-#
+# --- git exclude -------------------------------------------------------------
 # Make .ai-toolkit/ and .claude/ ignored via the repo's git exclude (resolved
 # for this worktree) rather than trusting the consuming repo's committed
 # .gitignore: a synced target may ship its own .gitignore without them, and
@@ -185,19 +187,17 @@ echo "→ lane / mode        $LANE / $MODE"
 # Anchoring used to be an LLM errand: the seed prompt told the spoke to run
 # /source-task, which shells `gh issue view`. The dispatcher already knows the
 # issue, so write the contract to <wt>/.ai-toolkit/task.md at spawn and point the
-# seed prompts (this script's default below and hub-afk's kickoff_for) at it.
+# seed prompts (the default seed prompt and hub-afk's kickoff_for) at it.
 # /source-task stays for crash re-anchor (a lost task.md). Numbered issues only —
 # an ad-hoc slug has no issue to fetch; best-effort, a gh miss simply leaves no
 # task.md and the seed falls back to /source-task. The Scope:/Gate: control lines
 # ride along inside the body verbatim.
 TASK_MD="$WT_DIR/.ai-toolkit/task.md"
 if [[ "$ISSUE" =~ ^[0-9]+$ ]] && [ ! -s "$TASK_MD" ] && command -v gh >/dev/null 2>&1; then
-  # Reuse what earlier blocks already fetched so a spawn makes at most one gh call
-  # per field (an unbounded gh here would double the round-trips and, under /afk's
-  # synchronous dispatch, add a second hang point). TITLE comes from the slug path
-  # (numeric, no-slug); ISSUE_BODY from the Model: block (when WT_AGENT_MODEL is
-  # unset). Both are unset on the other paths, so `-` (not `:-`) fetches only then
-  # and an already-fetched empty value is honoured, not re-fetched.
+  # Reuse what the caller already fetched (PROVISION_TASK_*) so a spawn makes at most one gh
+  # call per field (an unbounded gh here would double the round-trips and, under /afk's
+  # synchronous dispatch, add a second hang point). Unset means "not fetched", so `-` (not
+  # `:-`) fetches only then and an already-fetched empty value is honoured, not re-fetched.
   TASK_TITLE="${PROVISION_TASK_TITLE-$(gh issue view "$ISSUE" --json title -q .title 2>/dev/null || true)}"
   TASK_BODY="${PROVISION_TASK_BODY-$(gh issue view "$ISSUE" --json body -q .body 2>/dev/null || true)}"
   # Write ONLY a COMPLETE contract — both title AND body present (issue #206). A
@@ -287,15 +287,19 @@ if [ -d "$REPO_ROOT/.claude" ]; then
       KEPT_LOCAL="$(mktemp)"
       cp "$WT_DIR/.claude/settings.local.json" "$KEPT_LOCAL"
     fi
+    COPY_RC=0
     {
       mkdir -p "$WT_DIR/.claude" \
         && cp -R "$REPO_ROOT/.claude/." "$WT_DIR/.claude/" \
         && rm -rf "$WT_DIR/.claude/.review" "$WT_DIR/.claude/worktrees" \
         && find "$WT_DIR/.claude" -name '*.bak' -type f -delete
-    } || wt_die ".claude/ copy failed (cp) — refusing to leave an ungated worktree"
+    } || COPY_RC=$?
+    # Restore the worktree's own settings BEFORE a failure exit, so a failed copy never
+    # leaves the hub's file in its place.
     if [ -n "$KEPT_LOCAL" ]; then
       mv "$KEPT_LOCAL" "$WT_DIR/.claude/settings.local.json"
     fi
+    [ "$COPY_RC" -eq 0 ] || wt_die ".claude/ copy failed (cp) — refusing to leave an ungated worktree"
   fi
 fi
 
@@ -520,6 +524,7 @@ check_orca_skills() {
   watchdog=$!
   wait "$pid" 2>/dev/null || rc=$?
   kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
   if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then
     wt_warn "orca skills installed timed out after ${limit}s — could not verify the Orca worker skills"
   elif [ "$rc" -ne 0 ]; then

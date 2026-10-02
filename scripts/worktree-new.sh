@@ -237,7 +237,7 @@ SPOKE_RUN_ID="${BRANCH}+$(date +%s)"
 PROVISION_ENV=()
 [ -n "${TITLE+x}" ] && PROVISION_ENV+=("PROVISION_TASK_TITLE=$TITLE")
 [ -n "${ISSUE_BODY+x}" ] && PROVISION_ENV+=("PROVISION_TASK_BODY=$ISSUE_BODY")
-env ${PROVISION_ENV[@]+"${PROVISION_ENV[@]}"} bash "$SCRIPT_DIR/provision-worktree.sh" \
+env -u PROVISION_TASK_TITLE -u PROVISION_TASK_BODY ${PROVISION_ENV[@]+"${PROVISION_ENV[@]}"} bash "$SCRIPT_DIR/provision-worktree.sh" \
   --worktree "$WT_DIR" --repo-root "$REPO_ROOT" --issue "$ISSUE" --lane "$LANE" \
   --mode "$MODE" --branch "$BRANCH" --spoke-run-id "$SPOKE_RUN_ID" \
   --otel-body-dir "$WT_DIR/.ai-toolkit/raw-bodies" --repo-name "$(wt_repo_name "$REPO_ROOT")" \

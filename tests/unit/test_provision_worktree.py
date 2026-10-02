@@ -418,16 +418,16 @@ def test_env_pairs_helper_is_the_single_source_of_the_prefix(tmp_path: Path) -> 
 # ── Orca worker-skills probe (issue #359) ─────────────────────────────────────
 
 
-def _path_without_orca(tmp_path: Path) -> str:
-    """A PATH holding every tool the host has except `orca`: symlink farm of the real PATH."""
-    farm = tmp_path / "no-orca-bin"
+def _path_without(tmp_path: Path, tool: str) -> str:
+    """A PATH holding every tool the host has except `tool`: symlink farm of the real PATH."""
+    farm = tmp_path / f"no-{tool}-bin"
     farm.mkdir()
     for directory in os.environ["PATH"].split(os.pathsep):
         if not os.path.isdir(directory):
             continue
         for entry in os.scandir(directory):
             link = farm / entry.name
-            if entry.name != "orca" and not link.exists() and os.access(entry.path, os.X_OK):
+            if entry.name != tool and not link.exists() and os.access(entry.path, os.X_OK):
                 link.symlink_to(entry.path)
     return str(farm)
 
@@ -487,7 +487,10 @@ def test_a_hung_orca_probe_times_out_with_a_warning(hub: Path, wt: Path, stubs: 
 def test_absent_orca_cli_is_silent_and_succeeds(hub: Path, wt: Path, tmp_path: Path) -> None:
     empty_stubs = tmp_path / "gh-only"
     _stub(empty_stubs, "gh", "exit 1")
-    env = {**_orca_env(hub, wt), "PATH": f"{empty_stubs}{os.pathsep}{_path_without_orca(tmp_path)}"}
+    env = {
+        **_orca_env(hub, wt),
+        "PATH": f"{empty_stubs}{os.pathsep}{_path_without(tmp_path, 'orca')}",
+    }
 
     result = subprocess.run(
         ["bash", str(SCRIPT)],
@@ -501,3 +504,54 @@ def test_absent_orca_cli_is_silent_and_succeeds(hub: Path, wt: Path, tmp_path: P
     assert result.returncode == 0, result.stderr
     assert "orca skills" not in result.stderr
     assert "orchestration" not in result.stderr
+
+
+# ── review follow-ups (issue #359) ────────────────────────────────────────────
+
+
+def test_a_successful_run_never_reports_a_provisioning_failure(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    # A repo with no origin makes wt_repo_name's pipeline fail inside a $(...) the script
+    # tolerates; that must not surface as a false "provisioning FAILED" on a green run.
+    _git(hub, "remote", "remove", "origin")
+
+    result = _run_with_otel(hub, wt, stubs)
+
+    assert result.returncode == 0, result.stderr
+    assert "FAILED" not in result.stderr
+
+
+def test_cp_fallback_without_rsync_copies_and_keeps_the_local_settings(
+    hub: Path, wt: Path, tmp_path: Path
+) -> None:
+    gh_only = tmp_path / "gh-only"
+    _stub(gh_only, "gh", "exit 1")
+    env = {
+        **_orca_env(hub, wt),
+        "PATH": f"{gh_only}{os.pathsep}{_path_without(tmp_path, 'rsync')}",
+    }
+
+    def provision() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(SCRIPT)],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            env={**_GIT_ENV, **env},
+            timeout=120,
+        )
+
+    first = provision()
+    path = wt / ".claude" / "settings.local.json"
+    data = json.loads(path.read_text())
+    data["permissions"]["allow"].insert(0, "Bash(custom:*)")
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    second = provision()
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert (wt / ".claude" / "skills" / "s" / "SKILL.md").is_file()
+    for excluded in (".review", "worktrees", "settings.json.bak"):
+        assert not (wt / ".claude" / excluded).exists(), excluded
+    assert _settings(wt)["permissions"]["allow"][0] == "Bash(custom:*)"
