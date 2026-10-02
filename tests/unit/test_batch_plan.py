@@ -1771,7 +1771,8 @@ def test_inflight_nums_work_from_a_lone_copy_with_no_sibling_libs(tmp_path: Path
 def test_inflight_nums_helper_is_locale_pinned_and_sources_no_lib() -> None:
     text = BATCH_PLAN.read_text()
     body = text[text.index("_batch_inflight_issue_nums() {") :].split("\n}\n", 1)[0]
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
 
     assert body.count("LC_ALL=C") >= 2, "git and awk must both run under LC_ALL=C (#189/#194)"
-    assert "identity.sh" not in text and "worktree-lib" not in body
-    assert not re.search(r"^\s*(source|\.)\s", body, re.MULTILINE), "must stay dependency-free"
+    assert "identity.sh" not in code and "worktree-lib" not in code
+    assert not re.search(r"^\s*(source|\.)\s", code, re.MULTILINE), "must stay dependency-free"

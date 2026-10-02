@@ -40,6 +40,15 @@ for _cand in "$_script_dir/enabled.sh" "$_script_dir/../../../hooks/lib/enabled.
 done
 unset _cand
 
+# Spoke identity record (#361): the issue column reads <wt>/.ai-toolkit/identity before the branch
+# slug. Same layouts as above, plus the synced .claude layout (hooks/scripts/lib/). Absent => the
+# reader is undefined and every row keeps its branch-slug issue.
+for _cand in "$_script_dir/identity.sh" "$_script_dir/../../../hooks/lib/identity.sh" \
+             "$_script_dir/../../../hooks/scripts/lib/identity.sh"; do
+  if [ -f "$_cand" ]; then . "$_cand"; break; fi
+done
+unset _cand
+
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 
 # Lead with a LOUD banner when the toolkit is disabled, so a forgotten `off`
@@ -278,9 +287,16 @@ while IFS= read -r line; do
   dirty=""
   [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ] && dirty="dirty"
 
-  # Extract leading digits from branch slug (e.g. feature/1-pushed → 1)
-  slug="${branch##*/}"
-  issue_num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
+  # Issue: the identity record first (#361), else the leading digits of the branch slug
+  # (e.g. feature/1-pushed → 1)
+  issue_num=""
+  if command -v ai_toolkit_identity_issue_at >/dev/null 2>&1; then
+    issue_num="$(ai_toolkit_identity_issue_at "$path" 2>/dev/null)" || issue_num=""
+  fi
+  if [ -z "$issue_num" ]; then
+    slug="${branch##*/}"
+    issue_num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
+  fi
 
   # Push state is measured against the branch's own UPSTREAM (not the default
   # branch): a branch can be fully pushed yet still carry commits ahead of the
