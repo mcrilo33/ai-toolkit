@@ -128,7 +128,7 @@ subtasks outstanding — and `/land <primary>` then closes **every** issue the b
 
 ### 4. Report the fan-out
 
-Tell the user the issues dispatched, their branches, worktree paths, and tmux windows —
+Tell the user the issues dispatched, their branches, worktree paths, and Orca terminals —
 naming which issues share a spoke as packed subtasks, since that is the one thing the branch
 name does not tell them. The spokes are now running in parallel. The hub lands each one
 (`/land <primary>`) as it reaches `ready/<primary>`, closing every issue on that branch.
