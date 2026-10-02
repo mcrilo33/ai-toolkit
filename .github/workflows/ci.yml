@@ -37,17 +37,13 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
 
-      # Two phases (#328): tests that rewrite real shared refs are marked `serial` and
-      # must never run under xdist workers. Exit 5 = nothing collected, which is green.
-      - name: Run tests (parallel bulk)
-        run: python -m pytest tests/ -q -n auto -m "not serial"
-
-      - name: Run tests (serial tail)
-        run: |
-          rc=0
-          python -m pytest tests/ -q -m serial || rc=$?
-          [ "$rc" -eq 5 ] && rc=0
-          exit "$rc"
+      # SERIAL on purpose (#378 -> epic #377): the first CI runs under `-n auto` surfaced a
+      # different timing-sensitive failure on every attempt (gate-broker retry windows, hook-
+      # chaining EPIPE), flakes that serial CI had always masked. CI is the gate, so it must be
+      # reproducible: one process, ~9 min on a runner. Re-enable `-n auto -m "not serial"` +
+      # a `-m serial` tail once #377 makes the suite xdist-safe.
+      - name: Run tests
+        run: python -m pytest tests/ -q
 
   shellcheck:
     name: ShellCheck

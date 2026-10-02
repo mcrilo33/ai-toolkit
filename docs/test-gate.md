@@ -40,18 +40,17 @@ Lint, type-check and the anti-gutting scan are separate commit-time hooks and ar
 
 `.github/workflows/ci.yml` runs on push to **every branch** (plus PRs), with
 `concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }` so a newer push to a
-branch cancels that branch's older run. The suite runs in two phases (issue #328):
-
-1. **Parallel bulk** — `pytest tests/ -n auto -m "not serial"` (`pytest-xdist` from
-   `requirements-dev.txt`).
-2. **Serial tail** — `pytest tests/ -m serial`, single process; exit 5 (nothing collected) is
-   green.
+branch cancels that branch's older run. The Linux suite runs **serially** — one
+`pytest tests/ -q` process, about nine minutes on a runner. The issue text asked for
+`-n auto`, but the first CI runs under xdist surfaced a different timing-sensitive failure on
+every attempt (gate-broker retry windows, hook-chaining EPIPE): flakes that serial CI had always
+masked. CI is the gate, so it has to be reproducible; re-enable `-n auto -m "not serial"` plus a
+`-m serial` tail once epic #377 makes the suite xdist-safe.
 
 Tests that **escape isolation and rewrite real shared refs** (the tripwire family) carry the
-`serial` marker (registered in `pyproject.toml`) and must never run under xdist workers.
-`tests/conftest.py` installs a fail-loud guard for a bare, path-less `-n auto`; an explicit
-`tests/` path bypasses it, which is why CI excludes the marker explicitly instead of relying on
-the guard. ShellCheck and the sync-idempotency check run alongside. The macOS control-plane job
+`serial` marker (registered in `pyproject.toml`) and must never run under xdist workers;
+`tests/conftest.py` installs a fail-loud guard for a bare, path-less `-n auto` (an explicit
+`tests/` path bypasses it, so an xdist CI run must exclude the marker itself). ShellCheck and the sync-idempotency check run alongside. The macOS control-plane job
 stays `continue-on-error` until its flakes are fixed (separate issue). Only pushes to `main`
 and PRs file `CI red: …` backlog issues; a red spoke branch is reported to its own spoke.
 

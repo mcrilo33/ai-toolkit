@@ -95,14 +95,16 @@ def test_newer_push_cancels_the_older_run_of_the_same_branch(
     assert concurrency["cancel-in-progress"] is True
 
 
-def test_pytest_suite_runs_parallel_bulk_then_serial_tail(
+def test_pytest_suite_runs_serially_until_the_suite_is_xdist_safe(
     workflow: dict[str, Any],
 ) -> None:
-    # An explicit tests/ path bypasses the conftest xdist guard, so the serial-marked
-    # tests must be excluded from the -n auto phase here, not left to the guard.
+    # `-n auto` surfaced a new timing flake on every CI attempt (#378, epic #377), so the Linux
+    # suite stays single-process; CI is the gate and must be reproducible. Re-enable xdist
+    # (and the `serial` tail, #328) only once #377 lands, updating this test with it.
     runs = [s.get("run", "") for s in workflow["jobs"]["test"]["steps"]]
-    assert any('-n auto -m "not serial"' in r for r in runs)
-    assert any("-m serial" in r and "-n" not in r for r in runs)
+    pytest_runs = [r for r in runs if "pytest" in r]
+    assert pytest_runs == ["python -m pytest tests/ -q"]
+    assert not any("-n " in r or "xdist" in r for r in runs)
 
 
 def test_report_red_files_issues_only_for_main_and_prs(
