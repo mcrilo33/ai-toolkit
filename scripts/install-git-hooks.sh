@@ -111,6 +111,8 @@ cp "$SHARED_HOOKS/commit-quality.sh" \
 # enabled.sh (the #154 on/off switch) ships here too so a fresh install carries
 # the switch; utils.sh and the hook wrappers source it defensively, so a stale
 # install lacking it degrades to ENABLED rather than crashing.
+# identity.sh is sourced unconditionally by commit-quality.sh: omitting it kills
+# the native commit-msg hook at source-time (#369).
 cp "$SHARED_HOOKS/lib/utils.sh" "$SHARED_HOOKS/lib/telemetry.sh" \
    "$SHARED_HOOKS/lib/gate-stamp.sh" \
    "$SHARED_HOOKS/lib/test-reverse-index.sh" \

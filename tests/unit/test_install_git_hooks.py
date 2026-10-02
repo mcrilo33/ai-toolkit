@@ -16,8 +16,8 @@ is made BEFORE install so the commit-msg hook never enters the picture.
 from __future__ import annotations
 
 import json
-import re
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
