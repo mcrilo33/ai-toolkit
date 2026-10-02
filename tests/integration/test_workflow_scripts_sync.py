@@ -351,12 +351,37 @@ class TestOrcaYamlSync:
 
         config = yaml.safe_load((target_repo / "orca.yaml").read_text())
         assert config["setupAgentStartupPolicy"] == "wait-for-setup"
+        root = '"${ORCA_ROOT_PATH:-.}/.ai-toolkit/scripts'
         assert config["scripts"] == {
-            "setup": "./.ai-toolkit/scripts/provision-worktree.sh",
-            "archive": "./.ai-toolkit/scripts/archive-worktree.sh",
+            "setup": f'{root}/provision-worktree.sh"',
+            "archive": f'{root}/archive-worktree.sh"',
         }
+
+    def test_generated_paths_resolve_from_a_linked_worktree(self, target_repo: Path) -> None:
+        """Orca runs the hooks with cwd = the worktree; a host's .ai-toolkit/ lives only in the
+        main checkout (git-excluded), so the paths must anchor on ORCA_ROOT_PATH."""
+        import yaml
+
+        _run_sync(target_repo, "claude")
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(
+            [*git, "commit", "--allow-empty", "-q", "-m", "i"], cwd=target_repo, check=True
+        )
+        linked = target_repo.parent / "linked-wt"
+        subprocess.run(
+            [*git, "worktree", "add", "-q", "-b", "f/x", str(linked)], cwd=target_repo, check=True
+        )
+        assert not (linked / ".ai-toolkit" / "scripts").exists()
+
+        config = yaml.safe_load((target_repo / "orca.yaml").read_text())
         for command in config["scripts"].values():
-            assert os.access(target_repo / command, os.X_OK), f"{command} missing or not executable"
+            probe = subprocess.run(
+                ["bash", "-c", f"test -x {command}"],
+                cwd=linked,
+                env={**os.environ, "ORCA_ROOT_PATH": str(target_repo)},
+                check=False,
+            )
+            assert probe.returncode == 0, f"{command} does not resolve from a linked worktree"
 
     def test_orca_yaml_recorded_in_manifest_for_every_tool(self, target_repo: Path) -> None:
         _run_sync(target_repo, "all")
