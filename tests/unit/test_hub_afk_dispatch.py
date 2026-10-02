@@ -102,3 +102,41 @@ def test_inflight_scope_args_routes_through_the_shared_extractor() -> None:
     result = _call(expr)
 
     assert result.stdout.split() == ["--inflight", "SENTINEL"], result.stdout + result.stderr
+
+
+# --- an Orca failure is never "nothing in flight" (#364) ------------------------------
+# inflight_issues fails closed when Orca cannot list worktrees; every decision that reads it
+# must treat that as UNKNOWN, not as an empty set.
+_ORCA_DOWN = "inflight_worktrees() { echo 'orca down' >&2; return 1; }; "
+
+
+def test_inflight_scope_args_is_exclusive_when_the_inflight_set_is_unknown() -> None:
+    result = _call(_ORCA_DOWN + "_inflight_scope_args")
+
+    assert result.stdout.split() == ["--inflight", "*"], result.stdout + result.stderr
+
+
+def test_dispatch_batch_skips_the_tick_when_the_inflight_set_is_unknown() -> None:
+    expr = (
+        _ORCA_DOWN + "_afk_find_script() { printf /bin/true; }; "
+        "_afk_with_timeout() { echo PLANNER_RAN; }; dispatch_batch; echo RC=$?"
+    )
+
+    result = _call(expr)
+
+    assert "PLANNER_RAN" not in result.stdout
+    assert "in-flight set unknown" in result.stderr
+    assert "RC=0" in result.stdout
+
+
+def test_status_label_sync_skips_the_tick_when_the_inflight_set_is_unknown() -> None:
+    expr = (
+        _ORCA_DOWN + "afk_status_labels_enabled() { return 0; }; "
+        "_afk_find_script() { printf /bin/true; }; "
+        "_afk_with_timeout() { echo PLANNER_RAN; }; afk_sync_status_labels"
+    )
+
+    result = _call(expr)
+
+    assert "PLANNER_RAN" not in result.stdout
+    assert "in-flight set unknown" in result.stderr

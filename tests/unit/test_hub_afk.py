@@ -6829,6 +6829,17 @@ def test_afk_done_not_done_when_planner_errors(tmp_path: Path) -> None:
     assert "not declaring done" in result.stderr
 
 
+def test_afk_done_not_done_when_the_inflight_set_is_unknown(tmp_path: Path) -> None:
+    # #364: Orca down => inflight_issues fails closed. With a planner that reports an empty
+    # backlog, only "unknown in-flight" can keep the drain from declaring itself done.
+    bp = _planner_stub(tmp_path, exit_code=0, out="")
+    expr = 'inflight_worktrees() { return 1; }; afk_done drain 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp)})
+
+    assert "RC=1" in result.stdout, result.stdout + result.stderr
+
+
 def test_afk_done_done_when_planner_empty_and_no_inflight(tmp_path: Path) -> None:
     # The genuine drained state: nothing in flight AND the planner exits 0 with an empty
     # batch ⇒ done (rc 0).
