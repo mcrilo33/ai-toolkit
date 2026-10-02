@@ -93,14 +93,11 @@
 #                                on a blackout the reap pass is SKIPPED this tick and idle clocks are
 #                                refreshed, so a merely-offline fleet is not mis-blocked (#249)
 #   CLAUDE_PROJECTS_DIR          transcript root (default: $HOME/.claude/projects)
-#   AFK_REMOTE_HOST / AFK_REMOTE_REPO / AFK_REMOTE_SESSION / AFK_REMOTE_DRAIN_CMD
-#                                --remote target config (or a sourced AFK_REMOTE_CONF file)
 #
 # Usage:
 #   hub-afk.sh <duration>        # e.g. 90, 30m, 1h, 1h30m — drain for that long, then stop
 #   hub-afk.sh until <HH:MM>     # drain until the next HH:MM, then stop
 #   hub-afk.sh drain             # drain until the backlog is empty + nothing in flight
-#   hub-afk.sh --remote          # launch a detached `drain` on a configured always-on Mac
 #   hub-afk.sh --status          # report the window: off / draining-idle / STALLED / DRAIN DEAD
 #   hub-afk.sh --off             # stop the supervisor + watchdog (clears the state file)
 #   hub-afk.sh --off --wait      # ...and BLOCK until the supervisor has actually exited
@@ -113,8 +110,7 @@
 #                                #   (auto-spawned on arm; rarely run by hand)
 #
 # Run it on the hub (main checkout, on the default branch). Read-only against the work
-# except for dispatching, answering, landing, and reaping spokes. --remote runs the drain
-# on a different machine instead (see docs/remote-afk.md).
+# except for dispatching, answering, landing, and reaping spokes.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -748,10 +744,6 @@ _status() {
 }
 
 main() {
-  # --remote triggers a drain on a DIFFERENT machine and operates only on the remote repo,
-  # so it needs no local checkout — handle it before the git-repo guard.
-  if [ "${1:-}" = "--remote" ]; then remote_launch; return $?; fi
-
   MAIN_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { log "not inside a git repository"; return 1; }
 
   # Long-running entries (arm, no-arg resume, --watchdog) re-exec from a private tmp

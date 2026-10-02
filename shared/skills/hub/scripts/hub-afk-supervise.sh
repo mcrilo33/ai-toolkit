@@ -16,8 +16,7 @@ set -uo pipefail
 # every spoke, tmux, and the OTel stack mid-run, and wall-clock timers (reap ceilings,
 # staleness checks) misfire on wake. So arming ties a `caffeinate -is -w <supervisor pid>`
 # to the supervisor's LIFETIME: `caffeinate -w <pid>` self-exits the instant that pid dies,
-# so /afk off (and any crash) needs NO teardown — this mirrors the --remote path's
-# `caffeinate -s` wrap (build_remote_launch_cmd) for the LOCAL arm. AFK_CAFFEINATE_BIN wins
+# so /afk off (and any crash) needs NO teardown. AFK_CAFFEINATE_BIN wins
 # for tests. On a non-macOS host (no caffeinate) the ensure is a SILENT no-op so arming never
 # fails; the loud battery/lid and missing-caffeinate warnings are surfaced separately at arm.
 #

@@ -233,6 +233,19 @@ _AGENT_PID = 4243
 _DISPLAY_CASE = f'  display-message) printf "{_PANE_PID}\\n" ;;\n'
 
 
+def _write_warmed_stub(path: Path, body: str) -> None:
+    """Write an executable bash stub (`body` follows the shebang) and exec it once, `--warm`.
+
+    A freshly written script's FIRST exec can take seconds under xdist (macOS vets each new
+    executable) while a re-exec takes ~10ms (#374) -- longer than the bounded waits the stubbed
+    commands run under. The warm-up exec leaves a `<path>.warm` marker and runs none of `body`.
+    """
+    guard = '[ "${1:-}" = "--warm" ] && { : > "$0.warm"; exit 0; }\n'
+    path.write_text("#!/usr/bin/env bash\n" + guard + body)
+    path.chmod(0o755)
+    subprocess.run([str(path), "--warm"], check=True)
+
+
 def _agent_ps_stub(fake_bin: Path, *, agent_alive: bool = True, pane_pid: int = _PANE_PID) -> None:
     """PATH-stub `ps` for the #301 agent probe. Default ALIVE: a stub that silently reported
     every pane's agent as dead would disable the inject lane across the whole suite, and the
@@ -256,14 +269,13 @@ def _agent_ps_stub(fake_bin: Path, *, agent_alive: bool = True, pane_pid: int = 
     table += "999 1 /Applications/Other.app/Contents/MacOS/claude\n"
     tbl = fake_bin / "ps_table.txt"
     tbl.write_text(table)
-    (fake_bin / "ps").write_text(
-        "#!/usr/bin/env bash\n"
+    _write_warmed_stub(
+        fake_bin / "ps",
         'case "$*" in\n'
         f'  "-eo pid=,ppid=,comm=") cat "{tbl}" ;;\n'
         '  *) exec /bin/ps "$@" ;;\n'
-        "esac\n"
+        "esac\n",
     )
-    (fake_bin / "ps").chmod(0o755)
 
 
 def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path, *, agent_alive: bool = True) -> Path:
