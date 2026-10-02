@@ -469,10 +469,14 @@ PYEOF
   cmd="${parsed#*$'\n'}"
   [ -n "$cmd" ] || return 0
   [ -n "$wt" ] || wt="$(pwd)"
-  # Spoke self-limit: an issue-numbered branch slug AND a live supervisor. Either missing ⇒ stay
-  # silent so the normal permission flow (and any attended user) is untouched.
-  br="$(git -C "$wt" branch --show-current 2>/dev/null)" || return 0
-  slug="${br##*/}"; issue="${slug%%[!0-9]*}"
+  # Spoke self-limit: an issue (the identity record, else the branch slug) AND a live supervisor.
+  # Either missing ⇒ stay silent so the normal permission flow (and any attended user) is
+  # untouched.
+  issue="$(_afk_wt_identity_issue "$wt")" || issue=""
+  if [ -z "$issue" ]; then
+    br="$(git -C "$wt" branch --show-current 2>/dev/null)" || return 0
+    slug="${br##*/}"; issue="${slug%%[!0-9]*}"
+  fi
   case "$issue" in '' | *[!0-9]*) return 0 ;; esac
   _afk_supervisor_live "$wt" || return 0
   decision="$(classify_permission "$cmd" "$wt")"
@@ -513,6 +517,19 @@ _afk_spoke_mode() {
   [ -n "$root" ] || return 0
   [ -f "$root/.ai-toolkit/mode" ] || return 0
   tr -d '[:space:]' < "$root/.ai-toolkit/mode" 2>/dev/null || return 0
+}
+
+# _afk_wt_identity_issue <wt> -> the numeric issue the worktree's identity record names, or
+# nothing (rc 1) when it has no record (#361, S2b). <wt> is a tool cwd and may be a subdirectory,
+# so the record is read from the git toplevel (as _afk_spoke_mode reads the mode file). The reader
+# itself is loaded by hub-inject.sh; absent => no record is ever read and the caller falls back
+# to the branch slug, exactly as before the record existed.
+_afk_wt_identity_issue() {
+  local root
+  declare -F ai_toolkit_identity_issue_at >/dev/null 2>&1 || return 1
+  root="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ -n "$root" ] || return 1
+  ai_toolkit_identity_issue_at "$root" 2>/dev/null
 }
 
 # afk_danger_guard_decide -> read a Claude Code PreToolUse payload on stdin and print a `deny`
@@ -558,10 +575,14 @@ PYEOF
   wt="${parsed%%$'\n'*}"; cmd="${parsed#*$'\n'}"
   [ -n "$cmd" ] || return 0
   [ -n "$wt" ] || wt="$(pwd)"
-  # Issue number (best-effort, for the fail-safe gate + the journal). Empty on a detached HEAD
-  # or a non-issue branch -- which is EXACTLY why it must NOT be the primary gate.
-  br="$(git -C "$wt" branch --show-current 2>/dev/null || true)"
-  slug="${br##*/}"; issue="${slug%%[!0-9]*}"
+  # Issue number (best-effort, for the fail-safe gate + the journal): the identity record, else the
+  # branch slug. Empty on a detached HEAD or a non-issue branch with no record -- which is EXACTLY
+  # why it must NOT be the primary gate.
+  issue="$(_afk_wt_identity_issue "$wt")" || issue=""
+  if [ -z "$issue" ]; then
+    br="$(git -C "$wt" branch --show-current 2>/dev/null || true)"
+    slug="${br##*/}"; issue="${slug%%[!0-9]*}"
+  fi
   case "$issue" in *[!0-9]*) issue="" ;; esac
   # MODE GATE (fail-safe, mode-first -- #261 review BLOCKER). A positively-read `afk` mode means
   # this spoke launched under bypassPermissions, so the wall is ACTIVE on ANY branch: `git bisect`

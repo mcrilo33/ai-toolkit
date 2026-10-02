@@ -780,16 +780,24 @@ _afk_find_script() {
 }
 
 # --- in-flight survey ---------------------------------------------------------
-# "<path>\t<issue>" per task worktree whose branch slug leads with an issue number.
+# "<path>\t<issue>" per task worktree that names an issue: its identity record (#361, so a
+# worktree on a bare branch is still in flight), else a branch slug that leads with the number.
 # Built on worktree-lib's wt_task_worktrees so the hub and these helpers agree on
-# what counts as a task worktree.
+# what counts as a task worktree. The record reader is loaded by hub-inject.sh; absent => the
+# slug read alone, exactly as before.
 inflight_worktrees() {
   local main path br slug num
   main="$(wt_main_root 2>/dev/null)" || return 0
   while IFS=$'\t' read -r path br; do
     [ -n "$path" ] || continue
-    slug="${br##*/}"
-    num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
+    num=""
+    if declare -F ai_toolkit_identity_issue_at >/dev/null 2>&1; then
+      num="$(ai_toolkit_identity_issue_at "$path" 2>/dev/null)" || num=""
+    fi
+    if [ -z "$num" ]; then
+      slug="${br##*/}"
+      num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
+    fi
     [ -n "$num" ] && printf '%s\t%s\n' "$path" "$num"
   done < <(wt_task_worktrees "$main")
 }
