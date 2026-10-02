@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -718,3 +719,33 @@ def test_telemetry_lib_copied_and_utils_sources_clean(repo: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert "OK" in proc.stdout
+
+
+_SOURCE_RE = re.compile(
+    r'^\s*(?:\[[^]]*\]\s*&&\s*)?(?:source|\.)\s+"[^"]*/([\w.-]+\.sh)"', re.MULTILINE
+)
+_SHARED_LIB = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "lib"
+
+
+def test_every_sourced_lib_is_installed(repo: Path) -> None:
+    # #369: identity.sh was sourced by commit-quality.sh but missing from the
+    # installer's copy list, so the native commit-msg hook died at source-time.
+    # Walk the source graph from every installed script (and transitively through
+    # libs) and require each sourced lib to be present in the installed lib/.
+    scripts = _scripts_dir(_install(repo))
+    lib_dir = scripts / "lib"
+
+    collected: set[str] = set()
+    pending = [p.read_text() for p in sorted(scripts.glob("*.sh"))]
+    pending += [p.read_text() for p in sorted(lib_dir.glob("*.sh"))]
+    while pending:
+        for name in _SOURCE_RE.findall(pending.pop()):
+            if name in collected:
+                continue
+            collected.add(name)
+            if not (lib_dir / name).is_file() and (_SHARED_LIB / name).is_file():
+                pending.append((_SHARED_LIB / name).read_text())
+
+    assert {"utils.sh", "telemetry.sh", "identity.sh"} <= collected, collected
+    missing = sorted(n for n in collected if not (lib_dir / n).is_file())
+    assert not missing, f"sourced but not installed: {missing}"
