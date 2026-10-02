@@ -153,6 +153,26 @@ class TestSpokeReadyScriptSpan:
         assert len(spans) == 1
         assert spans[0]["phase"] == phase
 
+    @pytest.mark.parametrize(
+        "answer,rc", [("Revise: split step 2.", 3), (None, 6)], ids=["revise", "ask-pending"]
+    )
+    def test_gate_span_survives_every_blocking_ask_outcome(
+        self, spoke: Path, telemetry_dir: Path, orca_bin: Path, answer: str | None, rc: int
+    ) -> None:
+        # An Orca worker's --gate blocks in `ask` and may exit 3 / 6: the span must already be out
+        # (and must not measure the wait), whatever the coordinator answers.
+        from _orca_stub import ok_reply, orca_scenario
+
+        result = {"messageId": "m1", "answer": answer, "timedOut": answer is None}
+        orca_scenario(orca_bin, {"orchestration ask": [{"out": ok_reply(result)}]})
+        env = {**_tele_env(telemetry_dir), "WT_SPOKE": "54", "ORCA_TERMINAL_HANDLE": "term_w"}
+
+        res = _run(SPOKE_READY, spoke, env, "--gate", "54", "-m", "plan")
+
+        assert res.returncode == rc, res.stdout + res.stderr
+        spans = _scripts(telemetry_dir, name="spoke-ready")
+        assert [s["phase"] for s in spans] == ["gate"]
+
     def test_noop_when_disabled(self, spoke: Path, telemetry_dir: Path) -> None:
         res = _run(SPOKE_READY, spoke, _tele_env(telemetry_dir, enabled=False), "54")
 
