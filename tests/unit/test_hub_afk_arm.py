@@ -1,6 +1,6 @@
 """Mirror tests for hub-afk-arm.sh (issue #307 split).
 
-The ARM-time lane extracted from hub-afk.sh: the --remote launch, the telemetry preflight,
+The ARM-time lane extracted from hub-afk.sh: the telemetry preflight,
 the sleep-inhibitor/power status warnings, and the arm-time liveness probes + preconditions
 + the ONE arm verdict + the self-check. A behaviour-neutral MOVE, so these tests assert the
 functions are reachable through the entry and physically located in the module file.
@@ -16,8 +16,6 @@ from _hub_afk_support import HUB_SCRIPTS_DIR, _call, function_source_file
 MODULE = "hub-afk-arm.sh"
 
 ARM_FUNCTIONS = [
-    "remote_launch",
-    "build_remote_launch_cmd",
     "afk_telemetry_enabled",
     "afk_resolve_telemetry_auth",
     "afk_telemetry_preflight",
@@ -54,15 +52,6 @@ def test_module_file_is_present_and_executable() -> None:
 
     assert mod.is_file(), f"{MODULE} missing"
     assert os.access(mod, os.X_OK), f"{MODULE} is not executable"
-
-
-def test_build_remote_launch_cmd_is_pure() -> None:
-    # A pure helper: sanity that the moved code still renders the detached tmux launch.
-    out = _call("build_remote_launch_cmd /repo afk 'bash x drain'").stdout
-
-    assert "cd '/repo'" in out
-    assert "tmux new -d -s 'afk'" in out
-    assert "caffeinate -s bash x drain" in out
 
 
 def test_arm_claude_check_default_probe_runs_on_haiku() -> None:

@@ -25,10 +25,10 @@ The drain runs a hub side and a spoke side, so the guard measures both.
       a newly added lifecycle script is measured automatically), plus
     * the standalone lifecycle scripts ``sync-to-repo.sh``, ``gate-sweep.sh``,
       ``telemetry-ingest-spoke.sh``.
-  Everything else in ``scripts/`` is deliberately OUT: install/build/test-harness and
-  travel helpers (``install.sh``, ``install-git-hooks.sh``, ``build-cursor-plugin.sh``,
+  Everything else in ``scripts/`` is deliberately OUT: install/build/test-harness
+  helpers (``install.sh``, ``install-git-hooks.sh``, ``build-cursor-plugin.sh``,
   ``list-cursor-rules.sh``, ``ensure-test-venv.sh``, ``test-run.sh``,
-  ``test-budget-watch.sh``, ``afk-travel.sh``, ``travel-local.sh``) are operator
+  ``test-budget-watch.sh``) are operator
   tooling, never a shared spoke ``Scope:``, so a scheduling-bottleneck budget has no
   business measuring them.
 """
@@ -149,7 +149,6 @@ def test_non_control_plane_utilities_are_excluded() -> None:
         ("build-cursor-plugin.sh", False),
         ("list-cursor-rules.sh", False),
         ("ensure-test-venv.sh", False),
-        ("afk-travel.sh", False),
         ("README.md", False),
     ],
 )
