@@ -187,6 +187,16 @@ scripts (executable, manifest-recorded).
 `archive-worktree.sh` only spools an OTel spoke's raw bodies and identity to
 `<git-common-dir>/ai-toolkit-afk/ingest-spool/<spoke_run_id>/` (with `/` in the id
 flattened to `__`) for removals outside land; land keeps its synchronous ingest.
+A failed spool leaves `<dirname>.failed` beside it. The spool dir is accepted by
+`telemetry-ingest-spoke.sh` as a worktree dir (raw bodies itemized), but it lives
+inside the shared git dir, so the ingest's git-derived enrichments (branch, commit
+range) read the main checkout; the spool consumer (follow-up) must handle that.
+
+> [!WARNING]
+> In a host repo `.ai-toolkit/` is git-excluded, so a worktree has no
+> `./.ai-toolkit/scripts/`; Orca runs the hooks with the worktree as cwd. Pointing
+> the generated paths at `"$ORCA_ROOT_PATH"/.ai-toolkit/scripts/…` is the likely fix
+> and is tracked as an open question in `03-spike.md` (Round 3).
 
 ## --dry-run
 

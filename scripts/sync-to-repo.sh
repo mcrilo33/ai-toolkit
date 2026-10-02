@@ -565,6 +565,8 @@ sync_mcp_servers() {
 # The telemetry python PACKAGE the land-time ingest imports rides along too, via
 # copy_telemetry_package (issue #319) — a package, not a flat file, so it takes its
 # own recursive step rather than the name loop.
+# (The two helpers below are generate_orca_yaml's; sync_workflow_scripts follows them.)
+
 # Is $1 (a path relative to $TARGET) listed under ANY tool in the target's sync manifest?
 # True only for files an earlier sync wrote; a host-authored file is never listed.
 manifest_owns() {
@@ -586,6 +588,11 @@ PY
 generate_orca_yaml() {
     local src="$REPO_DIR/orca.yaml"
     [ -f "$src" ] || { warn "toolkit orca.yaml not found at $src — target orca.yaml not generated"; return 0; }
+    # The hub syncing into itself: the target's orca.yaml IS the committed source.
+    if [ "$TARGET/orca.yaml" -ef "$src" ]; then
+        info "orca.yaml is the toolkit's own — not regenerated"
+        return 0
+    fi
     if [ -e "$TARGET/orca.yaml" ] && ! manifest_owns "orca.yaml"; then
         warn "orca.yaml already exists in target and is not toolkit-owned — skipped (point its scripts at .ai-toolkit/scripts/{provision,archive}-worktree.sh manually)"
         return 0

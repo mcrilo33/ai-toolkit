@@ -13,7 +13,12 @@
 #
 # Layout: <git-common-dir>/ai-toolkit-afk/ingest-spool/<spoke_run_id>/.ai-toolkit/
 #         {raw-bodies,spoke-run-id,lane,mode,identity}  ("/" in the id becomes "__"; mirrors the worktree, so
-#         `telemetry-ingest-spoke.sh <spool>/<id>` takes the land-time path unchanged).
+#         `telemetry-ingest-spoke.sh <spool>/<id>` takes the land-time path: raw bodies are
+#         itemized and the id is read from the spooled file). The spool sits inside the shared
+#         git dir, so the ingest's git-derived enrichments (branch, issue, commit range) read
+#         the MAIN checkout there; the spool consumer must account for that (follow-up).
+#
+# A failure leaves <spool-root>/<dirname>.failed next to the spool (a later success clears it).
 #
 # Safe under a kill at any point: the new spool is built in a sibling temp dir, the old final
 # is renamed to a sibling (never deleted before the new one is in place), then removed. Stale
@@ -61,14 +66,32 @@ OLD="$ROOT/$DIRNAME.old.$$"
 
 mkdir -p "$ROOT" 2>/dev/null || { warn "cannot create spool root $ROOT — NOT spooling $ID"; exit 0; }
 
-# Clear what an earlier killed run left behind (its pid differs, so the glob catches it).
-rm -rf "$ROOT/$DIRNAME".tmp.* "$ROOT/$DIRNAME".old.* 2>/dev/null
+# Nobody watches an Orca hook's stderr, so a failure also leaves a durable marker next to the
+# spool (AFK Design Principle #2); a later successful run clears it.
+FAILED="$ROOT/$DIRNAME.failed"
+fail() {
+  warn "$1 — NOT spooling $ID"
+  printf '%s\n' "$1" > "$FAILED" 2>/dev/null
+  rm -rf "$TMP" 2>/dev/null
+  exit 0
+}
+
+# Settle what an earlier KILLED run left behind. A sibling whose pid suffix is still alive
+# belongs to a concurrent run and is left alone. A dead run's .old is the previous good spool:
+# put it back if the final is missing (so a failure below cannot lose it), else drop it.
+for d in "$ROOT/$DIRNAME".tmp.* "$ROOT/$DIRNAME".old.*; do
+  [ -e "$d" ] || continue
+  pid="${d##*.}"
+  case "$pid" in '' | *[!0-9]*) ;; *) if kill -0 "$pid" 2>/dev/null; then continue; fi ;; esac
+  case "$d" in
+    *.old.*) [ -e "$FINAL" ] || { mv "$d" "$FINAL" 2>/dev/null && continue; } ;;
+  esac
+  rm -rf "$d" 2>/dev/null
+done
 
 if ! mkdir -p "$TMP/.ai-toolkit" 2>/dev/null \
   || ! cp -R "$AIT/raw-bodies" "$TMP/.ai-toolkit/raw-bodies" 2>/dev/null; then
-  warn "could not copy raw-bodies into $TMP — NOT spooling $ID"
-  rm -rf "$TMP" 2>/dev/null
-  exit 0
+  fail "could not copy raw-bodies into $TMP"
 fi
 for f in spoke-run-id lane mode identity; do
   [ -f "$AIT/$f" ] || continue
@@ -78,15 +101,11 @@ done
 # Swap: final -> .old, tmp -> final, delete .old. The final is never absent for longer than
 # one rename, so a kill at ~120 s cannot leave the spool missing.
 if [ -e "$FINAL" ] && ! mv "$FINAL" "$OLD" 2>/dev/null; then
-  warn "could not move the previous spool aside — keeping it, NOT replacing $FINAL"
-  rm -rf "$TMP" 2>/dev/null
-  exit 0
+  fail "could not move the previous spool aside (kept as is)"
 fi
 if ! mv "$TMP" "$FINAL" 2>/dev/null; then
-  warn "could not move the new spool into $FINAL"
   [ -e "$OLD" ] && mv "$OLD" "$FINAL" 2>/dev/null
-  rm -rf "$TMP" 2>/dev/null
-  exit 0
+  fail "could not move the new spool into $FINAL"
 fi
-rm -rf "$OLD" 2>/dev/null
+rm -rf "$OLD" "$FAILED" 2>/dev/null
 exit 0
