@@ -4,6 +4,10 @@ A freshly written script's FIRST exec on macOS can take seconds under xdist (the
 new executable) while a re-exec takes ~10ms. A test that writes a raw `chmod +x` stub and then
 races it against a bounded wait is therefore a latent flake (#374/#375). `write_stub` warms the
 stub up front; this test fails when a test file marks a file executable any other way.
+
+Known blind spots (AST scan of `<x>.chmod(<literal or S_IX*>)` only): mode-preserving copies of
+executable scripts (`shutil.copy*`), a mode held in a variable, a bare `chmod(...)` import, and
+`chmod +x` inside a stub's shell body.
 """
 
 from __future__ import annotations

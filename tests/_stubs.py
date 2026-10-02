@@ -22,17 +22,20 @@ def write_stub(path: Path, script: str, *, warm: bool = True) -> None:
 
     Args:
         path: Where the stub lands.
-        script: Full script text; must start with a `#!` line, after which the warm guard
-            is injected.
+        script: Full script text; must start with a sh/bash `#!` line, after which the warm
+            guard is injected.
         warm: Exec the stub once now. Pass False to write a batch and call `warm_stubs`.
 
     Raises:
-        ValueError: `script` has no shebang line.
+        ValueError: `script` has no sh/bash shebang line.
         subprocess.CalledProcessError: the warm-up exec failed.
     """
     shebang, sep, rest = script.partition("\n")
-    if not shebang.startswith("#!"):
-        raise ValueError(f"stub {path.name} must start with a shebang, got {shebang[:40]!r}")
+    if not shebang.startswith("#!") or not shebang.rstrip().endswith(("sh", "bash")):
+        raise ValueError(
+            f"stub {path.name} must start with a sh/bash shebang (the warm guard is shell), "
+            f"got {shebang[:40]!r}"
+        )
     path.write_text(f"{shebang}\n{_WARM_GUARD}{rest if sep else ''}")
     path.chmod(0o755)
     if warm:
@@ -43,7 +46,13 @@ def warm_stubs(paths: Iterable[Path]) -> None:
     """Exec every stub once, concurrently, with the warm guard armed (a no-op run)."""
     env = {**os.environ, WARM_ENV: "1"}
     procs = [
-        subprocess.Popen([str(p)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(
+            [str(p)],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         for p in paths
     ]
     for proc in procs:
