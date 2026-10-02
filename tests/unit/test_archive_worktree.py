@@ -181,6 +181,16 @@ def test_missing_or_empty_spoke_run_id_exits_zero_loudly(
     assert not _spool_root(repo).exists()
 
 
+def test_branch_style_spoke_run_id_flattens_slashes(repo: Path, worktree: Path) -> None:
+    real_id = "feature/362-feat-orca-add-orca+1790910976"
+    (worktree / ".ai-toolkit" / "spoke-run-id").write_text(real_id + "\n")
+    assert _run(worktree).returncode == 0
+    root = _spool_root(repo)
+    assert [p.name for p in root.iterdir()] == ["feature__362-feat-orca-add-orca+1790910976"]
+    spooled = root / "feature__362-feat-orca-add-orca+1790910976" / ".ai-toolkit" / "spoke-run-id"
+    assert spooled.read_text().strip() == real_id
+
+
 def test_unsafe_spoke_run_id_is_refused(repo: Path, worktree: Path) -> None:
     (worktree / ".ai-toolkit" / "spoke-run-id").write_text("../escape\n")
     r = _run(worktree)

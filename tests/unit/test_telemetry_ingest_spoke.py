@@ -784,7 +784,9 @@ def test_commit_base_env_overrides_post_push_range(worktree: Path, tmp_path: Pat
     _git(worktree, "commit", "-qm", "chore: base")
     base_sha = subprocess.run(
         ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     (worktree / "a.py").write_text("x\ny\n")
     _git(worktree, "add", "a.py")
@@ -813,7 +815,9 @@ def test_commit_base_env_used_under_rebuild(worktree: Path, tmp_path: Path) -> N
     _git(worktree, "commit", "-qm", "chore: base")
     base_sha = subprocess.run(
         ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     (worktree / "a.py").write_text("x\n")
     _git(worktree, "add", "a.py")
@@ -823,7 +827,8 @@ def test_commit_base_env_used_under_rebuild(worktree: Path, tmp_path: Path) -> N
     _make_python_stub(bindir, runlog)
 
     result = _run(
-        worktree, bindir,
+        worktree,
+        bindir,
         argv=[str(worktree), "--rebuild"],
         extra_env={"AI_TOOLKIT_COMMIT_BASE": base_sha},
     )
@@ -851,7 +856,8 @@ def test_skips_commits_when_base_unresolvable(worktree: Path, tmp_path: Path) ->
     _make_python_stub(bindir, runlog)
 
     result = _run(
-        worktree, bindir,
+        worktree,
+        bindir,
         extra_env={"AI_TOOLKIT_COMMIT_BASE": "0" * 40},
     )
 
@@ -991,3 +997,44 @@ def test_itemization_runs_when_no_afk_state_dir(tmp_path: Path) -> None:
     lifecycle = json.loads((wt / ".ai-toolkit" / "lifecycle.json").read_text())
     assert set(lifecycle) == {"issue", "landed"}, lifecycle
     assert lifecycle["issue"] == "280"
+
+
+# ── ingest-spool consumability (issue #362) ───────────────────────────────────
+# archive-worktree.sh spools an OTel spoke to <git-common-dir>/ai-toolkit-afk/ingest-spool/
+# <id>/.ai-toolkit/{spoke-run-id,raw-bodies}, mirroring the worktree layout. That dir must
+# be consumable by the UNCHANGED ingest as a plain <worktree-dir> argument — the land-time
+# path, with --request-bodies — so the spool consumer needs no new ingest mode.
+
+
+def test_spooled_dir_takes_the_land_time_path(worktree: Path, tmp_path: Path) -> None:
+    # Arrange: archive a real linked worktree, then point the ingest at its spool
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git_env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    for leak in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+        git_env.pop(leak, None)
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q", "-b", "main"], cwd=repo, env=git_env, check=True)
+    subprocess.run(
+        [*git, "commit", "--allow-empty", "-q", "-m", "i"], cwd=repo, env=git_env, check=True
+    )
+    linked = tmp_path / "linked"
+    subprocess.run(
+        [*git, "worktree", "add", "-q", "-b", "f/x", str(linked)], cwd=repo, env=git_env, check=True
+    )
+    shutil.copytree(worktree / ".ai-toolkit", linked / ".ai-toolkit")
+    archive = INGEST.parent / "archive-worktree.sh"
+    subprocess.run(["bash", str(archive), str(linked)], env=git_env, check=True)
+    (spool,) = (repo / ".git" / "ai-toolkit-afk" / "ingest-spool").iterdir()
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    # Act
+    result = _run(spool, bindir, argv=[str(spool)])
+
+    # Assert: land-time path — raw bodies itemized, spoke_run_id read from the spooled file
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "--request-bodies" in tree
+    assert str(spool / ".ai-toolkit" / "raw-bodies") in tree
+    assert SPOKE_RUN_ID in tree

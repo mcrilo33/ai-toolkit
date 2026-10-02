@@ -12,7 +12,7 @@
 # Usage: archive-worktree.sh [worktree-dir]   # default: $ORCA_WORKTREE_PATH, else the cwd
 #
 # Layout: <git-common-dir>/ai-toolkit-afk/ingest-spool/<spoke_run_id>/.ai-toolkit/
-#         {raw-bodies,spoke-run-id,lane,mode,identity}  (mirrors the worktree, so
+#         {raw-bodies,spoke-run-id,lane,mode,identity}  ("/" in the id becomes "__"; mirrors the worktree, so
 #         `telemetry-ingest-spoke.sh <spool>/<id>` takes the land-time path unchanged).
 #
 # Safe under a kill at any point: the new spool is built in a sibling temp dir, the old final
@@ -38,9 +38,13 @@ if [ -z "$ID" ]; then
   warn "no usable spoke-run-id under $AIT though raw-bodies exists — NOT spooling $WT"
   exit 0
 fi
-case "$ID" in
-  */* | .* | *[!A-Za-z0-9._-]*)
-    warn "spoke-run-id '$ID' is not a safe path component — NOT spooling $WT"
+# Real ids are "<branch>+<epoch>" and the branch carries slashes (feature/362-x+17...), so the
+# spool dir name flattens "/" to "__" to stay ONE directory level; the ingest re-reads the real
+# id from the spoke-run-id file, never from the dir name.
+DIRNAME="${ID//\//__}"
+case "$DIRNAME" in
+  .* | *[!A-Za-z0-9._+-]*)
+    warn "spoke-run-id '$ID' cannot be mapped to a safe spool dir name — NOT spooling $WT"
     exit 0 ;;
 esac
 
@@ -51,14 +55,14 @@ if [ -z "$GCD" ]; then
 fi
 
 ROOT="$GCD/ai-toolkit-afk/ingest-spool"
-FINAL="$ROOT/$ID"
-TMP="$ROOT/$ID.tmp.$$"
-OLD="$ROOT/$ID.old.$$"
+FINAL="$ROOT/$DIRNAME"
+TMP="$ROOT/$DIRNAME.tmp.$$"
+OLD="$ROOT/$DIRNAME.old.$$"
 
 mkdir -p "$ROOT" 2>/dev/null || { warn "cannot create spool root $ROOT — NOT spooling $ID"; exit 0; }
 
 # Clear what an earlier killed run left behind (its pid differs, so the glob catches it).
-rm -rf "$ROOT/$ID".tmp.* "$ROOT/$ID".old.* 2>/dev/null
+rm -rf "$ROOT/$DIRNAME".tmp.* "$ROOT/$DIRNAME".old.* 2>/dev/null
 
 if ! mkdir -p "$TMP/.ai-toolkit" 2>/dev/null \
   || ! cp -R "$AIT/raw-bodies" "$TMP/.ai-toolkit/raw-bodies" 2>/dev/null; then
