@@ -99,8 +99,8 @@ jobs:
   # pass on ubuntu where the code does not run. This job runs only the
   # shell-control-plane test subset (suites that drive a *.sh hook or
   # scripts/*.sh via subprocess), not the full suite, to keep macOS minutes
-  # bounded. continue-on-error while the documented flakes are burned down;
-  # remove it to make the job required once green. Related: #189.
+  # bounded. Not continue-on-error: a red result here is a real failure and
+  # the job is a required check (#379). Related: #189.
   shell-control-plane-macos:
     name: Shell control-plane (macOS, fr_FR.UTF-8)
     # Pinned to macos-15, not macos-latest: the macos-26 image dropped the
@@ -113,7 +113,6 @@ jobs:
     # locale-agnostic is a separate change, out of this ci.yml-only scope.
     runs-on: macos-15
     timeout-minutes: 15
-    continue-on-error: true
     env:
       LANG: fr_FR.UTF-8
       LC_ALL: fr_FR.UTF-8
@@ -142,7 +141,14 @@ jobs:
           # (test_process_probes.py, test_worktree_lib.py) hardcode
           # LC_ALL=fr_FR.UTF-8, so this exact locale must resolve or they pass
           # vacuously under a C fallback.
-          locale -a | grep -qiE '^fr_FR\.(UTF-8|utf8)$'
+          # Capture first, then grep: `locale -a | grep -q` exits grep on the
+          # first match, locale then dies on a closed pipe ("failed to flush
+          # stdout") and pipefail turns that into a red job (#379).
+          locales=$(locale -a)
+          grep -qiE '^fr_FR\.(UTF-8|utf8)$' <<<"$locales" || {
+            echo "fr_FR.UTF-8 is not available on this runner image." >&2
+            exit 1
+          }
           locale
 
       - name: Select and run the shell-control-plane test subset
