@@ -183,6 +183,30 @@ printf '%s\n' "$LANE" > "$WT_DIR/.ai-toolkit/lane"
 printf '%s\n' "$MODE" > "$WT_DIR/.ai-toolkit/mode"
 echo "→ lane / mode        $LANE / $MODE"
 
+# Identity record (#360): spoke identity is RECORDED here and read back by the guards
+# through shared/hooks/lib/identity.sh — the env marker, git-dir pattern and branch slug
+# are only its fallbacks. key=value, LF-terminated, no quoting; empty values are allowed
+# (no orca_* means the tmux path). orca_* come from the Orca env when set; run_id is S4's.
+# Written to a sibling temp file then renamed, so a reader never sees a partial record.
+_id_leaf="${BRANCH##*/}"
+_id_type=""
+case "$BRANCH" in */*) _id_type="${BRANCH%%/*}" ;; esac
+IDENTITY_TMP="$(mktemp "$WT_DIR/.ai-toolkit/identity.XXXXXX")"
+{
+  printf 'issue=%s\n' "$ISSUE"
+  printf 'type=%s\n' "$_id_type"
+  printf 'slug=%s\n' "$_id_leaf"
+  printf 'mode=%s\n' "$MODE"
+  printf 'lane=%s\n' "$LANE"
+  printf 'spoke_run_id=%s\n' "$SPOKE_RUN_ID"
+  printf 'orca_worktree_id=%s\n' "${ORCA_WORKTREE_ID:-}"
+  printf 'orca_dispatch_id=%s\n' "${ORCA_DISPATCH_ID:-}"
+  printf 'run_id=\n'
+} > "$IDENTITY_TMP"
+mv -f "$IDENTITY_TMP" "$WT_DIR/.ai-toolkit/identity"
+unset _id_leaf _id_type IDENTITY_TMP
+echo "→ identity record    .ai-toolkit/identity (#$ISSUE)"
+
 # --- write the task contract to disk (issue #177) ----------------------------
 # Anchoring used to be an LLM errand: the seed prompt told the spoke to run
 # /source-task, which shells `gh issue view`. The dispatcher already knows the
