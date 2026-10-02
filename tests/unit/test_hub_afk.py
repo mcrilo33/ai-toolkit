@@ -9936,7 +9936,7 @@ def test_arm_inhibitor_second_arm_does_not_stack(tmp_path: Path) -> None:
         _call("_afk_arm_inhibitor 424242; _afk_arm_inhibitor 424242", env=env)
 
         _wait_lines(log)
-        _wait_lines(log, 2, timeout=0.5)  # a stacked second spawn would log within ms
+        _wait_lines(log, 2, timeout=0.5)  # a stacked second spawn (warm stub) logs within ms
         assert log.read_text().splitlines() == ["-is -w 424242"], (
             "a second arm must not stack a second caffeinate"
         )

@@ -284,6 +284,8 @@ class World:
         )
         for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
             env.pop(k, None)
+        # An inherited warm marker dir would make every stub exit as a no-op (see _WARM_GUARD).
+        env.pop("AFK_SIM_WARM", None)
         # Strip inherited telemetry/OTel env: the harness may run inside a
         # telemetry-on spoke whose OTEL_EXPORTER_OTLP_ENDPOINT points at a shared,
         # busy collector — the drain would inherit it and intermittently block up to
