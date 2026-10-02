@@ -2206,3 +2206,33 @@ def test_subtasks_do_not_glob_against_the_cwd(hub: Path, tmp_path: Path) -> None
     assert proc.returncode != 0, "a glob must be rejected, never silently expanded"
     assert "2*" in proc.stderr + proc.stdout, "the literal value is what gets refused"
     assert not (tmp_path / "afk-state" / "queued-263").exists()
+
+
+def test_spawn_writes_the_launch_prefix_otel_env_into_settings_local(
+    hub: Path, tmp_path: Path
+) -> None:
+    # #359: the OTel env that rides the tmux launch prefix is ALSO written to the worktree's
+    # settings.local.json env block (one source), so a host that never sees the prefix
+    # (Orca) still streams the spoke trace. The tmux prefix itself is unchanged.
+    proc, log = _run_new(
+        hub, tmp_path, "8", "some-slug", "--no-code", extra_env={"AI_TOOLKIT_OTEL": "1"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    cmd = _calls(log.read_text(), "new-window")[0]
+    env = _load_allowlist(_worktree_dir(hub, "8"))["env"]
+    for key in env:
+        assert f"{key}=" in cmd, f"{key} is in the env block but not the launch prefix"
+    assert env["OTEL_RESOURCE_ATTRIBUTES"].startswith("spoke_run_id=feature/8-some-slug+")
+    assert env["OTEL_RESOURCE_ATTRIBUTES"].endswith(",repo=hub-remote")
+    assert env["AI_TOOLKIT_OTEL_BODY_DIR"].endswith("/hub-8/.ai-toolkit/raw-bodies")
+    assert "OTEL_EXPORTER_OTLP_HEADERS" not in env
+
+
+def test_spawn_with_otel_off_writes_no_env_block(hub: Path, tmp_path: Path) -> None:
+    proc, _ = _run_new(
+        hub, tmp_path, "8", "some-slug", "--no-code", extra_env={"AI_TOOLKIT_OTEL": "0"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "env" not in _load_allowlist(_worktree_dir(hub, "8"))

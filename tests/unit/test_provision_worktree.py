@@ -382,7 +382,7 @@ def test_env_merge_is_additive_and_idempotent(hub: Path, wt: Path, stubs: Path) 
     path = wt / ".claude" / "settings.local.json"
     data = json.loads(path.read_text())
     data["env"]["MY_KEY"] = "mine"
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data, indent=2) + "\n")
     before = _snapshot(wt)
 
     result = _run_with_otel(hub, wt, stubs)

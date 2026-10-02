@@ -124,7 +124,13 @@ wt_repo_name() {
   printf '%s' "$name"
 }
 
-wt_native_otel_prefix() {
+# The spoke's native-OTel environment as KEY=VALUE lines — the SINGLE source of the key/value
+# set. wt_native_otel_prefix renders it as the launch-command prefix and
+# wt_native_otel_env_json as the settings.local.json `env` block (provision-worktree.sh,
+# issue #359), so the two can never drift. Prints nothing unless AI_TOOLKIT_OTEL=1. The auth
+# header (OTEL_EXPORTER_OTLP_HEADERS) is NEVER in the set — see the secret note above.
+# Usage: wt_native_otel_env_pairs <spoke_run_id> <body_dir> [repo]
+wt_native_otel_env_pairs() {
   local spoke_run_id="$1" body_dir="$2" repo="${3:-}"
   [ "${AI_TOOLKIT_OTEL:-}" = "1" ] || return 0
   # Default the non-secret endpoints when unset (operator override preserved); the
@@ -141,13 +147,42 @@ wt_native_otel_prefix() {
   if [ -n "$repo" ]; then
     resource="${resource},repo=${repo}"
   fi
-  printf 'CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_EXPORTER_OTLP_ENDPOINT=%s BETA_TRACING_ENDPOINT=%s AI_TOOLKIT_OTEL_SPAN_ENDPOINT=%s OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_LOG_RAW_API_BODIES=%s AI_TOOLKIT_OTEL_BODY_DIR=%s OTEL_RESOURCE_ATTRIBUTES=%s ' \
-    "$(printf '%q' "$OTEL_EXPORTER_OTLP_ENDPOINT")" \
-    "$(printf '%q' "$BETA_TRACING_ENDPOINT")" \
-    "$(printf '%q' "$AI_TOOLKIT_OTEL_SPAN_ENDPOINT")" \
-    "$(printf '%q' "file:${body_dir}")" \
-    "$(printf '%q' "$body_dir")" \
-    "$(printf '%q' "$resource")"
+  printf '%s\n' \
+    "CLAUDE_CODE_ENABLE_TELEMETRY=1" \
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1" \
+    "OTEL_TRACES_EXPORTER=otlp" \
+    "OTEL_METRICS_EXPORTER=otlp" \
+    "OTEL_LOGS_EXPORTER=otlp" \
+    "ENABLE_BETA_TRACING_DETAILED=1" \
+    "OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false" \
+    "OTEL_EXPORTER_OTLP_PROTOCOL=grpc" \
+    "OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}" \
+    "BETA_TRACING_ENDPOINT=${BETA_TRACING_ENDPOINT}" \
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT}" \
+    "OTEL_LOG_USER_PROMPTS=1" \
+    "OTEL_LOG_TOOL_DETAILS=1" \
+    "OTEL_LOG_TOOL_CONTENT=1" \
+    "OTEL_LOG_RAW_API_BODIES=file:${body_dir}" \
+    "AI_TOOLKIT_OTEL_BODY_DIR=${body_dir}" \
+    "OTEL_RESOURCE_ATTRIBUTES=${resource}"
+}
+
+wt_native_otel_prefix() {
+  local pairs line
+  pairs="$(wt_native_otel_env_pairs "$@")" || return $?
+  [ -n "$pairs" ] || return 0
+  while IFS= read -r line; do
+    printf '%s=%q ' "${line%%=*}" "${line#*=}"
+  done <<EOF
+$pairs
+EOF
+}
+
+# The same pairs as one JSON object, for the settings.local.json `env` block. Needs jq.
+# Usage: wt_native_otel_env_json <spoke_run_id> <body_dir> [repo]
+wt_native_otel_env_json() {
+  wt_native_otel_env_pairs "$@" | jq -Rn \
+    'reduce (inputs | select(length > 0)) as $l ({}; .[$l[:($l | index("="))]] = $l[($l | index("=")) + 1:])'
 }
 
 # Resolve the spoke driver's default model + effort (issue #142), layered so it works

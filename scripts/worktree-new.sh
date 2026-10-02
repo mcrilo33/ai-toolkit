@@ -240,6 +240,7 @@ PROVISION_ENV=()
 env ${PROVISION_ENV[@]+"${PROVISION_ENV[@]}"} bash "$SCRIPT_DIR/provision-worktree.sh" \
   --worktree "$WT_DIR" --repo-root "$REPO_ROOT" --issue "$ISSUE" --lane "$LANE" \
   --mode "$MODE" --branch "$BRANCH" --spoke-run-id "$SPOKE_RUN_ID" \
+  --otel-body-dir "$WT_DIR/.ai-toolkit/raw-bodies" --repo-name "$(wt_repo_name "$REPO_ROOT")" \
   || wt_die "provisioning $WT_DIR failed — the worktree is NOT gated; fix the error above, then re-run: bash $SCRIPT_DIR/provision-worktree.sh --worktree $WT_DIR --repo-root $REPO_ROOT --issue $ISSUE --lane $LANE --mode $MODE"
 SPOKE_RUN_ID="$(cat "$WT_DIR/.ai-toolkit/spoke-run-id")"
 

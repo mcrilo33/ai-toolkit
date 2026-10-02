@@ -40,9 +40,12 @@ LANE=""
 MODE=""
 BRANCH=""
 SPOKE_RUN_ID=""
+OTEL_BODY_DIR=""
+REPO_NAME=""
+REPO_NAME_SET=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --worktree|--repo-root|--issue|--lane|--mode|--branch|--spoke-run-id)
+    --worktree|--repo-root|--issue|--lane|--mode|--branch|--spoke-run-id|--otel-body-dir|--repo-name)
       [ "$#" -ge 2 ] || wt_die "$1 needs a value" ;;
   esac
   case "$1" in
@@ -53,6 +56,8 @@ while [ "$#" -gt 0 ]; do
     --mode)         MODE="$2"; shift 2 ;;
     --branch)       BRANCH="$2"; shift 2 ;;
     --spoke-run-id) SPOKE_RUN_ID="$2"; shift 2 ;;
+    --otel-body-dir) OTEL_BODY_DIR="$2"; shift 2 ;;
+    --repo-name)    REPO_NAME="$2"; REPO_NAME_SET=1; shift 2 ;;
     *)              wt_die "unknown argument: $1" ;;
   esac
 done
@@ -460,4 +465,39 @@ else
   wt_warn "settings.local.json exists but jq is missing — add the allow rules yourself:"
   for r in "${ALLOW_RULES[@]}"; do wt_warn "  $r"; done
   wt_warn_deny_rules
+fi
+
+# --- spoke OTel env into settings.local.json (issue #359) ----------------------
+# The native-OTel env otherwise exists only as the tmux launch prefix, which an Orca-created
+# worktree never gets. Write the SAME key/value set (wt_native_otel_env_pairs — one source
+# with the prefix) into the `env` block, ADDITIVELY: keys already in the file win, so a
+# re-run is a no-op and user-curated env survives. The tmux prefix stays too (plan §2 keeps
+# "Claude honours settings.local.json env" an open spike). AI_TOOLKIT_OTEL resolves exactly
+# as worktree-new does (env -> settings/ai-toolkit.yml -> default-on); off writes no block.
+# Secrets never enter: OTEL_EXPORTER_OTLP_HEADERS / Langfuse auth are not in the pair set.
+wt_resolve_telemetry_config "${AI_TOOLKIT_CONFIG:-$REPO_ROOT/settings/ai-toolkit.yml}"
+AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"
+if [ "$AI_TOOLKIT_OTEL" = "1" ]; then
+  # Same derivations as worktree-new.sh: the raw-request body dir lives under the gitignored
+  # .ai-toolkit/ and is created here; repo=<name> is the origin basename (never written empty).
+  [ -n "$OTEL_BODY_DIR" ] || OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
+  mkdir -p "$OTEL_BODY_DIR"
+  [ "$REPO_NAME_SET" -eq 1 ] || REPO_NAME="$(wt_repo_name "$REPO_ROOT")"
+  # The tmux launch prefix still carries the same env, so an unmergeable settings file (jq
+  # missing, malformed or empty JSON) only WARNS — exactly as the allow-rule merge above does —
+  # and never truncates the file.
+  if ! command -v jq >/dev/null 2>&1; then
+    wt_warn "jq is missing — the OTel env block was not written to settings.local.json"
+  else
+    OTEL_ENV_JSON="$(wt_native_otel_env_json "$SPOKE_RUN_ID" "$OTEL_BODY_DIR" "$REPO_NAME")"
+    TMP_SETTINGS="$(mktemp)"
+    if jq --argjson otel "$OTEL_ENV_JSON" '.env = ($otel + (.env // {}))' \
+         "$WT_DIR/.claude/settings.local.json" > "$TMP_SETTINGS" 2>/dev/null && [ -s "$TMP_SETTINGS" ]; then
+      mv "$TMP_SETTINGS" "$WT_DIR/.claude/settings.local.json"
+      echo "→ seeded spoke OTel env (.claude/settings.local.json env)"
+    else
+      rm -f "$TMP_SETTINGS"
+      wt_warn "could not merge the OTel env into settings.local.json (invalid JSON?) — left untouched"
+    fi
+  fi
 fi
