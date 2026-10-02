@@ -8,9 +8,11 @@
 #
 # WHEN IT FIRES
 #   While a gate/<N> tag sits AT the branch tip of the session's worktree, with N
-#   parsed from the branch slug (feature/173-foo → 173). That single condition is
+#   read from the worktree's .ai-toolkit/identity record, else parsed from the branch
+#   slug (feature/173-foo → 173) — see lib/identity.sh. That single condition is
 #   self-limiting: the hub sits on the default branch (slug `main` → no leading
-#   number → no-op), and a gate tag at the tip only exists in a spoke actually
+#   number) and never gets a record (only provision-worktree.sh writes one) → no-op,
+#   and a gate tag at the tip only exists in a spoke actually
 #   parked at its PLAN gate. No WT_SPOKE check is needed.
 #
 # WHAT IT DENIES (only while parked)
