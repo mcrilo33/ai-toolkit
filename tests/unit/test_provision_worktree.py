@@ -28,6 +28,8 @@ for _k in (
     "ORCA_ROOT_PATH",
     "ORCA_WORKTREE_PATH",
     "ORCA_WORKSPACE_NAME",
+    "ORCA_WORKTREE_ID",
+    "ORCA_DISPATCH_ID",
 ):
     _GIT_ENV.pop(_k, None)
 # OTel is default-on in the hub; keep the base fixtures off it so env-block tests opt in.
@@ -588,3 +590,70 @@ def test_cp_fallback_failure_exits_nonzero_and_keeps_the_local_settings(
     assert result.returncode != 0
     assert "copy failed (cp)" in result.stderr
     assert _settings(wt)["permissions"]["allow"][0] == "Bash(custom:*)"
+
+
+# --- .ai-toolkit/identity record (#360, S2a) ------------------------------------
+
+IDENTITY_KEYS = [
+    "issue",
+    "type",
+    "slug",
+    "mode",
+    "lane",
+    "spoke_run_id",
+    "orca_worktree_id",
+    "orca_dispatch_id",
+    "run_id",
+]
+
+
+def _identity(wt: Path) -> dict[str, str]:
+    text = (wt / ".ai-toolkit" / "identity").read_text()
+    assert text.endswith("\n") and "\r" not in text
+    pairs = [line.partition("=") for line in text.splitlines()]
+    assert all(sep == "=" for _, sep, _ in pairs)
+    return {k: v for k, _, v in pairs}
+
+
+def test_identity_record_holds_all_nine_keys_in_order(hub: Path, wt: Path, stubs: Path) -> None:
+    result = _run(wt, stubs, *_explicit(hub, wt, "afk"))
+
+    assert result.returncode == 0, result.stderr
+    record = _identity(wt)
+    assert list(record) == IDENTITY_KEYS
+    assert record["issue"] == "359"
+    assert (record["type"], record["slug"]) == ("feature", "359-extract")
+    assert (record["mode"], record["lane"]) == ("afk", "spoke")
+    assert record["spoke_run_id"] == (wt / ".ai-toolkit" / "spoke-run-id").read_text().strip()
+
+
+def test_identity_record_leaves_absent_orca_ids_and_run_id_empty(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    assert _run(wt, stubs, *_explicit(hub, wt)).returncode == 0
+
+    record = _identity(wt)
+    assert (record["orca_worktree_id"], record["orca_dispatch_id"], record["run_id"]) == ("", "", "")
+
+
+def test_identity_record_takes_orca_ids_from_the_environment(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    env = {**_orca_env(hub, wt), "ORCA_WORKTREE_ID": "wt-42", "ORCA_DISPATCH_ID": "dsp-7"}
+
+    assert _run(wt, stubs, env=env).returncode == 0
+
+    record = _identity(wt)
+    assert (record["orca_worktree_id"], record["orca_dispatch_id"]) == ("wt-42", "dsp-7")
+
+
+def test_identity_record_rewrite_is_byte_identical_and_leaves_no_temp_files(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    assert _run(wt, stubs, *_explicit(hub, wt)).returncode == 0
+    first = (wt / ".ai-toolkit" / "identity").read_bytes()
+
+    assert _run(wt, stubs, *_explicit(hub, wt)).returncode == 0
+
+    assert (wt / ".ai-toolkit" / "identity").read_bytes() == first
+    assert sorted(p.name for p in (wt / ".ai-toolkit").glob("identity*")) == ["identity"]
