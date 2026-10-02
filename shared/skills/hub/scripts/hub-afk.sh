@@ -659,17 +659,6 @@ afk_offline_status() {
   printf '/afk: OFFLINE for %sm — network unreachable, reaping paused (idle clocks refreshed); re-checked each tick\n' "$mins"
 }
 
-# afk_hang_forensics_status -> a one-line summary of the hang-forensics bundles captured before
-# a reaper revival (#243), or nothing when none exist. Like the blocked-locally line, a bundle
-# outlives the drain, so the operator returning from AFK sees where the hang evidence sits.
-afk_hang_forensics_status() {
-  local dir count; dir="$(_afk_hang_forensics_dir)"
-  [ -d "$dir" ] || return 0
-  count="$(find "$dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d '[:space:]')"
-  case "$count" in '' | 0) return 0 ;; esac
-  printf '/afk: hang-forensics: %s bundle(s) captured [%s]\n' "$count" "$dir"
-}
-
 # --- duplicate-lineage detection (issue #252) ---------------------------------
 # The heartbeat records only ONE pid, so a SECOND live supervisor from a fast off/re-arm race is
 # invisible to afk_supervisor_state. _afk_supervisor_pids emits one pid per live supervisor
@@ -725,7 +714,6 @@ _status() {
     # A durable escalation outlives the drain — surface it even when off, so the operator
     # returning from AFK sees a block that never reached the dashboard (#109).
     afk_blocked_locally_status
-    afk_hang_forensics_status   # #243: hang-forensics bundles outlive the drain too
     return 0
   fi
   _afk_status_state_line "$state" "$now"
@@ -736,11 +724,7 @@ _status() {
   # so the operator must be able to see whether it's actually receiving data (#108). A
   # no-op line when telemetry is opted out (AI_TOOLKIT_OTEL=0).
   afk_telemetry_status
-  # ...and the sleep-inhibitor state (#242): while a drain is armed the Mac must not sleep, so
-  # the operator must be able to see whether the inhibitor is actually holding.
-  afk_inhibitor_status
   afk_blocked_locally_status
-  afk_hang_forensics_status   # #243: surface where a reaper revival stashed the hang evidence
 }
 
 main() {
@@ -834,9 +818,6 @@ main() {
     _afk_clear_selfupdate_pending # fresh window ⇒ drop any stale self-update flag (#250)
     _afk_clear_respawn_log   # fresh window ⇒ the crash-loop guard starts with an empty window (#250)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
-    # Power-management caveats the sleep inhibitor cannot cover (#242): loud, once at arm.
-    afk_warn_power          # on battery: the inhibitor holds only on AC, and a lid-close sleeps
-    _afk_warn_no_inhibitor  # non-macOS: no caffeinate — arming proceeds, but sleep is not inhibited
   else
     # No window spec and not --once: a RESUME of the persisted window (a watchdog respawn or
     # a manual re-run). Refuse if a supervisor is ALREADY live — a second one clobbers the
@@ -872,11 +853,6 @@ main() {
     # heal each other: neither is a single silent point of failure (#107). Skipped for
     # --once (a one-shot cron tick must not leave a background keeper behind).
     [ "$once" -eq 0 ] && _afk_spawn_watchdog
-    # Keep the Mac awake for the whole armed window (#242): arm a `caffeinate -is -w $$`
-    # tied to THIS supervisor's lifetime. Idempotent each tick (re-arms a killed caffeinate);
-    # a watchdog respawn re-ties to the new pid. Skipped for --once (no background inhibitor
-    # for a one-shot cron tick, mirroring the watchdog-spawn skip).
-    [ "$once" -eq 0 ] && _afk_arm_inhibitor "$$"
     # A wake (USR1 during the last sleep) runs the targeted announce-driven pass; a full
     # tick (the sleep ran out, or --once) runs the whole sweep. Either way slot_state
     # re-derives, so the two never disagree — a wake is just an early, narrower tick.

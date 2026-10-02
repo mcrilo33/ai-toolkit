@@ -566,14 +566,9 @@ _warn_parked_last() {
 # same-tick reap_pass re-reaps it as idle). Marks the once-per-window revival. rc 1 when the
 # window could not be opened (the caller warns + retries next tick).
 _revive_spoke() {
-  local wt="$1" issue="$2" bundle
+  local wt="$1" issue="$2"
   log "→ revive #$issue: killing any hung/crashed pane and relaunching (claude --continue)"
   _afk_set_last_action "revive #$issue"
-  # #243: capture the hang forensics BEFORE the kill destroys them (a live pane leaves a bundle;
-  # a spoke whose window is already gone echoes nothing and is skipped). Best-effort — a failed
-  # capture never blocks the revive. (Also fires on the over-ceiling revive path; over-capture is
-  # harmless and the fingerprint's silence delta distinguishes a real hang from a merely-slow run.)
-  bundle="$(_afk_capture_hang_forensics "$wt" "$issue")"
   _kill_spoke_window "$issue"
   if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_resume_command "$wt" "$issue")"; then
     log "  could not open a revive window for #$issue"
@@ -583,14 +578,13 @@ _revive_spoke() {
   stamp_progress_epoch "$issue"
   stamp_answer_attempt "$issue"
   # #241 §10: a revival is a taken decision the morning review sees — journal it (a successful
-  # revival is not a loud warned record, just an auditable journal line + span). #243: name the
-  # forensics bundle in the journal line so the morning review can open it.
+  # revival is not a loud warned record, just an auditable journal line + span).
   broker_journal_decision "$issue" revive \
-    "revived a hung/crashed pane (killed + relaunched claude --continue)${bundle:+ — hang forensics: $bundle}" reversible
+    "revived a hung/crashed pane (killed + relaunched claude --continue)" reversible
   # #300 step 3: the drain reviving this spoke is a lifecycle transition — record it.
   _afk_tlog_transition "$wt" "$issue" revived \
     "killed a hung/crashed pane and relaunched claude --continue" \
-    "{\"path\":\"revive\"${bundle:+,\"forensics\":\"$bundle\"}}"
+    '{"path":"revive"}'
   _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
   _afk_clear_park_episode "$wt"          # #231: a fresh run may re-park → count the next block anew
   _afk_emit_span "$wt" afk-revive success
