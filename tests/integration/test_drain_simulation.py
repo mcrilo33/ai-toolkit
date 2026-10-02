@@ -1014,3 +1014,15 @@ def test_scenarios_are_well_formed() -> None:
         if mutation:
             want = mutation.get("expect_violation")
             assert want in INVARIANT_IDS, f"{sid}: mutation targets unknown invariant {want!r}"
+
+
+def test_world_stubs_are_warmed_before_any_tick(tmp_path: Path) -> None:
+    """#374: a freshly written stub's FIRST exec can take seconds under xdist (macOS vets
+    each new executable), and a tick is wall-clock-capped — so a cold tmux/ps stub could
+    burn the cap before the drain reached its recovery. Every stub is exec'd once
+    synchronously at World build, leaving the ticks only ~10ms re-execs."""
+    world = World(root=tmp_path)
+
+    stubs = {f.name for f in world.fake_bin.iterdir()}
+    warmed = {f.name for f in (tmp_path / "warmed").glob("*")}
+    assert stubs and warmed == stubs, f"stubs never warmed: {sorted(stubs - warmed)}"

@@ -9885,6 +9885,17 @@ def _kill_inhibitor(pidfile: Path) -> None:
             return
 
 
+def test_caffeinate_stub_is_warmed_before_the_arm_runs(tmp_path: Path) -> None:
+    # #374: a freshly written script's FIRST exec can take seconds under xdist (macOS vets each
+    # new executable), longer than the arm tests' log poll. The stub is exec'd once
+    # synchronously when built, so the exec the arm backgrounds is a ~10ms re-exec.
+    stub, log = _caffeinate_stub(tmp_path)
+
+    assert (tmp_path / "caffeinate.warm").exists(), "the stub must be exec'd once up front"
+    assert not log.exists(), "the warm-up exec must not look like an arm"
+    assert stub.stat().st_mode & 0o111
+
+
 def test_arm_inhibitor_spawns_one_caffeinate_tied_to_the_pid(tmp_path: Path) -> None:
     # AC1: arming spawns exactly one `caffeinate -is -w <supervisor pid>`, recorded in the
     # pidfile so a later tick can tell it is already armed.
