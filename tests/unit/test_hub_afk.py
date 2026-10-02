@@ -2231,148 +2231,6 @@ def test_decide_and_act_healthy_answer_mentioning_auth_is_not_a_failure(
     assert "human" in result.stderr, result.stderr
 
 
-# ── the --remote launcher (issue #73) ─────────────────────────────────────────
-# `/afk --remote` launches a detached, caffeinate-wrapped `/afk drain` on a configured
-# always-on Mac over SSH (Tailscale hostname), confirms the tmux session started, and
-# prints the reattach command. The remote command is built purely (build_remote_launch_cmd)
-# and ssh is stubbed via AFK_SSH so the orchestration runs without a real host.
-
-
-def _ssh_recorder(tmp_path: Path, log_name: str = "ssh.log", *, exit_code: int = 0) -> Path:
-    """An ssh stub that appends its args to a log and exits with exit_code."""
-    log = tmp_path / log_name
-    stub = tmp_path / "ssh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit {exit_code}\n')
-    stub.chmod(0o755)
-    return stub
-
-
-def test_build_remote_launch_cmd_contains_all_parts() -> None:
-    result = _call("build_remote_launch_cmd '/home/me/ai-toolkit' 'afk' 'bash hub-afk.sh drain'")
-
-    out = result.stdout
-    assert "cd '/home/me/ai-toolkit'" in out
-    assert "tmux new -d -s 'afk'" in out
-    assert "caffeinate -s" in out
-    assert "bash hub-afk.sh drain" in out
-
-
-def test_build_remote_launch_cmd_preserves_drain_args() -> None:
-    # AFK_REMOTE_DRAIN_CMD may carry args/flags; they must reach the remote command
-    # unquoted so the remote shell runs them as separate words, not one mis-quoted arg.
-    result = _call(
-        "build_remote_launch_cmd /repo afk 'claude --dangerously-skip-permissions \"/afk drain\"'"
-    )
-
-    assert 'caffeinate -s claude --dangerously-skip-permissions "/afk drain"' in result.stdout
-
-
-def test_remote_reattach_cmd() -> None:
-    result = _call("remote_reattach_cmd mac-home afk")
-
-    assert result.stdout.strip() == "ssh mac-home -t 'tmux attach -t afk'"
-
-
-def test_remote_launch_requires_host() -> None:
-    env = {"AFK_REMOTE_HOST": "", "AFK_REMOTE_REPO": "/repo", "AFK_REMOTE_CONF": "/nonexistent"}
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode != 0
-    assert "AFK_REMOTE_HOST" in result.stderr
-
-
-def test_remote_launch_requires_repo() -> None:
-    env = {"AFK_REMOTE_HOST": "mac-home", "AFK_REMOTE_REPO": "", "AFK_REMOTE_CONF": "/nonexistent"}
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode != 0
-    assert "AFK_REMOTE_REPO" in result.stderr
-
-
-def test_remote_launch_invokes_ssh_and_prints_reattach(tmp_path: Path) -> None:
-    ssh_stub = _ssh_recorder(tmp_path)
-    env = {
-        "AFK_REMOTE_HOST": "mac-home",
-        "AFK_REMOTE_REPO": "/home/me/ai-toolkit",
-        "AFK_REMOTE_SESSION": "afk",
-        "AFK_SSH": str(ssh_stub),
-        "AFK_REMOTE_CONF": "/nonexistent",
-    }
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode == 0, result.stderr
-    log = (tmp_path / "ssh.log").read_text()
-    assert "mac-home" in log  # launched on the host
-    assert "caffeinate -s" in log  # kept awake for the drain
-    assert "tmux new -d -s" in log
-    # The default launched command runs the supervisor SCRIPT directly (self-driving,
-    # unattended) — NOT an interactive `claude "/afk drain"` that would stall on a prompt.
-    assert "hub-afk.sh drain" in log
-    assert "has-session" in log  # confirmed the session is up
-    assert "ssh mac-home -t 'tmux attach -t afk'" in result.stdout  # reattach hint
-
-
-def test_remote_launch_fails_when_session_absent(tmp_path: Path) -> None:
-    # ssh launch succeeds but the confirm (has-session) fails → non-zero, no false success.
-    ssh_stub = tmp_path / "ssh"
-    ssh_stub.write_text(
-        '#!/usr/bin/env bash\ncase "$*" in *has-session*) exit 1 ;; *) exit 0 ;; esac\n'
-    )
-    ssh_stub.chmod(0o755)
-    env = {
-        "AFK_REMOTE_HOST": "mac-home",
-        "AFK_REMOTE_REPO": "/repo",
-        "AFK_SSH": str(ssh_stub),
-        "AFK_REMOTE_CONF": "/nonexistent",
-    }
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode != 0
-    assert "not found" in result.stderr
-
-
-def test_remote_launch_reads_conf_file_when_env_unset(tmp_path: Path) -> None:
-    conf = tmp_path / "afk-remote"
-    conf.write_text("AFK_REMOTE_HOST=mac-home\nAFK_REMOTE_REPO=/srv/ai-toolkit\n")
-    ssh_stub = _ssh_recorder(tmp_path)
-    env = {
-        "AFK_REMOTE_HOST": "",
-        "AFK_REMOTE_REPO": "",
-        "AFK_SSH": str(ssh_stub),
-        "AFK_REMOTE_CONF": str(conf),
-    }
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode == 0, result.stderr
-    log = (tmp_path / "ssh.log").read_text()
-    assert "mac-home" in log
-    assert "/srv/ai-toolkit" in log
-
-
-def test_remote_launch_env_overrides_conf_file(tmp_path: Path) -> None:
-    conf = tmp_path / "afk-remote"
-    conf.write_text("AFK_REMOTE_HOST=from-file\nAFK_REMOTE_REPO=/from/file\n")
-    ssh_stub = _ssh_recorder(tmp_path)
-    env = {
-        "AFK_REMOTE_HOST": "from-env",
-        "AFK_REMOTE_REPO": "/from/file",
-        "AFK_SSH": str(ssh_stub),
-        "AFK_REMOTE_CONF": str(conf),
-    }
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode == 0, result.stderr
-    log = (tmp_path / "ssh.log").read_text()
-    assert "from-env" in log
-    assert "from-file" not in log
-
-
 # ── in-flight scope exclusion (issue #74, defect 3) ───────────────────────────
 # The supervisor must feed every live spoke's Scope into batch-plan so an overlapping
 # ready issue is held back. A regression on the maiden run co-dispatched two spokes
@@ -4825,7 +4683,7 @@ def test_preflight_exports_resolved_auth_for_spoke_inheritance(tmp_path: Path) -
 
 
 def test_preflight_resolves_auth_from_conf_file(tmp_path: Path) -> None:
-    # Env auth absent but the optional conf file (mirroring ~/.afk-remote) supplies it ⇒
+    # Env auth absent but the optional conf file (~/.afk-telemetry) supplies it ⇒
     # resolve from the file, export it, and arm.
     conf = tmp_path / "afk-telemetry"
     conf.write_text('LANGFUSE_BASIC_AUTH="Basic-from-file"\n')
@@ -4845,8 +4703,8 @@ def test_preflight_resolves_auth_from_conf_file(tmp_path: Path) -> None:
 
 
 def test_preflight_env_auth_wins_over_conf_file(tmp_path: Path) -> None:
-    # An explicit env LANGFUSE_BASIC_AUTH outranks the conf file (same precedence as
-    # _load_remote_conf): the env value is what spokes inherit.
+    # An explicit env LANGFUSE_BASIC_AUTH outranks the conf file: the env value is
+    # what spokes inherit.
     conf = tmp_path / "afk-telemetry"
     conf.write_text('LANGFUSE_BASIC_AUTH="Basic-from-file"\n')
     up_dir = tmp_path / "ports"

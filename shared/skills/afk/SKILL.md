@@ -45,8 +45,8 @@ How the run ends is the argument:
 | `/afk drain` | the backlog is empty **and** nothing is in flight — no clock bound |
 
 Use a clock bound (`<duration>` / `until HH:MM`) when you will be back at a known time.
-Use **`drain`** for a trip: it has no clock and stops only when the work is genuinely done
-(this is the mode remote AFK builds on).
+Use **`drain`** for a long absence: it has no clock and stops only when the work is
+genuinely done.
 
 Plus two control subcommands:
 
@@ -104,35 +104,9 @@ the keeper respawns is never overwritten with broken code, and the drain stays o
 code with a loud warning. Every self-deploy is journaled. `AFK_SELFUPDATE_SCOPE` overrides
 the trigger set.
 
-## Remote AFK (an always-on Mac)
-
-When you are away from the machine that can run the backlog, `/afk --remote` triggers the
-drain on a configured **always-on second Mac** (e.g. one at home) over SSH and returns. It
-runs unattended there on the **same Claude subscription** — no API key, no proxy.
-
-```bash
-# from anywhere (work, travel) — needs AFK_REMOTE_HOST + AFK_REMOTE_REPO configured
-.ai-toolkit/scripts/hub-afk.sh --remote
-```
-
-It SSHes to the host (a Tailscale hostname reaches it across networks), starts a detached,
-`caffeinate`-wrapped `drain` in a named tmux session, confirms the session came up, and
-prints the reattach command. The host is configured by env or a sourced `~/.afk-remote`:
-
-| Variable | Meaning |
-|----------|---------|
-| `AFK_REMOTE_HOST` | the always-on Mac's (Tailscale) hostname — **required** |
-| `AFK_REMOTE_REPO` | the repo path on that host — **required** |
-| `AFK_REMOTE_SESSION` | the detached tmux session name (default `afk`) |
-| `AFK_REMOTE_DRAIN_CMD` | the command run under `caffeinate` (default: the supervisor itself) |
-
-The one-time host setup (subscription `/login`, auto-login + unlocked Keychain, `caffeinate`,
-the Tailscale trigger, and a GitHub-poll fallback) is the runbook in
-[`docs/remote-afk.md`](../../../docs/remote-afk.md).
-
 If the subscription token cannot refresh mid-run, the supervisor blocks the affected spokes
-(`blocked/<issue>`, visible on the dashboard) and **stops** rather than spinning — you fix
-auth (`/login`) on the host and re-trigger.
+(`blocked/<issue>`, visible on the dashboard) and **stops** rather than spinning — see
+[`docs/afk-arm-selfcheck.md`](../../../docs/afk-arm-selfcheck.md) for recovery.
 
 ## Workflow
 
