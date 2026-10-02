@@ -57,6 +57,17 @@ def test_an_acked_gate_reply_emits_a_human_gate_span_with_the_wait(
     assert span["human"] == {"type": "gate", "wait_ms": 600000}
 
 
+def test_an_iso_created_at_still_yields_the_gate_wait(tmp_path: Path, orca_bin: Path) -> None:
+    # Orca's messages carry created_at as ISO-8601 UTC, not epoch milliseconds.
+    wt = _spoke(tmp_path)
+    orca_park(orca_bin, wt, question="plan?", qid="m1")
+
+    _call(f'deliver_reply "{wt}" m1 approved 1970-01-01T00:16:40Z', env=_env(tmp_path))
+
+    (span,) = [s for s in _spans(tmp_path) if s.get("kind") == "human"]
+    assert span["human"] == {"type": "gate", "wait_ms": 0}  # AFK_NOW=1000s == the ask time
+
+
 def test_an_acked_permission_approve_emits_a_human_permission_span(
     tmp_path: Path, orca_bin: Path
 ) -> None:

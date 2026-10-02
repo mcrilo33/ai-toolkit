@@ -726,8 +726,11 @@ def test_slot_state_busy_when_answer_attempt_fresh(spoke_repo: Path, tmp_path: P
     assert result.stdout.strip() == "busy", result.stderr
 
 
-def test_slot_state_reaps_idle_without_answer_attempt(spoke_repo: Path, tmp_path: Path) -> None:
+def test_slot_state_reaps_idle_without_answer_attempt(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # Control for the exclusion above: same 2h-idle transcript, no delivery attempt.
+    orca_park(orca_bin, spoke_repo)
     now = int(time.time())
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
@@ -870,9 +873,12 @@ def test_decide_and_act_stamps_answer_attempt(
     assert (statedir / "answer-attempt-5.epoch").exists()
 
 
-def test_slot_state_reaps_when_progress_also_stale(spoke_repo: Path, tmp_path: Path) -> None:
+def test_slot_state_reaps_when_progress_also_stale(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # Progress DEFERS the ceiling, it never cancels it: once the last progress stamp
     # is itself older than the ceiling, the spoke is reaped.
+    orca_park(orca_bin, spoke_repo)
     now = int(time.time())
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
@@ -898,12 +904,13 @@ def test_slot_state_reaps_when_progress_also_stale(spoke_repo: Path, tmp_path: P
 
 
 def test_slot_state_hard_ceiling_reaps_despite_fresh_progress(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # The absolute backstop: a doom-loop that keeps committing (progress always
     # fresh) is still reaped once dispatch age exceeds
     # AFK_SPOKE_HARD_CEILING_MULT x AFK_SPOKE_MAX_MINUTES — it must not be able to
     # burn a whole drain window (ST3 review).
+    orca_park(orca_bin, spoke_repo)
     now = int(time.time())
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
@@ -1088,6 +1095,9 @@ def test_decide_and_act_gate_park_routes_plan_to_answerer(
     # afk-answering rule text (which also contains "PLAN gate").
     assert "Approve it or state precise amendments" in dumped, (
         "the prompt must route to approve/amend-the-posted-plan"
+    )
+    assert "Begin your ANSWER with APPROVE" in dumped, (
+        "the spoke reads the first word of a gate reply: APPROVE or REVISE"
     )
     assert "restate" in dumped, (
         "the prompt must forbid re-issuing the task (the #124 seed-replay shape)"
@@ -1277,14 +1287,14 @@ def test_decide_and_act_replies_to_the_recorded_question_and_emits_success_span(
     assert span["status"] == "success"
 
 
-def test_decide_and_act_consumes_gate_tag_on_inject(
+def test_decide_and_act_leaves_the_gate_tag_to_the_spoke(
     spoke_repo: Path, stub_env: dict[str, str], orca_bin: Path
 ) -> None:
-    # When the answerer approves a PLAN-gate park and the answer is delivered, the gate/<issue>
-    # tag must be consumed -- otherwise the next tick re-reads it at the tip (the spoke has not
-    # committed its first RED/GREEN yet) and re-answers the same gate.
+    # The spoke is the single writer of its gate tag (spoke-ready.sh --gate consumes it on an
+    # approve), so a delivered reply -- an approve OR a revise -- never deletes it from the hub:
+    # a revise must keep the plan gate shut while the plan is amended.
     subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
-    env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'ANSWER: approved, proceed'"}
+    env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'ANSWER: REVISE: split step 2'"}
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
@@ -1295,7 +1305,7 @@ def test_decide_and_act_consumes_gate_tag_on_inject(
         capture_output=True,
         text=True,
     )
-    assert tag.returncode != 0, "the gate/5 tag must be consumed after a successful inject"
+    assert tag.returncode == 0, "the hub must not consume the spoke's gate tag"
 
 
 def test_decide_and_act_warns_when_answer_is_not_acknowledged(
@@ -4667,6 +4677,17 @@ def test_recover_dead_panes_revives_a_phantom_waiting_exited_worker(
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
 
 
+def orca_scenario_workers(orca_bin: Path, extra_rows: list[dict]) -> str:
+    """Append rows to the scripted worker-list reply (keeps the rest of the parked scenario)."""
+    f = orca_bin / ".orca-stub" / "scenario.json"
+    sc = json.loads(f.read_text())
+    sc["orchestration worker-list"][0]["out"]["result"]["workers"] += extra_rows
+    f.write_text(json.dumps(sc))
+    return "workers: " + ", ".join(
+        r["dispatchId"] for r in sc["orchestration worker-list"][0]["out"]["result"]["workers"]
+    )
+
+
 def _recovery_trail(orca_bin: Path, upto: int | None = None) -> list[str]:
     """The Orca write verbs the drain issued (first `upto` calls), in order, as `<noun> <verb>`."""
     names = [" ".join(argv[:2]) for argv in orca_calls(orca_bin)[:upto]]
@@ -4702,7 +4723,7 @@ def test_recover_dead_panes_missing_worker_record_takes_no_action(
         retry = _call(f"_afk_retry_worker '{spoke}' 5", env=env)
 
         assert result.returncode == 0, result.stderr
-        assert retry.returncode == 0, "an unreadable record is rc 0 with nothing touched"
+        assert retry.returncode == 2, "an unreadable record is rc 2: no action, nothing touched"
         assert _recovery_trail(orca_bin) == [], f"no recovery on an unknown record: {reply}"
         assert not ready_log.exists(), "unknown is never a blocked escalation"
         assert not (statedir / "resumed-5").exists()
@@ -4755,14 +4776,13 @@ def test_recover_dead_panes_retries_an_exited_worker_with_work_in_place(
     assert not ready_log.exists(), "work is retried, never blocked"
 
 
-@pytest.mark.parametrize("liveness", ["live", "unverifiable"])
-def test_afk_retry_worker_stops_a_live_or_unverifiable_worker_before_restarting(
-    tmp_path: Path, orca_bin: Path, liveness: str
+def test_afk_retry_worker_stops_a_live_worker_before_restarting(
+    tmp_path: Path, orca_bin: Path
 ) -> None:
-    # A worker that may still be running is worker-stop'd first: the retry never issues
-    # worker-start while the old dispatch is unfenced (no two live dispatches on one worktree).
+    # A live (hung) worker is worker-stop'd first: the retry never issues worker-start while the
+    # old dispatch is unfenced (no two live dispatches on one worktree).
     spoke = _branched_spoke(tmp_path, ahead=True)
-    orca_park(orca_bin, spoke, liveness=liveness)
+    orca_park(orca_bin, spoke, liveness="live")
     _expr, env, _ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
 
     result = _call(f"_afk_retry_worker '{spoke}' 5", env=env)
@@ -4770,6 +4790,48 @@ def test_afk_retry_worker_stops_a_live_or_unverifiable_worker_before_restarting(
     assert result.returncode == 0, result.stderr
     assert _recovery_trail(orca_bin)[:2] == ["orchestration worker-stop", "terminal create"]
     assert _recovery_trail(orca_bin)[-1] == "orchestration worker-start"
+
+
+def test_afk_retry_worker_takes_no_action_on_an_unverifiable_worker(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # Orca's own recovery guide: an unverifiable worker is never stopped, abandoned or retried.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    orca_park(orca_bin, spoke, liveness="unverifiable")
+    _expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    retry = _call(f"_afk_retry_worker '{spoke}' 5", env=env)
+    revive = _call(f"_revive_spoke '{spoke}' 5", env=env)
+
+    assert retry.returncode == 2, "rc 2 is 'no action on an unknown state'"
+    assert revive.returncode == 0, revive.stderr
+    assert _recovery_trail(orca_bin) == []
+    assert not (statedir / "resumed-5").exists(), "a no-op revive records nothing"
+    assert not ready_log.exists()
+
+
+def test_afk_retry_worker_refuses_a_second_live_dispatch_on_the_worktree(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # After the fence Orca still lists ANOTHER live worker there (an unsettled earlier restart that
+    # did take effect): starting a third would put two live dispatches on one worktree.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    other = {
+        "dispatchId": "ctx_other",
+        "taskId": "task_1",
+        "agentTerminalHandle": "term_other",
+        "resource": {"worktreeId": f"stub-repo::{spoke}"},
+        "projection": {"liveness": {"verdict": "live"}},
+    }
+    orca_park(orca_bin, spoke, liveness="live", dispatch="ctx_old")
+    mine = orca_scenario_workers(orca_bin, [other])
+    _expr, env, _ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    result = _call(f"_afk_retry_worker '{spoke}' 5", env=env)
+
+    assert result.returncode == 1, mine
+    assert "orchestration worker-start" not in _recovery_trail(orca_bin)
+    assert "terminal create" not in _recovery_trail(orca_bin)
 
 
 def test_afk_retry_worker_never_starts_while_the_old_dispatch_is_unfenced(
@@ -4801,7 +4863,8 @@ def test_afk_retry_worker_records_the_new_dispatch_in_the_identity(
 
     assert result.returncode == 0, result.stderr
     lines = identity.read_text().splitlines()
-    assert lines == ["issue=5", "orca_dispatch_id=ctx_stub"], "later reads must match the NEW row"
+    assert "orca_dispatch_id=ctx_stub" in lines, "later reads must match the NEW row"
+    assert "orca_dispatch_id=ctx_old" not in lines
 
 
 def test_recover_dead_panes_redispatches_clean_dead_pane(tmp_path: Path, orca_bin: Path) -> None:
@@ -4956,19 +5019,18 @@ def test_pushed_but_unmarked_false_when_unpushed_work(tmp_path: Path) -> None:
     assert "NO" in result.stdout, "unpushed work is mid-task, not a pushed-but-unmarked finish"
 
 
-def test_recover_dead_panes_skips_done_spoke(tmp_path: Path) -> None:
+def test_recover_dead_panes_skips_done_spoke(tmp_path: Path, orca_bin: Path) -> None:
     # A finished spoke (ready/<N> at the tip) with a dead pane is left for auto_land — never
     # revived or torn down by the dead-pane pass.
     spoke = _branched_spoke(tmp_path, ahead=True)
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke, check=True, capture_output=True)
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+    orca_park(orca_bin, spoke, liveness="exited")
+    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, orca_bin)
 
     _call(expr, env=env)
 
     # A done spoke is skipped before the liveness check: no worker is restarted for it.
-    assert not any(c[:2] == ["orchestration", "worker-start"] for c in orca_calls(fake_bin))
+    assert not any(c[:2] == ["orchestration", "worker-start"] for c in orca_calls(orca_bin))
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
 
 

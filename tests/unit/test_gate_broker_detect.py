@@ -173,10 +173,11 @@ def test_slot_state_task_output_keeps_live_spoke_busy(spoke_repo: Path, tmp_path
 
 
 def test_slot_state_reaps_stale_spoke_without_task_evidence(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # AC2: a live-pane spoke with a stale transcript AND no task evidence still reaps — the
     # new signal must EXTEND the idle reference, never disable the ceiling.
+    orca_park(orca_bin, spoke_repo)
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     jsonl = pd / "session.jsonl"
@@ -249,11 +250,12 @@ def test_slot_state_stale_task_output_does_not_reap_transcriptless_spoke(
 
 
 def test_slot_state_task_output_does_not_lift_hard_ceiling(
-    spoke_repo: Path, tmp_path: Path
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
 ) -> None:
     # AC3: the absolute hard ceiling (#133) is unchanged. A spoke past the hard wall-clock
     # ceiling reaps even with a brand-new task-output write — the signal extends idle, not the
     # ceiling. dispatch is stamped at an early clock, `now` is well past MAX_MINUTES x 3.
+    orca_park(orca_bin, spoke_repo)
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     jsonl = pd / "session.jsonl"
@@ -628,9 +630,12 @@ def test_stamp_park_onset_epoch_once_is_idempotent(tmp_path: Path) -> None:
     assert (statedir / "park-onset-5.epoch").read_text().strip() == "1700000000"
 
 
-def test_slot_state_busy_spoke_clears_park_onset(spoke_repo: Path, tmp_path: Path) -> None:
+def test_slot_state_busy_spoke_clears_park_onset(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
     # A spoke that has moved on (no park signal) must drop a stale onset so a later re-park
     # measures the watchdog ceiling from the NEW onset, not the prior park's.
+    orca_park(orca_bin, spoke_repo)
     statedir = tmp_path / "afk-state"
     statedir.mkdir(parents=True)
     (statedir / "park-onset-5.epoch").write_text("1700000000\n")  # a stale onset
@@ -885,22 +890,6 @@ def test_task_output_mtime_survives_both_stat_flavors(
     )
 
 
-def test_consume_gate_tag_removes_artifact(spoke_repo: Path) -> None:
-    (spoke_repo / ".ai-toolkit").mkdir()
-    artifact = spoke_repo / ".ai-toolkit" / "gate-5.md"
-    artifact.write_text("plan\n")
-    _tag_gate_at_head(spoke_repo, 5)
-
-    result = _call(f"_consume_gate_tag '{spoke_repo}' 5")
-
-    assert result.returncode == 0, result.stderr
-    assert not artifact.exists(), "_consume_gate_tag must remove the plan artifact"
-    tags = subprocess.run(
-        ["git", "tag", "-l", "gate/5"], cwd=spoke_repo, capture_output=True, text=True
-    )
-    assert tags.stdout.strip() == "", "the local gate tag must also be dropped"
-
-
 # ── #304 (#300 step 5): slot_state is a pure read + a RECONCILER ──────────────────────────────
 # Observing a spoke no longer silently stamps the done epoch: the reconciler records the terminal /
 # park state as a VISIBLE `actor:reconciler` transition, and read_done_epoch projects its onset from
@@ -1083,3 +1072,21 @@ def test_note_park_context_re_stamps_the_onset_on_a_signature_change(
     assert onset == "1700009999", (
         f"a changed signature must re-stamp the onset, not keep A's: {onset}"
     )
+
+
+def test_slot_state_holds_a_spoke_with_no_worker_record_busy_never_reap(
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path
+) -> None:
+    # An over-ceiling spoke Orca cannot say anything about (no worker record, so no inbox either)
+    # is unknown, and unknown is never a basis to reap it (AFK principle 6).
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-5.epoch").write_text("1000\n")
+    orca_scenario(orca_bin, {})  # stub defaults: empty worker-list / worktree ps
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "99999999", "AFK_SPOKE_MAX_MINUTES": "1"},
+    )
+
+    assert result.stdout.strip() == "busy", result.stderr

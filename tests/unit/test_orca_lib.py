@@ -709,3 +709,48 @@ def test_inbox_question_without_a_worker_record_is_unknown_not_none(tmp_path: Pa
     )
 
     assert proc.returncode == 2
+
+
+def test_worker_row_without_a_recorded_dispatch_is_the_newest_row_first_in_the_list(
+    tmp_path: Path,
+) -> None:
+    # worker-list is newest first: after a retry the fallback must pick the NEW dispatch, never the
+    # fenced one behind it.
+    wt = _wt(tmp_path)
+    rows = _workers(_worker("ctx_new", wt, "live"), _worker("ctx_old", wt, "exited"))
+
+    proc, _ = _run(
+        tmp_path,
+        f'orca_worker_field "{wt}" .dispatchId',
+        scenario={"orchestration worker-list": [rows]},
+    )
+
+    assert proc.stdout.strip() == "ctx_new"
+
+
+def test_live_count_ignores_the_fenced_dispatch_and_other_worktrees(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+    other = tmp_path / "other"
+    rows = _workers(
+        _worker("ctx_fenced", wt, "live"),
+        _worker("ctx_second", wt, "live"),
+        _worker("ctx_gone", wt, "exited"),
+        _worker("ctx_elsewhere", other, "live"),
+    )
+
+    proc, _ = _run(
+        tmp_path,
+        f'orca_worker_live_count "{wt}" ctx_fenced; orca_worker_live_count "{wt}"',
+        scenario={"orchestration worker-list": [rows]},
+    )
+
+    assert proc.stdout.split() == ["1", "2"]
+
+
+def test_identity_reads_survive_set_e_without_an_identity_file(tmp_path: Path) -> None:
+    # spoke-ready.sh sources this lib under `set -euo pipefail`: a missing record is "", not death.
+    proc, _ = _run(
+        tmp_path, f'set -euo pipefail; x="$(_orca_identity "{tmp_path}/none" issue)"; echo "[$x]"'
+    )
+
+    assert proc.stdout.strip() == "[]"

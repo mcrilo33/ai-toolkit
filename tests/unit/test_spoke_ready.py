@@ -1367,3 +1367,37 @@ def test_no_worker_done_outside_a_spoke_session_or_for_a_packed_subtask(
     _run(spoke, "46", env=_orca_env())
 
     assert _sends(orca_bin) == []
+
+
+def test_a_pending_ask_from_a_previous_dispatch_is_discarded_and_asked_afresh(
+    spoke: Path, orca_bin: Path
+) -> None:
+    _record_dispatch(spoke)  # identity: orca_dispatch_id=ctx_9
+    (spoke / ".ai-toolkit" / "gate-45.ask").write_text("m_old ctx_old\n")
+    _answer(orca_bin, messageId="m_new", answer="Approved.")
+
+    result = _run(spoke, "--gate", "45", "-m", "plan", env=_orca_env())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    (call,) = _ask_calls(orca_bin)
+    assert "--resume" not in call, (
+        "a restarted worker owns a new terminal: the old question is dead"
+    )
+
+
+def test_a_timed_out_ask_is_kept_bound_to_its_dispatch_and_a_failed_one_is_dropped(
+    spoke: Path, orca_bin: Path
+) -> None:
+    from _orca_stub import orca_scenario
+
+    _record_dispatch(spoke)
+    _answer(orca_bin, messageId="m_pending", answer=None, timedOut=True)
+    _run(spoke, "--gate", "45", "-m", "plan", env=_orca_env())
+    kept = (spoke / ".ai-toolkit" / "gate-45.ask").read_text().split()
+    orca_scenario(orca_bin, {"orchestration ask": [{"rc": 1, "out": {"ok": False}}]})
+
+    failed = _run(spoke, "--gate", "45", "-m", "plan", env=_orca_env())
+
+    assert kept == ["m_pending", "ctx_9"]
+    assert failed.returncode == 1
+    assert not (spoke / ".ai-toolkit" / "gate-45.ask").exists()

@@ -172,6 +172,30 @@ def test_deliver_text_silence_is_rc1_and_sends_exactly_once(tmp_path: Path, orca
     assert "--wait-submit" in call
 
 
+def test_deliver_text_refuses_a_worker_orca_reports_exited(tmp_path: Path, orca_bin: Path) -> None:
+    wt = _wt(tmp_path)
+    exited = {**_worker(wt), "projection": {"liveness": {"verdict": "exited"}}}
+    orca_scenario(
+        orca_bin,
+        {"orchestration worker-list": [{"out": {"ok": True, "result": {"workers": [exited]}}}]},
+    )
+
+    result = _call(f'deliver_text "{wt}" hi')
+
+    assert result.returncode == 1
+    assert _sends(orca_bin) == []
+
+
+@pytest.mark.parametrize(
+    ("since", "want"),
+    [("400000", "600000"), ("1970-01-01T00:06:40Z", "600000"), ("nonsense", ""), ("", "")],
+)
+def test_wait_ms_reads_epoch_ms_and_iso_timestamps(since: str, want: str) -> None:
+    result = _call(f'_hi_wait_ms "{since}"', env={"AFK_NOW": "1000"})
+
+    assert result.stdout.strip() == want
+
+
 def test_deliver_text_without_a_recorded_terminal_sends_nothing(
     tmp_path: Path, orca_bin: Path
 ) -> None:
