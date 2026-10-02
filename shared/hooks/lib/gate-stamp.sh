@@ -2,8 +2,9 @@
 # gate-stamp.sh — green-tree stamp storage (issue #122).
 #
 # Since #378 the pre-push gate (test-select.sh) no longer runs or stamps full suites:
-# CI is the gate. What remains here is the storage half that gate-sweep.sh's
-# post-land sweep still writes and reads:
+# CI is the gate. What remains here is the storage half gate-sweep.sh reads and
+# writes. Nothing mints stamps or spawns that sweep any more, so this lib and gate-sweep.sh
+# are inert (outside #378's Scope; a follow-up deletes them):
 #   • KEY: `git rev-parse HEAD^{tree}` — any tracked change (tests included)
 #     yields a new tree, so invalidation is structural, never time-based.
 #   • PLACE: <git-common-dir>/.gate-stamps/<tree> — shared by the hub and every

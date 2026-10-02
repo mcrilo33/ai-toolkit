@@ -470,7 +470,8 @@ git tag -f -a "$TAG" "${MSG_ARGS[@]}"
 # passed) re-pushes without re-running the suite.
 _push_tag() {
   (
-    if [ "$LOCAL_GATE" = "1" ]; then TEST_SELECT_CMD="$(wt_local_gate_cmd)"; export TEST_SELECT_CMD; fi
+    # unset first: an inherited TEST_SELECT_SKIP would make the hook exit 0 without the suite
+    if [ "$LOCAL_GATE" = "1" ]; then unset TEST_SELECT_SKIP; TEST_SELECT_CMD="$(wt_local_gate_cmd)"; export TEST_SELECT_CMD; fi
     wt_git_push -f origin "$TAG"
   )
 }
@@ -485,12 +486,24 @@ if [ -n "$PUSH_LOG" ]; then
   # exit code even if tee itself fails (pipefail would report tee's rc, turning
   # a landed marker into a spurious "rejected").
   _push_tag 2>&1 | tee "$PUSH_LOG" || PUSH_RC="${PIPESTATUS[0]}"
+  # The hook must report running the local gate, else exit 0 proves nothing (disabled hook,
+  # persistent skip config): refuse rather than stamp "ran locally" over it.
+  if [ "$PUSH_RC" -eq 0 ] && [ "$LOCAL_GATE" = "1" ] \
+     && ! grep -q 'running custom suite (TEST_SELECT_CMD)' "$PUSH_LOG"; then
+    echo "spoke-ready: refusing --local-gate — the pre-push hook did not report running the suite (disabled or skipped by config?); the marker is NOT trusted" >&2
+    git push origin ":refs/tags/$TAG" >/dev/null 2>&1 || true
+    git tag -d "$TAG" >/dev/null 2>&1 || true
+    rm -f "$PUSH_LOG"
+    exit 1
+  fi
 else
   echo "spoke-ready: warning — cannot create a capture file under ${TMPDIR:-/tmp}; pushing uncaptured" >&2
   _push_tag || PUSH_RC=$?
 fi
 RETRY_TRANSPORT=0
-if [ "$PUSH_RC" -ne 0 ] \
+# A bare exit 141 is NOT proof the gate passed (a killed gate shares it), so a local-gate
+# marker is never retried on transport shape alone.
+if [ "$PUSH_RC" -ne 0 ] && [ "$LOCAL_GATE" != "1" ] \
    && wt_push_transport_died "$PUSH_RC" "${PUSH_LOG:-/dev/null}" \
    && ! grep -qE '[0-9]+ (failed|error)|Interrupted' "${PUSH_LOG:-/dev/null}" 2>/dev/null; then
   RETRY_TRANSPORT=1
@@ -505,6 +518,9 @@ if [ "$PUSH_RC" -ne 0 ]; then
     fi
   else
     echo "spoke-ready: push of $TAG rejected — the marker did not reach origin" >&2
+    # The hub reads the LOCAL tag: a ready that never passed its gate must not linger in the
+    # shared ref store as if the spoke were landable.
+    [ "$KIND" != "ready" ] || git tag -d "$TAG" >/dev/null 2>&1 || true
     exit "$PUSH_RC"
   fi
 fi

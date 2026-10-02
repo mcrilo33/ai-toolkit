@@ -2356,3 +2356,20 @@ def test_otel_prefix_is_empty_when_otel_is_off() -> None:
 
     assert result.returncode == 0
     assert result.stdout == ""
+
+
+def test_ci_check_sanitizes_garbage_bounds_instead_of_polling_forever(tmp_path: Path) -> None:
+    proc = subprocess.run(
+        ["bash", "-c", f'. "{WT_LIB}"; wt_ci_check abc123 30s'],  # a unit-suffix typo
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env={
+            **os.environ,
+            **_gh_stub(tmp_path, [_ci_run("in_progress", "")]),
+            "WT_CI_POLL": "abc",
+            "WT_CI_NONE_GRACE": "0",
+        },
+    )
+
+    assert proc.returncode == 2  # pending at a sanitized bound of 0: one check, no hang

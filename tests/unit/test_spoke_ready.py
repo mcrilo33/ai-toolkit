@@ -1366,14 +1366,22 @@ def test_ci_gate_does_not_apply_to_the_other_markers(spoke: Path, remote: Path, 
 # --- --local-gate: the offline escape hatch --------------------------------------------
 
 
-def _install_prepush_hook(repo: Path, tmp_path: Path, *, exit_code: int = 0) -> Path:
+def _install_prepush_hook(
+    repo: Path, tmp_path: Path, *, exit_code: int = 0, announce: bool = True
+) -> Path:
     """A pre-push hook recording the TEST_SELECT_CMD it was handed, then exiting `exit_code`."""
     seen = tmp_path / "hook-saw-cmd"
     hooks = Path(_git(repo, "rev-parse", "--git-path", "hooks").strip())
     hooks = hooks if hooks.is_absolute() else repo / hooks
     hooks.mkdir(parents=True, exist_ok=True)
     hook = hooks / "pre-push"
-    hook.write_text(f'#!/bin/sh\ncat >/dev/null\nprintf "%s" "${{TEST_SELECT_CMD-UNSET}}" >> "{seen}"\nexit {exit_code}\n')
+    announce_line = (
+        'echo "test-select: running custom suite (TEST_SELECT_CMD)" >&2' if announce else ":"
+    )
+    hook.write_text(
+        f'#!/bin/sh\ncat >/dev/null\n{announce_line}\n'
+        f'printf "%s" "${{TEST_SELECT_CMD-UNSET}}" >> "{seen}"\nexit {exit_code}\n'
+    )
     hook.chmod(0o755)
     return seen
 
@@ -1462,3 +1470,36 @@ def test_ci_flags_are_usage_errors_when_misapplied(spoke: Path, args: tuple[str,
     result = _run(spoke, *args)
 
     assert result.returncode == 2
+
+
+def test_local_gate_refused_when_the_hook_never_ran_the_suite(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    # A hook that exits 0 without announcing the custom suite (disabled / persistent skip) is
+    # not proof the suite ran: refuse, and leave no marker local or remote.
+    _install_prepush_hook(spoke, tmp_path, announce=False)
+
+    result = _run(spoke, "--local-gate", "45")
+
+    assert result.returncode != 0
+    assert "did not report running the suite" in result.stderr
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+    assert _git(spoke, "tag", "-l", "ready/45").strip() == ""
+
+
+def test_local_gate_ignores_an_inherited_test_select_skip(spoke: Path, tmp_path: Path) -> None:
+    seen = _install_prepush_hook(spoke, tmp_path)
+
+    result = _run(spoke, "--local-gate", "45", env={**_GIT_ENV, "TEST_SELECT_SKIP": "1"})
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '-n auto -m "not serial"' in seen.read_text()
+
+
+def test_a_ready_whose_gate_failed_leaves_no_local_tag(spoke: Path, tmp_path: Path) -> None:
+    _install_prepush_hook(spoke, tmp_path, exit_code=1)
+
+    result = _run(spoke, "--local-gate", "45")
+
+    assert result.returncode != 0
+    assert _git(spoke, "tag", "-l", "ready/45").strip() == ""  # the hub reads local tags

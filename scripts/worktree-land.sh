@@ -67,16 +67,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # if a host ever carried spaces). A crashed holder is broken (dead pid, or a hard age
 # bound as a wedged-alive/pid-reuse backstop); a live holder is waited on and the wait
 # is LOGGED, never silent (fail-loud, Principle 2). Bounds are env-tunable for tests.
-: "${LAND_LOCK_WAIT_MAX:=1200}"        # hard cap (s) to wait before failing loud
-: "${LAND_LOCK_STALE_SECONDS:=1800}"   # break even a live-looking holder past this age (0 disables)
+# The land now holds the lock across CI waits (LAND_CI_WAIT_MAX each, up to LAND_SYNC_ROUNDS
+# of them, #378), so both bounds must outlast a slow CI run or a live holder is aged out.
+: "${LAND_LOCK_WAIT_MAX:=5400}"        # hard cap (s) to wait before failing loud
+: "${LAND_LOCK_STALE_SECONDS:=5400}"   # break even a live-looking holder past this age (0 disables)
 : "${LAND_LOCK_POLL:=2}"               # poll interval (s) between acquire attempts
 : "${LAND_LOCK_PUSH_RETRIES:=1}"       # non-ff push-recovery re-merge+retry attempts (issue #315)
 case "$LAND_LOCK_PUSH_RETRIES" in '' | *[!0-9]*) LAND_LOCK_PUSH_RETRIES=1 ;; esac
 # Sanitize a garbage value to the SAFE default, never to 0 (Principle 2): a STALE_SECONDS
 # silently zeroed would read EVERY live lock as stale and disable the mutex. An EXPLICIT
 # numeric 0 is honored as "no age backstop" (dead-pid break only), handled in _land_lock_stale.
-case "$LAND_LOCK_WAIT_MAX"      in '' | *[!0-9]*) LAND_LOCK_WAIT_MAX=1200 ;; esac
-case "$LAND_LOCK_STALE_SECONDS" in '' | *[!0-9]*) LAND_LOCK_STALE_SECONDS=1800 ;; esac
+case "$LAND_LOCK_WAIT_MAX"      in '' | *[!0-9]*) LAND_LOCK_WAIT_MAX=5400 ;; esac
+case "$LAND_LOCK_STALE_SECONDS" in '' | *[!0-9]*) LAND_LOCK_STALE_SECONDS=5400 ;; esac
 case "$LAND_LOCK_POLL"          in '' | *[!0-9]* | 0) LAND_LOCK_POLL=2 ;; esac
 
 _LAND_LOCK=""   # the lock dir once WE own it — the release guard's ownership witness
@@ -221,6 +223,9 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$TARGET" ] || wt_die "usage: worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--local] [--force-land] [--local-gate] [--test-cmd <cmd>]"
 [ -z "$LOCAL_GATE" ] || [ -z "$TEST_CMD" ] || wt_die "--local-gate and --test-cmd conflict (pick one)"
+# A local gate that is also told to skip tests would report "ran" over a hook that ran nothing.
+[ -z "$SKIP_TESTS" ] || { [ -z "$LOCAL_GATE" ] && [ -z "$TEST_CMD" ]; } \
+  || wt_die "--skip-tests conflicts with --local-gate/--test-cmd (a gate that is skipped proves nothing)"
 # --local-gate is --test-cmd with the canonical full-suite command (issue #378).
 [ -z "$LOCAL_GATE" ] || TEST_CMD="$(wt_local_gate_cmd)"
 
@@ -596,6 +601,7 @@ case "$WT_LAND_CONFLICT_EXIT" in '' | *[!0-9]*) WT_LAND_CONFLICT_EXIT=4 ;; esac
 CI_MODE=""
 [ -n "$LOCAL" ] || [ -n "$TEST_CMD" ] || CI_MODE=1
 AUTO_SKIP=""        # the main push skips the hook: CI already proved this exact SHA
+LOCAL_GATE_UNPROVEN=""
 CI_URL=""
 PRE_SHA="$(git rev-parse HEAD)"
 
@@ -634,23 +640,44 @@ land_require_ci_green() {
   wt_die "$why — nothing landed. Re-run once CI settles, or pass --local-gate to run the suite locally."
 }
 
+# land_move_ready_markers <old> <new> -> re-point every ready/<N> tag at <old> to <new>,
+# keeping its annotation (the force/local-gate audit notes live in the body), and re-push it.
+land_move_ready_markers() {
+  local t msg
+  while IFS= read -r t; do
+    [ "$(git rev-parse -q --verify "refs/tags/$t^{commit}" 2>/dev/null)" = "$1" ] || continue
+    msg="$(git tag -l --format='%(contents)' "$t")"
+    git tag -f -a "$t" -m "$msg" "$2" >/dev/null \
+      && ( export TEST_SELECT_SKIP=1; wt_git_push -f origin "refs/tags/$t" >/dev/null 2>&1 ) \
+      || wt_warn "couldn't move $t to the merged tip ${2:0:9} — re-tag it on the spoke before re-landing"
+  done < <(git for-each-ref --format='%(refname:short)' 'refs/tags/ready/*' 2>/dev/null || true)
+}
+
 # land_sync_with_default -> make the spoke tip contain the default branch. While it does
 # not: merge the default branch INTO the spoke ON THE SPOKE (conflicts are the spoke's to
 # resolve), push the spoke, and wait for CI on the new tip — so the hub's merge is a pure
 # fast-forward of a CI-green SHA (land-resolve-on-spoke-then-FF). Bounded rounds guard a
 # default branch that keeps moving under the land.
 land_sync_with_default() {
-  local round=0 tip
+  local round=0 tip old
   while ! git merge-base --is-ancestor "$DEFAULT" "refs/heads/$WT_BRANCH"; do
     round=$(( round + 1 ))
     [ "$round" -le "${LAND_SYNC_ROUNDS:-3}" ] \
       || wt_die "$DEFAULT kept moving through ${LAND_SYNC_ROUNDS:-3} spoke merges — nothing landed; re-run"
     echo "→ $DEFAULT moved past $WT_BRANCH — merging it into the branch on the spoke, then waiting for CI (round $round)"
+    old="$(git rev-parse "refs/heads/$WT_BRANCH")"
     git -C "$WT_DIR" merge --no-edit "$DEFAULT" || land_merge_conflict "$WT_DIR"
     tip="$(git rev-parse "refs/heads/$WT_BRANCH")"
     # CI is this SHA's gate, so the spoke push skips the hook's fast tier (and its minutes).
-    ( export TEST_SELECT_SKIP=1; cd "$WT_DIR" && wt_git_push origin "$WT_BRANCH" ) \
-      || wt_die "pushing the merged $WT_BRANCH failed — nothing landed; re-run"
+    if ! ( export TEST_SELECT_SKIP=1; cd "$WT_DIR" && wt_git_push origin "$WT_BRANCH" ); then
+      # Undo the unpushed merge so the spoke is exactly what it was (pushed, tip == upstream):
+      # a re-land must not trip the "ahead of upstream" precondition on our own commit.
+      git -C "$WT_DIR" reset --keep "$old" >/dev/null 2>&1 || true
+      wt_die "pushing the merged $WT_BRANCH failed — nothing landed; re-run"
+    fi
+    # The land moved the tip, so the land records it (Principle 1): ready/<N> markers sitting
+    # at the old tip follow it, else a re-land after a CI timeout reads a "stale" marker.
+    land_move_ready_markers "$old" "$tip"
     land_require_ci_green "$tip"
   done
 }
@@ -720,7 +747,8 @@ land_push() {
     if [ -n "$SKIP_TESTS" ] || [ -n "$AUTO_SKIP" ]; then
       export TEST_SELECT_SKIP=1
     fi
-    if [ -n "$TEST_CMD" ]; then export TEST_SELECT_CMD="$TEST_CMD"; fi
+    # An inherited skip would make the hook exit 0 without running the local gate.
+    if [ -n "$TEST_CMD" ]; then unset TEST_SELECT_SKIP; export TEST_SELECT_CMD="$TEST_CMD"; fi
     wt_git_push origin "$DEFAULT"
   )
 }
@@ -794,6 +822,14 @@ if [ "$PUSH_RC" -ne 0 ]; then
     land_rollback "push rejected (pre-push test gate or remote)"
   fi
 fi
+# A local gate is only a gate if the hook really ran it: the installed hook also exits 0 when
+# the toolkit or the test-select hook is disabled or a persistent skip is configured. The
+# land already pushed, so this can only be loud, not roll back — but it must never write
+# "full suite ran" over a hook that ran nothing (Principle 2).
+if [ -n "$TEST_CMD" ] && ! grep -q 'running custom suite (TEST_SELECT_CMD)' "$PUSH_LOG"; then
+  wt_warn "the pre-push hook did not report running the local gate (disabled or skipped by config?) — the suite may NOT have run for this land"
+  LOCAL_GATE_UNPROVEN=1
+fi
 rm -f "$PUSH_LOG"
 
 # What gated this land, for the issue-close comment and the report (computed from the FINAL
@@ -803,7 +839,7 @@ if [ -n "$AUTO_SKIP" ]; then
 elif [ -n "$SKIP_TESTS" ]; then
   SUITE_RESULT="skipped (--skip-tests)"
 elif [ -n "$LOCAL_GATE" ]; then
-  SUITE_RESULT="local full suite via the pre-push hook (--local-gate); CI not consulted"
+  SUITE_RESULT="local full suite via the pre-push hook (--local-gate); CI not consulted${LOCAL_GATE_UNPROVEN:+ — UNVERIFIED: the hook did not report running it}"
 elif [ -n "$TEST_CMD" ]; then
   SUITE_RESULT="via pre-push hook (--test-cmd: $TEST_CMD)"
 else

@@ -130,9 +130,10 @@ To skip that seed, a maintained baseline `.testmondata` lives at
   by hand. An aged baseline only widens testmon's impact set; it never wrong-greens.
 - **Staleness.** testmon keys its `environment` row on `system_packages` +
   `python_version`, so a copied baseline whose `.venv` dep set differs (e.g. after a
-  `requirements-dev.txt` bump) is invalidated automatically — testmon re-runs the
-  full suite. A missing or unreadable baseline likewise degrades to today's
-  full-suite seed. Both paths fail toward *more* testing, never a wrong-green.
+  `requirements-dev.txt` bump) is invalidated automatically — testmon then re-runs the
+  full suite. The fast tier only guards a *missing* database, not an *invalidated* one, so
+  a stale baseline can still make one python push run long locally (it never wrong-greens).
+  Rebuild the baseline after a dependency bump; bounding this automatically is a follow-up.
 
 ## Safe fallbacks
 

@@ -377,8 +377,15 @@ else:
 # pushed SHA has no run for a few seconds, so "none" only becomes final once
 # WT_CI_NONE_GRACE seconds (default 90) have passed.
 wt_ci_check() {
-  local sha="$1" max="${2:-0}" waited=0 told="" poll="${WT_CI_POLL:-15}" grace="${WT_CI_NONE_GRACE:-90}"
-  [ "$poll" -gt 0 ] 2>/dev/null || poll=15
+  local sha="$1" max="${2:-0}" told="" poll="${WT_CI_POLL:-15}" grace="${WT_CI_NONE_GRACE:-90}"
+  local start waited=0
+  # A garbage bound must not turn into a numeric-test error that polls forever (Principle 2):
+  # sanitize to the safe defaults. The bound is WALL-CLOCK (gh's own latency counts), so a
+  # slow `gh run list` cannot stretch the wait past what the caller's tool timeout allows.
+  case "$max" in '' | *[!0-9]*) max=0 ;; esac
+  case "$poll" in '' | *[!0-9]* | 0) poll=15 ;; esac
+  case "$grace" in '' | *[!0-9]*) grace=90 ;; esac
+  start="$(date +%s)"
   while :; do
     IFS='|' read -r WT_CI_STATE WT_CI_URL WT_CI_RUN <<< "$(wt_ci_state "$sha")"
     case "$WT_CI_STATE" in
@@ -392,7 +399,7 @@ wt_ci_check() {
     fi
     [ -n "$told" ] || { echo "→ waiting for CI on ${sha:0:9} (up to ${max}s; ${WT_CI_URL:-run not created yet})" >&2; told=1; }
     sleep "$poll"
-    waited=$(( waited + poll ))
+    waited=$(( $(date +%s) - start ))
   done
 }
 

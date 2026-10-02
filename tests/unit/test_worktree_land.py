@@ -257,6 +257,11 @@ def _install_prepush_stub(hub: Path, *, exit_code: int = 0, env_log: Path | None
     body = "#!/bin/sh\n"
     if env_log is not None:
         body += f'env | grep -E "^TEST_SELECT_" >> "{env_log}" || true\n'
+    # The real hook announces a custom/local gate on stderr; the land trusts that line.
+    body += (
+        '[ -z "${TEST_SELECT_CMD:-}" ] || '
+        'echo "test-select: running custom suite (TEST_SELECT_CMD)" >&2\n'
+    )
     body += f"exit {exit_code}\n"
     hook.write_text(body)
     hook.chmod(0o755)
@@ -2237,3 +2242,104 @@ def test_nonff_push_rejection_in_ci_mode_re_syncs_and_re_checks_ci(
     gh = _log_text(logs["gh"])
     assert f"--commit {tip}" in gh and f"--commit {head}" in gh  # CI re-checked on the new SHA
     assert _log_text(logs["pytest"]) == ""
+
+
+# --- review follow-ups (#378) ----------------------------------------------------------
+
+
+def test_reland_after_a_ci_timeout_on_the_merged_sha_succeeds(hub: Path, tmp_path: Path) -> None:
+    # The land moved the spoke tip (merge of main pushed), so it must move the ready marker
+    # with it — else the re-land reads a "stale marker" and nothing can land the spoke.
+    wt = _make_spoke(hub, tmp_path, "feature/1-reland", push=True, ready=True)
+    tip = _git(wt, "rev-parse", "HEAD").strip()
+    _diverge_hub(hub)
+
+    first, _ = _run_land(hub, tmp_path, "1", ci_green_only_for=tip)  # merged SHA stays pending
+
+    assert first.returncode == 1, first.stderr
+    moved_tip = _git(wt, "rev-parse", "HEAD").strip()
+    assert moved_tip != tip  # the land really pushed a merge onto the spoke
+    # the ready marker followed the tip, locally and on origin
+    assert _git(hub, "rev-parse", "ready/1^{commit}").strip() == moved_tip
+    assert _git(hub, "ls-remote", "origin", "refs/tags/ready/1^{}").split()[0] == moved_tip
+
+    second, _ = _run_land(hub, tmp_path, "1")  # CI has caught up
+
+    assert second.returncode == 0, second.stderr
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+
+
+def test_moved_ready_marker_keeps_its_annotation(hub: Path, tmp_path: Path) -> None:
+    wt = _make_spoke(hub, tmp_path, "feature/1-annot", push=True, ready=False)
+    _git(wt, "tag", "-a", "ready/1", "-m", "ready", "-m", "LOCAL_GATE: audit note")
+    _git(wt, "push", "-q", "origin", "ready/1")
+    tip = _git(wt, "rev-parse", "HEAD").strip()
+    _diverge_hub(hub)
+
+    _run_land(hub, tmp_path, "1", ci_green_only_for=tip)
+
+    assert _git(hub, "tag", "-l", "--format=%(contents:body)", "ready/1").strip() == (
+        "LOCAL_GATE: audit note"
+    )
+    assert _git(hub, "rev-parse", "ready/1^{commit}").strip() != tip  # followed the new tip
+
+
+def test_failed_spoke_push_leaves_the_spoke_as_it_was(hub: Path, tmp_path: Path) -> None:
+    wt = _make_spoke(hub, tmp_path, "feature/1-pushfail", push=True, ready=True)
+    tip = _git(wt, "rev-parse", "HEAD").strip()
+    _diverge_hub(hub)
+    hook = tmp_path / "remote.git" / "hooks" / "pre-receive"
+    hook.write_text(
+        '#!/bin/sh\nwhile read -r _o _n ref; do\n  case "$ref" in refs/heads/feature/*) '
+        'echo "declined" >&2; exit 1 ;; esac\ndone\nexit 0\n'
+    )
+    hook.chmod(0o755)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert _git(wt, "rev-parse", "HEAD").strip() == tip  # the unpushed merge was undone
+    assert _git(wt, "status", "--porcelain").strip() == ""
+
+
+def test_local_gate_the_hook_never_ran_is_flagged_unverified(hub: Path, tmp_path: Path) -> None:
+    # A hook that exits 0 without running the gate (disabled / skip-configured) must not let
+    # the log claim the full suite ran.
+    _make_spoke(hub, tmp_path, "feature/1-mute", push=True, ready=True)
+    hook = hub / ".git" / "hooks" / "pre-push"
+    hook.write_text("#!/bin/sh\nexit 0\n")
+    hook.chmod(0o755)
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--local-gate")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "did not report running the local gate" in proc.stderr
+    assert "UNVERIFIED" in proc.stdout
+
+
+def test_local_gate_ignores_an_inherited_skip(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/1-inherit", push=True, ready=True)
+    seen = tmp_path / "gate-skip.log"
+    hook = hub / ".git" / "hooks" / "pre-push"
+    # Record the skip flag only for the push that carries the local gate command.
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'[ -z "${{TEST_SELECT_CMD:-}}" ] || echo "skip=[${{TEST_SELECT_SKIP:-}}]" >> "{seen}"\n'
+        'echo "test-select: running custom suite (TEST_SELECT_CMD)" >&2\n'
+        "exit 0\n"
+    )
+    hook.chmod(0o755)
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--local-gate", extra_env={"TEST_SELECT_SKIP": "1"})
+
+    assert proc.returncode == 0, proc.stderr
+    assert _log_text(seen).splitlines()[0] == "skip=[]"  # the gate push ran un-skipped
+
+
+def test_skip_tests_conflicts_with_a_local_gate(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/1-skiplg", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--local-gate", "--skip-tests")
+
+    assert proc.returncode != 0
+    assert "--skip-tests conflicts" in proc.stderr
