@@ -32,6 +32,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from _stubs import write_stub
+
 WORKTREE_NEW = Path(__file__).resolve().parents[2] / "scripts" / "worktree-new.sh"
 TELEMETRY_LIB = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "lib" / "telemetry.sh"
 
@@ -163,8 +165,7 @@ def _stub_curl(bin_dir: Path) -> Path:
     bin_dir.mkdir(parents=True, exist_ok=True)
     sentinel = bin_dir / "curl_invoked"
     stub = bin_dir / "curl"
-    stub.write_text(f'#!/usr/bin/env bash\necho called >> "{sentinel}"\ncat >/dev/null 2>&1\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\necho called >> "{sentinel}"\ncat >/dev/null 2>&1\n')
     return sentinel
 
 

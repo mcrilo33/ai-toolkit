@@ -23,6 +23,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 INGEST = Path(__file__).resolve().parents[2] / "scripts" / "telemetry-ingest-spoke.sh"
 SPOKE_RUN_ID = "feature/otel-teardown-ingest+1700000000"
@@ -39,11 +40,11 @@ def _make_python_stub(bindir: Path, runlog: Path, *, exit_code: int = 0) -> None
     """
     bindir.mkdir(parents=True, exist_ok=True)
     stub = bindir / "python3.12"
-    stub.write_text(
+    write_stub(
+        stub,
         f'#!/bin/sh\nprintf "RUN PYTHONPATH=%s %s\\n" "${{PYTHONPATH:-}}" "$*" >> "{runlog}"\n'
-        f"exit {exit_code}\n"
+        f"exit {exit_code}\n",
     )
-    stub.chmod(0o755)
 
 
 def _make_flaky_python_stub(bindir: Path, runlog: Path, *, fail_times: int) -> None:
@@ -56,14 +57,14 @@ def _make_flaky_python_stub(bindir: Path, runlog: Path, *, fail_times: int) -> N
     bindir.mkdir(parents=True, exist_ok=True)
     counter = bindir / "flaky-count"
     stub = bindir / "python3.12"
-    stub.write_text(
+    write_stub(
+        stub,
         "#!/bin/sh\n"
         f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); printf "%s" "$n" > "{counter}"\n'
         f'[ "$n" -le {fail_times} ] && exit 1\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    stub.chmod(0o755)
 
 
 def _make_repo(tmp_path: Path, *, script_dir: str, git: bool = True) -> Path:
@@ -387,8 +388,7 @@ def _make_notify_stub(bindir: Path, alarmlog: Path, *, exit_code: int = 0) -> Pa
     """A notifier stub for AI_TOOLKIT_NOTIFY_CMD that records the message it is handed."""
     bindir.mkdir(parents=True, exist_ok=True)
     stub = bindir / "notify-stub"
-    stub.write_text(f'#!/bin/sh\nprintf "ALARM %s\\n" "$1" >> "{alarmlog}"\nexit {exit_code}\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/bin/sh\nprintf "ALARM %s\\n" "$1" >> "{alarmlog}"\nexit {exit_code}\n')
     return stub
 
 
@@ -488,8 +488,7 @@ def test_alarm_notifies_via_osascript_when_no_notify_cmd_is_set(
     _make_python_stub(bindir, runlog)
     osalog = tmp_path / "osascript-argv"
     osa = bindir / "osascript"
-    osa.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{osalog}"\nexit 0\n')
-    osa.chmod(0o755)
+    write_stub(osa, f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{osalog}"\nexit 0\n')
 
     result = _run(
         worktree,
@@ -515,8 +514,7 @@ def test_alarm_escapes_quotes_for_the_applescript_literal(worktree: Path, tmp_pa
     _make_flaky_python_stub(bindir, runlog, fail_times=99)
     osalog = tmp_path / "osascript-argv"
     osa = bindir / "osascript"
-    osa.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{osalog}"\nexit 0\n')
-    osa.chmod(0o755)
+    write_stub(osa, f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{osalog}"\nexit 0\n')
 
     result = _run(
         worktree,
@@ -539,8 +537,7 @@ def test_alarm_cannot_fail_its_caller_even_under_set_e(tmp_path: Path) -> None:
     alarm_fn = re.search(r"^alarm\(\) \{$.*?^\}$", INGEST.read_text(), re.MULTILINE | re.DOTALL)
     assert alarm_fn, "alarm() not found in telemetry-ingest-spoke.sh"
     failing_notifier = tmp_path / "notifier"
-    failing_notifier.write_text("#!/bin/sh\nexit 42\n")
-    failing_notifier.chmod(0o755)
+    write_stub(failing_notifier, "#!/bin/sh\nexit 42\n")
     harness = "\n".join(
         [
             "set -euo pipefail",

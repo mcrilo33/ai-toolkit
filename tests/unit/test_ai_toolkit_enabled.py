@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 ENABLED_SH = _REPO_ROOT / "shared" / "hooks" / "lib" / "enabled.sh"
@@ -269,10 +270,10 @@ def installed_repo(tmp_path: Path) -> Path:
     scripts = _common_dir(r) / "hooks" / "ai-toolkit-scripts"
     for name, code in [(n, 1) for n in _BLOCKING_STUBS] + [(n, 0) for n in _ADVISORY_STUBS]:
         stub = scripts / f"{name}.sh"
-        stub.write_text(
-            f"#!/usr/bin/env bash\ncat >/dev/null 2>&1 || true\necho RAN-{name} >&2\nexit {code}\n"
+        write_stub(
+            stub,
+            f"#!/usr/bin/env bash\ncat >/dev/null 2>&1 || true\necho RAN-{name} >&2\nexit {code}\n",
         )
-        stub.chmod(0o755)
     return r
 
 
@@ -364,8 +365,7 @@ def _run_utils_probe(repo: Path) -> subprocess.CompletedProcess[str]:
     through (exit 0 at source-time) BEFORE arming telemetry, so the sentinel
     never prints — locking both the guard and the telemetry-off implication."""
     probe = repo / "probe.sh"
-    probe.write_text(f'#!/usr/bin/env bash\nsource "{UTILS}"\necho REACHED_BODY\n')
-    probe.chmod(0o755)
+    write_stub(probe, f'#!/usr/bin/env bash\nsource "{UTILS}"\necho REACHED_BODY\n')
     return subprocess.run(
         ["bash", str(probe)], cwd=str(repo), capture_output=True, text=True, env=_env(repo)
     )
@@ -397,8 +397,7 @@ def test_cc_hook_degrades_to_enabled_when_switch_absent(repo: Path, tmp_path: Pa
     (libdir / "telemetry.sh").write_text((UTILS.parent / "telemetry.sh").read_text())
     # deliberately NO enabled.sh — a pre-#154 install.
     probe = tmp_path / "probe.sh"
-    probe.write_text(f'#!/usr/bin/env bash\nsource "{libdir}/utils.sh"\necho REACHED_BODY\n')
-    probe.chmod(0o755)
+    write_stub(probe, f'#!/usr/bin/env bash\nsource "{libdir}/utils.sh"\necho REACHED_BODY\n')
     _disable(repo)  # marker present, but the switch file is absent, so it can't disable
     result = subprocess.run(
         ["bash", str(probe)], cwd=str(repo), capture_output=True, text=True, env=_env(repo)

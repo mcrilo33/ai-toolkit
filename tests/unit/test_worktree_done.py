@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 WORKTREE_DONE = Path(__file__).resolve().parents[2] / "scripts" / "worktree-done.sh"
 
@@ -91,13 +92,13 @@ def _run_done(
     bindir.mkdir(exist_ok=True)
     log = tmp_path / "code-calls.log"
     code = bindir / "code"
-    code.write_text(
+    write_stub(
+        code,
         "#!/bin/sh\n"
         'if [ -e "$2" ]; then exists=present; else exists=absent; fi\n'
         f'printf "%s %s\\n" "$exists" "$*" >> "{log}"\n'
-        f"exit {code_exit}\n"
+        f"exit {code_exit}\n",
     )
-    code.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     # HOME is sandboxed so the workspace-file default ($HOME/.claude/….code-workspace,
     # issue #134) can never resolve to — let alone rewrite — the host's real file.
@@ -216,12 +217,12 @@ def test_remote_branch_delete_carries_keepalive(hub: Path, tmp_path: Path) -> No
     bindir.mkdir(exist_ok=True)
     log = tmp_path / "push-invocations.log"
     shim = bindir / "git"
-    shim.write_text(
+    write_stub(
+        shim,
         "#!/bin/sh\n"
         f'if [ "$1" = push ]; then echo "GIT_SSH_COMMAND=[$GIT_SSH_COMMAND] $*" >> "{log}"; fi\n'
-        f'exec "{real_git}" "$@"\n'
+        f'exec "{real_git}" "$@"\n',
     )
-    shim.chmod(0o755)
     _make_spoke(hub, tmp_path, "feature/8-keepalive", push=True, merge=True)
 
     proc, _ = _run_done(hub, tmp_path, "8")
@@ -244,12 +245,12 @@ def _fetch_fail_git_shim(tmp_path: Path) -> None:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     shim = bindir / "git"
-    shim.write_text(
+    write_stub(
+        shim,
         "#!/bin/sh\n"
         'if [ "$1" = fetch ]; then echo "fatal: unable to access origin (stubbed)" >&2; exit 128; fi\n'
-        f'exec "{real_git}" "$@"\n'
+        f'exec "{real_git}" "$@"\n',
     )
-    shim.chmod(0o755)
 
 
 def test_remote_delete_skipped_when_fetch_fails(hub: Path, tmp_path: Path) -> None:
@@ -651,7 +652,8 @@ def _leftover_git_shim(tmp_path: Path, leftover_dir: Path) -> None:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     shim = bindir / "git"
-    shim.write_text(
+    write_stub(
+        shim,
         "#!/bin/sh\n"
         'if [ "$1" = worktree ] && [ "$2" = remove ]; then\n'
         f'  "{real_git}" "$@"; rc=$?\n'
@@ -659,9 +661,8 @@ def _leftover_git_shim(tmp_path: Path, leftover_dir: Path) -> None:
         f'  echo runtime-junk > "{leftover_dir}/leftover.txt"\n'
         '  exit "$rc"\n'
         "fi\n"
-        f'exec "{real_git}" "$@"\n'
+        f'exec "{real_git}" "$@"\n',
     )
-    shim.chmod(0o755)
 
 
 def test_done_sweeps_leftover_dir_after_worktree_remove(hub: Path, tmp_path: Path) -> None:
@@ -689,14 +690,14 @@ def test_done_warns_loudly_when_leftover_dir_survives_rm(hub: Path, tmp_path: Pa
     assert real_rm is not None
     bindir = tmp_path / "bin"
     rm_stub = bindir / "rm"
-    rm_stub.write_text(
+    write_stub(
+        rm_stub,
         "#!/bin/sh\n"
         'for a in "$@"; do\n'
         f'  [ "$a" = "{wt}" ] && exit 1\n'
         "done\n"
-        f'exec "{real_rm}" "$@"\n'
+        f'exec "{real_rm}" "$@"\n',
     )
-    rm_stub.chmod(0o755)
 
     proc, _ = _run_done(hub, tmp_path, "9")
 

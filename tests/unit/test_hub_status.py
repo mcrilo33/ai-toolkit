@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 HUB_STATUS = (
     Path(__file__).resolve().parents[2] / "shared" / "skills" / "hub" / "scripts" / "hub-status.sh"
@@ -120,7 +121,7 @@ def _run_hub_status_proc(
     bindir.mkdir(exist_ok=True)
     gh = bindir / "gh"
     if issue_state:
-        gh.write_text(
+        gh_script = (
             "#!/bin/sh\n"
             'if [ "$1" = "issue" ] && [ "$2" = "view" ]; then\n'
             "  printf '%s\\n' \"$HUB_STATUS_TEST_ISSUE_STATE\"\n"
@@ -129,10 +130,11 @@ def _run_hub_status_proc(
             "exit 1\n"
         )
     else:
-        gh.write_text("#!/bin/sh\nexit 1\n")
-    gh.chmod(0o755)
+        gh_script = "#!/bin/sh\nexit 1\n"
+    write_stub(gh, gh_script)
     tmux = bindir / "tmux"
-    tmux.write_text(
+    write_stub(
+        tmux,
         "#!/bin/sh\n"
         '[ "${HUB_STATUS_TEST_TMUX_FAIL:-}" = "1" ] && exit 1\n'
         'case "$1" in\n'
@@ -143,18 +145,17 @@ def _run_hub_status_proc(
         "    printf '%s\\n' \"$HUB_STATUS_TEST_SESSION\"\n"
         "    ;;\n"
         "esac\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    tmux.chmod(0o755)
     lsof = bindir / "lsof"
-    lsof.write_text(
+    write_stub(
+        lsof,
         "#!/bin/sh\n"
         'p=""\n'
         'for a in "$@"; do case "$a" in -iTCP:*) p="${a#-iTCP:}";; esac; done\n'
         'case " ${HUB_STATUS_TEST_LISTENING:-} " in *" $p "*) exit 0;; esac\n'
-        "exit 1\n"
+        "exit 1\n",
     )
-    lsof.chmod(0o755)
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)  # hermetic by default; faked only when inside_tmux
     # The host's base-branch override (#117) must never steer the script under test.
@@ -1014,8 +1015,7 @@ def _batch_plan_stub(tmp_path: Path, *, stdout: str = "", exit_code: int = 0) ->
         # printf the literal fixture verbatim.
         body += "cat <<'SCHED'\n" + stdout + "\nSCHED\n"
     body += f"exit {exit_code}\n"
-    stub.write_text(body)
-    stub.chmod(0o755)
+    write_stub(stub, body)
     return str(stub)
 
 

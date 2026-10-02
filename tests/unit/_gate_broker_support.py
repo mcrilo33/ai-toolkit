@@ -11,6 +11,7 @@ from pathlib import Path
 from shlex import quote as shlex_quote
 
 import pytest
+from _stubs import write_stub
 from bash_session import BashSession, fresh_call
 
 # gate-broker.sh, like hub-afk.sh, targets the macOS control plane (BSD stat / tmux).
@@ -150,7 +151,8 @@ def _write_fake_tmux(
     list_panes = f'printf "afk:1\\t%s\\n" "{pane_path}"' if pane_path else ":"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         "  send-keys)\n"
@@ -161,9 +163,8 @@ def _write_fake_tmux(
         f"  capture-pane) {on_capture} ;;\n"
         f"  list-panes) {list_panes} ;;\n"
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin
 
@@ -256,14 +257,14 @@ def _agent_ps_stub(fake_bin: Path, *, agent_alive: bool = True, pane_pid: int = 
     table += "999 1 /Applications/Other.app/Contents/MacOS/claude\n"
     tbl = fake_bin / "ps_table.txt"
     tbl.write_text(table)
-    (fake_bin / "ps").write_text(
+    write_stub(
+        fake_bin / "ps",
         "#!/usr/bin/env bash\n"
         'case "$*" in\n'
         f'  "-eo pid=,ppid=,comm=") cat "{tbl}" ;;\n'
         '  *) exec /bin/ps "$@" ;;\n'
-        "esac\n"
+        "esac\n",
     )
-    (fake_bin / "ps").chmod(0o755)
 
 
 def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path, *, agent_alive: bool = True) -> Path:
@@ -295,7 +296,8 @@ def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path, *, agent_alive: bool 
         '"text":open(os.environ[chr(95)+"AFK_PASTE"]).read()}]}},ensure_ascii=False))'
         "'"
     )
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'case "$1" in\n'
@@ -309,9 +311,8 @@ def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path, *, agent_alive: bool 
         f'                  : > "{paste}"\n'
         f'                else printf "{{}}\\n" >> "{jsonl}"; fi ;;\n'
         "    esac ;;\n"
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return log
 
@@ -366,7 +367,8 @@ def _install_fake_claude(fake_bin: Path, decision: str) -> None:
             "message": {"content": [{"type": "text", "text": "reasoning about the gate"}]},
         }
     )
-    (fake_bin / "claude").write_text(
+    write_stub(
+        fake_bin / "claude",
         "#!/usr/bin/env bash\n"
         "persist=1\n"
         'for a in "$@"; do [ "$a" = "--no-session-persistence" ] && persist=0; done\n'
@@ -379,11 +381,9 @@ def _install_fake_claude(fake_bin: Path, decision: str) -> None:
         '  mkdir -p "$base/$slug"\n'
         f"  printf '%s\\n' '{reasoner_record}' > \"$base/$slug/reasoner-transcript.jsonl\"\n"
         "fi\n"
-        f"printf '%s' '{decision}'\n"
+        f"printf '%s' '{decision}'\n",
     )
-    (fake_bin / "claude").chmod(0o755)
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
 
 
 # ── issue #271: a FAILED gate emission must not latch a phantom park ───────────
@@ -558,12 +558,10 @@ def _gate_broker_env(spoke_repo: Path, tmp_path: Path, *, prompt_log: Path) -> d
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
 
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text("#!/usr/bin/env bash\ntrue\n")
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, "#!/usr/bin/env bash\ntrue\n")
 
     return {
         "CLAUDE_PROJECTS_DIR": str(projects),
@@ -688,14 +686,14 @@ _SMOKE_COMPOUND = "chmod +x scripts/dev/afk-gate-smoke.sh && ./scripts/dev/afk-g
 def _fake_tmux_capture(fake_bin: Path, wt: Path, pane_text: str) -> None:
     """A tmux stub whose capture-pane prints <pane_text> and whose list-panes maps the
     pane to <wt>, so _pane_shows_permission_prompt observes exactly that pane content."""
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  capture-pane) printf "%s\\n" {shlex_quote(pane_text)} ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" {shlex_quote(str(wt))} ;;\n'
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
 
 
 def _resolved_only_transcript(pd: Path) -> None:
@@ -737,7 +735,8 @@ def _perm_env(tmp_path: Path, spoke_repo: Path, command: str, answerer: str) -> 
     keylog = tmp_path / "keys.log"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         "  send-keys)\n"
@@ -746,19 +745,16 @@ def _perm_env(tmp_path: Path, spoke_repo: Path, command: str, answerer: str) -> 
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
     statedir = tmp_path / "sd"
     statedir.mkdir(exist_ok=True)
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     gh = fake_bin / "gh"
-    gh.write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    gh.chmod(0o755)
+    write_stub(gh, '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
     return {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",

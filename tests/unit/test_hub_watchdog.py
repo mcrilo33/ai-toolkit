@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from _gate_broker_support import _project_dir_for, _resumed_gate_transcript
+from _stubs import write_stub
 
 # hub-watchdog.sh cross-checks the macOS afk hub (kill -0, BSD tooling) like its siblings.
 pytestmark = pytest.mark.skipif(
@@ -320,8 +321,7 @@ def test_arm_refuses_when_a_live_daemon_generation_is_unmeasurable(tmp_path: Pat
     pidfile = tmp_path / "wd.pid"
     marker = tmp_path / "relaunched"
     stub = tmp_path / "stub.sh"
-    stub.write_text(f'#!/usr/bin/env bash\ntouch "{marker}"\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\ntouch "{marker}"\n')
     parts = [
         f'export HUB_WATCHDOG_PIDFILE="{pidfile}"',
         f'export HUB_WATCHDOG_GENFILE="{tmp_path / "absent.gen"}"',
@@ -342,8 +342,7 @@ def test_arm_recycles_a_live_daemon_running_a_stale_generation(tmp_path: Path) -
     genfile = tmp_path / "wd.gen"
     marker = tmp_path / "relaunched"
     stub = tmp_path / "stub.sh"
-    stub.write_text(f'#!/usr/bin/env bash\ntouch "{marker}"\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\ntouch "{marker}"\n')
     parts = [
         f'export HUB_WATCHDOG_PIDFILE="{pidfile}"',
         f'export HUB_WATCHDOG_GENFILE="{genfile}"',
@@ -2583,8 +2582,7 @@ def test_revive_budget_marker_records_the_spawned_run(tmp_path: Path) -> None:
     bindir.mkdir()
     claude_pid = tmp_path / "claude-pid"
     fake = bindir / "claude"
-    fake.write_text(f'#!/usr/bin/env bash\nprintf "%s" "$$" > "{claude_pid}"\n')
-    fake.chmod(0o755)
+    write_stub(fake, f'#!/usr/bin/env bash\nprintf "%s" "$$" > "{claude_pid}"\n')
     env = _dead_pane_env(tmp_path, PATH=f"{bindir}:{os.environ['PATH']}")
 
     _call(f"_wd_intervene_revive '{wt}' 284", env=env)
@@ -2676,8 +2674,7 @@ def test_intervene_revive_keeps_its_budget_when_the_worktree_is_gone(tmp_path: P
     bindir = tmp_path / "bin"
     bindir.mkdir()
     fake = bindir / "claude"
-    fake.write_text("#!/usr/bin/env bash\ntrue\n")
-    fake.chmod(0o755)
+    write_stub(fake, "#!/usr/bin/env bash\ntrue\n")
     env = _dead_pane_env(tmp_path, PATH=f"{bindir}:{os.environ['PATH']}")
 
     _call(f"_wd_intervene_revive '{tmp_path / 'no-such-worktree'}' 284", env=env)

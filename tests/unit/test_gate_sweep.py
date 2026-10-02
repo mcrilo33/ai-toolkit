@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 GATE_SWEEP = Path(__file__).resolve().parents[2] / "scripts" / "gate-sweep.sh"
 
@@ -118,12 +119,10 @@ def _run_sweep(
     bindir.mkdir(exist_ok=True)
     gh_log = tmp_path / "gh-calls.log"
     gh = bindir / "gh"
-    gh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{gh_log}"\nexit {gh_exit}\n')
-    gh.chmod(0o755)
+    write_stub(gh, f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{gh_log}"\nexit {gh_exit}\n')
     if budget_watch is None:
         budget_watch = tmp_path / "budget-watch-noop.sh"
-        budget_watch.write_text("#!/usr/bin/env bash\nexit 0\n")
-        budget_watch.chmod(0o755)
+        write_stub(budget_watch, "#!/usr/bin/env bash\nexit 0\n")
     env = {
         **_GIT_ENV,
         "PATH": f"{bindir}:{os.environ['PATH']}",
@@ -521,8 +520,7 @@ def _run_sweep_real_runner(
     bindir.mkdir(exist_ok=True)
     gh_log = tmp_path / "gh-calls.log"
     gh = bindir / "gh"
-    gh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{gh_log}"\nexit 0\n')
-    gh.chmod(0o755)
+    write_stub(gh, f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{gh_log}"\nexit 0\n')
     drain_body = (
         (
             "git commit --allow-empty -q -m 'drain lands another spoke'\n"
@@ -536,14 +534,14 @@ def _run_sweep_real_runner(
         else ""
     )
     pytest_stub = bindir / "pytest"
-    pytest_stub.write_text(
+    write_stub(
+        pytest_stub,
         "#!/bin/sh\n"
         'case "$1" in --help|-h) echo "usage: pytest"; exit 0 ;; '
         '--version|-V) echo "pytest 9.9"; exit 0 ;; esac\n'
         f"{drain_body}"
-        f"exit {suite_exit}\n"
+        f"exit {suite_exit}\n",
     )
-    pytest_stub.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     proc = subprocess.run(
         ["bash", str(GATE_SWEEP), *args],
@@ -601,14 +599,14 @@ def test_run_suite_parallelizes_the_full_sweep(repo: Path, tmp_path: Path) -> No
     bindir.mkdir()
     argv_log = tmp_path / "argv.log"
     pytest_stub = bindir / "pytest"
-    pytest_stub.write_text(
+    write_stub(
+        pytest_stub,
         "#!/bin/sh\n"
         'case "$1" in --help|-h) echo "usage: pytest"; echo "  -n numprocesses"; exit 0 ;; '
         '--version|-V) echo "pytest 9.9"; exit 0 ;; esac\n'
         f'printf "%s\\n" "$*" >> "{argv_log}"\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    pytest_stub.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
 
     subprocess.run(
@@ -633,14 +631,14 @@ def test_run_suite_runs_two_phase_serial_split(repo: Path, tmp_path: Path) -> No
     bindir.mkdir()
     argv_log = tmp_path / "argv.log"
     pytest_stub = bindir / "pytest"
-    pytest_stub.write_text(
+    write_stub(
+        pytest_stub,
         "#!/bin/sh\n"
         'case "$1" in --help|-h) echo "usage: pytest"; echo "  -n numprocesses"; exit 0 ;; '
         '--version|-V) echo "pytest 9.9"; exit 0 ;; esac\n'
         f'printf "%s\\n" "$*" >> "{argv_log}"\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    pytest_stub.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
 
     subprocess.run(
@@ -763,11 +761,11 @@ def _run_sweep_with_rm_shim(
     bindir.mkdir(exist_ok=True)
     gh_log = tmp_path / "gh-calls.log"
     gh = bindir / "gh"
-    gh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{gh_log}"\nexit 0\n')
-    gh.chmod(0o755)
+    write_stub(gh, f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{gh_log}"\nexit 0\n')
     sentinel = tmp_path / "rm-injected"
     rm = bindir / "rm"
-    rm.write_text(
+    write_stub(
+        rm,
         "#!/bin/sh\n"
         'if [ -n "$RM_INJECT_SENTINEL" ] && [ ! -e "$RM_INJECT_SENTINEL" ]; then\n'
         '  for arg in "$@"; do\n'
@@ -779,9 +777,8 @@ def _run_sweep_with_rm_shim(
         "    esac\n"
         "  done\n"
         "fi\n"
-        'exec /bin/rm "$@"\n'
+        'exec /bin/rm "$@"\n',
     )
-    rm.chmod(0o755)
     env = {
         **_GIT_ENV,
         "PATH": f"{bindir}:{os.environ['PATH']}",
@@ -893,8 +890,7 @@ def test_sweep_hands_capture_to_budget_watch(repo: Path, tmp_path: Path) -> None
     runner_log = tmp_path / "runner.log"
     cap_seen = tmp_path / "cap-seen.txt"
     watch = tmp_path / "watch.sh"
-    watch.write_text(f'#!/usr/bin/env bash\ncat "$1" >> "{cap_seen}" 2>/dev/null || true\n')
-    watch.chmod(0o755)
+    write_stub(watch, f'#!/usr/bin/env bash\ncat "$1" >> "{cap_seen}" 2>/dev/null || true\n')
 
     proc, _ = _run_sweep(
         repo,
@@ -915,8 +911,7 @@ def test_budget_watch_failure_does_not_fail_sweep(repo: Path, tmp_path: Path) ->
     _mint(repo, "testmon")
     runner_log = tmp_path / "runner.log"
     watch = tmp_path / "watch.sh"
-    watch.write_text("#!/usr/bin/env bash\nexit 7\n")
-    watch.chmod(0o755)
+    write_stub(watch, "#!/usr/bin/env bash\nexit 7\n")
 
     proc, _ = _run_sweep(
         repo, tmp_path, "--run", _head(repo), cmd=_runner_cmd(runner_log), budget_watch=watch

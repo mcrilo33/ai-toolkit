@@ -32,6 +32,7 @@ from _gate_broker_support import (
     _run_hook,
     _tool_result_record,
 )
+from _stubs import write_stub
 
 
 @pytest.fixture(autouse=True)
@@ -464,16 +465,16 @@ def test_decide_permission_classifies_the_whole_long_command(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     tmux_log = fake_bin / "tmux.log"
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{tmux_log}"\n'
         'case "$1" in\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
     statedir = tmp_path / "sd"
     statedir.mkdir()
@@ -963,16 +964,16 @@ def _break_the_keypress(spoke_repo: Path, tmp_path: Path, env: dict[str, str]) -
     keystroke, but whose Enter never advances the transcript — approve_permission's exact
     "sent it, could not confirm it landed" failure (it verifies the mtime moved, nothing more)."""
     tmux = tmp_path / "bin" / "tmux"
-    tmux.write_text(
+    write_stub(
+        tmux,
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  send-keys) printf "%s\\n" "$*" >> "{env["_KEYLOG"]}" ;;\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    tmux.chmod(0o755)
     _agent_ps_stub(tmux.parent)
 
 

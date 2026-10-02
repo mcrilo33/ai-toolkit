@@ -30,6 +30,7 @@ from _gate_broker_support import (
     _tag_gate_at_head,
     _write_transcript,
 )
+from _stubs import write_stub
 
 
 def _dead_agent_bin(tmp_path: Path, spoke_repo: Path, *, capture: str = "") -> Path:
@@ -40,15 +41,15 @@ def _dead_agent_bin(tmp_path: Path, spoke_repo: Path, *, capture: str = "") -> P
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  capture-pane) printf "%s\\n" "{capture}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin, agent_alive=False)  # the pane pid has no claude descendant
     return fake_bin
 
@@ -606,14 +607,14 @@ def test_slot_state_permission_park_beats_ceiling(spoke_repo: Path, tmp_path: Pa
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     statedir = tmp_path / "sd"
     statedir.mkdir()
     (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over the ceiling
@@ -641,8 +642,7 @@ def test_broker_service_gate_injects_despite_reasoner_transcript(
     tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, Path(reasoner_env["_SPOKE_JSONL"]))
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         **reasoner_env,
         "SPOKE_READY": str(ready_stub),
@@ -676,20 +676,19 @@ def test_decide_permission_logs_escalate_verdict(spoke_repo: Path, tmp_path: Pat
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     statedir = tmp_path / "sd"
     statedir.mkdir()
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -924,14 +923,14 @@ def test_slot_state_gate_parked_live_agent_stays_waiting(spoke_repo: Path, tmp_p
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin, agent_alive=True)
 
     result = _call(
@@ -1040,8 +1039,7 @@ def test_inject_verify_default_budget_is_60(spoke_repo: Path, tmp_path: Path) ->
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     sleeps = fake_bin / "sleeps.log"
-    (fake_bin / "sleep").write_text(f'#!/usr/bin/env bash\necho x >> "{sleeps}"\nexit 0\n')
-    (fake_bin / "sleep").chmod(0o755)
+    write_stub(fake_bin / "sleep", f'#!/usr/bin/env bash\necho x >> "{sleeps}"\nexit 0\n')
 
     result = _call(
         f"_transcript_advanced '{spoke_repo}' 1000000000; echo RC=$?",
@@ -1215,8 +1213,7 @@ def _stat_stub_path(tmp_path: Path, stub_body: str) -> str:
     bindir = tmp_path / "stat-stub-bin"
     bindir.mkdir(exist_ok=True)
     stub = bindir / "stat"
-    stub.write_text(stub_body)
-    stub.chmod(0o755)
+    write_stub(stub, stub_body)
     return f"{bindir}:{os.environ['PATH']}"
 
 

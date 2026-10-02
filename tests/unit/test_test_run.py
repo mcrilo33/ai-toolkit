@@ -28,6 +28,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 TEST_RUN = Path(__file__).resolve().parents[2] / "scripts" / "test-run.sh"
 
@@ -73,8 +74,7 @@ def project(tmp_path: Path) -> Path:
     # dropped to simulate a fresh checkout that lost it.
     exec_sh = repo / "scripts" / "exec.sh"
     exec_sh.parent.mkdir(parents=True)
-    exec_sh.write_text("#!/usr/bin/env bash\necho hi\n")
-    exec_sh.chmod(0o755)
+    write_stub(exec_sh, "#!/usr/bin/env bash\necho hi\n")
     _git(repo, "add", "scripts/exec.sh")
 
     # A tracked sourced library: committed 100644, must stay non-executable.
@@ -85,8 +85,7 @@ def project(tmp_path: Path) -> Path:
     # A tracked-100755 script whose path has a space — its restore loop is the one
     # that word-split and aborted the wrapper before the NUL-delimited read fix.
     spaced_sh = repo / "scripts" / "has space.sh"
-    spaced_sh.write_text("#!/usr/bin/env bash\necho spaced\n")
-    spaced_sh.chmod(0o755)
+    write_stub(spaced_sh, "#!/usr/bin/env bash\necho spaced\n")
     _git(repo, "add", "scripts/has space.sh")
 
     # A trivial passing test so real pytest exits 0 fast.

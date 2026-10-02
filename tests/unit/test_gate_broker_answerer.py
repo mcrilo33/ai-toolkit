@@ -27,6 +27,7 @@ from _gate_broker_support import (
     _result_event,
     _tag_gate_at_head,
 )
+from _stubs import write_stub
 
 
 @pytest.fixture(autouse=True)
@@ -222,8 +223,7 @@ def test_reasoner_runs_in_isolated_copy_not_live_tree(spoke_repo: Path, tmp_path
     # A write to cwd + a read of a committed file prove both halves.
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
     real = subprocess.run(
         ["bash", "-c", f"cd '{spoke_repo}' && pwd -P"], capture_output=True, text=True
     ).stdout.strip()
@@ -373,11 +373,9 @@ def test_broker_service_gate_voids_commit_escape_on_gate_parked_spoke(
     _tag_gate_at_head(spoke_repo, 5)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{tmp_path}/ready.log"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{tmp_path}/ready.log"\n')
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "SPOKE_READY": str(ready_stub),
@@ -845,8 +843,7 @@ def test_snapshot_isolates_linked_worktree_refs_from_shared_gitdir(
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
     result = _call(
         f"run_answerer 5 'q' '{wt}'",
         env={
@@ -945,8 +942,7 @@ def test_snapshot_falls_back_to_copy_when_private_gitdir_fails(
     wt = linked_spoke_repo
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
     real = subprocess.run(
         ["bash", "-c", f"cd '{wt}' && pwd -P"], capture_output=True, text=True
     ).stdout.strip()
@@ -971,8 +967,7 @@ def test_snapshot_falls_back_to_copy_when_private_gitdir_fails(
 def test_reasoner_prompt_has_readonly_posture_and_evidence(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
 
     result = _call(
         "build_answerer_prompt 5 'Which store?' '/some/worktree'",
@@ -1082,7 +1077,8 @@ def test_decide_permission_logs_auto_approve(spoke_repo: Path, tmp_path: Path) -
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     tmux_log = fake_bin / "tmux.log"
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{tmux_log}"\n'
         'case "$1" in\n'
@@ -1090,9 +1086,8 @@ def test_decide_permission_logs_auto_approve(spoke_repo: Path, tmp_path: Path) -
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
         f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
     statedir = tmp_path / "sd"
     statedir.mkdir()
@@ -1178,8 +1173,7 @@ def test_run_answerer_delegates_to_shared_timeout(spoke_repo: Path, tmp_path: Pa
     # seconds it was handed and runs the command, proving both the delegation and the budget.
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
 
     result = _call(
         '_afk_with_timeout() { echo "BOUND=$1"; shift; "$@"; }; run_answerer 5 \'q\'',
@@ -1237,8 +1231,7 @@ def test_run_answerer_standalone_fallback_bounds_a_slow_answerer(
     # killed before it prints, and run_answerer returns nonzero (→ no decision → escalate).
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
 
     result = _call(
         "run_answerer 5 'q'; echo RC=$?",
@@ -1272,12 +1265,10 @@ def test_broker_service_gate_drops_escalation_when_spoke_moves_on(
     os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the reasoner write advances it
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -1403,8 +1394,7 @@ def test_broker_journal_decision_posts_issue_comment(tmp_path: Path) -> None:
     bindir.mkdir()
     gh_log = tmp_path / "gh.log"
     gh = bindir / "gh"
-    gh.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "' + str(gh_log) + '"\n')
-    gh.chmod(0o755)
+    write_stub(gh, '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "' + str(gh_log) + '"\n')
     env = {
         "AFK_STATE_DIR": str(statedir),
         "PATH": f"{bindir}:{os.environ['PATH']}",
@@ -1905,8 +1895,7 @@ def test_answerer_prompt_carries_the_ship_contract(tmp_path: Path) -> None:
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
 
     result = _call(
         "build_answerer_prompt 5 'Should I push my feature branch and emit the ready marker?'",
@@ -1924,8 +1913,7 @@ def test_answerer_prompt_carries_the_ship_contract(tmp_path: Path) -> None:
 def test_answerer_prompt_instructs_answer_only(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
 
     out = _call(
         "build_answerer_prompt 5 'Which store?' '/some/worktree'",
@@ -2079,22 +2067,21 @@ def test_permission_approve_delivery_failure_warns_not_blocks(
     os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pinned mtime: no Enter-append -> no advance
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"  # send-keys is a no-op: the transcript never advances -> delivery fails
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
     statedir = tmp_path / "sd"
     statedir.mkdir()
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -2286,9 +2273,9 @@ def test_permission_approve_journals_before_inject(spoke_repo: Path, tmp_path: P
     (pd / "session.jsonl").write_text(json.dumps(_bash_tool_record("npm run deploy")) + "\n")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
-    (fake_bin / "tmux").write_text(
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         "  send-keys)\n"
@@ -2296,14 +2283,12 @@ def test_permission_approve_journals_before_inject(spoke_repo: Path, tmp_path: P
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -2428,8 +2413,7 @@ def test_success_answer_routine_journals_file_only(
     os.utime(jsonl, (1_000_000_000, 1_000_000_000))
     _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     gh_log = tmp_path / "gh.log"
-    (fake_bin / "gh").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{gh_log}"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{gh_log}"\n')
     env = {
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: reversible\\nANSWER: use Redis'",
@@ -2465,22 +2449,20 @@ def test_ceiling_mechanical_approve_is_paced_not_every_tick(
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
-    (fake_bin / "tmux").write_text(
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  send-keys) case "$*" in *" 1") printf "1\\n" >> "{keylog}" ;; esac ;;\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"  # the approve never advances the transcript → the dialog re-appears
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text("#!/usr/bin/env bash\n:\n")
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, "#!/usr/bin/env bash\n:\n")
     base = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -2549,16 +2531,16 @@ def test_permission_deny_delivery_failure_journaled_distinctly(
     )
     fake_bin = Path(env["PATH"].split(":", 1)[0])
     # Rewrite tmux so send-keys never advances the transcript -> the redirect inject FAILS.
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  send-keys) printf "%s\\n" "$*" >> "{env["_KEYLOG"]}" ;;\n'
         f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
     jsonl = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo) / "session.jsonl"
     os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # no external advance masks the failure
@@ -2689,14 +2671,12 @@ def _fastpath_env(
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text("#!/usr/bin/env bash\ncat <<'GHBODY'\n" + body + "\nGHBODY\n")
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", "#!/usr/bin/env bash\ncat <<'GHBODY'\n" + body + "\nGHBODY\n")
     tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
 
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
@@ -2848,14 +2828,14 @@ def test_broker_service_gate_fastpath_inject_failure_falls_through(
         extra={"AFK_INJECT_MENU_PAUSE": "0", "AFK_INJECT_VERIFY_SECONDS": "0"},
     )
     fake_bin = tmp_path / "bin"
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"  # never advances the transcript -> verify fails
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)

@@ -26,6 +26,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 WORKTREE_NEW = SCRIPTS / "worktree-new.sh"
@@ -319,13 +320,11 @@ class TestWorktreeLandSpoke:
         bindir.mkdir(exist_ok=True)
         for name in ("gh", "code"):
             stub = bindir / name
-            stub.write_text("#!/bin/sh\nexit 0\n")
-            stub.chmod(0o755)
+            write_stub(stub, "#!/bin/sh\nexit 0\n")
         env = _tele_env(telemetry_dir)
         env["PATH"] = f"{bindir}:{os.environ['PATH']}"
         suite = bindir / "suite"
-        suite.write_text("#!/bin/sh\nexit 0\n")
-        suite.chmod(0o755)
+        write_stub(suite, "#!/bin/sh\nexit 0\n")
 
         res = _run(WORKTREE_LAND, hub, env, "9", "--skip-tests")
 
@@ -388,8 +387,7 @@ class TestWorktreeScriptSpans:
         bindir.mkdir(exist_ok=True)
         for name in ("gh", "code"):
             stub = bindir / name
-            stub.write_text("#!/bin/sh\nexit 0\n")
-            stub.chmod(0o755)
+            write_stub(stub, "#!/bin/sh\nexit 0\n")
         env = _tele_env(telemetry_dir)
         env["PATH"] = f"{bindir}:{os.environ['PATH']}"
 

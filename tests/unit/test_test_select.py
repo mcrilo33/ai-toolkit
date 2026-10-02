@@ -21,6 +21,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 TEST_SELECT = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "test-select.sh"
 ZERO_SHA = "0" * 40
@@ -90,7 +91,8 @@ def _make_pytest_stub(
     bindir.mkdir(parents=True, exist_ok=True)
     testmon_line = '  echo "  --testmon  select impacted tests"' if testmon else ":"
     xdist_line = '  echo "  -n numprocesses, --numprocesses=numprocesses"' if xdist else ":"
-    (bindir / "pytest").write_text(
+    write_stub(
+        bindir / "pytest",
         "#!/bin/sh\n"
         'case "$1" in\n'
         "  --help|-h)\n"
@@ -104,9 +106,8 @@ def _make_pytest_stub(
         "esac\n"
         f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         f'printf "GITDIR=[%s]\\n" "${{GIT_DIR-UNSET}}" >> "{runlog}"\n'
-        f"exit {exit_code}\n"
+        f"exit {exit_code}\n",
     )
-    (bindir / "pytest").chmod(0o755)
 
 
 def _make_python_module_stub(bindir: Path, runlog: Path, *, testmon: bool) -> None:
@@ -119,7 +120,8 @@ def _make_python_module_stub(bindir: Path, runlog: Path, *, testmon: bool) -> No
     """
     bindir.mkdir(parents=True, exist_ok=True)
     testmon_line = 'echo "  --testmon  select impacted tests"' if testmon else ":"
-    (bindir / "python3").write_text(
+    write_stub(
+        bindir / "python3",
         "#!/bin/sh\n"
         'if [ "$1" = "-c" ]; then exit 0; fi\n'  # `import pytest` succeeds
         'if [ "$1" = "-m" ] && [ "$2" = "pytest" ]; then\n'
@@ -132,9 +134,8 @@ def _make_python_module_stub(bindir: Path, runlog: Path, *, testmon: bool) -> No
         f'  printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         "  exit 0\n"
         "fi\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    (bindir / "python3").chmod(0o755)
 
 
 def _make_testmon_modeling_stub(bindir: Path, runlog: Path, *, impact: list[str]) -> None:
@@ -156,7 +157,8 @@ def _make_testmon_modeling_stub(bindir: Path, runlog: Path, *, impact: list[str]
     """
     bindir.mkdir(parents=True, exist_ok=True)
     impact_words = " ".join(impact)
-    (bindir / "pytest").write_text(
+    write_stub(
+        bindir / "pytest",
         "#!/bin/sh\n"
         'case "$1" in\n'
         '  --help|-h) echo "usage: pytest"; echo "  --testmon"; '
@@ -186,9 +188,8 @@ def _make_testmon_modeling_stub(bindir: Path, runlog: Path, *, impact: list[str]
         "  done\n"
         '  [ "$ran" = "1" ] || exit 5\n'  # no tests collected after --ignore
         "fi\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    (bindir / "pytest").chmod(0o755)
 
 
 def _run_select(
@@ -361,7 +362,8 @@ def test_full_tier_serial_leg_no_tests_is_green(repo: Path, tmp_path: Path) -> N
     # invocation exits 0.
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    (bindir / "pytest").write_text(
+    write_stub(
+        bindir / "pytest",
         "#!/bin/sh\n"
         'case "$1" in\n'
         '  --help|-h) echo "usage: pytest"; echo "  --testmon"; '
@@ -375,9 +377,8 @@ def test_full_tier_serial_leg_no_tests_is_green(repo: Path, tmp_path: Path) -> N
         '  [ "$a" = "not serial" ] && is_not=1\n'
         "done\n"
         '[ "$is_serial" = "1" ] && [ "$is_not" = "0" ] && exit 5\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    (bindir / "pytest").chmod(0o755)
 
     proc = _run_select(repo, _stdin(tip, base), bindir)
 
@@ -579,8 +580,7 @@ def _make_no_pytest_sandbox(tmp_path: Path) -> Path:
     os.symlink(git_bin, sandbox / "git")  # git stays reachable
     for py in ("python3", "python"):  # but `import pytest` always fails
         stub = sandbox / py
-        stub.write_text("#!/bin/sh\nexit 1\n")
-        stub.chmod(0o755)
+        write_stub(stub, "#!/bin/sh\nexit 1\n")
     return sandbox
 
 

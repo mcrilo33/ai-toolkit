@@ -36,6 +36,7 @@ from _gate_broker_support import (
     _write_fake_tmux,
     _write_transcript,
 )
+from _stubs import write_stub
 
 
 @pytest.fixture(autouse=True)
@@ -498,8 +499,7 @@ def test_inject_and_verify_degrades_to_advance_when_scan_unavailable(
         on_enter=f'[ -e "{pasted}" ] && printf "{{}}\\n" >> "{jsonl}"',
         on_capture=f'[ -e "{pasted}" ] && echo "> {answer}"',
     )
-    (fake_bin / "python3").write_text("#!/usr/bin/env bash\nexit 7\n")
-    (fake_bin / "python3").chmod(0o755)
+    write_stub(fake_bin / "python3", "#!/usr/bin/env bash\nexit 7\n")
 
     result = _call(
         f"inject_and_verify '{spoke_repo}' afk:1 \"$ANSWER\"; echo RC=$?",
@@ -544,8 +544,7 @@ def test_present_qcm_injects_reviewer_reply(spoke_repo: Path, tmp_path: Path) ->
     statedir.mkdir()
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -584,8 +583,7 @@ def test_present_qcm_injects_reply_without_trailing_newline(
     statedir.mkdir()
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -615,8 +613,7 @@ def test_present_qcm_empty_reply_defers_to_block(spoke_repo: Path, tmp_path: Pat
     statedir.mkdir()
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -644,15 +641,13 @@ def test_broker_service_gate_attended_presents_qcm_on_human_decision(
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
     tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     statedir = tmp_path / "sd"
     statedir.mkdir()
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -719,12 +714,10 @@ _MOVED_ON = "_still_parked_same() { return 1; }; _spoke_still_parked() { return 
 
 def _retire_gate_env(spoke_repo: Path, tmp_path: Path, projects: Path) -> dict[str, str]:
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text("#!/usr/bin/env bash\ntrue\n")
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, "#!/usr/bin/env bash\ntrue\n")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text("#!/usr/bin/env bash\ntrue\n")
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", "#!/usr/bin/env bash\ntrue\n")
     return {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "SPOKE_READY": str(ready_stub),

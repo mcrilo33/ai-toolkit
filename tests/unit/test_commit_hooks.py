@@ -25,6 +25,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 HOOKS_DIR = Path(__file__).resolve().parents[2] / "shared" / "hooks"
 COMMIT_QUALITY = HOOKS_DIR / "commit-quality.sh"
@@ -1126,8 +1127,7 @@ def _fake_tsc(repo: Path, output: str) -> None:
     bin_dir = repo / "node_modules" / ".bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     fake = bin_dir / "tsc"
-    fake.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(output)}\nexit 1\n")
-    fake.chmod(0o755)
+    write_stub(fake, f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(output)}\nexit 1\n")
 
 
 class TestStrictGauntlet:

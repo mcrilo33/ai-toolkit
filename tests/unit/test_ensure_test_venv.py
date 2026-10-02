@@ -29,6 +29,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 ENSURE = Path(__file__).resolve().parents[2] / "scripts" / "ensure-test-venv.sh"
 
@@ -50,10 +51,12 @@ def _write_shims(shim_dir: Path, log: Path, *, venv_fails: bool = False) -> None
     """A PATH shim providing a fake `python3` whose `-m venv` installs venv stubs."""
     shim_dir.mkdir(parents=True, exist_ok=True)
     # venv python: `import testmon, xdist` (any `-c`) passes iff the .plugins_ok marker is present.
-    (shim_dir / "venv_python").write_text(
+    write_stub(
+        shim_dir / "venv_python",
         "#!/usr/bin/env bash\n"
         'd="$(cd "$(dirname "$0")/.." && pwd)"\n'
-        '[ -f "$d/.plugins_ok" ] && exit 0 || exit 1\n'
+        '[ -f "$d/.plugins_ok" ] && exit 0 || exit 1\n',
+        warm=False,  # a template: only copied into the venv, never exec'd from here
     )
     # venv pip: record argv, then model pip's REAL --system-site-packages behavior on the host
     # class #342 targets (host already has a satisfying pytest). Any install makes the plugins
@@ -61,12 +64,14 @@ def _write_shims(shim_dir: Path, log: Path, *, venv_fails: bool = False) -> None
     # generate the venv's bin/pytest console script — only a --force-reinstall of pytest
     # materializes it (verified: `pip install --force-reinstall --no-deps pytest` creates the
     # entrypoint where a bare `-r requirements-dev.txt` does not).
-    (shim_dir / "venv_pip").write_text(
+    write_stub(
+        shim_dir / "venv_pip",
         "#!/usr/bin/env bash\n"
         'd="$(cd "$(dirname "$0")/.." && pwd)"\n'
         f'printf "pip %s\\n" "$*" >> "{log}"\n'
         'touch "$d/.plugins_ok"\n'
-        'case "$*" in *--force-reinstall*) touch "$d/bin/pytest"; chmod +x "$d/bin/pytest";; esac\n'
+        'case "$*" in *--force-reinstall*) touch "$d/bin/pytest"; chmod +x "$d/bin/pytest";; esac\n',
+        warm=False,  # a template: only copied into the venv, never exec'd from here
     )
     if venv_fails:
         py_body = "#!/usr/bin/env bash\nexit 1\n"
@@ -84,9 +89,7 @@ def _write_shims(shim_dir: Path, log: Path, *, venv_fails: bool = False) -> None
             "fi\n"
             "exit 0\n"
         )
-    (shim_dir / "python3").write_text(py_body)
-    for f in ("python3", "venv_python", "venv_pip"):
-        (shim_dir / f).chmod(0o755)
+    write_stub(shim_dir / "python3", py_body)
 
 
 def _seed_venv(root: Path, shim_dir: Path, *, plugins_ok: bool) -> None:
@@ -95,10 +98,8 @@ def _seed_venv(root: Path, shim_dir: Path, *, plugins_ok: bool) -> None:
     bindir.mkdir(parents=True)
     for name, stub in (("python", "venv_python"), ("pip", "venv_pip")):
         dst = bindir / name
-        dst.write_text((shim_dir / stub).read_text())
-        dst.chmod(0o755)
-    (bindir / "pytest").write_text("#!/usr/bin/env bash\nexit 0\n")
-    (bindir / "pytest").chmod(0o755)
+        write_stub(dst, (shim_dir / stub).read_text())
+    write_stub(bindir / "pytest", "#!/usr/bin/env bash\nexit 0\n")
     if plugins_ok:
         (root / ".venv" / ".plugins_ok").touch()
 

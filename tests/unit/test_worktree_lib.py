@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 WT_LIB = Path(__file__).resolve().parents[2] / "scripts" / "worktree-lib.sh"
 
@@ -165,12 +166,12 @@ def test_bridge_launch_forwards_required_env_to_child(tmp_path: Path) -> None:
     bindir.mkdir()
     dump = tmp_path / "child-env.txt"
     stub = bindir / "python3"
-    stub.write_text(
+    write_stub(
+        stub,
         "#!/bin/sh\n"
         '{ echo "LANGFUSE_BASIC_AUTH=$LANGFUSE_BASIC_AUTH"; '
-        'echo "BRIDGE_PORT=$BRIDGE_PORT"; } > "$STUB_ENV_DUMP"\n'
+        'echo "BRIDGE_PORT=$BRIDGE_PORT"; } > "$STUB_ENV_DUMP"\n',
     )
-    stub.chmod(0o755)
     env = {
         **os.environ,
         "PATH": f"{bindir}:{os.environ['PATH']}",
@@ -196,8 +197,7 @@ def _bridge_launch_host(tmp_path: Path, expr: str) -> str:
     bindir.mkdir()
     dump = tmp_path / "child-host.txt"
     stub = bindir / "python3"
-    stub.write_text('#!/bin/sh\necho "LANGFUSE_HOST=$LANGFUSE_HOST" > "$STUB_ENV_DUMP"\n')
-    stub.chmod(0o755)
+    write_stub(stub, '#!/bin/sh\necho "LANGFUSE_HOST=$LANGFUSE_HOST" > "$STUB_ENV_DUMP"\n')
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "STUB_ENV_DUMP": str(dump)}
     subprocess.run(["bash", "-c", f'source "{WT_LIB}"; {expr}'], env=env, check=True)
     deadline = time.monotonic() + 5.0
@@ -260,8 +260,7 @@ def _call_with_stat_stub(
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     stub = bindir / "stat"
-    stub.write_text(stub_body)
-    stub.chmod(0o755)
+    write_stub(stub, stub_body)
     return subprocess.run(
         ["bash", "-c", f'source "{WT_LIB}"; wt_bridge_source_mtime "{root}"'],
         capture_output=True,
@@ -470,11 +469,9 @@ def test_bridge_pid_resolves_via_lsof_not_pgrep(tmp_path: Path) -> None:
     bindir.mkdir()
     pgrep_marker = tmp_path / "pgrep-called.txt"
     lsof = bindir / "lsof"
-    lsof.write_text("#!/bin/sh\necho 9999\n")
-    lsof.chmod(0o755)
+    write_stub(lsof, "#!/bin/sh\necho 9999\n")
     pgrep = bindir / "pgrep"
-    pgrep.write_text(f'#!/bin/sh\necho called > "{pgrep_marker}"\n')
-    pgrep.chmod(0o755)
+    write_stub(pgrep, f'#!/bin/sh\necho called > "{pgrep_marker}"\n')
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
 
     result = subprocess.run(
@@ -713,14 +710,14 @@ def test_collector_launch_publishes_four_ports_and_unquoted_auth(tmp_path: Path)
     bindir.mkdir()
     dump = tmp_path / "docker-invocation.txt"
     stub = bindir / "docker"
-    stub.write_text(
+    write_stub(
+        stub,
         "#!/bin/sh\n"
         '{ echo "ARGV=$*"; '
         'echo "LANGFUSE_BASIC_AUTH=[$LANGFUSE_BASIC_AUTH]"; '
         'echo "LANGFUSE_OTLP_ENDPOINT=$LANGFUSE_OTLP_ENDPOINT"; '
-        'echo "BRIDGE_OTLP_ENDPOINT=$BRIDGE_OTLP_ENDPOINT"; } > "$STUB_DOCKER_DUMP"\n'
+        'echo "BRIDGE_OTLP_ENDPOINT=$BRIDGE_OTLP_ENDPOINT"; } > "$STUB_DOCKER_DUMP"\n',
     )
-    stub.chmod(0o755)
     env = {
         **os.environ,
         "PATH": f"{bindir}:{os.environ['PATH']}",
@@ -1041,11 +1038,11 @@ def test_git_push_injects_keepalive_and_passes_args_through(tmp_path: Path) -> N
     bindir.mkdir()
     dump = tmp_path / "git-invocation.txt"
     stub = bindir / "git"
-    stub.write_text(
+    write_stub(
+        stub,
         "#!/bin/sh\n"
-        '{ echo "ARGV=$*"; echo "GIT_SSH_COMMAND=$GIT_SSH_COMMAND"; } > "$STUB_GIT_DUMP"\n'
+        '{ echo "ARGV=$*"; echo "GIT_SSH_COMMAND=$GIT_SSH_COMMAND"; } > "$STUB_GIT_DUMP"\n',
     )
-    stub.chmod(0o755)
     env = {
         **os.environ,
         "PATH": f"{bindir}:{os.environ['PATH']}",
@@ -1073,8 +1070,7 @@ def test_git_push_keepalive_does_not_leak_into_caller_env(tmp_path: Path) -> Non
     bindir = tmp_path / "bin"
     bindir.mkdir()
     stub = bindir / "git"
-    stub.write_text("#!/bin/sh\nexit 0\n")
-    stub.chmod(0o755)
+    write_stub(stub, "#!/bin/sh\nexit 0\n")
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "TZ": "UTC"}
     env.pop("GIT_SSH_COMMAND", None)
 
@@ -1733,14 +1729,12 @@ def _gh_lib_call(
     log = tmp_path / "gh-calls.log"
     if with_gh:
         gh = bindir / "gh"
-        gh.write_text(_GH_STUB)
-        gh.chmod(0o755)
+        write_stub(gh, _GH_STUB)
     if with_timeout:
         # A `timeout` stub that records it wrapped the call, then execs the rest
         # (dropping the duration arg) so the wrapped `gh` still runs and logs.
         tstub = bindir / "timeout"
-        tstub.write_text('#!/bin/sh\nprintf "timeout %s\\n" "$1" >> "$GH_LOG"\nshift\nexec "$@"\n')
-        tstub.chmod(0o755)
+        write_stub(tstub, '#!/bin/sh\nprintf "timeout %s\\n" "$1" >> "$GH_LOG"\nshift\nexec "$@"\n')
     env = {**os.environ, "TZ": "UTC", "GH_LOG": str(log), "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("AI_TOOLKIT_GH_LIFECYCLE_LABELS", None)
     env.pop("GH_RC", None)
@@ -1931,8 +1925,7 @@ def test_gh_bounds_a_hung_gh_without_coreutils_timeout(tmp_path: Path) -> None:
     # (1) BOUNDED: a hung gh is killed FAR under its own 30s hang. A load-insensitive
     # UPPER bound — the kill lands at the ~2s budget; a wt_gh that failed to bound would
     # take the full 30s. No lower-bound/marker assertion here, so nothing races the killer.
-    gh.write_text('#!/bin/sh\nprintf start >> "$MARK"\nsleep 30\n')
-    gh.chmod(0o755)
+    write_stub(gh, '#!/bin/sh\nprintf start >> "$MARK"\nsleep 30\n')
     proc, elapsed = _run_wt_gh("2", tmp_path / "hung")
 
     assert proc.returncode == 0, proc.stderr
@@ -1944,8 +1937,7 @@ def test_gh_bounds_a_hung_gh_without_coreutils_timeout(tmp_path: Path) -> None:
     # (2) INVOKED: a FAST gh (no hang) completes long before the 30s budget's killer could
     # fire, so its marker is written RACE-FREE regardless of scheduling latency — proving
     # wt_gh actually runs gh (never short-circuits) without betting on winning a race.
-    gh.write_text('#!/bin/sh\nprintf start >> "$MARK"\n')
-    gh.chmod(0o755)
+    write_stub(gh, '#!/bin/sh\nprintf start >> "$MARK"\n')
     fast_mark = tmp_path / "fast"
     proc, _ = _run_wt_gh("30", fast_mark)
 

@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_OTEL_WATCH = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-otel-watch.sh"
@@ -561,11 +562,11 @@ _ARM_HOST_VARS = (
 def _write_arm_stub(path: Path, record: Path) -> None:
     """A hub-otel-watch.sh stand-in that records its argv and the env it saw."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    write_stub(
+        path,
         "#!/usr/bin/env bash\n"
-        f'printf "%s|%s|%s\\n" "$*" "${{AI_TOOLKIT_OTEL:-}}" "${{LANGFUSE_BASIC_AUTH:-}}" > "{record}"\n'
+        f'printf "%s|%s|%s\\n" "$*" "${{AI_TOOLKIT_OTEL:-}}" "${{LANGFUSE_BASIC_AUTH:-}}" > "{record}"\n',
     )
-    path.chmod(0o755)
 
 
 def _call_arm(body: str) -> subprocess.CompletedProcess[str]:

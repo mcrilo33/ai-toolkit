@@ -30,6 +30,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BATCH_PLAN = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.sh"
@@ -1033,13 +1034,13 @@ def test_main_fetches_via_gh_and_prints_batch(tmp_path: Path) -> None:
     gh = bindir / "gh"
     # `gh repo view` → owner/name; `gh api graphql` → the issues node array (what
     # fetch_issues extracts with --jq). The fake ignores --jq and just emits it.
-    gh.write_text(
+    write_stub(
+        gh,
         "#!/bin/sh\n"
         'if [ "$1" = "repo" ] && [ "$2" = "view" ]; then echo "octo ai-toolkit"; exit 0; fi\n'
         'if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then cat "$PAYLOAD"; exit 0; fi\n'
-        "exit 1\n"
+        "exit 1\n",
     )
-    gh.chmod(0o755)
     (tmp_path / "payload.json").write_text(payload)
     env = {
         **os.environ,

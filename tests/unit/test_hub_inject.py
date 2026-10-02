@@ -25,6 +25,7 @@ import pytest
 # the bash SOURCE is standalone here (that is what this suite exists to prove), not the
 # python fixtures.
 from _gate_broker_support import _DISPLAY_CASE, _PANE_PID, _agent_ps_stub
+from _stubs import write_stub
 
 # hub-inject.sh reads transcript mtimes/sizes with BSD `stat -f` and drives the macOS tmux
 # hub, exactly like its parent hub-afk.sh — so the suite is macOS-only for the same reason.
@@ -64,15 +65,15 @@ def _recording_tmux(tmp_path: Path, *, agent_alive: bool = True) -> tuple[Path, 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     log = tmp_path / "tmux.log"
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'case "$1" in\n'
         f"{_DISPLAY_CASE}"
         "esac\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin, log
 
@@ -101,8 +102,7 @@ case "$1" in
 esac
 exit 0
 """
-    (fake_bin / "tmux").write_text(script)
-    (fake_bin / "tmux").chmod(0o755)
+    write_stub(fake_bin / "tmux", script)
     _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin, log
 
@@ -222,8 +222,7 @@ case "$1" in
 esac
 exit 0
 """
-    (fake_bin / "tmux").write_text(script)
-    (fake_bin / "tmux").chmod(0o755)
+    write_stub(fake_bin / "tmux", script)
     _agent_ps_stub(fake_bin)
     return fake_bin, log
 
@@ -330,8 +329,7 @@ case "$1" in
 esac
 exit 0
 """
-    (fake_bin / "tmux").write_text(script)
-    (fake_bin / "tmux").chmod(0o755)
+    write_stub(fake_bin / "tmux", script)
     _agent_ps_stub(fake_bin)
     env = {
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -429,8 +427,7 @@ case "$1" in
 esac
 exit 0
 """
-    (fake_bin / "tmux").write_text(script)
-    (fake_bin / "tmux").chmod(0o755)
+    write_stub(fake_bin / "tmux", script)
     _agent_ps_stub(fake_bin)
     return fake_bin, log
 
@@ -569,8 +566,7 @@ def _stat_stub_path(tmp_path: Path, stub_body: str) -> str:
     bindir = tmp_path / "stat-stub-bin"
     bindir.mkdir(exist_ok=True)
     stub = bindir / "stat"
-    stub.write_text(stub_body)
-    stub.chmod(0o755)
+    write_stub(stub, stub_body)
     return f"{bindir}:{os.environ['PATH']}"
 
 
@@ -883,20 +879,20 @@ def test_pane_agent_alive_rejects_a_substring_match_on_the_agent_name(tmp_path: 
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "tmux").write_text(
-        f'#!/usr/bin/env bash\n[ "$1" = display-message ] && printf "{_PANE_PID}\\n"\nexit 0\n'
+    write_stub(
+        fake_bin / "tmux",
+        f'#!/usr/bin/env bash\n[ "$1" = display-message ] && printf "{_PANE_PID}\\n"\nexit 0\n',
     )
-    (fake_bin / "tmux").chmod(0o755)
     tbl = fake_bin / "ps_table.txt"
     tbl.write_text(f"{_PANE_PID} 1 -zsh\n4400 {_PANE_PID} /usr/local/bin/inode-watcher\n")
-    (fake_bin / "ps").write_text(
+    write_stub(
+        fake_bin / "ps",
         "#!/usr/bin/env bash\n"
         'case "$*" in\n'
         f'  "-eo pid=,ppid=,comm=") cat "{tbl}" ;;\n'
         '  *) exec /bin/ps "$@" ;;\n'
-        "esac\n"
+        "esac\n",
     )
-    (fake_bin / "ps").chmod(0o755)
 
     result = _call("_pane_agent_alive 'hub:0'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
 
@@ -911,22 +907,22 @@ def test_pane_agent_alive_matches_a_full_path_claude_basename(tmp_path: Path) ->
     BASENAME is `claude`. Anchoring to the basename must still recognize it as the agent."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "tmux").write_text(
-        f'#!/usr/bin/env bash\n[ "$1" = display-message ] && printf "{_PANE_PID}\\n"\nexit 0\n'
+    write_stub(
+        fake_bin / "tmux",
+        f'#!/usr/bin/env bash\n[ "$1" = display-message ] && printf "{_PANE_PID}\\n"\nexit 0\n',
     )
-    (fake_bin / "tmux").chmod(0o755)
     tbl = fake_bin / "ps_table.txt"
     tbl.write_text(
         f"{_PANE_PID} 1 -zsh\n4500 {_PANE_PID} /Users/x/.vscode/extensions/native-binary/claude\n"
     )
-    (fake_bin / "ps").write_text(
+    write_stub(
+        fake_bin / "ps",
         "#!/usr/bin/env bash\n"
         'case "$*" in\n'
         f'  "-eo pid=,ppid=,comm=") cat "{tbl}" ;;\n'
         '  *) exec /bin/ps "$@" ;;\n'
-        "esac\n"
+        "esac\n",
     )
-    (fake_bin / "ps").chmod(0o755)
 
     result = _call("_pane_agent_alive 'hub:0'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
 
@@ -944,8 +940,7 @@ def test_pane_agent_alive_is_unprovable_when_the_pane_pid_is_unreadable(tmp_path
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     # tmux answers display-message with nothing: no pane pid, so the tree cannot be walked.
-    (fake_bin / "tmux").write_text("#!/usr/bin/env bash\nexit 0\n")
-    (fake_bin / "tmux").chmod(0o755)
+    write_stub(fake_bin / "tmux", "#!/usr/bin/env bash\nexit 0\n")
     _agent_ps_stub(fake_bin)
 
     result = _call("_pane_agent_alive 'hub:0'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
@@ -983,8 +978,7 @@ def test_inject_answer_refuses_when_the_agent_probe_is_unprovable(tmp_path: Path
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     log = tmp_path / "tmux.log"
-    (fake_bin / "tmux").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
-    (fake_bin / "tmux").chmod(0o755)
+    write_stub(fake_bin / "tmux", f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
     _agent_ps_stub(fake_bin)
     env = {"PATH": f"{fake_bin}:{os.environ['PATH']}", "AFK_INJECT_MENU_PAUSE": "0"}
 

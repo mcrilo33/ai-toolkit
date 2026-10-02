@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKTREE_LAND = _REPO_ROOT / "scripts" / "worktree-land.sh"
@@ -161,49 +162,48 @@ def _run_land(
         for name in ("gh", "tmux", "code", "pytest", "python3.12", "curl")
     }
     code_stub = bindir / "code"
-    code_stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["code"]}"\nexit 0\n')
-    code_stub.chmod(0o755)
+    write_stub(code_stub, f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["code"]}"\nexit 0\n')
     # `gh` logs every call AND answers `issue view --json state` with `issue_state`,
     # so the resume finalize's OPEN-check (issue #151) can be steered per test.
     gh_stub = bindir / "gh"
-    gh_stub.write_text(
+    write_stub(
+        gh_stub,
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{logs["gh"]}"\n'
         f'case "$*" in *"issue view"*state*) printf "%s\\n" "{issue_state}" ;; esac\n'
-        f"exit {gh_exit}\n"
+        f"exit {gh_exit}\n",
     )
-    gh_stub.chmod(0o755)
     tmux = bindir / "tmux"
-    tmux.write_text(
+    write_stub(
+        tmux,
         f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["tmux"]}"\n'
-        f'case "$1" in list-windows) printf "%s\\n" "{tmux_windows}" ;; esac\nexit 0\n'
+        f'case "$1" in list-windows) printf "%s\\n" "{tmux_windows}" ;; esac\nexit 0\n',
     )
-    tmux.chmod(0o755)
     pytest_stub = bindir / "pytest"
-    pytest_stub.write_text(
+    write_stub(
+        pytest_stub,
         f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["pytest"]}"\n'
         f"{pytest_side_effect}\n"
-        f"exit {pytest_exit}\n"
+        f"exit {pytest_exit}\n",
     )
-    pytest_stub.chmod(0o755)
     if stub_python312:
         py_stub = bindir / "python3.12"
-        py_stub.write_text(
+        write_stub(
+            py_stub,
             "#!/bin/sh\n"
             f'printf "CALL %s\\n" "$*" >> "{logs["python3.12"]}"\n'
             f'env | grep -E "^LANGFUSE_" >> "{logs["python3.12"]}" || true\n'
-            "exit 0\n"
+            "exit 0\n",
         )
-        py_stub.chmod(0o755)
     if stub_curl:
         curl_stub = bindir / "curl"
-        curl_stub.write_text(
+        write_stub(
+            curl_stub,
             "#!/bin/sh\n"
             f'printf "ARGV %s\\n" "$*" >> "{logs["curl"]}"\n'
             f'cat >> "{logs["curl"]}"\nprintf "\\n" >> "{logs["curl"]}"\n'
-            "exit 0\n"
+            "exit 0\n",
         )
-        curl_stub.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)
     for var in ("LANGFUSE_BASIC_AUTH", "LANGFUSE_HOST", "AI_TOOLKIT_OTEL_SPAN_ENDPOINT"):
@@ -239,8 +239,7 @@ def _install_prepush_stub(hub: Path, *, exit_code: int = 0, env_log: Path | None
     if env_log is not None:
         body += f'env | grep -E "^TEST_SELECT_" >> "{env_log}" || true\n'
     body += f"exit {exit_code}\n"
-    hook.write_text(body)
-    hook.chmod(0o755)
+    write_stub(hook, body)
 
 
 def _local_branches(hub: Path) -> list[str]:
@@ -276,12 +275,12 @@ def _fetch_fail_git_shim(tmp_path: Path) -> None:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     shim = bindir / "git"
-    shim.write_text(
+    write_stub(
+        shim,
         "#!/bin/sh\n"
         'if [ "$1" = fetch ]; then echo "fatal: unable to access origin (stubbed)" >&2; exit 128; fi\n'
-        f'exec "{real_git}" "$@"\n'
+        f'exec "{real_git}" "$@"\n',
     )
-    shim.chmod(0o755)
 
 
 # --- happy path ----------------------------------------------------------------
@@ -306,8 +305,7 @@ def test_land_returns_cleanup_sentinel_when_teardown_fails_after_push(
     # stamp blocked over merged code). WT_DONE seams the worktree-done teardown to a failing stub.
     _make_spoke(hub, tmp_path, "feature/1-done", push=True)
     fail_done = tmp_path / "fail-done.sh"
-    fail_done.write_text("#!/bin/sh\necho 'teardown boom' >&2\nexit 1\n")
-    fail_done.chmod(0o755)
+    write_stub(fail_done, "#!/bin/sh\necho 'teardown boom' >&2\nexit 1\n")
 
     proc, _ = _run_land(hub, tmp_path, "1", extra_env={"WT_DONE": str(fail_done)})
 
@@ -977,8 +975,7 @@ def _install_counting_gate(
         lines.append(_MINT_STAMP_FN)
         lines.append("_mint_green_stamp")
     lines.append(f"exit {exit_code}")
-    hook.write_text("\n".join(lines) + "\n")
-    hook.chmod(0o755)
+    write_stub(hook, "\n".join(lines) + "\n")
 
 
 # Shared sh snippet: write a green-tree stamp for HEAD^{tree} under
@@ -1012,7 +1009,8 @@ def _push141_git_shim(tmp_path: Path, *, mint_stamp: bool) -> None:
     marker = tmp_path / "ship-push-died-once"
     mint = "_mint_green_stamp" if mint_stamp else ":"
     shim = bindir / "git"
-    shim.write_text(
+    write_stub(
+        shim,
         "#!/bin/sh\n"
         f'GIT_REAL="{real_git}"\n'
         f'git() {{ "$GIT_REAL" "$@"; }}\n'
@@ -1022,9 +1020,8 @@ def _push141_git_shim(tmp_path: Path, *, mint_stamp: bool) -> None:
         f"  {mint}\n"
         "  exit 141\n"
         "fi\n"
-        f'exec "$GIT_REAL" "$@"\n'
+        f'exec "$GIT_REAL" "$@"\n',
     )
-    shim.chmod(0o755)
 
 
 def _install_pre_receive(
@@ -1048,8 +1045,7 @@ def _install_pre_receive(
             "fi\n"
         )
     body += "exit 0\n"
-    hook.write_text(body)
-    hook.chmod(0o755)
+    write_stub(hook, body)
 
 
 def _diverge_hub(hub: Path) -> None:
@@ -1247,13 +1243,13 @@ def test_remote_rejection_after_green_gate_rolls_back_without_retry(
     _install_counting_gate(hub, gate_log)
     ref_log = tmp_path / "pre-receive-refs.log"
     hook = tmp_path / "remote.git" / "hooks" / "pre-receive"
-    hook.write_text(
+    write_stub(
+        hook,
         "#!/bin/sh\n"
         f'while read -r _o _n ref; do echo "$ref" >> "{ref_log}"; done\n'
         'echo "protected branch hook declined" >&2\n'
-        "exit 1\n"
+        "exit 1\n",
     )
-    hook.chmod(0o755)
 
     proc, _ = _run_land(hub, tmp_path, "1")
 
@@ -1271,12 +1267,12 @@ def test_ship_push_carries_keepalive(hub: Path, tmp_path: Path) -> None:
     bindir.mkdir(exist_ok=True)
     push_log = tmp_path / "push-invocations.log"
     shim = bindir / "git"
-    shim.write_text(
+    write_stub(
+        shim,
         "#!/bin/sh\n"
         f'if [ "$1" = push ]; then echo "GIT_SSH_COMMAND=[$GIT_SSH_COMMAND] $*" >> "{push_log}"; fi\n'
-        f'exec "{real_git}" "$@"\n'
+        f'exec "{real_git}" "$@"\n',
     )
-    shim.chmod(0o755)
     _make_spoke(hub, tmp_path, "feature/1-shipkeep", push=True, ready=True)
 
     proc, _ = _run_land(hub, tmp_path, "1")
@@ -1745,8 +1741,7 @@ def _noop_wt_done(tmp_path: Path) -> Path:
     """A no-op worktree-done stub so a land keeps the worktree for post-land inspection."""
     stub = tmp_path / "bin" / "wt-done-noop.sh"
     stub.parent.mkdir(exist_ok=True)
-    stub.write_text("#!/bin/sh\nexit 0\n")
-    stub.chmod(0o755)
+    write_stub(stub, "#!/bin/sh\nexit 0\n")
     return stub
 
 
@@ -2017,11 +2012,11 @@ def test_land_spawns_sweep_only_after_main_is_pushed(hub: Path, tmp_path: Path) 
     _mint_stamp(hub, "feature/1-ordswp", "testmon")
     spawn_log = tmp_path / "sweep-spawn.log"
     stub = tmp_path / "sweep-stub.sh"
-    stub.write_text(
+    write_stub(
+        stub,
         "#!/bin/sh\n"
-        f'printf "ARGS %s\\nORIGIN %s\\n" "$*" "$(git rev-parse origin/main)" >> "{spawn_log}"\n'
+        f'printf "ARGS %s\\nORIGIN %s\\n" "$*" "$(git rev-parse origin/main)" >> "{spawn_log}"\n',
     )
-    stub.chmod(0o755)
 
     proc, _ = _run_land(hub, tmp_path, "1", extra_env={"GATE_SWEEP_BIN": str(stub)})
 
@@ -2041,13 +2036,13 @@ def test_diverged_merge_land_sweeps_from_gate_minted_stamp(hub: Path, tmp_path: 
     runner_log = tmp_path / "sweep-runner.log"
     stamps = hub / ".git" / ".gate-stamps"
     hook = hub / ".git" / "hooks" / "pre-push"
-    hook.write_text(
+    write_stub(
+        hook,
         "#!/bin/sh\n"
         f'mkdir -p "{stamps}"\n'
         f'printf "tier=testmon\\nenv=test\\n" > "{stamps}/$(git rev-parse "HEAD^{{tree}}")"\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    hook.chmod(0o755)
 
     proc, _ = _run_land(
         hub, tmp_path, "1", extra_env={"GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"'}
@@ -2573,8 +2568,7 @@ def _stub_bindir(bindir: Path, sandbox: Path) -> dict[str, str]:
         if name == "gh":
             body += 'case "$*" in *"issue view"*state*) printf "OPEN\\n" ;; esac\n'
         body += "exit 0\n"
-        (bindir / name).write_text(body)
-        (bindir / name).chmod(0o755)
+        write_stub(bindir / name, body)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env["AFK_TELEMETRY_CONF"] = str(sandbox / "no-such-conf")
     for var in (
@@ -2634,7 +2628,8 @@ def test_nonff_push_rejection_recovers_and_reruns_gate(hub: Path, tmp_path: Path
     advanced = tmp_path / "origin-advanced"
     remote = tmp_path / "remote.git"
     hook = hub / ".git" / "hooks" / "pre-push"
-    hook.write_text(
+    write_stub(
+        hook,
         "#!/bin/sh\n"
         # Record the threaded skip flag per invocation so the test can prove the recovery push
         # actually re-gated (skip empty) rather than riding the stale clean-FF skip.
@@ -2651,9 +2646,8 @@ def test_nonff_push_rejection_recovers_and_reruns_gate(hub: Path, tmp_path: Path
         '    && git commit -qm "feat: sibling" -m "Refs #0" \\\n'
         "    && git push -q origin main ) >/dev/null 2>&1 || exit 0\n"
         "fi\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    hook.chmod(0o755)
 
     proc, _ = _run_land(hub, tmp_path, "1")
 

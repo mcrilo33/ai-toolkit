@@ -28,6 +28,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 SPOKE_PUSH = Path(__file__).resolve().parents[2] / "scripts" / "spoke-push.sh"
 
@@ -212,12 +213,12 @@ def _install_git_shim(tmp_path: Path) -> tuple[Path, Path]:
     bindir.mkdir()
     log = tmp_path / "push-invocations.log"
     shim = bindir / "git"
-    shim.write_text(
+    write_stub(
+        shim,
         "#!/bin/sh\n"
         f'if [ "$1" = push ]; then echo "GIT_SSH_COMMAND=[$GIT_SSH_COMMAND] $*" >> "{log}"; fi\n'
-        f'exec "{real_git}" "$@"\n'
+        f'exec "{real_git}" "$@"\n',
     )
-    shim.chmod(0o755)
     return log, bindir
 
 

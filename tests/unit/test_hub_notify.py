@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 NOTIFY = (
     Path(__file__).resolve().parents[2] / "shared" / "skills" / "hub" / "scripts" / "hub-notify.sh"
@@ -79,8 +80,7 @@ def _run(
     """
     notify_log = tmp_path / "notifications.log"
     notifier = tmp_path / "notifier.sh"
-    notifier.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{notify_log}"\n')
-    notifier.chmod(0o755)
+    write_stub(notifier, f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{notify_log}"\n')
 
     # A logging `gh` stub on PATH so the issue #236 status-label mirror is hermetic
     # and its `gh issue edit` / `gh label create` calls are asserted from $GH_LOG.
@@ -89,12 +89,12 @@ def _run(
     bindir.mkdir(exist_ok=True)
     gh_log = tmp_path / "gh-calls.log"
     gh = bindir / "gh"
-    gh.write_text(
+    write_stub(
+        gh,
         "#!/bin/sh\n"
         '{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n'
-        'case "$*" in "issue edit"*|"issue comment"*|"label create"*) exit "${GH_MIRROR_RC:-0}";; esac\n'
+        'case "$*" in "issue edit"*|"issue comment"*|"label create"*) exit "${GH_MIRROR_RC:-0}";; esac\n',
     )
-    gh.chmod(0o755)
 
     env = {
         **os.environ,

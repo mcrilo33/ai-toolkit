@@ -14,6 +14,7 @@ from _gate_broker_support import (
     _call,
     _perm_env,
 )
+from _stubs import write_stub
 
 
 @pytest.fixture(autouse=True)
@@ -1399,10 +1400,8 @@ def _mask_shasum(fake_bin: Path) -> None:
     under test is that the CODE tries the sha256sum SPELLING, never how the stub hashes.
     """
     assert _REAL_SHASUM, "this suite already requires the macOS hasher (see pytestmark)"
-    (fake_bin / "shasum").write_text(_ABSENT_SHASUM_STUB)
-    (fake_bin / "shasum").chmod(0o755)
-    (fake_bin / "sha256sum").write_text(f'#!/bin/sh\nexec "{_REAL_SHASUM}" -a 256\n')
-    (fake_bin / "sha256sum").chmod(0o755)
+    write_stub(fake_bin / "shasum", _ABSENT_SHASUM_STUB)
+    write_stub(fake_bin / "sha256sum", f'#!/bin/sh\nexec "{_REAL_SHASUM}" -a 256\n')
 
 
 def test_park_signature_still_hashes_when_shasum_is_absent(

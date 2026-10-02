@@ -34,6 +34,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TELEMETRY_LIB = REPO_ROOT / "shared" / "hooks" / "lib" / "telemetry.sh"
@@ -663,12 +664,12 @@ def _stub_curl(tmp_path: Path) -> tuple[Path, Path]:
     bin_dir.mkdir()
     capture = tmp_path / "curl_capture.txt"
     stub = bin_dir / "curl"
-    stub.write_text(
+    write_stub(
+        stub,
         "#!/usr/bin/env bash\n"
         '{ printf "ARGV: %s\\n" "$*"; printf "STDIN_START\\n"; cat; '
-        'printf "\\nSTDIN_END\\n"; } > "$CURL_CAPTURE"\n'
+        'printf "\\nSTDIN_END\\n"; } > "$CURL_CAPTURE"\n',
     )
-    stub.chmod(0o755)
     return bin_dir, capture
 
 

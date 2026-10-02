@@ -30,6 +30,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 SPOKE_READY = Path(__file__).resolve().parents[2] / "scripts" / "spoke-ready.sh"
 
@@ -884,15 +885,15 @@ def _install_git_shim(tmp_path: Path, *, fail_pushes: str | None = None) -> tupl
             "  fi\n"
         )
     shim = bindir / "git"
-    shim.write_text(
+    write_stub(
+        shim,
         "#!/bin/sh\n"
         'if [ "$1" = push ]; then\n'
         f'  echo "GIT_SSH_COMMAND=[$GIT_SSH_COMMAND] $*" >> "{log}"\n'
         f"{fail_snippet}"
         "fi\n"
-        f'exec "{real_git}" "$@"\n'
+        f'exec "{real_git}" "$@"\n',
     )
-    shim.chmod(0o755)
     return log, bindir
 
 
@@ -1007,8 +1008,7 @@ def _gh_logging_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
     bindir.mkdir(exist_ok=True)
     log = tmp_path / "gh-calls.log"
     gh = bindir / "gh"
-    gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_LOG"\n')
-    gh.chmod(0o755)
+    write_stub(gh, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_LOG"\n')
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}", "GH_LOG": str(log)}
     return env, log
 

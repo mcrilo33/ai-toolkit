@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 from _hub_afk_support import HUB_SCRIPTS_DIR, _call, function_source_file
+from _stubs import write_stub
 
 MODULE = "hub-afk-land.sh"
 
@@ -305,8 +306,7 @@ def test_auto_land_refuses_to_invoke_land_on_live_sibling_collision(tmp_path: Pa
 
     land_log = tmp_path / "land.log"
     wt_land = tmp_path / "wtland.sh"
-    wt_land.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\n')
-    wt_land.chmod(0o755)
+    write_stub(wt_land, f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\n')
 
     expr = (
         f"inflight_worktrees() {{ printf '{spoke}\\t353\\n'; }}; "

@@ -40,6 +40,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 HOOKS = Path(__file__).resolve().parents[2] / "shared" / "hooks"
 UTILS = HOOKS / "lib" / "utils.sh"
@@ -535,10 +536,10 @@ def test_observe_captures_command_output_to_capfile(repo: Path, tmp_path: Path) 
 def _make_pytest_stub(bindir: Path, body: str) -> None:
     """Install a `pytest` stub: answers `--help`, else runs `body` then exits 0."""
     bindir.mkdir(parents=True, exist_ok=True)
-    (bindir / "pytest").write_text(
-        f'#!/bin/sh\ncase "$1" in --help|-h) echo "usage: pytest"; exit 0 ;; esac\n{body}\nexit 0\n'
+    write_stub(
+        bindir / "pytest",
+        f'#!/bin/sh\ncase "$1" in --help|-h) echo "usage: pytest"; exit 0 ;; esac\n{body}\nexit 0\n',
     )
-    (bindir / "pytest").chmod(0o755)
 
 
 def _run_select(

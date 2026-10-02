@@ -16,9 +16,28 @@ TESTS_DIR = Path(__file__).resolve().parents[1]
 # Names whose appearance in a `chmod` call's mode argument sets an executable bit.
 _EXEC_BIT_NAMES = {"S_IEXEC", "S_IXUSR", "S_IXGRP", "S_IXOTH"}
 
-# <path relative to tests/> -> why a raw exec bit is correct there.
+# "<path relative to tests/>" (whole file) or "<path>::<function>" -> why a raw exec bit is
+# correct there.
 ALLOWLIST: dict[str, str] = {
     "unit/test_hub_afk.py": "pending #375 (converting this file concurrently); follow-up sweep",
+    "unit/test_archive_worktree.py::test_unwritable_spool_root_exits_zero_with_stderr_only": (
+        "chmods a directory read-only, not a stub"
+    ),
+    "unit/test_hub_watchdog.py::test_intervene_revive_refuses_to_spawn_when_the_budget_cannot_be_recorded": (
+        "chmods a directory read-only, not a stub"
+    ),
+    "unit/test_commit_hooks.py::test_docs_executable_md_still_requires_anchor": (
+        "the fixture IS an executable markdown file, not a stub"
+    ),
+    "unit/test_install_git_hooks.py::_foreign": (
+        "a foreign hook the installer must preserve byte-for-byte; the warm guard would alter it"
+    ),
+    "unit/test_worktree_foreign_checkout.py::synced_repo": (
+        "copies the repo's real scripts into a fixture checkout, not synthetic stubs"
+    ),
+    "unit/test_stubs.py::test_warm_stubs_raises_when_a_stub_cannot_run": (
+        "builds a deliberately unrunnable script to exercise the helper's failure path"
+    ),
 }
 
 
@@ -62,7 +81,8 @@ def _violations() -> list[str]:
         if rel == "_stubs.py" or rel in ALLOWLIST:
             continue
         for scope in find_raw_exec_files(path.read_text()):
-            out.append(f"{rel}::{scope}")
+            if f"{rel}::{scope}" not in ALLOWLIST:
+                out.append(f"{rel}::{scope}")
     return sorted(set(out))
 
 
@@ -102,7 +122,13 @@ def test_scanner_ignores_non_executable_modes() -> None:
     assert find_raw_exec_files(src) == []
 
 
-def test_allowlist_entries_name_existing_files() -> None:
-    missing = [rel for rel in ALLOWLIST if not (TESTS_DIR / rel).is_file()]
+def test_allowlist_entries_still_match_a_raw_exec_chmod() -> None:
+    stale = []
+    for entry in ALLOWLIST:
+        rel, _, scope = entry.partition("::")
+        path = TESTS_DIR / rel
+        scopes = find_raw_exec_files(path.read_text()) if path.is_file() else []
+        if not scopes or (scope and scope not in scopes):
+            stale.append(entry)
 
-    assert missing == [], f"stale ALLOWLIST entries: {missing}"
+    assert stale == [], f"stale ALLOWLIST entries (remove them): {stale}"

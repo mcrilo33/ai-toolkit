@@ -12,11 +12,11 @@ import json
 import os
 import shlex
 import shutil
-import stat
 import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "provision-worktree.sh"
 
@@ -50,8 +50,7 @@ def _git(repo: Path, *args: str) -> str:
 def _stub(bin_dir: Path, name: str, body: str) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     path = bin_dir / name
-    path.write_text(f"#!/usr/bin/env bash\n{body}\n")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    write_stub(path, f"#!/usr/bin/env bash\n{body}\n")
 
 
 def _exclude_file(wt: Path) -> Path:

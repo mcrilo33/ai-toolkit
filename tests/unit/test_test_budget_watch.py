@@ -27,6 +27,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 WATCH = Path(__file__).resolve().parents[2] / "scripts" / "test-budget-watch.sh"
 
@@ -96,10 +97,9 @@ def _run(
     if scoper_log is None:
         scoper_log = tmp_path / "scoper.log"
     scoper = tmp_path / "scoper.sh"
-    scoper.write_text(
-        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{scoper_log}"\nexit {scoper_exit}\n'
+    write_stub(
+        scoper, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{scoper_log}"\nexit {scoper_exit}\n'
     )
-    scoper.chmod(0o755)
     if state_dir is None:
         state_dir = tmp_path / "state"
     env = {
@@ -244,8 +244,7 @@ def test_budgets_read_from_config_file(repo: Path, tmp_path: Path) -> None:
     cap.write_text(_capture(slow_test=8.0, suite=130.0))  # 8s > 5s config budget
     scoper_log = tmp_path / "scoper.log"
     scoper = tmp_path / "scoper.sh"
-    scoper.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{scoper_log}"\n')
-    scoper.chmod(0o755)
+    write_stub(scoper, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{scoper_log}"\n')
     env = {
         **_GIT_ENV,
         "TEST_BUDGET_CONFIG": str(config),

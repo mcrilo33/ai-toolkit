@@ -51,6 +51,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 WORKTREE_NEW = Path(__file__).resolve().parents[2] / "scripts" / "worktree-new.sh"
 
@@ -145,15 +146,15 @@ def _run_new(
     log = tmp_path / "tmux-calls.log"
     log.touch()
     tmux = bindir / "tmux"
-    tmux.write_text(
+    write_stub(
+        tmux,
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'if [ "$1" = "new-window" ]; then printf "@1\\n"; fi\n'
         'if [ "$1" = "has-session" ]; then exit "${STUB_HAS_SESSION:-0}"; fi\n'
         'if [ "$1" = "new-session" ]; then exit "${STUB_NEW_SESSION:-0}"; fi\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    tmux.chmod(0o755)
     # A logging `gh` stub so the issue fetch (title/body) is hermetic. It answers
     # `gh issue view N --json title …` with $GH_ISSUE_TITLE and `--json body …`
     # with $GH_ISSUE_BODY, so a test can seed a `Model:` line into the body
@@ -165,7 +166,8 @@ def _run_new(
     # `gh issue edit` / `gh issue comment` / `gh label create`), still answering the
     # title/body fetches. $GH_MIRROR_RC forces a nonzero exit for the mirror writes
     # (issue edit / comment / label create) so a test can model an offline gh.
-    gh.write_text(
+    write_stub(
+        gh,
         "#!/bin/sh\n"
         # Log each call on ONE line (a multi-line --body is flattened) so the log
         # stays one-record-per-invocation.
@@ -174,9 +176,8 @@ def _run_new(
         '  *"--json title"*) printf "%s\\n" "${GH_ISSUE_TITLE:-Some Issue Title}" ;;\n'
         '  *"--json body"*)  printf "%s\\n" "$GH_ISSUE_BODY" ;;\n'
         '  "issue edit"*|"issue comment"*|"label create"*) exit "${GH_MIRROR_RC:-0}" ;;\n'
-        "esac\n"
+        "esac\n",
     )
-    gh.chmod(0o755)
     # HOME is sandboxed so the workspace-file default ($HOME/.claude/….code-workspace,
     # issue #134) can never resolve to — let alone rewrite — the host's real file.
     home = tmp_path / "home"
@@ -615,8 +616,7 @@ def _seed_hub_marker_scripts(hub: Path) -> None:
     scripts = hub / "scripts"
     scripts.mkdir(exist_ok=True)
     for name in ("spoke-ready.sh", "spoke-push.sh"):
-        (scripts / name).write_text("#!/usr/bin/env bash\ntrue\n")
-        (scripts / name).chmod(0o755)
+        write_stub(scripts / name, "#!/usr/bin/env bash\ntrue\n")
     _git(hub, "add", "scripts")
     _git(hub, "commit", "-qm", "chore: add marker scripts", "-m", "Refs #0")
     _git(hub, "push", "-q", "origin", "main")
@@ -1350,8 +1350,7 @@ def _run_new_quiet(hub: Path, *args: str) -> subprocess.CompletedProcess:
     bindir = hub.parent / f"{hub.name}-quiet-bin"
     bindir.mkdir(exist_ok=True)
     gh = bindir / "gh"
-    gh.write_text("#!/bin/sh\nexit 0\n")
-    gh.chmod(0o755)
+    write_stub(gh, "#!/bin/sh\nexit 0\n")
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)
     for _k in ("GH_TOKEN", "GITHUB_TOKEN", "GH_REPO", "GH_HOST"):
@@ -1880,8 +1879,7 @@ def _code_stub(tmp_path: Path) -> Path:
     log = tmp_path / "code-calls.log"
     log.touch()
     stub = bindir / "code"
-    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
     return log
 
 

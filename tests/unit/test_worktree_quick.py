@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 WORKTREE_QUICK = Path(__file__).resolve().parents[2] / "scripts" / "worktree-quick.sh"
 
@@ -90,23 +91,23 @@ def _run_quick(
     log = tmp_path / "tmux-calls.log"
     log.touch()
     tmux = bindir / "tmux"
-    tmux.write_text(
+    write_stub(
+        tmux,
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'if [ "$1" = "new-window" ]; then printf "@1\\n"; fi\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    tmux.chmod(0o755)
     if stub_curl:
         curl_log = tmp_path / "curl-calls.log"
         curl = bindir / "curl"
-        curl.write_text(
+        write_stub(
+            curl,
             "#!/bin/sh\n"
             f'printf "ARGV %s\\n" "$*" >> "{curl_log}"\n'
             f'cat >> "{curl_log}"\nprintf "\\n" >> "{curl_log}"\n'
-            "exit 0\n"
+            "exit 0\n",
         )
-        curl.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)
     env.pop("WT_SPOKE", None)

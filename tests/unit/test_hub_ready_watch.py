@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 WATCH = (
     Path(__file__).resolve().parents[2]
@@ -93,8 +94,7 @@ def _run(
     # seen-set under tmp_path, and strip any inherited drain state so mode-gating
     # is deterministic. Notifications are readable at _notify_log(tmp_path).
     notifier = tmp_path / "notifier.sh"
-    notifier.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{_notify_log(tmp_path)}"\n')
-    notifier.chmod(0o755)
+    write_stub(notifier, f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{_notify_log(tmp_path)}"\n')
     env["HUB_NOTIFY_CMD"] = str(notifier)
     env["HUB_NOTIFY_SEEN_FILE"] = str(tmp_path / "hub-notify-seen")
     env.pop("AFK_STATE", None)
@@ -105,8 +105,7 @@ def _run(
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     gh = bindir / "gh"
-    gh.write_text('#!/bin/sh\n{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n')
-    gh.chmod(0o755)
+    write_stub(gh, '#!/bin/sh\n{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n')
     env["PATH"] = f"{bindir}:{env['PATH']}"
     env["GH_LOG"] = str(tmp_path / "gh-calls.log")
     env["HUB_LABEL_SEEN_FILE"] = str(tmp_path / "label-seen")

@@ -23,6 +23,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 HUB_AGENT = (
     Path(__file__).resolve().parents[2] / "shared" / "skills" / "hub" / "scripts" / "hub-agent.sh"
@@ -56,16 +57,16 @@ def _tmux_stub(bindir: Path, log: Path, *, new_window_ok: bool = True) -> None:
     succeeds."""
     nw = "printf '@9\\n'; exit 0" if new_window_ok else "exit 1"
     tmux = bindir / "tmux"
-    tmux.write_text(
+    write_stub(
+        tmux,
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'case "$1" in\n'
         f"  new-window) {nw} ;;\n"
         "  display-message) printf 'hub-sess\\n' ;;\n"
         "esac\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    tmux.chmod(0o755)
 
 
 def _env(hub: Path, tmp_path: Path, *, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -266,8 +267,7 @@ def test_exec_applies_native_otel_prefix_when_enabled(hub: Path, tmp_path: Path)
     # only see if the prefix were actually applied to its environment.
     env = _env(hub, tmp_path, extra={"AI_TOOLKIT_OTEL": "1"})
     fake_claude = tmp_path / "bin" / "claude"
-    fake_claude.write_text("#!/bin/sh\nprintf 'exporter=%s\\n' \"$OTEL_TRACES_EXPORTER\"\n")
-    fake_claude.chmod(0o755)
+    write_stub(fake_claude, "#!/bin/sh\nprintf 'exporter=%s\\n' \"$OTEL_TRACES_EXPORTER\"\n")
     log = tmp_path / "hub-agents" / "otelcheck.log"
 
     result = _run(

@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 HOOKS_DIR = Path(__file__).resolve().parents[2] / "shared" / "hooks"
 UTILS = HOOKS_DIR / "lib" / "utils.sh"
@@ -602,8 +603,7 @@ class TestReviewWindowOpenIdentity:
         stub_bin = tmp_path / "stub-bin"
         stub_bin.mkdir()
         jq_stub = stub_bin / "jq"
-        jq_stub.write_text("#!/bin/sh\nexit 127\n")
-        jq_stub.chmod(0o755)
+        write_stub(jq_stub, "#!/bin/sh\nexit 127\n")
         payload = self._subagent_payload(git_repo, subagent_type="code-review")
         env = {k: v for k, v in os.environ.items() if k != "CURSOR_PROJECT_DIR"}
         env["PATH"] = f"{stub_bin}:{env.get('PATH', '/usr/bin:/bin')}"

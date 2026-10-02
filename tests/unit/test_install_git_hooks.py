@@ -23,6 +23,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 INSTALL = Path(__file__).resolve().parents[2] / "scripts" / "install-git-hooks.sh"
 # Strip any ambient arming signal: the composed pre-push runs the REAL
@@ -83,8 +84,7 @@ def _stub_selector(hooks: Path, *, exit_code: int, stdin_log: Path | None = None
     if stdin_log is not None:
         body += f'cat >> "{stdin_log}"\n'
     body += f"exit {exit_code}\n"
-    sel.write_text(body)
-    sel.chmod(0o755)
+    write_stub(sel, body)
 
 
 def _unpushed_commit(repo: Path, fname: str = "change.txt") -> str:
@@ -211,8 +211,7 @@ def test_advisory_warns_do_not_block(repo: Path) -> None:
     # Make the advisory scripts "fail": the hook must swallow it and still push.
     for name in ("red-proof-warn.sh", "reviewer-sep-warn.sh"):
         adv = _scripts_dir(hooks) / name
-        adv.write_text("#!/bin/sh\nexit 1\n")
-        adv.chmod(0o755)
+        write_stub(adv, "#!/bin/sh\nexit 1\n")
 
     push = _push(repo)
 
@@ -261,8 +260,7 @@ def _stub_cage(hooks: Path, name: str, log: Path | None = None) -> None:
     if log is not None:
         body += f'cat >> "{log}"\n'
     body += "exit 0\n"
-    s.write_text(body)
-    s.chmod(0o755)
+    write_stub(s, body)
 
 
 def _commit(repo: Path, *msg_args: str) -> subprocess.CompletedProcess[str]:
@@ -509,7 +507,7 @@ def test_commit_msg_blocks_when_cage_script_not_executable(repo: Path, script: s
 def _foreign(hooks_dir: Path, name: str, body: str) -> Path:
     hooks_dir.mkdir(parents=True, exist_ok=True)
     hook = hooks_dir / name
-    hook.write_text(body)
+    hook.write_text(body)  # raw: uninstall must restore this foreign hook byte-for-byte
     hook.chmod(0o755)
     return hook
 

@@ -15,6 +15,7 @@ from _gate_broker_support import (
     _install_fake_claude,
     _project_dir_for,
 )
+from _stubs import write_stub
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -97,13 +98,11 @@ def waiting_spoke_env(tmp_path: Path, spoke_repo: Path) -> dict[str, str]:
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
 
     return {
         "CLAUDE_PROJECTS_DIR": str(projects),

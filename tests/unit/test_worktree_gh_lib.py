@@ -17,6 +17,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from _stubs import write_stub
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WT_LIB = REPO_ROOT / "scripts" / "worktree-lib.sh"
 MODULE = REPO_ROOT / "scripts" / "worktree-gh-lib.sh"
@@ -88,8 +90,7 @@ def test_apply_dispatch_labels_reachable_through_entry(tmp_path: Path) -> None:
     bindir = tmp_path / "bin"
     bindir.mkdir()
     gh = bindir / "gh"
-    gh.write_text(_GH_STUB)
-    gh.chmod(0o755)
+    write_stub(gh, _GH_STUB)
     log = tmp_path / "gh-calls.log"
     env = {
         **os.environ,

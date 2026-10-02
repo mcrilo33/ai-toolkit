@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _stubs import write_stub
 
 WT_LIB = Path(__file__).resolve().parents[2] / "scripts" / "worktree-lib.sh"
 
@@ -184,8 +185,7 @@ def test_wt_ps_start_epoch_returns_2_when_the_start_time_is_unparseable(
     bindir = tmp_path / "bin"
     bindir.mkdir()
     ps_stub = bindir / "ps"
-    ps_stub.write_text("#!/bin/sh\necho 'not-a-real-date'\n")
-    ps_stub.chmod(0o755)
+    write_stub(ps_stub, "#!/bin/sh\necho 'not-a-real-date'\n")
 
     result = _run(
         r"""
