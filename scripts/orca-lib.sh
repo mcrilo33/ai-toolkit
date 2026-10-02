@@ -206,11 +206,17 @@ orca_reply() { _orca_mutate orchestration reply --id "$1" --body "$2" ${3:+--run
 # orca_send_text <terminal> <text> [wait-seconds=15] [enter=1] -> type into the agent's terminal;
 # prints the stages Orca observed (input_accepted, turn_started). rc 0 when the call was accepted
 # (NOT proof of submission: the caller checks the stage it needs), 1 otherwise. Never resends.
+# --retry-request and --wait-submit are only valid on a prompt (text + --enter), so a bare key
+# (Escape) goes without them.
 orca_send_text() {
   local wait="${3:-15}" enter="${4:-1}" args=(terminal send --terminal "$1" --text "$2")
-  [ "$enter" = 1 ] && args+=(--enter)
-  [ "$wait" -gt 0 ] && args+=(--wait-submit "$wait")
-  _orca_mutate "${args[@]}" || return 1
+  if [ "$enter" = 1 ]; then
+    args+=(--enter)
+    [ "$wait" -gt 0 ] && args+=(--wait-submit "$wait")
+    _orca_mutate "${args[@]}" || return 1
+  else
+    orca_call_settled "" "${args[@]}" || return 1
+  fi
   printf '%s' "$ORCA_OUT" | jq -r '[.. | objects | .stages? | arrays | .[]] | unique | join(",")' 2>/dev/null
   return 0
 }
@@ -221,13 +227,38 @@ orca_worker_stop() { _orca_mutate orchestration worker-stop --dispatch "$1"; }
 orca_worker_abandon() { _orca_mutate orchestration worker-abandon --dispatch "$1"; }
 orca_worker_release() { _orca_mutate orchestration worker-release --dispatch "$1"; }
 
+# orca_capability <wt> -> the dispatch capability token the spoke was handed in its preamble:
+# $ORCA_DISPATCH_CAPABILITY, else <wt>/.ai-toolkit/dispatch-capability (written by spoke-ready.sh the
+# first time the agent passes it). Orca offers no other way to read it; empty when unknown.
+orca_capability() {
+  if [ -n "${ORCA_DISPATCH_CAPABILITY:-}" ]; then printf '%s\n' "$ORCA_DISPATCH_CAPABILITY"; return 0; fi
+  printf '%s\n' "$(head -n1 "$1/.ai-toolkit/dispatch-capability" 2>/dev/null | tr -d '[:space:]')"
+}
+
 # orca_worker_done <wt> <succeeded|failed> <subject> -> tell the coordinator this worker finished
 # (a `worker_done` message; there is no verb). Best-effort: the caller ignores the rc.
 orca_worker_done() {
-  local did task
+  local did task cap
   did="$(_orca_identity "$1" orca_dispatch_id)"
   [ -n "$did" ] || return 1
-  task="$(orca_worker_field "$1" '.taskId' 2>/dev/null)"
+  task="$(orca_worker_field "$1" '.taskId' 2>/dev/null)"; cap="$(orca_capability "$1")"
   _orca_mutate orchestration send --type worker_done --outcome "$2" --subject "$3" \
-    ${ORCA_TERMINAL_HANDLE:+--from "$ORCA_TERMINAL_HANDLE"} --dispatch-id "$did" ${task:+--task-id "$task"}
+    ${ORCA_TERMINAL_HANDLE:+--from "$ORCA_TERMINAL_HANDLE"} --dispatch-id "$did" ${task:+--task-id "$task"} \
+    ${cap:+--dispatch-capability "$cap"}
 }
+
+# orca_ask <wt> <question> <options-csv> <timeout-ms> | orca_ask_resume <wt> <msg_id> <timeout-ms>
+# -> block in `orchestration ask` for the coordinator's reply. Prints the answer (rc 0). rc 3: the
+# timeout elapsed and the question is STILL PENDING (its id is in ORCA_ASK_ID: resume it, never ask
+# again). rc 1: failed or cancelled. Not settled through orca_call_settled: the call blocks by design.
+_orca_ask_run() {
+  local wt="$1"; shift
+  local cap; cap="$(orca_capability "$wt")"
+  orca_json orchestration ask "$@" ${cap:+--dispatch-capability "$cap"} || true
+  ORCA_ASK_ID="$(orca_field '.result.messageId')"
+  [ "$(orca_field '.result.timedOut')" = true ] && return 3
+  [ -n "$(orca_field '.result')" ] && [ "$(orca_field '.result.cancelled')" != true ] || return 1
+  orca_field '.result.answer'
+}
+orca_ask() { _orca_ask_run "$1" --question "$2" --options "$3" --timeout-ms "$4"; }
+orca_ask_resume() { _orca_ask_run "$1" --resume "$2" --timeout-ms "$3"; }

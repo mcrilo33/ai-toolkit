@@ -584,3 +584,66 @@ def test_worker_done_without_a_recorded_dispatch_is_a_quiet_rc1(tmp_path: Path) 
 
     assert proc.returncode == 1
     assert orca_calls(bindir) == []
+
+
+def test_ask_prints_the_answer_and_passes_options_timeout_and_capability(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+    (wt / ".ai-toolkit" / "dispatch-capability").write_text("dcap_file\n")
+
+    proc, bindir = _run(tmp_path, f'orca_ask "{wt}" "plan?" approve,revise 90000')
+
+    assert proc.stdout.strip() == "approve"
+    (call,) = orca_calls(bindir)
+    assert call[:2] == ["orchestration", "ask"]
+    assert call[call.index("--question") + 1] == "plan?"
+    assert call[call.index("--options") + 1] == "approve,revise"
+    assert call[call.index("--timeout-ms") + 1] == "90000"
+    assert call[call.index("--dispatch-capability") + 1] == "dcap_file"
+
+
+def test_ask_timeout_is_rc3_with_the_pending_id_to_resume(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+    timeout = {
+        "rc": 1,
+        "out": {"ok": True, "result": {"messageId": "msg_7", "answer": None, "timedOut": True}},
+    }
+
+    proc, bindir = _run(
+        tmp_path,
+        f'orca_ask "{wt}" q a,b 1000; echo "rc=$? id=$ORCA_ASK_ID"; '
+        f'orca_ask_resume "{wt}" "$ORCA_ASK_ID" 1000; echo "rc=$?"',
+        scenario={"orchestration ask": [timeout, {"out": {"ok": True, "result": {"messageId": "msg_7", "answer": "approve"}}}]},
+    )
+
+    assert proc.stdout.split() == ["rc=3", "id=msg_7", "approve", "rc=0"]
+    resume = orca_calls(bindir)[1]
+    assert resume[resume.index("--resume") + 1] == "msg_7"
+    assert "--question" not in resume
+
+
+def test_ask_cancelled_or_failed_is_rc1(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+    cancelled = {"out": {"ok": True, "result": {"messageId": "m", "answer": None, "cancelled": True}}}
+    failed = {"rc": 1, "out": {"ok": False, "error": {"code": "dispatch_capability_invalid"}}}
+
+    for reply in (cancelled, failed):
+        proc, _ = _run(tmp_path, f'orca_ask "{wt}" q a 1000', scenario={"orchestration ask": [reply]})
+
+        assert proc.returncode == 1
+
+
+def test_capability_prefers_the_env_over_the_recorded_file(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+    (wt / ".ai-toolkit" / "dispatch-capability").write_text("dcap_file\n")
+
+    proc, _ = _run(tmp_path, f'orca_capability "{wt}"; ORCA_DISPATCH_CAPABILITY=dcap_env orca_capability "{wt}"')
+
+    assert proc.stdout.split() == ["dcap_file", "dcap_env"]
+
+
+def test_a_bare_escape_goes_without_enter_wait_or_retry_request(tmp_path: Path) -> None:
+    _, bindir = _run(tmp_path, "orca_send_text term_w $'\\e' 0 0 >/dev/null")
+
+    (call,) = orca_calls(bindir)
+    assert "--retry-request" not in call
+    assert "--enter" not in call

@@ -160,7 +160,11 @@ if key == "orchestration worker-list":
 if key == "orchestration check":
     emit(0, ok({"messages": []}))
 if key == "terminal send":
-    emit(0, ok({"stages": ["input_accepted", "turn_started"]}))
+    emit(0, ok({"send": {"accepted": True,
+                         "prompt": {"stages": ["input_accepted", "turn_started"]}}}))
+if key == "orchestration ask":
+    emit(0, ok({"messageId": "msg_ask", "answer": "approve", "timedOut": False,
+                "cancelled": False}))
 if key in ("orchestration reply", "orchestration send", "orchestration worker-stop",
            "orchestration worker-abandon"):
     emit(0, ok({}))
