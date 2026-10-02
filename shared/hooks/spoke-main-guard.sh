@@ -5,7 +5,8 @@
 #   This repo uses a parallel-worktree model: the MAIN CHECKOUT ("hub") stays on
 #   the default branch and lands finished work; each task lives in a LINKED
 #   WORKTREE ("spoke") on its own branch, driven by its own session that
-#   worktree-new.sh stamps with WT_SPOKE.
+#   worktree-new.sh stamps with WT_SPOKE (and provision-worktree.sh records in
+#   .ai-toolkit/identity, which wins — see lib/identity.sh).
 #
 # WHAT IT CLOSES (issue #32)
 #   push-scope-guard (#26) blocks a spoke from PUSHING the default branch, but
@@ -15,7 +16,7 @@
 #   never even fired. This guard makes a spoke unable to touch the local default
 #   branch at all.
 #
-# WHAT IT DENIES (only when this is a spoke — WT_SPOKE set, or a linked worktree)
+# WHAT IT DENIES (only when this is a spoke — identity record, WT_SPOKE set, or a linked worktree)
 #   • git checkout <default> / git switch <default>  (incl. -b/-c force-create)
 #   • git merge … while <default> IS HEAD  (a merge always targets HEAD)
 #   • git branch -f/--force/-M/-m/-c/-C/-d/-D <default>, and a bare

@@ -9,9 +9,9 @@
 #   a `git push` that left the branch's `@{upstream}` at HEAD             -> push
 #   a Write of a worktree-root `.review/<name>.json` artifact            -> review
 #
-# SCOPE — cycle steps belong to a solo-cycle running in a SPOKE. WT_SPOKE is the
-# mechanical spoke-role signal (set by worktree-new.sh); the hub and /quick lanes
-# do not set it, so their commits/pushes never mint phantom cycle steps. This is
+# SCOPE — cycle steps belong to a solo-cycle running in a SPOKE. The spoke-role signal
+# is the worktree's .ai-toolkit/identity record, else WT_SPOKE (set by worktree-new.sh);
+# the hub and /quick lanes have neither, so their commits/pushes never mint phantom cycle steps. This is
 # the context guard the #139 emitters get implicitly by only running on real
 # cycle/ship paths; this hook fires on every commit/push, so it gates explicitly.
 #
@@ -77,7 +77,8 @@ INPUT=$(read_stdin)
 [ -n "$INPUT" ] || exit 0
 
 # Spoke-role gate (see header): only a spoke runs solo-cycles — the worktree's identity
-# record, else WT_SPOKE.
+# record, else WT_SPOKE. The record is per-worktree, so the gate needs the payload root
+# and sits after utils.sh: a telemetry-on non-spoke call pays that sourcing before exiting.
 # shellcheck source=lib/identity.sh
 source "$HOOK_DIR/lib/identity.sh"
 ai_toolkit_identity_is_spoke "$(_telemetry_project_root)" env || exit 0
