@@ -5129,6 +5129,17 @@ def _reaper_env(
     return expr, env, ready_log, statedir
 
 
+def test_reaper_stubs_are_warmed_before_the_reap_runs(tmp_path: Path) -> None:
+    # #375: reap_pass execs the tmux and `ps` stubs dozens of times, and a freshly written
+    # script's FIRST exec can take seconds under xdist (macOS vets each new executable). Both
+    # are exec'd once when built, so the pass only ever pays ~10ms re-execs.
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=tmp_path)
+
+    assert (fake_bin / "tmux.warm").exists(), "the tmux stub must be exec'd once up front"
+    assert (fake_bin / "ps.warm").exists(), "the ps stub must be exec'd once up front"
+    assert not tmux_log.exists(), "the warm-up exec must not look like a tmux call"
+
+
 def test_afk_resume_command_reuses_run_id_and_plain_prompt(tmp_path: Path) -> None:
     spoke = _branched_spoke(tmp_path, ahead=True)
     (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
