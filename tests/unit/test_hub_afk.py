@@ -4804,7 +4804,7 @@ def test_afk_retry_worker_takes_no_action_on_an_unverifiable_worker(
     revive = _call(f"_revive_spoke '{spoke}' 5", env=env)
 
     assert retry.returncode == 2, "rc 2 is 'no action on an unknown state'"
-    assert revive.returncode == 0, revive.stderr
+    assert revive.returncode == 2, "a skipped revive says so; callers treat 2 as handled"
     assert _recovery_trail(orca_bin) == []
     assert not (statedir / "resumed-5").exists(), "a no-op revive records nothing"
     assert not ready_log.exists()
@@ -4840,10 +4840,52 @@ def test_a_skipped_revive_warns_once_per_window_of_time_not_every_tick(
     stamp = (statedir / "unknown-5").read_text()
     second = _call(f"_revive_spoke '{spoke}' 5", env=env)
 
-    assert first.returncode == 0 and second.returncode == 0
+    assert first.returncode == 2 and second.returncode == 2
     assert (statedir / "unknown-5").read_text() == stamp, (
         "rate-limited: not re-stamped inside the gap"
     )
+
+
+def test_the_crash_ladder_counts_nothing_when_the_row_lacks_a_task_id(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # The third reason a retry takes no action: an exited row with no taskId. The ladder must not keep
+    # its own copy of the no-action rules -- it asks the retry, which says rc 2 -- so this no-op
+    # cannot burn the budget toward blocked either.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
+    f = orca_bin / ".orca-stub" / "scenario.json"
+    sc = json.loads(f.read_text())
+    del sc["orchestration worker-list"][0]["out"]["result"]["workers"][0]["taskId"]
+    f.write_text(json.dumps(sc))
+    _expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+    env = {**env, "AFK_WARN_BACKOFF_BASE": "0"}
+
+    for _ in range(5):
+        _call(f"_afk_crash_reresume_or_escalate '{spoke}' 5 'crashed again' resume_spoke", env=env)
+
+    assert _recovery_trail(orca_bin) == []
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+    assert not (statedir / "warned-state-5").exists()
+
+
+def test_a_skipped_conflict_resolve_restart_neither_records_nor_warn_parks(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    orca_park(orca_bin, spoke, liveness="exited")
+    f = orca_bin / ".orca-stub" / "scenario.json"
+    sc = json.loads(f.read_text())
+    del sc["orchestration worker-list"][0]["out"]["result"]["workers"][0]["taskId"]  # -> rc 2
+    f.write_text(json.dumps(sc))
+    _expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, orca_bin)
+
+    result = _call(f"_afk_route_conflict_resolution '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not (statedir / "conflict-resolved-5").exists(), "nothing was dispatched"
+    assert not (statedir / "warned-state-5").exists(), "and nothing was warn-parked"
+    assert not ready_log.exists()
 
 
 def test_afk_record_dispatch_falls_back_to_a_loud_single_key_rewrite(tmp_path: Path) -> None:

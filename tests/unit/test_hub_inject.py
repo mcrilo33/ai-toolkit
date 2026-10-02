@@ -26,7 +26,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_INJECT = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-inject.sh"
 
 
-def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _call(
+    fn_call: str, *, env: dict[str, str] | None = None, timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
     """Source hub-inject.sh standalone and invoke a shell expression against its functions."""
     full_env = {**os.environ, "TZ": "UTC", "AFK_INJECT_MENU_PAUSE": "0"}
     if env:
@@ -36,6 +38,7 @@ def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.Comp
         capture_output=True,
         text=True,
         env=full_env,
+        timeout=timeout,
     )
 
 
@@ -274,19 +277,49 @@ def test_approve_permission_never_types_into_a_dialog_that_is_already_gone(
 
     result = _call(f'approve_permission "{wt}"')
 
-    assert result.returncode == 1
+    assert result.returncode == 3, "rc 3 = nothing to approve, distinct from a failed delivery"
     assert _sends(orca_bin) == [], "a stray `1` would land in the next prompt"
 
 
-def test_approve_permission_survives_a_non_numeric_settle_budget(
+def test_approve_permission_refuses_a_dialog_other_than_the_one_judged(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    wt = _wt(tmp_path)
+    orca_park(orca_bin, wt, state="waiting", tool="Bash", tool_input="rm -rf build")
+
+    result = _call(f'approve_permission "{wt}" "git status"')
+
+    assert result.returncode == 3
+    assert _sends(orca_bin) == [], "an approval must never land on a dialog nobody classified"
+
+
+def test_approve_permission_sends_to_the_dialog_that_was_judged(
     tmp_path: Path, orca_bin: Path
 ) -> None:
     wt = _wt(tmp_path)
     orca_park(orca_bin, wt, state="waiting", tool="Bash", tool_input="git status")
 
-    result = _call(f'approve_permission "{wt}"', env={"AFK_APPROVE_SETTLE_SECONDS": "abc"})
+    result = _call(f'approve_permission "{wt}" "git status"')
 
     assert result.returncode == 0, result.stderr
+    assert len(_sends(orca_bin)) == 1
+
+
+def test_approve_permission_survives_a_non_numeric_settle_budget(
+    tmp_path: Path, orca_bin: Path
+) -> None:
+    # The dialog STAYS up, so the settle loop must run to its (defaulted) budget and stop: a bad
+    # AFK_APPROVE_SETTLE_SECONDS used to make the integer test error and spin forever.
+    wt = _wt(tmp_path)
+    orca_park(orca_bin, wt, state="waiting", tool="Bash", tool_input="x", resumes=False)
+
+    result = _call(
+        f'approve_permission "{wt}"',
+        env={"AFK_APPROVE_SETTLE_SECONDS": "abc", "AFK_APPROVE_POLL_SECONDS": "0"},
+        timeout=30,
+    )
+
+    assert result.returncode == 1
     assert "integer expression" not in result.stderr
 
 
