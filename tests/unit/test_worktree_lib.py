@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -1984,104 +1985,202 @@ def test_gh_seed_marker_only_persists_on_success_and_self_heals(tmp_path: Path) 
     assert "status:gate" in seeded, "the second run must re-seed — the failed run left no marker"
 
 
-# --- wt_gate_green_stamped_fresh: freshness-bounded green-stamp check (issue #270) --
-# A freshness-bounded variant of wt_gate_green_stamped (existence-only) that a
-# tree-identical fast-forward land consults to reuse a RECENT green proof instead of
-# re-running the gate. Existence + HEAD^{tree} identity (as the base helper) PLUS the
-# stamp mtime younger than the max-age bound. Fail-CLOSED on absence / staleness /
-# unborn HEAD.
+# --- CI is the gate: wt_ci_state / wt_ci_check / wt_ci_refusal (issue #378) -----------
+# The ready and land scripts refuse until CI reports success for the exact SHA. `gh` is
+# stubbed with realistic `gh run list --json` output: the stub reads the run list from
+# $GH_RUNS (a JSON file) and the failing-job names from $GH_JOBS.
 
-_LIB_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+_RUN_URL = "https://github.com/o/r/actions/runs/101"
 
 
-def _repo_with_stamp(tmp_path: Path, *, stamp_age_seconds: int | None) -> Path:
-    """A git repo with one commit; a green stamp for HEAD^{tree} aged `stamp_age_seconds`.
+def _gh_stub(tmp_path: Path, runs: list[dict[str, object]] | None, jobs: str = "") -> dict[str, str]:
+    """A `gh` on PATH answering `run list` (the runs JSON) and `run view` (the jobs string).
 
-    `stamp_age_seconds=None` writes no stamp at all (the missing case). `0` writes a
-    fresh stamp (mtime now); a positive value back-dates the stamp mtime that many
-    seconds (the stale case).
+    ``runs=None`` makes `gh run list` fail (offline); otherwise it prints the JSON.
     """
-    repo = tmp_path / "repo"
-    subprocess.run(
-        ["git", "init", "-q", "-b", "main", str(repo)],
-        check=True,
-        capture_output=True,
-        env=_LIB_GIT_ENV,
+    bindir = tmp_path / "ghbin"
+    bindir.mkdir(exist_ok=True)
+    runs_file = tmp_path / "runs.json"
+    runs_file.write_text(json.dumps(runs if runs is not None else []))
+    fail = "1" if runs is None else "0"
+    (bindir / "gh").write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        f'  "run list") [ "{fail}" = 1 ] && exit 1; cat "{runs_file}"; echo "$*" >> "{tmp_path}/gh.log" ;;\n'
+        f'  "run view") printf "%s" "{jobs}" ;;\n'
+        "esac\n"
     )
-    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
-        subprocess.run(
-            ["git", "config", k, v],
-            cwd=str(repo),
-            check=True,
-            capture_output=True,
-            env=_LIB_GIT_ENV,
-        )
-    (repo / "README.md").write_text("seed\n")
-    subprocess.run(
-        ["git", "add", "README.md"],
-        cwd=str(repo),
-        check=True,
-        capture_output=True,
-        env=_LIB_GIT_ENV,
-    )
-    subprocess.run(
-        ["git", "commit", "-qm", "chore: seed"],
-        cwd=str(repo),
-        check=True,
-        capture_output=True,
-        env=_LIB_GIT_ENV,
-    )
-    if stamp_age_seconds is not None:
-        tree = subprocess.run(
-            ["git", "rev-parse", "HEAD^{tree}"],
-            cwd=str(repo),
-            check=True,
-            capture_output=True,
-            text=True,
-            env=_LIB_GIT_ENV,
-        ).stdout.strip()
-        stamps = repo / ".git" / ".gate-stamps"
-        stamps.mkdir(parents=True, exist_ok=True)
-        stamp = stamps / tree
-        stamp.write_text("tier=selected-set\nenv=test\n")
-        if stamp_age_seconds:
-            when = time.time() - stamp_age_seconds
-            os.utime(stamp, (when, when))
-    return repo
+    (bindir / "gh").chmod(0o755)
+    return {"PATH": f"{bindir}:{os.environ['PATH']}"}
 
 
-def _call_fresh(repo: Path, max_age: int) -> subprocess.CompletedProcess[str]:
+def _ci_run(status: str, conclusion: str, run_id: int = 101) -> dict[str, object]:
+    return {
+        "status": status,
+        "conclusion": conclusion,
+        "url": f"https://github.com/o/r/actions/runs/{run_id}",
+        "databaseId": run_id,
+    }
+
+
+def _ci(expr: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", "-c", f'. "{WT_LIB}"; wt_gate_green_stamped_fresh {max_age}'],
-        cwd=str(repo),
+        ["bash", "-c", f'. "{WT_LIB}"; {expr}'],
         capture_output=True,
         text=True,
-        env=_LIB_GIT_ENV,
+        env={**os.environ, **env, "WT_CI_POLL": "1", "WT_CI_NONE_GRACE": "0"},
     )
 
 
-def test_gate_green_stamped_fresh_accepts_a_recent_stamp(tmp_path: Path) -> None:
-    repo = _repo_with_stamp(tmp_path, stamp_age_seconds=0)  # minted just now
+@pytest.mark.parametrize(
+    ("runs", "state"),
+    [
+        ([_ci_run("completed", "success")], f"success|{_RUN_URL}|101"),
+        ([_ci_run("in_progress", "")], f"pending|{_RUN_URL}|101"),
+        ([_ci_run("queued", "")], f"pending|{_RUN_URL}|101"),
+        ([_ci_run("completed", "failure")], f"failure|{_RUN_URL}|101"),
+        ([_ci_run("completed", "cancelled")], f"failure|{_RUN_URL}|101"),
+        ([], "none||"),
+        # several runs share a SHA: a success anywhere wins, then anything unfinished
+        ([_ci_run("completed", "failure", 102), _ci_run("completed", "success")], f"success|{_RUN_URL}|101"),
+        (
+            [_ci_run("completed", "failure", 102), _ci_run("in_progress", "", 103)],
+            "pending|https://github.com/o/r/actions/runs/103|103",
+        ),
+    ],
+    ids=["success", "in-progress", "queued", "failure", "cancelled", "none", "any-success", "live"],
+)
+def test_ci_state_classifies_the_runs_for_a_sha(
+    tmp_path: Path, runs: list[dict[str, object]], state: str
+) -> None:
+    proc = _ci("wt_ci_state abc123", _gh_stub(tmp_path, runs))
 
-    result = _call_fresh(repo, 86400)
-
-    assert result.returncode == 0, result.stderr  # within the bound → reuse the proof
-
-
-def test_gate_green_stamped_fresh_rejects_a_stale_stamp(tmp_path: Path) -> None:
-    repo = _repo_with_stamp(tmp_path, stamp_age_seconds=100000)  # older than 24h
-
-    result = _call_fresh(repo, 86400)
-
-    assert result.returncode != 0  # too old → fail closed, the land re-runs the gate
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == state
 
 
-def test_gate_green_stamped_fresh_rejects_a_missing_stamp(tmp_path: Path) -> None:
-    repo = _repo_with_stamp(tmp_path, stamp_age_seconds=None)  # no stamp at all
+def test_ci_state_queries_the_ci_workflow_for_the_exact_commit(tmp_path: Path) -> None:
+    env = _gh_stub(tmp_path, [_ci_run("completed", "success")])
 
-    result = _call_fresh(repo, 86400)
+    _ci("wt_ci_state deadbeef", env)
 
-    assert result.returncode != 0  # no proof → fail closed
+    log = (tmp_path / "gh.log").read_text()
+    assert "--commit deadbeef" in log
+    assert "--workflow CI" in log
+
+
+def test_ci_state_is_unavailable_when_gh_is_absent(tmp_path: Path) -> None:
+    sandbox = tmp_path / "nogh"
+    sandbox.mkdir()
+    os.symlink(shutil.which("python3") or "/usr/bin/python3", sandbox / "python3")
+
+    proc = _ci("wt_ci_state abc123", {"PATH": f"{sandbox}:/bin"})
+
+    assert proc.stdout.strip() == "unavailable||"
+
+
+def test_ci_state_is_unavailable_when_the_query_fails(tmp_path: Path) -> None:
+    proc = _ci("wt_ci_state abc123", _gh_stub(tmp_path, None))
+
+    assert proc.stdout.strip() == "unavailable||"
+
+
+@pytest.mark.parametrize(
+    ("runs", "rc"),
+    [
+        ([_ci_run("completed", "success")], 0),
+        ([_ci_run("completed", "failure")], 1),
+        ([_ci_run("in_progress", "")], 2),
+        ([], 3),
+    ],
+    ids=["green", "failed", "pending-at-bound", "no-run"],
+)
+def test_ci_check_returns_a_distinct_code_per_outcome(
+    tmp_path: Path, runs: list[dict[str, object]], rc: int
+) -> None:
+    proc = _ci("wt_ci_check abc123 0", _gh_stub(tmp_path, runs))
+
+    assert proc.returncode == rc, proc.stderr
+
+
+def test_ci_check_polls_until_pending_turns_green(tmp_path: Path) -> None:
+    # The stub flips from in_progress to success on its 2nd `run list` call.
+    bindir = tmp_path / "ghbin"
+    bindir.mkdir()
+    counter = tmp_path / "n"
+    (bindir / "gh").write_text(
+        "#!/bin/sh\n"
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "{counter}"\n'
+        'if [ "$n" -ge 2 ]; then s=completed; c=success; else s=in_progress; c=""; fi\n'
+        'printf \'[{"status":"%s","conclusion":"%s","url":"u","databaseId":1}]\' "$s" "$c"\n'
+    )
+    (bindir / "gh").chmod(0o755)
+
+    proc = _ci("wt_ci_check abc123 30", {"PATH": f"{bindir}:{os.environ['PATH']}"})
+
+    assert proc.returncode == 0, proc.stderr
+    assert int(counter.read_text()) == 2  # polled again rather than giving up
+
+
+def test_ci_check_gives_a_fresh_push_time_for_its_run_to_appear(tmp_path: Path) -> None:
+    # No run yet is not final until the grace passes: here the run appears on call 2.
+    bindir = tmp_path / "ghbin"
+    bindir.mkdir()
+    counter = tmp_path / "n"
+    (bindir / "gh").write_text(
+        "#!/bin/sh\n"
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "{counter}"\n'
+        'if [ "$n" -ge 2 ]; then\n'
+        '  printf \'[{"status":"completed","conclusion":"success","url":"u","databaseId":1}]\'\n'
+        "else printf '[]'; fi\n"
+    )
+    (bindir / "gh").chmod(0o755)
+
+    proc = subprocess.run(
+        ["bash", "-c", f'. "{WT_LIB}"; wt_ci_check abc123 30'],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "WT_CI_POLL": "1",
+            "WT_CI_NONE_GRACE": "20",
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize(
+    ("rc", "needle"),
+    [
+        (2, "CI pending (https://x/run)"),
+        (3, "no CI run for this SHA (was it pushed?)"),
+        (4, "--local-gate"),
+    ],
+)
+def test_ci_refusal_names_the_state(tmp_path: Path, rc: int, needle: str) -> None:
+    proc = _ci(f'WT_CI_URL=https://x/run; wt_ci_refusal {rc}', _gh_stub(tmp_path, []))
+
+    assert needle in proc.stdout
+
+
+def test_ci_refusal_for_a_failed_run_names_the_failing_jobs(tmp_path: Path) -> None:
+    env = _gh_stub(tmp_path, [], jobs="Pytest suite, ShellCheck")
+
+    proc = _ci("WT_CI_URL=https://x/run WT_CI_RUN=7; wt_ci_refusal 1", env)
+
+    assert proc.stdout == "CI failed (https://x/run, failing jobs: Pytest suite, ShellCheck)"
+
+
+def test_local_gate_cmd_runs_the_two_phase_suite_with_xdist() -> None:
+    proc = subprocess.run(
+        ["bash", "-c", f'. "{WT_LIB}"; wt_local_gate_cmd'], capture_output=True, text=True
+    )
+
+    cmd = proc.stdout
+    assert '-n auto -m "not serial"' in cmd  # parallel-safe bulk
+    assert "-m serial" in cmd  # ref-mutating tail, single-process
 
 
 # ── issue #271: resolve the marker-emitter dir that EXISTS in the spawned worktree ──
