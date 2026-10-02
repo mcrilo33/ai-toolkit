@@ -182,7 +182,29 @@ class World:
         # `land:` knob (e.g. fail) for a mutation.
         (b / "worktree-land.sh").write_text(_LAND_STUB.format(tlog=TLOG_LIB))
         for f in b.iterdir():
+            shebang, body = f.read_text().split("\n", 1)
+            f.write_text(f"{shebang}\n{_WARM_GUARD}\n{body}")
             f.chmod(0o755)
+        self._warm_stubs()
+
+    def _warm_stubs(self) -> None:
+        """Exec every stub once, concurrently, before any tick (#374).
+
+        A freshly written script's FIRST exec can take seconds under xdist (macOS vets each
+        new executable) while a re-exec takes ~10ms. A tick is wall-clock-capped, so cold
+        tmux/ps stubs could burn the cap before the drain reached its recovery lane. The
+        `_WARM_GUARD` makes the warm-up exec side-effect-free and leaves a marker per stub."""
+        warmed = self.root / "warmed"
+        warmed.mkdir(exist_ok=True)
+        env = {**os.environ, "AFK_SIM_WARM": str(warmed)}
+        procs = [
+            subprocess.Popen(
+                [str(f)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            for f in self.fake_bin.iterdir()
+        ]
+        for proc in procs:
+            proc.wait()
 
     def _write_window_state(self) -> None:
         (self.state_dir / ".afk-state").write_text("drain\n")
@@ -410,6 +432,10 @@ class World:
             return rows
         return [r for r in rows if str(r.get("issue")) == str(issue)]
 
+
+# First line of every stub body: under `_warm_stubs` (AFK_SIM_WARM = a marker dir) the stub
+# records that it ran and exits, so the warm-up exec never executes the stub's real logic.
+_WARM_GUARD = r'[ -z "${AFK_SIM_WARM:-}" ] || { : > "$AFK_SIM_WARM/${0##*/}"; exit 0; }'
 
 _TMUX_STUB = r"""#!/usr/bin/env bash
 # Scripted tmux: reads per-spoke ground truth under {state}/panes/. The window index
