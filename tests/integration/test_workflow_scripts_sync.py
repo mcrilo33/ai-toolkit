@@ -38,6 +38,8 @@ WORKTREE_SCRIPTS = (
     # entry warns loudly (OTel preflight / gh lifecycle labels dead in the target).
     "worktree-otel-lib.sh",
     "worktree-gh-lib.sh",
+    # The only caller of the `orca` CLI (#363); worktree-lib.sh sources it as a sibling.
+    "orca-lib.sh",
     "spoke-push.sh",
     "spoke-ready.sh",
     # The dead-pane relaunch script (issue #233) ships alongside its spoke siblings so a

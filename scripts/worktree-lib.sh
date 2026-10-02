@@ -789,7 +789,7 @@ wt_ps_start_epoch() {
 # --- native-OTel preflight + gh lifecycle-label mirror (extracted modules) ----
 # Issue #353 split this lib behind a thin entry: the native-OTel bridge/collector
 # preflight machinery moved to worktree-otel-lib.sh and the gh lifecycle-label
-# mirror to worktree-gh-lib.sh, so a change to either stops serializing the drain
+# mirror to worktree-gh-lib.sh (and orca-lib.sh, the only caller of the `orca` CLI, #363), so a change to any stops serializing the drain
 # on this file's Scope: token (AFK Design Principle 7). Both are co-located siblings
 # (this checkout's scripts/, a synced target's .ai-toolkit/scripts/), so the single
 # $_WT_LIB_DIR candidate resolves in both. They carry functions consumers call
@@ -798,16 +798,15 @@ wt_ps_start_epoch() {
 # silent skip telemetry.sh/transition-log.sh use for their genuinely-optional libs.
 # The [ -r ] guard is load-bearing: `. ` of a missing file is a special builtin that
 # can exit the sourcing shell, escaping into every consumer that sources this lib.
-for _wt_mod in otel gh; do
-  _wt_modfile="$_WT_LIB_DIR/worktree-$_wt_mod-lib.sh"
-  if [ -r "$_wt_modfile" ]; then
+for _wt_modfile in worktree-otel-lib.sh worktree-gh-lib.sh orca-lib.sh; do
+  if [ -r "$_WT_LIB_DIR/$_wt_modfile" ]; then
     # shellcheck source=/dev/null
-    . "$_wt_modfile"
+    . "$_WT_LIB_DIR/$_wt_modfile"
   else
-    wt_warn "required module worktree-$_wt_mod-lib.sh missing/unreadable at $_WT_LIB_DIR — OTel preflight / gh lifecycle labels unavailable"
+    wt_warn "required module $_wt_modfile missing/unreadable at $_WT_LIB_DIR — OTel preflight / gh lifecycle labels / Orca dispatch unavailable"
   fi
 done
-unset _wt_mod _wt_modfile
+unset _wt_modfile
 
 # --- #300 lifecycle transition log ------------------------------------------
 # The four lifecycle ACTORS (worktree-new, spoke-ready, spoke-push,

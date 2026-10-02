@@ -30,6 +30,7 @@ WORKTREE_SCRIPTS = (
     "worktree-lib.sh",
     "worktree-otel-lib.sh",
     "worktree-gh-lib.sh",
+    "orca-lib.sh",
     # worktree-new.sh runs it as a sibling to gate every spawn (issue #359).
     "provision-worktree.sh",
 )
