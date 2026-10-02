@@ -137,12 +137,13 @@ def test_stale_siblings_with_no_final_converge(repo: Path, worktree: Path) -> No
     assert (root / SPOKE_ID / ".ai-toolkit" / "raw-bodies" / "req-1.json").is_file()
 
 
-def test_final_spool_never_absent_during_swap(repo: Path, worktree: Path, tmp_path: Path) -> None:
-    """The old spool is renamed aside, not deleted, before the new one is moved in."""
+def test_final_spool_never_absent_during_swap() -> None:
+    """The old spool is renamed aside, then the new one moved in, then the old deleted."""
     text = SCRIPT.read_text()
-    assert ".old." in text and "rm -rf" in text
-    swap = text.index(".old.")
-    assert text.index("rm -rf", swap) > swap
+    aside = text.index('mv "$FINAL" "$OLD"')
+    move_in = text.index('mv "$TMP" "$FINAL"')
+    delete_old = text.index('rm -rf "$OLD"')
+    assert aside < move_in < delete_old
 
 
 def test_non_otel_worktree_spools_nothing(repo: Path, worktree: Path) -> None:
@@ -242,4 +243,4 @@ def test_completes_under_five_seconds_on_realistic_bodies(repo: Path, worktree: 
     elapsed = time.monotonic() - start
     assert r.returncode == 0, r.stderr
     assert elapsed < 5.0
-    assert len(list((_spool_root(repo) / SPOKE_ID / ".ai-toolkit" / "raw-bodies").iterdir())) == 601
+    assert len(list((_spool_root(repo) / SPOKE_ID / ".ai-toolkit" / "raw-bodies").iterdir())) == 600
