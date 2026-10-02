@@ -1197,3 +1197,112 @@ def test_approve_permission_records_approval_injected(tmp_path: Path) -> None:
     _call(f"approve_permission '{wt}'", env=env)
 
     assert '"event":"approval_injected"' in _tlog(state, 311)
+
+
+# ── issue #361 (S2b): _hi_issue_for_wt reads the identity record ──────────────
+# Identity first, then the branch slug. AFK_TLOG_ISSUE still wins over both.
+
+
+def _branch_wt(tmp_path: Path, branch: str, record: str | None = None) -> Path:
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", branch, str(wt)], check=True)
+    if record is not None:
+        (wt / ".ai-toolkit").mkdir()
+        (wt / ".ai-toolkit" / "identity").write_text(record)
+    return wt
+
+
+def _issue_for(wt: Path, *, env: dict[str, str] | None = None) -> str:
+    result = _call(f'out="$(_hi_issue_for_wt "{wt}")"; echo "rc=$? out=[$out]"', env=env)
+    return result.stdout.strip()
+
+
+def test_hi_issue_for_wt_reads_the_record_on_a_non_conforming_branch(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "orca-migration", "issue=361\n")
+
+    assert _issue_for(wt) == "rc=0 out=[361]"
+
+
+def test_hi_issue_for_wt_prefers_the_record_over_the_branch_slug(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "feature/5-x", "issue=361\n")
+
+    assert _issue_for(wt) == "rc=0 out=[361]"
+
+
+def test_hi_issue_for_wt_override_still_beats_the_record(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "orca-migration", "issue=361\n")
+
+    assert _issue_for(wt, env={"AFK_TLOG_ISSUE": "311"}) == "rc=0 out=[311]"
+
+
+def test_hi_issue_for_wt_without_a_record_keeps_the_branch_slug_read(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "feature/223-slug")
+
+    assert _issue_for(wt) == "rc=0 out=[223]"
+
+
+def test_hi_issue_for_wt_without_a_record_is_empty_on_a_bare_branch(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "orca-migration")
+
+    assert _issue_for(wt) == "rc=1 out=[]"
+
+
+def test_hi_issue_for_wt_ignores_a_non_numeric_record(tmp_path: Path) -> None:
+    wt = _branch_wt(tmp_path, "feature/223-slug", "issue=quick-slug\n")
+
+    assert _issue_for(wt) == "rc=0 out=[223]"
+
+
+def test_hi_tlog_delivery_logs_a_bare_branch_worktree_against_its_recorded_issue(
+    tmp_path: Path,
+) -> None:
+    wt = _branch_wt(tmp_path, "orca-migration", "issue=361\n")
+    state = tmp_path / "sd"
+
+    _call(
+        f'_hi_tlog_delivery "{wt}" answer_delivered answer \'{{"rc":0}}\'',
+        env={"AFK_STATE_DIR": str(state)},
+    )
+
+    assert '"event":"answer_delivered"' in _tlog(state, 361)
+
+
+@pytest.mark.parametrize(
+    ("scripts_dir", "lib_dir"),
+    [
+        # synced target: identity.sh co-located with hub-inject.sh
+        pytest.param(".ai-toolkit/scripts", ".ai-toolkit/scripts", id="toolkit"),
+        # synced .claude layout: the hook libs live under hooks/scripts/lib
+        pytest.param(".claude/skills/hub/scripts", ".claude/hooks/scripts/lib", id="claude"),
+    ],
+)
+def test_identity_loader_resolves_in_a_synced_target_layout(
+    tmp_path: Path, scripts_dir: str, lib_dir: str
+) -> None:
+    # The permission hook and danger wall run from <target>/.claude/skills/hub/scripts/ with a
+    # CLAUDE_PROJECT_DIR that is NOT the ai-toolkit checkout: the loader must still find the lib.
+    scripts = tmp_path / scripts_dir
+    libs = tmp_path / lib_dir
+    scripts.mkdir(parents=True)
+    libs.mkdir(parents=True, exist_ok=True)
+    (scripts / "hub-inject.sh").write_text(HUB_INJECT.read_text())
+    (libs / "identity.sh").write_text(
+        (REPO_ROOT / "shared" / "hooks" / "lib" / "identity.sh").read_text()
+    )
+    empty_top = tmp_path / "no-toplevel"
+    empty_top.mkdir()
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'cd "{empty_top}" && source "{scripts / "hub-inject.sh"}" && '
+            "declare -F ai_toolkit_identity_issue_at",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "_AFK_TOPLEVEL": str(empty_top)},
+    )
+
+    assert "ai_toolkit_identity_issue_at" in result.stdout, result.stderr

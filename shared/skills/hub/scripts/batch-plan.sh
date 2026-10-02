@@ -984,16 +984,38 @@ main()
 PYEOF
 }
 
-# _batch_inflight_issue_nums — the issue number leading each task worktree's branch slug
-# (e.g. feature/223-slug → 223), one per line. Used to seed the --explain view with the
-# live in-flight set so it can attribute blocked-by-scope collisions to a running spoke.
-# The main checkout (branch `main`) and detached worktrees carry no leading digits and
-# are skipped. A best-effort standalone parse (no worktree-lib dependency). LC_ALL=C forces
-# a byte-stable locale for the system-tool parse, matching this repo's locale-hardening
-# discipline (#189/#194) even though worktree branch refs are ASCII.
+# _batch_inflight_issue_nums — the issue number of each task worktree, one per line: its identity
+# record's numeric `issue` (#361, so a worktree on a bare branch is still in flight), else the
+# leading digits of its branch slug (e.g. feature/223-slug → 223). Used to seed the --explain view
+# with the live in-flight set so it can attribute blocked-by-scope collisions to a running spoke.
+# The main checkout (branch `main`) and detached worktrees with no record carry no number and are
+# skipped. A best-effort standalone parse (no worktree-lib / identity.sh dependency): the record
+# is read inline per listed path with identity.sh's semantics -- first `issue=` line wins, and an
+# empty or non-numeric value is unknown, never an issue. LC_ALL=C forces a byte-stable locale for
+# the system-tool parse, matching this repo's locale-hardening discipline (#189/#194) even though
+# worktree branch refs are ASCII.
 _batch_inflight_issue_nums() {
   LC_ALL=C git worktree list --porcelain 2>/dev/null | LC_ALL=C awk '
-    /^branch /{ slug = $2; sub(/.*\//, "", slug); if (match(slug, /^[0-9]+/)) print substr(slug, RSTART, RLENGTH) }'
+    function flush(   num, line, file) {
+      if (wt == "") return
+      num = ""
+      file = wt "/.ai-toolkit/identity"
+      while ((getline line < file) > 0) {
+        sub(/\r$/, "", line)
+        if (index(line, "issue=") == 1) { num = substr(line, 7); break }
+      }
+      close(file)
+      if (num !~ /^[0-9]+$/) {
+        num = ""
+        if (match(slug, /^[0-9]+/)) num = substr(slug, RSTART, RLENGTH)
+      }
+      if (num != "") print num
+      wt = ""; slug = ""
+    }
+    /^worktree /{ flush(); wt = substr($0, 10); next }
+    /^branch /{ slug = $2; sub(/.*\//, "", slug); next }
+    /^$/{ flush() }
+    END { flush() }'
 }
 
 # main — fetch the open backlog and print the next concurrent batch. Pass through any

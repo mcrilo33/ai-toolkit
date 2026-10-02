@@ -40,6 +40,26 @@ if ! declare -F wt_realpath >/dev/null 2>&1; then
   unset _cand _hi_top
 fi
 
+# identity.sh (#361): the hub-side readers take the issue from a worktree's recorded identity
+# (`<wt>/.ai-toolkit/identity`) before inferring it from the branch slug. THIS is the one loader
+# the gate-broker modules rely on (gate-broker.sh sources us before them). Same dual layout as the
+# siblings -- co-located in a synced target, shared/hooks/lib/ in the checkout, hooks/scripts/lib/
+# beside a synced .claude/skills/hub/scripts/ -- plus the _AFK_TOPLEVEL fallbacks a self-copy
+# drain needs (its temp dir carries neither). Absent => the reader is simply undefined and every
+# site keeps its branch-slug inference.
+if ! declare -F ai_toolkit_identity_issue_at >/dev/null 2>&1; then
+  _hi_top="${_AFK_TOPLEVEL:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
+  for _cand in \
+    "$HUB_INJECT_SCRIPT_DIR/identity.sh" \
+    "$HUB_INJECT_SCRIPT_DIR/../../../hooks/lib/identity.sh" \
+    "$HUB_INJECT_SCRIPT_DIR/../../../hooks/scripts/lib/identity.sh" \
+    "${_hi_top:+$_hi_top/shared/hooks/lib/identity.sh}" \
+    "${_hi_top:+$_hi_top/.ai-toolkit/scripts/identity.sh}"; do
+    if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; break; fi
+  done
+  unset _cand _hi_top
+fi
+
 # Guarded log fallback: gate-broker.sh defines its own log() before sourcing us, so this
 # only fires for a standalone source (the watchdog / tests). Same stderr contract.
 declare -F log >/dev/null 2>&1 || log() { printf '%s\n' "$*" >&2; }
@@ -54,16 +74,22 @@ declare -F log >/dev/null 2>&1 || log() { printf '%s\n' "$*" >&2; }
 # guard no-ops when transition-log.sh is absent, so a missing lib degrades cleanly.
 #
 # The injector receives only <wt> (the answer path passes no issue), so the issue is derived
-# from the spoke's branch slug — the same feature/<issue>-<slug> read afk_permission_hook_decide
-# uses — with AFK_TLOG_ISSUE as an explicit override (tests, and any caller that already knows
-# it). lane/episode ride env vars (AFK_TLOG_LANE / AFK_TLOG_EPISODE) so a caller that owns the
-# park context (the permission lane) threads it in, while the answer path degrades to a bare
-# delivery lane with no episode — the broker's own lane events carry the episode key instead.
+# from the worktree itself: its recorded identity first (#361, so a bare-branch Orca worktree is
+# still logged), else the spoke's branch slug -- the same feature/<issue>-<slug> read
+# afk_permission_hook_decide uses -- with AFK_TLOG_ISSUE as an explicit override (tests, and any
+# caller that already knows it). lane/episode ride env vars (AFK_TLOG_LANE / AFK_TLOG_EPISODE) so a
+# caller that owns the park context (the permission lane) threads it in, while the answer path
+# degrades to a bare delivery lane with no episode -- the broker's own lane events carry the
+# episode key instead.
 
-# _hi_issue_for_wt <wt> -> the numeric issue this worktree belongs to (AFK_TLOG_ISSUE wins,
-# else the branch slug's leading digits), or empty (rc 1) when none is derivable.
+# _hi_issue_for_wt <wt> -> the numeric issue this worktree belongs to (AFK_TLOG_ISSUE wins, then
+# the identity record, else the branch slug's leading digits), or empty (rc 1) when none is
+# derivable.
 _hi_issue_for_wt() {
   local wt="$1" issue="${AFK_TLOG_ISSUE:-}" br slug
+  if [ -z "$issue" ] && declare -F ai_toolkit_identity_issue_at >/dev/null 2>&1; then
+    issue="$(ai_toolkit_identity_issue_at "$wt" 2>/dev/null)" || issue=""
+  fi
   if [ -z "$issue" ]; then
     br="$(git -C "$wt" branch --show-current 2>/dev/null)" || true
     slug="${br##*/}"; issue="${slug%%[!0-9]*}"

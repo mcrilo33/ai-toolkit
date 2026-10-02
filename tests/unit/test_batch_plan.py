@@ -1653,3 +1653,126 @@ def test_chain_merge_lint_survives_for_a_blocked_chain() -> None:
     proc = _run_plan([_node(1, "a.py"), _node(2, "a.py", blocked_by=[(1, "OPEN")])])
 
     assert "merge candidates" in proc.stderr
+
+
+# ── issue #361 (S2b): _batch_inflight_issue_nums reads the identity record ─────
+# Identity first (per listed worktree path), then the branch slug's leading digits. batch-plan.sh
+# stays standalone and LC_ALL=C: the record is parsed inline, with no lib sourced (#189/#194).
+
+_INFLIGHT_GIT_ENV = {
+    **os.environ,
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+}
+
+
+def _inflight_repo(tmp_path: Path, worktrees: dict[str, str | None]) -> Path:
+    """A hub repo with one linked worktree per {branch: identity-record-or-None}."""
+    hub = tmp_path / "hub"
+    hub.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=hub, check=True, capture_output=True, env=_INFLIGHT_GIT_ENV
+        )
+
+    git("init", "-q", "-b", "main")
+    git("commit", "-q", "--allow-empty", "-m", "init")
+    for i, (branch, record) in enumerate(worktrees.items()):
+        path = tmp_path / f"wt{i}"
+        git("worktree", "add", "-q", str(path), "-b", branch)
+        if record is not None:
+            (path / ".ai-toolkit").mkdir()
+            (path / ".ai-toolkit" / "identity").write_text(record)
+    return hub
+
+
+def _inflight_nums(hub: Path, script: Path = BATCH_PLAN) -> list[str]:
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{script}"; _batch_inflight_issue_nums'],
+        cwd=hub,
+        capture_output=True,
+        text=True,
+        env=_INFLIGHT_GIT_ENV,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.split()
+
+
+def test_inflight_nums_include_a_bare_branch_worktree_with_an_identity_record(
+    tmp_path: Path,
+) -> None:
+    hub = _inflight_repo(tmp_path, {"orca-migration": "issue=361\nlane=spoke\n"})
+
+    assert _inflight_nums(hub) == ["361"]
+
+
+def test_inflight_nums_prefer_the_record_over_the_branch_slug(tmp_path: Path) -> None:
+    hub = _inflight_repo(tmp_path, {"feature/5-x": "issue=361\n"})
+
+    assert _inflight_nums(hub) == ["361"]
+
+
+def test_inflight_nums_without_a_record_keep_the_branch_slug_survey(tmp_path: Path) -> None:
+    hub = _inflight_repo(tmp_path, {"feature/223-slug": None, "orca-migration": None})
+
+    assert _inflight_nums(hub) == ["223"]
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "issue=fix-typo\n",
+        "issue=\nissue=7\n",  # first occurrence wins, and it is empty => unknown
+        "lane=spoke\n",
+        "# issue=9\n",
+    ],
+    ids=["non-numeric", "empty-first", "no-key", "comment"],
+)
+def test_inflight_nums_ignore_an_unusable_record_and_fall_back_to_the_slug(
+    tmp_path: Path, record: str
+) -> None:
+    hub = _inflight_repo(tmp_path, {"feature/223-slug": record})
+
+    assert _inflight_nums(hub) == ["223"]
+
+
+def test_inflight_nums_read_the_record_of_a_crlf_file_and_a_path_with_spaces(
+    tmp_path: Path,
+) -> None:
+    hub = tmp_path / "hub dir"
+    hub.mkdir()
+    for args in (
+        ["init", "-q", "-b", "main"],
+        ["commit", "-q", "--allow-empty", "-m", "init"],
+        ["worktree", "add", "-q", str(tmp_path / "wt one"), "-b", "orca-x"],
+    ):
+        subprocess.run(
+            ["git", *args], cwd=hub, check=True, capture_output=True, env=_INFLIGHT_GIT_ENV
+        )
+    (tmp_path / "wt one" / ".ai-toolkit").mkdir()
+    (tmp_path / "wt one" / ".ai-toolkit" / "identity").write_bytes(b"issue=361\r\n")
+
+    assert _inflight_nums(hub) == ["361"]
+
+
+def test_inflight_nums_work_from_a_lone_copy_with_no_sibling_libs(tmp_path: Path) -> None:
+    # Standalone: the reader must not depend on identity.sh / worktree-lib.sh being reachable.
+    lone = tmp_path / "lone" / "batch-plan.sh"
+    lone.parent.mkdir()
+    lone.write_text(BATCH_PLAN.read_text())
+    hub = _inflight_repo(tmp_path, {"orca-migration": "issue=361\n"})
+
+    assert _inflight_nums(hub, lone) == ["361"]
+
+
+def test_inflight_nums_helper_is_locale_pinned_and_sources_no_lib() -> None:
+    text = BATCH_PLAN.read_text()
+    body = text[text.index("_batch_inflight_issue_nums() {") :].split("\n}\n", 1)[0]
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+    assert body.count("LC_ALL=C") >= 2, "git and awk must both run under LC_ALL=C (#189/#194)"
+    assert "identity.sh" not in code and "worktree-lib" not in code
+    assert not re.search(r"^\s*(source|\.)\s", code, re.MULTILINE), "must stay dependency-free"
