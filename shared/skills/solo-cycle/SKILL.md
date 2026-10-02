@@ -46,8 +46,8 @@ After ANCHOR and before writing any code, a PLAN-gated spoke:
    message** — files, approach, test strategy, and **open questions**. The plan
    is the message itself, never an empty or abbreviated stub deferred to an
    approval card.
-2. **Parks** by emitting the `gate/<issue>` marker (below) and **stops** with an
-   explicit "reply to approve, or tell me what to change" — all **before writing
+2. **Parks** by emitting the `gate/<issue>` marker (below) — which then **blocks in
+   `orca orchestration ask`** until the coordinator replies — all **before writing
    code**. The hub planned the *what/why* (the issue); the PLAN gate is the *how*
    (it needs the codebase in front of it), so scope is not re-litigated twice.
 3. On approval, proceeds into the RED → GREEN → REVIEW → PUSH cycle below.
@@ -94,6 +94,23 @@ The script force-moves the annotated `gate/<issue>` tag and pushes it as a tag-o
 push, which the pre-push gate short-circuits (a marker carries no code), so emitting
 it never runs the suite. To re-emit or move the gate, just **re-run the script** — it
 is idempotent — never a manual re-push of the refspec.
+
+**Under Orca the gate then waits for the answer** (#365). `--gate` posts the plan as an
+`orchestration ask` (options `approve,revise`) and blocks. Read its exit code:
+
+| Exit | Meaning | What you do |
+|------|---------|-------------|
+| 0 | approved — the script consumed `gate/<issue>` and the plan artifact | proceed to RED |
+| 3 | the reply asks for changes (printed) | amend the plan, then re-run `--gate` |
+| 6 | no reply yet: the question is still **pending** (id kept in `.ai-toolkit/gate-<issue>.ask`) | **re-run the exact same command** to keep waiting; never start coding and never ask again |
+| 1 | the ask failed | read the error; a stale/missing capability needs the token below |
+
+Orca hands a dispatched worker a **dispatch capability** only in its preamble
+(`--dispatch-capability <token>`); pass it once as
+`spoke-ready.sh --gate <issue> --dispatch-capability <token>` — it is remembered in
+`.ai-toolkit/dispatch-capability`, so the later `ready` / `--blocked` (which send
+`worker_done` `succeeded` / `failed`, best-effort) find it. A restarted worker has a new
+token: pass it again.
 
 ### Gate action — who services a parked gate (attended vs unattended)
 

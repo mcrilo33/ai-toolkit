@@ -79,104 +79,24 @@ _spoke_idle_seconds() {
   [ -n "$ref" ] || return 0
   printf '%s\n' "$(( $(afk_now) - ref ))"
 }
-# extract_pending_question <wt_path> -> the prompt the spoke is parked on, or empty when
-# it is NOT waiting. The same waiting signal hub-status.sh surfaces (an open
-# AskUserQuestion, or a trailing notification entry) — but here we return the actual
-# question + options / trailing assistant message so the answerer has something to reason
-# about. Empty output ⇒ not waiting, so this doubles as the auto-answer trigger.
+# extract_pending_question <wt_path> -> the prompt the spoke is parked on, or empty when it is NOT
+# waiting (so this doubles as the auto-answer trigger). A worker's `ask` arrives as an inbox
+# `question` (the PLAN gate: the agent reads `working` while it blocks, so only the inbox shows it);
+# a stray AskUserQuestion dialog is the agent `waiting` on that tool, its questions in toolInput.
+# Never a transcript parse.
 extract_pending_question() {
-  local jsonl; jsonl="$(_spoke_jsonl "$1")"
-  [ -n "$jsonl" ] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
-import json, os
-
-pending = None        # list of formatted AskUserQuestion questions, or None
-last_asst_text = ""   # text of the most recent assistant message
-gate_plan = ""        # plan prose of a PLAN-gate park (spoke-ready.sh --gate), or ""
-gate_ids = set()      # tool_use ids of gate emissions, to detect a FAILED one (is_error)
-last_type = None
-try:
-    with open(os.environ["_AFK_JSONL"]) as fh:
-        for raw in fh:
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            last_type = obj.get("type")
-            content = (obj.get("message") or {}).get("content") or []
-            if not isinstance(content, list):
-                if last_type == "user":
-                    pending = None
-                    # A real reply — a human typing in the pane, or the broker's own tmux
-                    # inject — is recorded as a TYPED string-content user turn, not a text
-                    # block. That reply resolves the PLAN gate, so un-latch gate_plan just as
-                    # the list-content text-block branch does (#313). Mirror _gate_answer_landed
-                    # (#204): only a typed, non-meta submission counts, so every synthetic
-                    # string-content harness turn leaves a still-unanswered park latched.
-                    if (isinstance(content, str) and content.strip()
-                            and obj.get("promptSource") == "typed" and not obj.get("isMeta")):
-                        gate_plan = ""
-                continue
-            if last_type == "assistant":
-                asks, texts, gate_id = [], [], None
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") == "text":
-                        texts.append(block.get("text") or "")
-                    elif block.get("type") == "tool_use" and block.get("name") == "AskUserQuestion":
-                        for q in (block.get("input") or {}).get("questions") or []:
-                            lines = [f"Q: {q.get('question', '').strip()}"]
-                            for opt in q.get("options") or []:
-                                label = (opt.get("label") or "").strip()
-                                desc = (opt.get("description") or "").strip()
-                                lines.append(f"  - {label}: {desc}" if desc else f"  - {label}")
-                            asks.append("\n".join(lines))
-                    elif block.get("type") == "tool_use" and block.get("name") == "Bash":
-                        if "spoke-ready.sh --gate" in ((block.get("input") or {}).get("command") or ""):
-                            gate_id = block.get("id") or True   # True: a park with no id (fixtures)
-                if texts:
-                    last_asst_text = "\n".join(t for t in texts if t).strip()
-                pending = asks or None
-                # A PLAN-gate park = prose plan + a `spoke-ready.sh --gate` Bash, no
-                # AskUserQuestion. Remember the plan so the answerer has it to reason about; the
-                # emission's tool_result (below) can still un-latch it if it FAILED.
-                if gate_id:
-                    gate_plan = last_asst_text
-                    if gate_id is not True:
-                        gate_ids.add(gate_id)
-            elif last_type == "user":
-                # A gate emission that resolved with is_error (a hook DENY or a script failure)
-                # never established a park (issue #271): un-latch the plan so a spoke that keeps
-                # working is read as busy, not `waiting` — the phantom park the watchdog answered.
-                # This reads Claude Code's current shape: a failed/denied tool_use surfaces as a
-                # user-turn tool_result carrying the tool_use_id and a truthy is_error.
-                for b in content:
-                    if (isinstance(b, dict) and b.get("type") == "tool_result"
-                            and b.get("tool_use_id") in gate_ids and b.get("is_error")):
-                        gate_plan = ""
-                # A real human reply (a text block) means the spoke is no longer parked;
-                # a tool_result-only user turn (e.g. the gate Bash's result) does NOT.
-                if any(isinstance(b, dict) and b.get("type") == "text" for b in content):
-                    pending = None
-                    gate_plan = ""
-except Exception:
-    pass
-
-out = ""
-if pending:
-    out = "\n\n".join(pending)
-elif last_type == "notification":
-    out = last_asst_text
-elif gate_plan:
-    out = gate_plan
-# Bound the payload so a huge plan message can't blow up the answerer prompt.
-print(out[:4000].strip())
-PYEOF
+  local wt="$1" q
+  q="$(orca_inbox_question "$wt" body 2>/dev/null)" || q=""
+  if [ -n "$q" ]; then printf '%s\n' "${q:0:4000}"; return 0; fi
+  [ "$(orca_agent_state "$wt" 2>/dev/null)" = waiting ] || return 0
+  [ "$(orca_agent_field "$wt" toolName 2>/dev/null)" = AskUserQuestion ] || return 0
+  orca_agent_field "$wt" toolInput 2>/dev/null | jq -r '[.questions[]? | "Q: \(.question // "")\n"
+    + ([.options[]? | "  - \(.label // "")" + (if .description then ": \(.description)" else "" end)] | join("\n"))]
+    | join("\n\n")' 2>/dev/null | head -c 4000
 }
+# _pending_question_id <wt> -> the inbox id of the question the spoke is parked on (empty for a
+# permission dialog or a stray AskUserQuestion): the recorded id a reply answers.
+_pending_question_id() { orca_inbox_question "$1" id 2>/dev/null || true; }
 
 # _is_seed_replay <wt_path> <text> -> true when <text> substantially replays the
 # spoke's SEED prompt (the first user message in its transcript): normalized-whitespace,
@@ -231,15 +151,43 @@ PYEOF
 }
 
 # --- slot state ---------------------------------------------------------------
-# _detect_agent_dead <wt_path> -> #301: rc 0 when the spoke's agent is PROVEN gone. A thin,
-# GUARDED shim over hub-inject's _spoke_agent_dead: a standalone source of this module (no
-# hub-inject in the chain) falls through to "not dead" (rc 1) rather than erroring, preserving
-# the pre-#301 park behavior exactly. Every waiting classification below is gated through it so a
-# pane whose agent died — but whose scrollback dialog or gate/<issue> tag lingers — is read as the
-# crash it is, not a live park the answer lane keeps trying (and failing) to serve.
-_detect_agent_dead() {
-  declare -F _spoke_agent_dead >/dev/null 2>&1 || return 1
-  _spoke_agent_dead "$1"
+# _spoke_agent_dead <wt_path> -> rc 0 ONLY when Orca reports the spoke's worker `exited`. A missing
+# record, a failed read, `live` and `unverifiable` are all rc 1: unknown is never a basis for
+# recovery (AFK principle #6), and a park signal from a dead worker (a gate/<issue> tag outlives
+# the process) is the crash it is, not a live park the answer lane keeps trying to serve (#301).
+_spoke_agent_dead() { [ "$(orca_worker_liveness "$1" 2>/dev/null)" = exited ]; }
+
+# _spoke_turn_done <wt_path> -> rc 0 when the spoke's agent finished its turn and is idle at the
+# prompt: Orca reports it `done` and no question is waiting in the inbox (the #255 finished-turn-
+# idle shape). Such a spoke is NUDGED (a continue message into the live session), not restarted.
+# Unknown is rc 1, which falls through to the revive path -- the pre-#365 fail-closed posture.
+_spoke_turn_done() {
+  [ "$(orca_agent_state "$1" 2>/dev/null)" = done ] && [ -z "$(_pending_question_id "$1")" ]
+}
+
+# _afk_note_orca_state <wt> <issue> -> S7 measurement: a lifecycle span for the first agent state the
+# drain sees after dispatch (dispatch -> first state), and a `script` span orca:liveness-<verdict> on
+# each CHANGE of the worker's liveness. The last-seen values live in per-window marker files, written
+# by this function only; best-effort, an emit or marker failure never reaches the tick.
+_afk_note_orca_state() {
+  local wt="$1" issue="$2" dir st live last d
+  command -v _hi_span >/dev/null 2>&1 || return 0
+  dir="$(_afk_state_dir)"
+  if [ ! -f "$dir/first-state-$issue" ]; then
+    st="$(orca_agent_state "$wt" 2>/dev/null)"
+    case "$st" in working | waiting | done)
+      d="$(read_dispatch_epoch "$issue")"
+      _hi_span "$wt" --kind lifecycle --name orca:first-agent-state --phase spawn --status success \
+        ${d:+--start-ms "$(( d * 1000 ))"}
+      mkdir -p "$dir" 2>/dev/null; : > "$dir/first-state-$issue" 2>/dev/null || true ;;
+    esac
+  fi
+  live="$(orca_worker_liveness "$wt" 2>/dev/null)"
+  case "$live" in live | unverifiable | exited) ;; *) return 0 ;; esac
+  last="$(cat "$dir/liveness-$issue" 2>/dev/null)"
+  [ "$last" = "$live" ] && return 0
+  _hi_span "$wt" --kind script --name "orca:liveness-$live" --phase review --status success
+  mkdir -p "$dir" 2>/dev/null; printf '%s\n' "$live" > "$dir/liveness-$issue" 2>/dev/null || true
 }
 
 # --- the reconciler (issue #304) ----------------------------------------------
@@ -303,11 +251,14 @@ _afk_reconcile_park() {
   _afk_record_reconciled "$issue" parked "$episode"
 }
 
-# slot_state <wt_path> <issue> -> done|waiting|reap|busy.
+# slot_state <wt_path> <issue> -> done|waiting|reap|busy. Park signals come from Orca, never a
+# pane or a transcript: an inbox `question` (a PLAN gate or any worker `ask`; the agent reads
+# `working` meanwhile, so agent state alone never classifies a gate park), or the agent `waiting`
+# on a permission dialog. A gate/<issue> tag is the durable record, not a park signal.
 #   done    — a TERMINAL marker (ready/accept/blocked) at the branch tip.
 #   waiting — parked on a question / gate / permission dialog, AGENT ALIVE (auto-answer it; never
-#             reaped, regardless of ceiling — park detection precedes both reap verdicts, #246). A
-#             dead agent whose park signal lingers in scrollback / a git tag is NOT waiting (#301).
+#             reaped, regardless of ceiling — park detection precedes both reap verdicts, #246). An
+#             exited worker whose park signal lingers is NOT waiting (#301).
 #   reap    — over the wall-clock ceiling, or idle past AFK_IDLE_MINUTES, AND with no
 #             detectable pending park (a hung/working spoke, not a park).
 #   busy    — actively working (or just spawned, no transcript yet).
@@ -348,45 +299,33 @@ slot_state() {
       # live park: fall through to `done` (blocked is terminal; a human already owns it — never
       # auto-revived over the escalation, unlike the gate/question cases below).
       if { [ -n "$(extract_pending_question "$wt_path")" ] || _permission_pending "$wt_path"; } \
-         && ! _detect_agent_dead "$wt_path"; then
+         && ! _spoke_agent_dead "$wt_path"; then
         _afk_reconcile_park "$wt_path" "$issue"; printf 'waiting\n'; return
       fi
       printf 'done\n'; return
     fi
-    # A pushed gate/<issue> at the tip = parked at the PLAN gate → waiting, never reaped.
-    # The gate is a prose plan + this tag (no AskUserQuestion), so extract_pending_question
-    # can't see it. Checking at the tip is self-clearing: once approved and the spoke
-    # commits its first RED/GREEN, the tip moves past the gate commit and it reads busy.
-    if [ "$(git -C "$wt_path" rev-parse -q --verify "refs/tags/gate/${issue}^{commit}" 2>/dev/null)" = "$tip" ]; then
-      # #301: a gate/<issue> tag OUTLIVES the process (a git tag is the most durable phantom-park
-      # source there is), so the #296/#299 crash — agent dead, tag still at the tip — kept reading
-      # `waiting` and was never revived. Only a LIVE agent at the gate is a real park; a dead one
-      # falls through to busy/reap so recover_dead_panes revives it in place.
-      if ! _detect_agent_dead "$wt_path"; then
-        _afk_reconcile_park "$wt_path" "$issue"; printf 'waiting\n'; return
-      fi
-    fi
   fi
+  _afk_note_orca_state "$wt_path" "$issue" || true
   # Ledger progress (a tip advance since the last tick) refreshes the ceiling before
   # it is measured — a revived spoke is not re-reaped off its stale dispatch epoch.
   _afk_note_tip_progress "$wt_path" "$issue"
   # Park detection precedes BOTH reaps (#246): an answerable park — a pending question or a
   # permission dialog — is serviced by the answer lane, so it classifies `waiting` however long
   # it has been parked, never `reap`. Pre-#246 the wall-clock ceiling reap ran first, so an
-  # over-ceiling permission-parked spoke was reaped + revived (claude --continue), which only
+  # over-ceiling permission-parked spoke was reaped + revived (restarted), which only
   # re-raised the identical dialog: parked -> reaped -> revived -> parked forever. The doom-loop a
   # genuinely-stuck dialog could form is bounded NOT here but in the answer lane
   # (broker_service_gate's _broker_reanswer_exhausted / AFK_REANSWER_CEILING + the _afk_warned_arm
   # backoff, escalating to blocked/<issue> on a real judgment call), so park-wins is unconditional.
-  # #301: `&& ! _detect_agent_dead` — a question/dialog left by an agent that has since died is a
+  # #301: `&& ! _spoke_agent_dead` — a question/dialog left by an agent that has since died is a
   # crash, not a live park. The probe runs only AFTER the cheap park signal is already true (&&
   # short-circuits), so a busy spoke never pays for it.
-  if [ -n "$(extract_pending_question "$wt_path")" ] && ! _detect_agent_dead "$wt_path"; then
+  if [ -n "$(extract_pending_question "$wt_path")" ] && ! _spoke_agent_dead "$wt_path"; then
     _afk_reconcile_park "$wt_path" "$issue"; printf 'waiting\n'; return
   fi
   # A pending permission dialog (a CC confirmation prompt, no transcript entry) is decided by
   # the supervisor's classifier, so it waits — never reaped as idle (#149) or over-ceiling (#246).
-  if _permission_pending "$wt_path" && ! _detect_agent_dead "$wt_path"; then
+  if _permission_pending "$wt_path" && ! _spoke_agent_dead "$wt_path"; then
     _afk_reconcile_park "$wt_path" "$issue"; printf 'waiting\n'; return
   fi
   # Past every park check ⇒ the spoke is NOT parked (busy/reap). Reset its park-onset clock so a
@@ -418,126 +357,6 @@ _gate_parked() {
   tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 1
   [ -n "$tip" ] || return 1
   [ "$(git -C "$wt" rev-parse -q --verify "refs/tags/gate/${issue}^{commit}" 2>/dev/null)" = "$tip" ]
-}
-
-# _gate_answer_landed <wt> -> rc 0 when the spoke's transcript shows a GENUINE human/hub
-# reply — a TYPED prompt submission (promptSource == "typed"): a human typing in the pane,
-# or the broker's own tmux inject — AFTER the assistant turn that ran `spoke-ready.sh
-# --gate`, i.e. the PLAN-gate approval reply already landed. Used to self-heal a STALE gate
-# tag (issue #204): _consume_gate_tag ran only on the broker's confirmed-inject path, so an
-# answer that registered late, a wedge respawn started OUTSIDE the broker, or ANY
-# attended/manual reply in the pane left gate/<N> at the tip — re-read as "waiting" and
-# re-answered, and (with the #204 guard) wedging the resumed spoke. Every synthetic user
-# turn the harness injects (tool_results, <task-notification>/<system-reminder>, skill/meta
-# turns, SDK/system prompts) carries a non-"typed" promptSource (or none), so it can NOT
-# false-consume the tag on a spoke still awaiting its first approval. A (re-)park supersedes
-# an earlier approval. Fail-CLOSED (rc 1): no transcript, no python3, or no typed post-park
-# turn means "cannot prove a reply landed" → the broker services the gate as before. The
-# plan-gate-guard's approval_in_transcript mirrors this so both sides read the same signal.
-_gate_answer_landed() {
-  local wt="$1" jsonl
-  jsonl="$(_spoke_jsonl "$wt")"
-  [ -n "$jsonl" ] || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
-  _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
-import json, os, sys
-
-parked = False
-approved = False
-try:
-    with open(os.environ["_AFK_JSONL"], encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            ttype = obj.get("type")
-            content = (obj.get("message") or {}).get("content")
-            if ttype == "assistant":
-                for block in content if isinstance(content, list) else []:
-                    if (isinstance(block, dict)
-                            and block.get("type") == "tool_use"
-                            and block.get("name") == "Bash"
-                            and "spoke-ready.sh --gate" in ((block.get("input") or {}).get("command") or "")):
-                        parked = True       # a (re-)park supersedes any earlier approval
-                        approved = False
-            elif ttype == "user" and parked:
-                # ONLY a typed prompt submission is a genuine reply — harness-injected user
-                # turns (tool_results, notifications, skill/meta, SDK/system) are not.
-                if obj.get("promptSource") == "typed" and not obj.get("isMeta"):
-                    approved = True
-except Exception:
-    sys.exit(1)
-sys.exit(0 if approved else 1)
-PYEOF
-}
-
-# _gate_spoke_coded_past <wt> -> rc 0 when the spoke emitted its PLAN gate and then KEPT CODING
-# without a reply (the #117 shape): a MUTATING tool_use (Edit/Write/NotebookEdit/MultiEdit — the
-# write operations the PLAN gate exists to block) in an assistant turn AFTER the last
-# `spoke-ready.sh --gate` emission proves the spoke wrote code past the gate. This is the
-# keeps-coding twin of _gate_answer_landed (#204): that proves a TYPED reply landed; this proves
-# the spoke moved on under its own steam, which the typed-reply detector can never see. The
-# moved-on drop uses it to RETIRE the abandoned gate episode (#312) instead of leaving gate/<n> at
-# the tip to age.
-#
-# A WRITE — not merely "an assistant turn after the gate" — is the bar ON PURPOSE (#312 review): a
-# COMPLIANT parked spoke still emits the agent loop's trailing text-only "awaiting review" reply to
-# the gate Bash's tool_result, and may make read-only calls (Read) before idling; neither is coding
-# past, and reading them as such would tear down a live gate and discard a pending answer/amendment.
-# A commit moves the tip, so the gate tag leaves it (`_gate_parked` -> false) and the caller's
-# `was_gate` guard never reaches here — the stable-tip write is the case this must catch. A re-park
-# (another gate emission) resets the evidence, so a spoke sitting at a fresh gate is not coded past.
-# Fail-CLOSED (rc 1): no transcript, no python3, or no post-gate WRITE means "cannot prove the spoke
-# coded past" -> the caller does NOT retire (a missed retirement is caught by the watchdog's
-# drain-touched suppression, #312; a wrongful one tears down a live gate — so bias to not-retire).
-_gate_spoke_coded_past() {
-  local wt="$1" jsonl
-  jsonl="$(_spoke_jsonl "$wt")"
-  [ -n "$jsonl" ] || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
-  _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
-import json, os, sys
-
-# The write tools the PLAN gate blocks. A commit (Bash) advances the tip and is handled by the
-# caller's was_gate guard, so Bash is deliberately NOT here — it is too often read-only to trust.
-MUTATING = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
-parked = False
-advanced = False
-try:
-    with open(os.environ["_AFK_JSONL"], encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(obj, dict) or obj.get("type") != "assistant":
-                continue
-            content = (obj.get("message") or {}).get("content")
-            blocks = content if isinstance(content, list) else []
-            is_gate = False
-            wrote = False
-            for b in blocks:
-                if not (isinstance(b, dict) and b.get("type") == "tool_use"):
-                    continue
-                name = b.get("name")
-                if name == "Bash" and "spoke-ready.sh --gate" in (
-                    (b.get("input") or {}).get("command") or ""
-                ):
-                    is_gate = True
-                elif name in MUTATING:
-                    wrote = True
-            if is_gate:
-                parked = True        # a (re-)park resets the "advanced past it" evidence
-                advanced = False
-            elif parked and wrote:
-                advanced = True      # a WRITE after the emission = the spoke coded past the gate
-except Exception:
-    sys.exit(1)
-sys.exit(0 if advanced else 1)
-PYEOF
 }
 
 # _gate_artifact_path <wt> <issue> -> the gate plan artifact path (<wt>/.ai-toolkit/
@@ -573,53 +392,48 @@ _read_gate_artifact() {
   fi
 }
 
-# _still_parked_same <wt> <issue> <was_gate> <question> <before_mtime> -> true when the
-# spoke is still parked on the SAME prompt the answerer reasoned about. The answerer
-# takes minutes; a spoke that moved on meanwhile (a human replied, the turn resumed)
-# must not receive the stale answer mid-turn (#129/#89), and a spoke now parked on a
-# DIFFERENT question needs a fresh answer, not this one. Three signals, ALL required:
-#   - the transcript has not moved since the answerer started (<before_mtime>) — any
-#     write means activity, and a gate tag alone can't be trusted: it stays at the tip
-#     until the FIRST COMMIT, so a spoke that self-approved and kept coding (#117), or
-#     a human approving in-pane, still reads "parked" by the tag;
-#   - for a gate park, the gate/<issue> tag is still at the tip;
-#   - the extraction is unchanged (catches a same-second write mtime can't see; for an
-#     unextractable gate park this is the vacuous "" = "").
+# _still_parked_same <wt> <issue> <was_gate> <question> <qid> -> true when the spoke is still parked
+# on the SAME prompt the answerer reasoned about. The answerer takes minutes; a spoke that moved on
+# meanwhile (a reply landed, the turn resumed) must not receive the stale answer (#129/#89), and a
+# spoke now parked on a DIFFERENT question needs a fresh answer, not this one. A question is the
+# same while the inbox still holds the recorded <qid>; with no id (a stray AskUserQuestion dialog)
+# it is the same while the extracted prompt is unchanged. Read fresh: the tick cache predates the
+# reason step, so it is reset first.
 _still_parked_same() {
-  local wt="$1" issue="$2" was_gate="$3" question="$4" before="$5"
-  [ "$(_transcript_mtime "$wt")" = "$before" ] || return 1
-  if [ "$was_gate" -eq 1 ]; then
-    _gate_parked "$wt" "$issue" || return 1
-  fi
-  [ "$(extract_pending_question "$wt")" = "$question" ]
+  local wt="$1" question="$4" qid="$5"
+  orca_tick_reset
+  if [ -n "$qid" ]; then [ "$(_pending_question_id "$wt")" = "$qid" ]; return; fi
+  [ -n "$question" ] && [ "$(extract_pending_question "$wt")" = "$question" ]
 }
 
 # _spoke_still_parked <wt> <issue> -> true when the spoke is currently parked on SOMETHING (a
-# permission dialog, a PLAN gate, or an extractable question) — regardless of whether it is the
-# SAME prompt as before. #241 §4 uses this to tell a genuine park-change (recompute) from a
-# spoke that has MOVED ON and is actively working (no park → drop, preserving the #89 no-inject
-# -mid-turn guard). A positive park signal, so an ambiguous read fails toward "moved on" (drop).
+# permission dialog or a question / gate) -- not necessarily the SAME prompt as before. #241 §4 uses
+# this to tell a genuine park-change (recompute) from a spoke that has MOVED ON and is working (no
+# park -> drop, preserving the #89 no-inject-mid-turn guard). A positive park signal, so an
+# ambiguous read fails toward "moved on". An exited worker has no live park (#301).
 _spoke_still_parked() {
-  local wt="$1" issue="$2"
-  # #301: a dead agent has no LIVE park to service — its dialog / gate tag is scrollback and git
-  # state that outlived the process. Fail toward "moved on" (not parked) so _reap_or_resume
-  # REVIVES it rather than routing it back to the answerer, which would only inject into a shell.
-  _detect_agent_dead "$wt" && return 1
+  local wt="$1"
+  _spoke_agent_dead "$wt" && return 1
   _permission_pending "$wt" && return 0
-  _gate_parked "$wt" "$issue" && return 0
   [ -n "$(extract_pending_question "$wt")" ]
 }
 
-# _spoke_moved_on <wt> <before_mtime> -> true ONLY when the spoke's transcript has a NEW
-# write since <before_mtime>: a positive, confident signal that it is actively working. The
-# escalation freshness-gate (#171-subtask-2) uses this rather than !_still_parked_same so it
-# fails SAFE: an unreadable clock (empty / non-numeric mtime) or a non-numeric baseline reads
-# as "cannot confirm movement" → NOT moved on → the escalation is still stamped. Dropping an
-# escalation is only warranted on demonstrated activity, never on an ambiguous probe (review).
+# _spoke_moved_on <wt> <question> <qid> -> true ONLY on a positive signal that the spoke is no
+# longer parked on the prompt the answerer reasoned about: Orca answered (a failed read is NOT
+# "moved on") and the recorded question is gone from the inbox (or, with no id, the agent is no
+# longer waiting). The escalation freshness-gate (#171-subtask-2) uses it so an ambiguous probe
+# never drops a real escalation.
 _spoke_moved_on() {
-  local wt="$1" before="$2" now
-  now="$(_transcript_mtime "$wt")"
-  case "$now" in '' | *[!0-9]* ) return 1 ;; esac
-  case "$before" in '' | *[!0-9]* ) return 1 ;; esac
-  [ "$now" -gt "$before" ]
+  local wt="$1" question="$2" qid="$3" cur rc=0
+  orca_tick_reset
+  if [ -n "$qid" ]; then
+    cur="$(orca_inbox_question "$wt" id 2>/dev/null)" || rc=$?
+    [ "$rc" -eq 2 ] && return 1
+    [ "$cur" != "$qid" ]; return
+  fi
+  case "$(orca_agent_state "$wt" 2>/dev/null)" in
+    unknown) return 1 ;;
+    waiting) [ "$(extract_pending_question "$wt")" != "$question" ] ;;
+    *) return 0 ;;
+  esac
 }

@@ -315,8 +315,9 @@ archive hook, which spools the spoke's raw bodies for the telemetry consumer.
 
 > [!NOTE]
 > Dispatch no longer uses tmux (#363): `worktree-new.sh` launches in an Orca terminal. The
-> section below describes the legacy hub tooling that S6 (#365) migrates (`hub-agent.sh`,
-> `hub-inject.sh`, the drain's pane lanes).
+> The /afk drain no longer uses it either (#365): it reads and writes spokes through Orca. The
+> section below describes the legacy hub tooling that S8 still migrates (`hub-status.sh`,
+> `hub-agent.sh`).
 
 Each project gets **one tmux session**, and every spoke lives as a window of it.
 The session name is derived from the repo root — the parent directory plus the repo

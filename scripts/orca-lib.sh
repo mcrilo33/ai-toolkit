@@ -103,15 +103,15 @@ orca_wait_agent() {
 }
 
 # --- the drain's reads and writes (#365) -------------------------------------------------------
-# Reads answer from Orca, never from tmux or a transcript. A record that is missing (the call
+# Reads answer from Orca, never from a terminal pane or a transcript. A record that is missing (the call
 # failed, the worktree or worker is not listed) reads UNKNOWN (rc 2), never "dead" or "nothing":
 # unknown alone is never a basis for recovery or a `blocked` (AFK principle #6).
 
 # orca_tick_reset -> start a fresh per-tick read cache. The cache is a dir (not variables) so it
 # survives the $(...) subshells the callers read through; with no reset, reads are uncached.
 orca_tick_reset() {
-  [ -n "${_ORCA_TICK:-}" ] && rm -rf "$_ORCA_TICK"
   _ORCA_TICK="${TMPDIR:-/tmp}/orca-tick-$$"
+  rm -rf "$_ORCA_TICK"   # always: a leftover dir from a reused pid must never serve stale replies
   mkdir -p "$_ORCA_TICK" 2>/dev/null || _ORCA_TICK=""
 }
 
@@ -184,8 +184,7 @@ orca_worker_liveness() {
 orca_inbox_question() {
   local h run out rc=0
   h="$(orca_worker_field "$1" '.agentTerminalHandle')" || rc=$?
-  [ "$rc" -ne 0 ] && return "$rc"
-  [ -n "$h" ] || return 2
+  [ "$rc" -eq 0 ] && [ -n "$h" ] || return 2   # no worker record: whose inbox? unknown, never "none"
   run="$(_orca_identity "$1" run_id)"
   out="$(_orca_cached "in-${run:-bound}" orchestration check --peek --types question ${run:+--run "$run"})" || return 2
   out="$(printf '%s' "$out" | jq -r --arg h "$h" --arg f "$2" '

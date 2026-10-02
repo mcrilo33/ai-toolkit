@@ -3,16 +3,16 @@
 The `/afk` control plane (hub-afk, the gate-broker modules, the watchdog, the
 worktree/spoke scripts) is a distributed, unattended system. A week of incidents
 (the #263/#265/#283/#288/#290 watchdog false-fire family, #299's silent 10-hour
-jam, the #291/#305/#306 model-config leaks, #301's dead-agent-live-pane) all trace
+jam, the #291/#305/#306 model-config leaks, #301's dead-agent-live-terminal) all trace
 to a small set of violated principles. Honor these when writing or reviewing any
 control-plane change; a reviewer should cite the number a diff breaks.
 
 ## 1. Explicit state over inferred state
 
 Record a transition where it happens, by the actor that causes it. Do NOT
-reconstruct lifecycle state from side-effects — file mtimes, pane text, epoch
+reconstruct lifecycle state from side-effects — file mtimes, terminal text, epoch
 staleness, transcript tails. Inference is why detectors false-fire: the signal
-they read (a progress epoch that pre-ages during a park, a pane that survives a
+they read (a progress epoch that pre-ages during a park, a terminal that survives a
 dead agent) does not mean what they assume. If a detector must know "is this spoke
 landing / pushing / being serviced", something must have RECORDED that, not left
 it to be guessed. (The #300 transition log is this principle made concrete.)
@@ -38,15 +38,15 @@ irreversible and outward-facing (force-push, history rewrite, `main`, deletions
 outside the worktree). Every unattended decision is journaled so it can be audited
 after the fact — that auditability is what makes "act, don't wait" safe.
 
-## 4. Liveness = probe the real process, never a proxy
+## 4. Liveness = Orca worker liveness, never a proxy
 
-To decide whether a spoke's agent is alive, walk the pane pid's DESCENDANTS for a
-live agent process. Do NOT use `pane_current_command` (the launcher is a `zsh -c`
-wrapper, so tmux reports `zsh` whether the agent lives or died) and do NOT grep for
-a `WT_SPOKE=<n>` argv (that matches only the wrapper, which survives the agent's
-exit, and a live agent does not carry it). Both proxies are wrong in BOTH
-directions — false-dead and false-alive (#301). Getting this wrong means injecting
-prose into a shell, where it executes as commands.
+To decide whether a spoke's agent is alive, read Orca's worker liveness
+(`orchestration worker-list`: `live` / `unverifiable` / `exited`). Do NOT infer it from
+a terminal title, the last output, the age of a transcript, or a leftover process:
+those survive (or lag) the agent and are wrong in BOTH directions — false-dead and
+false-alive (#301). Only `exited` is dead; `unverifiable`, a failed read and a missing
+record all read alive (principle 6: unknown is never a basis for recovery). Getting this
+wrong means restarting a healthy worker, or typing into a terminal whose agent is gone.
 
 ## 5. Cross-lane shared state carries explicit, single-writer semantics
 

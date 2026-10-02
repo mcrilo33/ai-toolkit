@@ -214,24 +214,17 @@ _afk_subtask_chain_max() {
 }
 
 # _afk_route_subtask_nudge <wt> <spoke> <issue> -> tell a LIVE spoke it just gained a subtask.
-# Mirrors _afk_nudge_spoke/_afk_finish_up_nudge (same inject_and_verify + journal + span
-# shape) but carries the routing prompt. Advisory: the queued marker is the authority —
+# A wrapper over _afk_send_nudge (the one nudge sender) carrying the routing prompt. Advisory: the queued marker is the authority —
 # spoke-ready.sh refuses the terminal ready while the queue is non-empty, so a nudge that
 # never lands only delays the pickup to the spoke's own ready boundary, it cannot lose the
 # work. Stamps only the answer-attempt epoch, never the progress epoch: routing must not buy
 # a spoke a fresh reap ceiling (the #241 rule).
 _afk_route_subtask_nudge() {
-  local wt="$1" spoke="$2" issue="$3" target rc
+  local wt="$1" spoke="$2" issue="$3"
   log "→ route #$issue: packable into the live spoke #$spoke — queued as a subtask (no second worktree/suite seed)"
-  _afk_set_last_action "route #$issue -> #$spoke"
-  target="$(_spoke_pane_target "$wt")"
-  [ -n "$target" ] || { log "  no live pane for #$spoke — queued anyway; it consumes at its ready boundary"; return 1; }
-  stamp_answer_attempt "$spoke"
-  inject_and_verify "$wt" "$target" "$(_afk_route_subtask_prompt "$spoke" "$issue")"; rc=$?
-  broker_journal_decision "$spoke" route \
-    "issue #$issue shares this spoke's scope — queued onto its branch as a subtask instead of a fresh spoke (#278)" reversible
-  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-route success; else _afk_emit_span "$wt" afk-route retry; fi
-  return "$rc"
+  _afk_send_nudge "$wt" "$spoke" route afk-route \
+    "issue #$issue shares this spoke's scope — queued onto its branch as a subtask instead of a fresh spoke (#278)" \
+    "$(_afk_route_subtask_prompt "$spoke" "$issue")"
 }
 
 # _afk_route_queued_subtasks <route-lines> <chain-max> -> trigger B of #278.

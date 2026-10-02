@@ -295,19 +295,20 @@ afk_arm_preconditions() {
   afk_arm_orca_guard
 }
 
-# afk_arm_orca_guard -> the last arm precondition (#363). Dispatch is Orca-only since S4, so arming
-# needs a usable Orca (version floor + a read-only worktree listing). It then REFUSES regardless:
-# INTERIM guard until S6 (#365) moves the supervisor onto Orca. Until then recover_dead_panes would
-# read a pane-less Orca spoke as crashed and tear it down or relaunch it in tmux. S6 deletes it.
+# afk_arm_orca_guard -> the last arm precondition. The drain reads and writes spokes only through
+# Orca, so arming needs a usable Orca (version floor + a read-only worktree listing) AND a
+# coordinator terminal with a bound Run: `reply`, `worker-start` and `check` are fenced to it.
 # AFK_ARM_PRECHECK=0 opts out like the rest of the gate.
 afk_arm_orca_guard() {
   [ "${AFK_ARM_PRECHECK:-1}" = "0" ] && return 0
   if ! orca_require_version || ! orca_json worktree list; then
-    log "/afk: refusing to arm — Orca is not usable (need >= ${ORCA_MIN_VERSION} and a reachable runtime, see above); dispatch is Orca-only since #363"
+    log "/afk: refusing to arm — Orca is not usable (need >= ${ORCA_MIN_VERSION} and a reachable runtime, see above); the drain supervises spokes through Orca"
     return 1
   fi
-  log "/afk: refusing to arm — dispatch now runs on Orca (#363) but the drain still supervises tmux panes, so recover_dead_panes would tear down or relaunch a pane-less Orca spoke; blocked until #365 (S6) moves the supervisor to Orca"
-  return 1
+  if [ -z "${ORCA_TERMINAL_HANDLE:-}" ] || ! orca_run_id >/dev/null; then
+    log "/afk: refusing to arm — run it from an Orca terminal with a bound Run (ORCA_TERMINAL_HANDLE and 'orca orchestration run-current'): answering a gate and restarting a worker are fenced to the coordinator terminal"
+    return 1
+  fi
 }
 
 # --- the ONE arm-time verdict (issue #279) ------------------------------------
