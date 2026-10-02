@@ -157,6 +157,50 @@ Safety guarantees:
   both in recorded paths and in old manifest entries.
 - A corrupt or missing manifest is treated as a first run: nothing is deleted.
 
+## Generated `orca.yaml` (Orca hooks)
+
+Orca reads a repo-root `orca.yaml` ahead of its local `hookSettings` (no trust
+prompt) and holds the agent until `scripts.setup` exits (`setupAgentStartupPolicy:
+wait-for-setup`). The toolkit's own `orca.yaml` points at `./scripts/`; synced
+scripts live at `.ai-toolkit/scripts/`, so sync **generates** `<target>/orca.yaml`
+from it with `./scripts/` rewritten to `${ORCA_ROOT_PATH:-.}/.ai-toolkit/scripts/`:
+
+```yaml
+setupAgentStartupPolicy: wait-for-setup
+scripts:
+  setup: '"${ORCA_ROOT_PATH:-.}/.ai-toolkit/scripts/provision-worktree.sh"'
+  archive: '"${ORCA_ROOT_PATH:-.}/.ai-toolkit/scripts/archive-worktree.sh"'
+```
+
+Orca runs the hooks with the new worktree as cwd, and a host's `.ai-toolkit/` is
+git-excluded (it exists only in the main checkout), so a relative path would not
+resolve; `ORCA_ROOT_PATH` anchors on the main checkout. This relies on the hook
+command being run through a shell (02-orca-capabilities marks that as unconfirmed).
+
+`provision-worktree.sh` and `archive-worktree.sh` ship with the other workflow
+scripts (executable, manifest-recorded).
+
+- **Never clobbered** — an existing `orca.yaml` that no tool's manifest list owns
+  is a host file: sync warns, skips it, and does not record it, so it stays the
+  host's across re-syncs. Once sync has written it, it is manifest-owned and is
+  regenerated on every sync (byte-identical when nothing changed).
+- **Local `hookSettings.scripts` must stay empty** — a non-empty local setup or
+  archive script silently overrides `orca.yaml` (02-orca-capabilities §3.3), so the
+  gated provisioning would no longer run.
+- `--dry-run` prints `[dry-run] would write orca.yaml` and writes nothing.
+
+`archive-worktree.sh` only spools an OTel spoke's raw bodies and identity to
+`<git-common-dir>/ai-toolkit-afk/ingest-spool/<spoke_run_id>/` (with `/` in the id
+flattened to `__`) for removals outside land; land keeps its synchronous ingest.
+A failed spool leaves `<dirname>.failed` beside it. The spool dir is accepted by
+`telemetry-ingest-spoke.sh` as a worktree dir (raw bodies itemized), but it lives
+inside the shared git dir, so the ingest's git-derived enrichments (branch, commit
+range) read the main checkout; the spool consumer (follow-up) must handle that.
+
+> [!NOTE]
+> Still to confirm on a real host repo: that Orca expands `ORCA_ROOT_PATH` in the
+> hook command and reads `orca.yaml` from the main checkout (`03-spike.md`, Round 3).
+
 ## --dry-run
 
 `--dry-run` previews a sync without touching the target: each write is printed

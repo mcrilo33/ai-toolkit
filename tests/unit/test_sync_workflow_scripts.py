@@ -507,6 +507,38 @@ def test_provision_worktree_source_exists_and_is_executable() -> None:
     assert os.access(PROVISION_WORKTREE, os.X_OK), "scripts/provision-worktree.sh is not executable"
 
 
+# ── archive-worktree.sh + generated orca.yaml registration (issue #362) ───────
+# Orca's `scripts.archive` hook. A synced target's generated orca.yaml points at
+# ./.ai-toolkit/scripts/archive-worktree.sh, so it must ship there. Toolkit-root script.
+ARCHIVE_WORKTREE = REPO_ROOT / "scripts" / "archive-worktree.sh"
+
+
+def test_archive_worktree_registered_in_sync_loop() -> None:
+    assert "archive-worktree.sh" in _for_name_list(), (
+        "archive-worktree.sh is not registered in sync_workflow_scripts() — the generated "
+        "orca.yaml would point Orca's archive hook at a missing script"
+    )
+
+
+def test_archive_worktree_takes_the_default_root_source_case() -> None:
+    body = _sync_workflow_scripts_body()
+    mapped = re.search(r"\n\s*([\w.|-]*archive-worktree\.sh[\w.|-]*)\)\s+src=", body)
+    assert mapped is None, (
+        'archive-worktree.sh must take the default src="$SCRIPT_DIR/$name" (toolkit-root scripts/)'
+    )
+
+
+def test_archive_worktree_source_exists_and_is_executable() -> None:
+    assert ARCHIVE_WORKTREE.is_file(), "scripts/archive-worktree.sh missing"
+    assert os.access(ARCHIVE_WORKTREE, os.X_OK), "scripts/archive-worktree.sh is not executable"
+
+
+def test_sync_workflow_scripts_generates_orca_yaml() -> None:
+    assert "orca.yaml" in _sync_workflow_scripts_body(), (
+        "sync_workflow_scripts() must generate <target>/orca.yaml (issue #362)"
+    )
+
+
 # ── identity.sh registration (issue #361, S2b) ──────────────────────────────────
 # The hub-side readers (hub-status, hub-inject, the gate-broker modules) source identity.sh as a
 # co-located sibling in a synced target's .ai-toolkit/scripts/. Unregistered, a synced drain
@@ -524,7 +556,9 @@ def test_identity_lib_registered_in_sync_loop() -> None:
 
 def test_identity_lib_takes_the_hooks_lib_source_case() -> None:
     body = _sync_workflow_scripts_body()
-    lib_case = re.search(r"\n\s*([\w.|-]*identity\.sh[\w.|-]*)\)\s+src=\"\$SHARED_DIR/hooks/lib/", body)
+    lib_case = re.search(
+        r"\n\s*([\w.|-]*identity\.sh[\w.|-]*)\)\s+src=\"\$SHARED_DIR/hooks/lib/", body
+    )
     assert lib_case is not None, (
         "identity.sh must map to shared/hooks/lib/ "
         '(src="$SHARED_DIR/hooks/lib/$name") next to telemetry.sh|base-branch.sh|enabled.sh'

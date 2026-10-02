@@ -67,3 +67,28 @@ ai-toolkit, `main` and the main checkout were not touched.
 | 17 | Orchestration as a PLAN-gate transport | Full cycle run on the scratch repo with a real Claude worker. `run-create --from <my terminal>` → `worker-start --spec … --worktree new-top-level --agent claude` (it **also ran `orca.yaml` setup with `wait-for-setup`**). The worker wrote `plan.md`, then called `orca orchestration ask` with options `approve,revise` and **blocked**: `hello.txt` was absent and its agent state read `working / Bash: orca orchestration ask …`. The coordinator got a structured `question` message (`check --wait`) and `reply --body approve`. The worker then created `hello.txt` and sent `worker_done` with `outcome: succeeded` and `filesModified: [plan.md, hello.txt]`. Separately, `gate-create` on a task → task `blocked`; `gate-resolve approve` → task `ready`. Cleanup via `worker-release` (transcript archived, terminal closed), worktree rm, repo unregistered. Run `run_1c4ba3d70f6b` left inert in `orchestration.db` (`orchestration reset` would wipe all orchestration state). | **Viable, and better than today's channel:** a structured, durable, acknowledged question/answer instead of a marker tag + pane scrape + keystroke injection. Caveats: (a) during `ask` the agent shows `working`, not `waiting`, so "parked on a gate" must be read from the Run inbox, not agent state; (b) workers need the preamble (worker-start), so plain `worktree create --agent` spokes would have to be dispatched through `worker-start` instead; (c) `nestedWorkerMaxDepth: 1`. Recommendation: **later phase**, after the transport adapter (02 §2). The `ready/gate/accept/blocked` marker tags stay the source of truth until then. |
 
 All Phase 3a questions are now answered except the PLAN-gate migration itself (deferred by design).
+
+## Round 3 — S3 spikes (#362, 2026-10-02)
+
+Scratch repo (git, `orca.yaml` with `setup`, `issueCommand`, `worktree.sharedDirectories: [.venv]`) registered with
+`orca repo add`; worktrees created with `--run-hooks`. Orca 1.4.218.
+
+| Spike | Outcome | Evidence |
+|---|---|---|
+| (a) `issueCommand` | **Not adopted.** | `orca worktree create --issue 7 --run-hooks` linked the issue (`linkedIssue: 7`) and ran `scripts.setup` (`setup-ran.txt` written, `ORCA_*` env present), but the `issueCommand` script never ran (no output file after 8 s). In the Orca bundle `issueCommand` is read from `orca.yaml` or `.orca/issue-command` and executed by an `issue-command-runner` only on the UI worktree-activation path (Tasks panel / new-workspace dialog), not on CLI creation. Dispatch moves to the CLI (`worker-start`, S4), so it would never fire. **Not verified:** the template variables it expands (needs the GUI Tasks flow). It also runs a shell script, not an agent prompt, so seeding `/source-task #<n>` would still go through S4's `--spec`. |
+| (b) `worktree.sharedDirectories` for `.venv` | **Not adopted.** | Criterion 1 fails: console-script shebangs are absolute paths into the venv that created them (`.venv/bin/pip` starts `#!/<abs>/.venv/bin/python3.14`), so a shared `.venv` runs every worktree's `pytest` against the SOURCE checkout's interpreter and site-packages; any editable install would import the primary checkout's code, not the worktree's, silently testing the wrong tree. Criterion 3 is not guaranteed: concurrent provisioning (`ensure-test-venv.sh` pip-installing into one shared site-packages) has no lock. Criterion 2 holds by construction (`.testmondata*` live at the worktree root, outside `.venv`). A worktree created after the venv existed was **not** observed (see the note below), so link behaviour itself is untested; the decision rests on the shebang evidence. |
+
+`provision-worktree.sh` therefore keeps creating a per-worktree `.venv` (unchanged); `orca.yaml` carries no `worktree:` block.
+
+> [!WARNING]
+> **Deviation from the issue text (found in review, hub to confirm):** the issue names `./.ai-toolkit/scripts/{provision,archive}-worktree.sh`
+> for the generated host `orca.yaml`, but spikes #3/#10 run the hooks with cwd = the worktree and a host's `.ai-toolkit/` is
+> git-excluded, so those relative paths would not exist in a host worktree (setup would fail, archive would abort removal).
+> Sync therefore generates `"${ORCA_ROOT_PATH:-.}/.ai-toolkit/scripts/…"` (pinned by a linked-worktree test; the toolkit's own
+> committed `./scripts/` form is unchanged). **Unverified:** that Orca runs the hook through a shell (so the variable expands) and
+> reads `orca.yaml` from the main checkout. Confirm with one host-repo spike; revert is one `sed` line in `generate_orca_yaml`.
+
+> [!NOTE]
+> The scratch-repo cleanup (`orca worktree rm` for `spike-issue`, `orca project setup-delete`, removing `.ai-toolkit/spike-scratch`) and the
+> post-venv worktree creation were blocked by the `afk-danger-guard` judge (verdict `dangerous` for writes under `~/orca/`), so
+> the scratch repo `e6dd1f84-f82d-4420-92be-5968ef55ddcd` and worktree `spike-issue` still need removing by hand.

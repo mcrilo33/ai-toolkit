@@ -9105,6 +9105,19 @@ def test_recover_dead_panes_over_ceiling_near_complete_still_revives(tmp_path: P
 # process) has nothing to capture and skips gracefully.
 
 
+def _write_warmed_stub(path: Path, body: str) -> None:
+    """Write an executable bash stub (`body` follows the shebang) and exec it once, `--warm`.
+
+    A freshly written script's FIRST exec can take seconds under xdist (macOS vets each new
+    executable) while a re-exec takes ~10ms (#374) -- longer than the bounded waits the stubbed
+    commands run under. The warm-up exec leaves a `<path>.warm` marker and runs none of `body`.
+    """
+    guard = '[ "${1:-}" = "--warm" ] && { : > "$0.warm"; exit 0; }\n'
+    path.write_text("#!/usr/bin/env bash\n" + guard + body)
+    path.chmod(0o755)
+    subprocess.run([str(path), "--warm"], check=True)
+
+
 def _forensics_bin(
     tmp_path: Path,
     *,
@@ -9123,8 +9136,8 @@ def _forensics_bin(
     panes = tmp_path / "panes.txt"
     panes.write_text(f"afk:1\t{pane_path}\n" if pane_path is not None else "")
     pid = pane_pid if pane_pid is not None else str(os.getpid())
-    (fake_bin / "tmux").write_text(
-        "#!/usr/bin/env bash\n"
+    _write_warmed_stub(
+        fake_bin / "tmux",
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'case "$1" in\n'
         f'  list-panes) cat "{panes}" ;;\n'
@@ -9136,13 +9149,9 @@ def _forensics_bin(
         f'      printf "%s\\n" "{pid}"\n'
         "    fi ;;\n"
         "esac\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
-    (fake_bin / "sample").write_text(
-        '#!/usr/bin/env bash\nprintf "Sample stub for pid %s\\n" "$1"\nexit 0\n'
-    )
-    (fake_bin / "sample").chmod(0o755)
+    _write_warmed_stub(fake_bin / "sample", 'printf "Sample stub for pid %s\\n" "$1"\nexit 0\n')
     # #301: a hung-but-LIVE pane is a frozen AGENT, not a dead one — the liveness probe must
     # read it alive. Point the stubbed agent at the pane pid this builder advertises so the
     # ancestor-walk resolves. Only when a real pane maps: pane_path=None is the older
@@ -9848,11 +9857,12 @@ def _caffeinate_stub(tmp_path: Path, log_name: str = "caffeinate.log") -> tuple[
 
     `exec` keeps the SAME pid the launching shell captured in `$!`, so the pidfile's
     caffeinate pid maps to a live process exactly as a real `caffeinate -w` would.
+
+    Built via `_write_warmed_stub` (#374): a cold first exec could outlast `_wait_lines`.
     """
     log = tmp_path / log_name
     stub = tmp_path / "caffeinate"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexec sleep 600\n')
-    stub.chmod(0o755)
+    _write_warmed_stub(stub, f'printf "%s\\n" "$*" >> "{log}"\nexec sleep 600\n')
     return stub, log
 
 
@@ -9885,6 +9895,17 @@ def _kill_inhibitor(pidfile: Path) -> None:
             return
 
 
+def test_caffeinate_stub_is_warmed_before_the_arm_runs(tmp_path: Path) -> None:
+    # #374: a freshly written script's FIRST exec can take seconds under xdist (macOS vets each
+    # new executable), longer than the arm tests' log poll. The stub is exec'd once
+    # synchronously when built, so the exec the arm backgrounds is a ~10ms re-exec.
+    stub, log = _caffeinate_stub(tmp_path)
+
+    assert (tmp_path / "caffeinate.warm").exists(), "the stub must be exec'd once up front"
+    assert not log.exists(), "the warm-up exec must not look like an arm"
+    assert stub.stat().st_mode & 0o111
+
+
 def test_arm_inhibitor_spawns_one_caffeinate_tied_to_the_pid(tmp_path: Path) -> None:
     # AC1: arming spawns exactly one `caffeinate -is -w <supervisor pid>`, recorded in the
     # pidfile so a later tick can tell it is already armed.
@@ -9915,6 +9936,7 @@ def test_arm_inhibitor_second_arm_does_not_stack(tmp_path: Path) -> None:
         _call("_afk_arm_inhibitor 424242; _afk_arm_inhibitor 424242", env=env)
 
         _wait_lines(log)
+        _wait_lines(log, 2, timeout=0.5)  # a stacked second spawn (warm stub) logs within ms
         assert log.read_text().splitlines() == ["-is -w 424242"], (
             "a second arm must not stack a second caffeinate"
         )
