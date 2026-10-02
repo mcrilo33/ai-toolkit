@@ -5566,6 +5566,7 @@ def test_reap_pass_attended_re_crash_warns_not_reresumes(tmp_path: Path) -> None
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
     expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
     (statedir / "resumed-5").write_text("1700000000\n")  # already resumed once this window
+    env["AFK_STATE"] = str(tmp_path / "no-drain")  # #373: attended = no armed drain
 
     _call(expr, env=env)
 
@@ -11822,6 +11823,7 @@ def test_crash_reresume_attended_warn_parks_without_relaunch(tmp_path: Path) -> 
     (statedir / "warned-state-5").write_text("3\t1\n")  # budget spent, due — still no escalation
     retry_log = tmp_path / "retry.log"
     env["RETRY_LOG"] = str(retry_log)
+    env["AFK_STATE"] = str(tmp_path / "no-drain")  # #373: attended = no armed drain
 
     _call(
         'resume_spoke() { printf "RESUMED\\n" >> "$RETRY_LOG"; }; '
@@ -11846,6 +11848,7 @@ def test_crash_escalate_or_park_attended_never_escalates(tmp_path: Path) -> None
     statedir = tmp_path / "statedir"
     env = _crash_ready_env(tmp_path, spoke, statedir)
     (statedir / "warned-state-5").write_text("3\t1\n")
+    env["AFK_STATE"] = str(tmp_path / "no-drain")  # #373: attended = no armed drain
 
     _call('_afk_crash_escalate_or_park "$WT" 5 "resume budget exhausted"', env=env)
 

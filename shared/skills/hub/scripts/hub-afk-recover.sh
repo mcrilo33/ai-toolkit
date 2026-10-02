@@ -677,11 +677,33 @@ _afk_pushed_unmarked_nudge() {
   return "$rc"
 }
 
+# _afk_effective_attendance <wt> -> afk | attended+armed | attended (#373). The dispatch-time
+# .ai-toolkit/mode record says how the spoke was LAUNCHED; an armed drain says nobody is there NOW.
+# The crash ladder acts on the combination: mode=afk, or any spoke the armed drain has adopted
+# (attended+armed — the #371 shape). Only a spoke with no armed drain behind it, or no worktree,
+# stays `attended` (the human is the wall). "Armed" = a non-empty .afk-state, no heartbeat probe.
+# The mode record itself is never rewritten here (Principle 5: single writer).
+_afk_effective_attendance() {
+  local wt="$1"
+  if [ -z "$wt" ]; then printf 'attended\n'; return 0; fi
+  if [ "$(_afk_spoke_mode "$wt")" = afk ]; then printf 'afk\n'; return 0; fi
+  if [ -n "$(afk_read_state)" ]; then printf 'attended+armed\n'; else printf 'attended\n'; fi
+}
+
+# _afk_attendance_note <wt> -> the "(effective attendance: mode=…, drain armed=…)" suffix the crash
+# ladder appends to every decision it journals (#241), so the journal names the input it turned on.
+_afk_attendance_note() {
+  local wt="$1" armed=no
+  [ -n "$(afk_read_state)" ] && armed=yes
+  printf '(effective attendance: mode=%s, drain armed=%s)\n' \
+    "$([ -n "$wt" ] && _afk_spoke_mode "$wt" || true)" "$armed"
+}
+
 # _afk_crash_reresume_or_escalate <wt> <issue> <reason> <retry_fn> -> the #310 crash terminus that
 # replaces the eternal "parked LAST, retried at low frequency" warn (which never retried — only the
-# warn re-fired). UNATTENDED ONLY: the whole ladder (re-resume + escalate) is gated on mode=afk, so
-# an ATTENDED crashed-again spoke keeps today's warn-and-wait — the human is the wall (AC5). Under
-# afk, on the warned-lane (default/reap) backoff cadence: while the warned-retry attempt count is
+# warn re-fired). UNATTENDED ONLY: the whole ladder (re-resume + escalate) is gated on EFFECTIVE
+# attendance (#373: mode=afk OR an armed drain), so a genuinely attended crashed-again spoke (no
+# armed drain) keeps today's warn-and-wait — the human is the wall (AC5). Under unattended, on the warned-lane (default/reap) backoff cadence: while the warned-retry attempt count is
 # UNDER AFK_WARN_ESCALATE_ATTEMPTS, genuinely RE-ATTEMPT the revival (<retry_fn> is _revive_spoke for
 # a kill+relaunch site or resume_spoke for a re-adopt site) so a transient crash (an API blip, a
 # sleep/wake) self-heals mid-window — advancing the backoff and journaling each try. Inside the
@@ -691,11 +713,13 @@ _afk_pushed_unmarked_nudge() {
 # REUSES the warned-lane record (_afk_warn_attempt), so the retry cadence and the escalation bound
 # share one clock — no separate marker to drift (reuse of AFK_WARN_ESCALATE_ATTEMPTS, not a new knob).
 _afk_crash_reresume_or_escalate() {
-  local wt="$1" issue="$2" reason="$3" retry_fn="$4" lane attempts max
-  # AC5 regression pin: attended (and worktree-less) parks keep the old warn-and-parked-LAST — no
-  # auto relaunch, no escalation. The entire #310 crash ladder is an unattended-drain behavior.
-  if [ -z "$wt" ] || [ "$(_afk_spoke_mode "$wt")" != afk ]; then
-    _warn_parked_last "$wt" "$issue" "$reason — parked LAST, retried at low frequency"
+  local wt="$1" issue="$2" reason="$3" retry_fn="$4" lane attempts max note
+  note="$(_afk_attendance_note "$wt")"
+  # AC5 regression pin (narrowed by #373): a genuinely attended park (no armed drain) and a
+  # worktree-less park keep the old warn-and-parked-LAST — no auto relaunch, no escalation. The
+  # warn re-fires on the warned-lane backoff, so the message claims only that (#310 AC4).
+  if [ "$(_afk_effective_attendance "$wt")" = attended ]; then
+    _warn_parked_last "$wt" "$issue" "$reason — parked LAST; the warn re-fires on its backoff, no automatic relaunch $note"
     return 0
   fi
   lane="$(_afk_warned_lane reap)"                       # the default/reap lane (empty)
@@ -703,7 +727,7 @@ _afk_crash_reresume_or_escalate() {
   attempts="$(_afk_warn_attempt "$issue" "$lane")"
   max="$AFK_WARN_ESCALATE_ATTEMPTS"
   if [ "$attempts" -lt "$max" ]; then
-    local msg="$reason — re-attempting the revival (attempt $(( attempts + 1 ))/$max)"
+    local msg="$reason — re-attempting the revival (attempt $(( attempts + 1 ))/$max) $note"
     log "→ crash-reresume #$issue: $msg"
     _afk_set_last_action "crash-reresume #$issue"
     broker_journal_decision "$issue" reap "$msg" reversible
@@ -716,17 +740,18 @@ _afk_crash_reresume_or_escalate() {
 }
 
 # _afk_crash_escalate_or_park <wt> <issue> <reason> -> the terminus for a spoke whose crash-retry
-# budget is spent (#310). Under an unattended drain (mode=afk) the parked issue IS the stalled work,
+# budget is spent (#310). Under an unattended drain (effective attendance, #373) the parked issue IS the stalled work,
 # so escalate a loud, reversible blocked/<issue> + notification EVEN WITH ZERO scope-blocked
 # dependents (Principle 3 — act when unattended). This is a DEDICATED crash path, so _warn_parked_last's
 # generic #305 dependents gate is deliberately left untouched (a benign land/backoff park must not
 # escalate without dependents). blocked/ flips slot_state terminal, silencing the watchdog's dead-pane
-# race instead of losing the rest of the window to it. Attended (mode != afk) keeps today's
-# warn-and-wait — the human is the wall (the AC5 regression pin).
+# race instead of losing the rest of the window to it. Genuinely attended (no armed drain) keeps
+# today's warn-and-wait — the human is the wall (the AC5 regression pin, narrowed by #373).
 _afk_crash_escalate_or_park() {
-  local wt="$1" issue="$2" reason="$3"
-  if [ -n "$wt" ] && [ "$(_afk_spoke_mode "$wt")" = afk ]; then
-    local ereason="$reason. Escalated blocked/$issue for a human (#310)."
+  local wt="$1" issue="$2" reason="$3" note
+  note="$(_afk_attendance_note "$wt")"
+  if [ "$(_afk_effective_attendance "$wt")" != attended ]; then
+    local ereason="$reason $note. Escalated blocked/$issue for a human (#310/#373)."
     log "→ crash-escalate #$issue: $ereason"
     _afk_set_last_action "crash-escalate #$issue"
     broker_journal_decision "$issue" reap "$ereason" reversible
