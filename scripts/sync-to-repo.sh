@@ -602,7 +602,10 @@ generate_orca_yaml() {
         echo "[dry-run] would write orca.yaml"
         return 0
     fi
-    sed 's#\./scripts/#./.ai-toolkit/scripts/#g' "$src" > "$TARGET/orca.yaml"
+    # Hooks run with cwd = the worktree, where a host's git-excluded .ai-toolkit/ does not exist,
+    # so anchor on ORCA_ROOT_PATH (the main checkout); `:-.` keeps the old relative form if unset.
+    local q="'"
+    sed "s#: \./scripts/\(.*\)\$#: ${q}\"\${ORCA_ROOT_PATH:-.}/.ai-toolkit/scripts/\1\"${q}#" "$src" > "$TARGET/orca.yaml"
     info "orca.yaml"
 }
 

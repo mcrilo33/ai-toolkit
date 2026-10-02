@@ -81,12 +81,12 @@ Scratch repo (git, `orca.yaml` with `setup`, `issueCommand`, `worktree.sharedDir
 `provision-worktree.sh` therefore keeps creating a per-worktree `.venv` (unchanged); `orca.yaml` carries no `worktree:` block.
 
 > [!WARNING]
-> **Open question for the hub (found in review):** the issue prescribes `./.ai-toolkit/scripts/{provision,archive}-worktree.sh`
+> **Deviation from the issue text (found in review, hub to confirm):** the issue names `./.ai-toolkit/scripts/{provision,archive}-worktree.sh`
 > for the generated host `orca.yaml`, but spikes #3/#10 run the hooks with cwd = the worktree and a host's `.ai-toolkit/` is
 > git-excluded, so those relative paths would not exist in a host worktree (setup would fail, archive would abort removal).
-> The toolkit's own `orca.yaml` is unaffected (`./scripts/` is committed). Likely fix: `"$ORCA_ROOT_PATH"/.ai-toolkit/scripts/…`,
-> to be confirmed with one host-repo spike (also: does Orca read `orca.yaml` from the worktree or `ORCA_ROOT_PATH`?).
-> Implemented as specified; not changed unilaterally.
+> Sync therefore generates `"${ORCA_ROOT_PATH:-.}/.ai-toolkit/scripts/…"` (pinned by a linked-worktree test; the toolkit's own
+> committed `./scripts/` form is unchanged). **Unverified:** that Orca runs the hook through a shell (so the variable expands) and
+> reads `orca.yaml` from the main checkout. Confirm with one host-repo spike; revert is one `sed` line in `generate_orca_yaml`.
 
 > [!NOTE]
 > The scratch-repo cleanup (`orca worktree rm` for `spike-issue`, `orca project setup-delete`, removing `.ai-toolkit/spike-scratch`) and the
