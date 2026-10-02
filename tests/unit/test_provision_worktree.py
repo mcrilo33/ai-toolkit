@@ -413,3 +413,91 @@ def test_env_pairs_helper_is_the_single_source_of_the_prefix(tmp_path: Path) -> 
     assert result.returncode == 0, result.stderr
     pairs = dict(line.split("=", 1) for line in result.stdout.splitlines())
     assert pairs == _prefix_pairs("b+1", body_dir, "r", env)
+
+
+# ── Orca worker-skills probe (issue #359) ─────────────────────────────────────
+
+
+def _path_without_orca(tmp_path: Path) -> str:
+    """A PATH holding every tool the host has except `orca`: symlink farm of the real PATH."""
+    farm = tmp_path / "no-orca-bin"
+    farm.mkdir()
+    for directory in os.environ["PATH"].split(os.pathsep):
+        if not os.path.isdir(directory):
+            continue
+        for entry in os.scandir(directory):
+            link = farm / entry.name
+            if entry.name != "orca" and not link.exists() and os.access(entry.path, os.X_OK):
+                link.symlink_to(entry.path)
+    return str(farm)
+
+
+def _run_probe(
+    hub: Path, wt: Path, stubs: Path, extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    return _run(wt, stubs, env={**_orca_env(hub, wt), **(extra or {})})
+
+
+def test_orca_with_both_worker_skills_is_silent_and_succeeds(
+    hub: Path, wt: Path, stubs: Path
+) -> None:
+    result = _run_probe(hub, wt, stubs)
+
+    assert result.returncode == 0, result.stderr
+    assert "orca" not in result.stderr.lower().replace("orca_", "")
+
+
+def test_a_missing_orca_skill_warns_and_still_succeeds(hub: Path, wt: Path, stubs: Path) -> None:
+    _stub(stubs, "orca", 'printf \'[{"name":"orca-cli"}]\\n\'')
+
+    result = _run_probe(hub, wt, stubs)
+
+    assert result.returncode == 0, result.stderr
+    assert "orchestration" in result.stderr
+    assert "orca-cli" not in result.stderr
+
+
+def test_a_failing_orca_probe_warns_and_still_succeeds(hub: Path, wt: Path, stubs: Path) -> None:
+    _stub(stubs, "orca", "echo 'daemon disconnected' >&2; exit 3")
+
+    result = _run_probe(hub, wt, stubs)
+
+    assert result.returncode == 0, result.stderr
+    assert "orca skills installed" in result.stderr
+
+
+def test_unparseable_orca_output_warns_and_still_succeeds(hub: Path, wt: Path, stubs: Path) -> None:
+    _stub(stubs, "orca", "echo 'not json {'")
+
+    result = _run_probe(hub, wt, stubs)
+
+    assert result.returncode == 0, result.stderr
+    assert "orca skills installed" in result.stderr
+
+
+def test_a_hung_orca_probe_times_out_with_a_warning(hub: Path, wt: Path, stubs: Path) -> None:
+    _stub(stubs, "orca", "sleep 30")
+
+    result = _run_probe(hub, wt, stubs, {"PROVISION_ORCA_TIMEOUT": "1"})
+
+    assert result.returncode == 0, result.stderr
+    assert "timed out" in result.stderr
+
+
+def test_absent_orca_cli_is_silent_and_succeeds(hub: Path, wt: Path, tmp_path: Path) -> None:
+    empty_stubs = tmp_path / "gh-only"
+    _stub(empty_stubs, "gh", "exit 1")
+    env = {**_orca_env(hub, wt), "PATH": f"{empty_stubs}{os.pathsep}{_path_without_orca(tmp_path)}"}
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        cwd=str(wt),
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV, **env},
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "orca skills" not in result.stderr
+    assert "orchestration" not in result.stderr
