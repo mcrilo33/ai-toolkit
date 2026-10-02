@@ -202,8 +202,14 @@ deliver_answer() {
 # AFK_TLOG_LANE / AFK_TLOG_EPISODE).
 approve_permission() {
   local wt="$1" rc=1 h since now st waited=0 budget="${AFK_APPROVE_SETTLE_SECONDS:-10}" ms
+  case "$budget" in '' | *[!0-9]*) budget=10 ;; esac
+  # A FRESH read: the tick cache may predate a minutes-long reasoner step. Only a dialog that is
+  # still up gets the key (a stray `1` would otherwise land in the next prompt), and its
+  # stateStartedAt is the baseline the proof compares against.
+  orca_tick_reset
   since="$(orca_agent_field "$wt" stateStartedAt 2>/dev/null)"
-  if [ "$(orca_worker_liveness "$wt" 2>/dev/null)" != exited ] && h="$(_hi_terminal "$wt")" \
+  if [ "$(orca_agent_state "$wt" 2>/dev/null)" = waiting ] && [ -n "$since" ] \
+     && [ "$(orca_worker_liveness "$wt" 2>/dev/null)" != exited ] && h="$(_hi_terminal "$wt")" \
      && orca_send_text "$h" 1 0 0 >/dev/null; then
     while :; do
       orca_tick_reset

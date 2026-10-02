@@ -190,6 +190,21 @@ _afk_note_orca_state() {
   mkdir -p "$dir" 2>/dev/null; printf '%s\n' "$live" > "$dir/liveness-$issue" 2>/dev/null || true
 }
 
+# _afk_warn_unknown_state <wt> <issue> <what> -> the LOUD half of "unknown is never a basis for
+# action" (principles 2 + 6): when Orca cannot say what a spoke is doing, nothing is recovered, reaped
+# or blocked, but the drain WARNS (rate-limited to once per AFK_UNKNOWN_WARN_SECONDS, default 600, so a
+# stuck-unknown spoke is visible instead of silently held). Counts nothing and arms no backoff.
+_afk_warn_unknown_state() {
+  local issue="$2" f now last gap="${AFK_UNKNOWN_WARN_SECONDS:-600}"
+  case "$gap" in '' | *[!0-9]*) gap=600 ;; esac
+  f="$(_afk_state_dir)/unknown-$issue"; now="$(afk_now)"
+  last="$(cat "$f" 2>/dev/null)"
+  case "$last" in '' | *[!0-9]*) ;; *) [ "$(( now - last ))" -lt "$gap" ] && return 0 ;; esac
+  mkdir -p "$(dirname "$f")" 2>/dev/null; printf '%s\n' "$now" > "$f" 2>/dev/null || true
+  command -v broker_warn >/dev/null 2>&1 && broker_warn "$issue" "Orca cannot say what #$issue is doing ($3) -- holding it, taking NO recovery or blocked action"
+  return 0
+}
+
 # --- the reconciler (issue #304) ----------------------------------------------
 # slot_state is a pure READ of the #300 log; where the log DIVERGES from ground truth it heals the
 # log by APPENDING a visible actor:reconciler transition, never a silent epoch stamp (#300 principle
@@ -332,6 +347,7 @@ slot_state() {
   # clock or reap a spoke (principle 6) -- hold it busy until Orca answers.
   if [ "$(orca_agent_state "$wt_path" 2>/dev/null)" = unknown ] \
      || { orca_inbox_question "$wt_path" id >/dev/null 2>&1; [ "$?" -eq 2 ]; }; then
+    _afk_warn_unknown_state "$wt_path" "$issue" "no readable agent state or inbox"
     printf 'busy\n'; return
   fi
   # Past every park check ⇒ the spoke is NOT parked (busy/reap). Reset its park-onset clock so a

@@ -25,8 +25,8 @@
 #   • a non-commit git write like `git add` (only `commit` lands code).
 #
 # SELF-CLEARING — THREE UN-BLOCK PATHS
-#   1. spoke-ready.sh --gate consumes its own gate tag when the coordinator approves (#365); the
-#      broker's gate-answer path deletes it too (_consume_gate_tag, idempotent).
+#   1. spoke-ready.sh --gate consumes its own gate tag when the coordinator approves (#365): the
+#      spoke is the tag's only writer.
 #   2. The tip advances past the gate commit (the tag is no longer at the tip).
 #   3. BREAK-GLASS: AI_TOOLKIT_PLAN_GATE_OVERRIDE is set — the guard ALLOWS and best-effort drops
 #      the stale LOCAL tag so later calls are a no-op. There is no transcript heuristic: absent

@@ -334,7 +334,7 @@ _clear_progress_state() {
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/done-*.epoch "$dir"/tip-* \
     "$dir"/park-onset-*.epoch "$dir"/park-sig-* "$dir"/parked-total-*.seconds \
     "$dir"/answer-drop-* "$dir"/gate-voided-* \
-    "$dir"/terminal-logged-* "$dir"/first-state-* "$dir"/liveness-* \
+    "$dir"/terminal-logged-* "$dir"/first-state-* "$dir"/liveness-* "$dir"/unknown-* \
     "$dir"/wd-fire-dedup-* \
     "$dir"/offline-since.epoch 2>/dev/null || true   # #249: drop a stale outage marker too
   # #263: the watchdog's firing-dedup markers are per-window too — a leftover would suppress a

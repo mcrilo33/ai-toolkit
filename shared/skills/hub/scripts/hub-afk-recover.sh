@@ -410,13 +410,21 @@ _afk_retry_worker() {
 # every later read matches the live worker row, not the fenced one. provision-worktree.sh owns the
 # identity file (its --identity-only mode, which dispatch uses too); best-effort.
 _afk_record_dispatch() {
-  local wt="$1" prov top="${MAIN_ROOT:-${_AFK_TOPLEVEL:-.}}"
-  prov="$(_afk_find_script "${PROVISION_WORKTREE:-}" provision-worktree.sh)" || return 0
-  bash "$prov" --identity-only --worktree "$wt" --repo-root "$top" --issue "$(_orca_identity "$wt" issue)" \
-    --branch "$(git -C "$wt" branch --show-current 2>/dev/null)" --spoke-run-id "$(_afk_spoke_run_id "$wt")" \
-    --otel-body-dir "$wt/.ai-toolkit/raw-bodies" --repo-name "$(wt_repo_name "$top")" \
-    --orca-worktree-id "$(_orca_identity "$wt" orca_worktree_id)" --run-id "$(_orca_identity "$wt" run_id)" \
-    --orca-dispatch-id "$2" >/dev/null 2>&1 || log "  could not record dispatch $2 in the identity of $wt"
+  local wt="$1" prov top="${MAIN_ROOT:-${_AFK_TOPLEVEL:-.}}" br tmp f="$1/.ai-toolkit/identity"
+  br="$(git -C "$wt" branch --show-current 2>/dev/null)"
+  if prov="$(_afk_find_script "${PROVISION_WORKTREE:-}" provision-worktree.sh)" \
+     && bash "$prov" --identity-only --worktree "$wt" --repo-root "$top" --issue "$(_orca_identity "$wt" issue)" \
+          ${br:+--branch "$br"} --spoke-run-id "$(_afk_spoke_run_id "$wt")" \
+          --otel-body-dir "$wt/.ai-toolkit/raw-bodies" --repo-name "$(wt_repo_name "$top")" \
+          --orca-worktree-id "$(_orca_identity "$wt" orca_worktree_id)" --run-id "$(_orca_identity "$wt" run_id)" \
+          --orca-dispatch-id "$2" >/dev/null 2>&1; then
+    return 0
+  fi
+  # Loud fallback: a stale dispatch id makes every later read match the FENCED row (deliveries refused,
+  # the new worker's questions invisible). One atomic single-key rewrite beats leaving it stale.
+  log "  WARNING: provision-worktree.sh --identity-only failed for $wt -- rewriting orca_dispatch_id directly"
+  tmp="$(mktemp "$f.XXXXXX" 2>/dev/null)" || return 0
+  { grep -v '^orca_dispatch_id=' "$f" 2>/dev/null; printf 'orca_dispatch_id=%s\n' "$2"; } > "$tmp" && mv "$tmp" "$f" || rm -f "$tmp"
 }
 
 # _afk_journal_agent <issue> <text> -> journal the Orca agent snapshot a recovery acted on.
@@ -430,7 +438,8 @@ resume_spoke() {
   log "→ resume #$issue: worker exited with work intact — restarting it in place once"
   _afk_set_last_action "resume #$issue"
   _afk_retry_worker "$wt" "$issue"; rc=$?
-  [ "$rc" -ne 2 ] || return 0   # no action on an unknown state: nothing happened, nothing to record
+  # rc 2 = no action on an unknown state: warn (rate-limited), record and count NOTHING.
+  [ "$rc" -ne 2 ] || { _afk_warn_unknown_state "$wt" "$issue" "resume skipped"; return 0; }
   [ "$rc" -eq 0 ] || { log "  could not restart the worker for #$issue"; return 1; }
   _afk_mark_resumed "$issue"
   stamp_progress_epoch "$issue"   # a deliberate revival resets the reap ceiling (#133)
@@ -526,7 +535,7 @@ _revive_spoke() {
   log "→ revive #$issue: stopping the hung worker and restarting it in place"
   _afk_set_last_action "revive #$issue"
   _afk_retry_worker "$wt" "$issue"; rc=$?
-  [ "$rc" -ne 2 ] || return 0   # no action on an unknown state: nothing happened, nothing to record
+  [ "$rc" -ne 2 ] || { _afk_warn_unknown_state "$wt" "$issue" "revive skipped"; return 0; }
   [ "$rc" -eq 0 ] || { log "  could not restart the worker for #$issue"; return 1; }
   _afk_mark_resumed "$issue"
   stamp_progress_epoch "$issue"
@@ -601,6 +610,12 @@ _afk_crash_reresume_or_escalate() {
     _warn_parked_last "$wt" "$issue" "$reason — parked LAST, retried at low frequency"
     return 0
   fi
+  # Never count, journal or arm a retry Orca will refuse: an unreadable or unverifiable worker is
+  # unknown, and unknown is no basis to burn the resume budget toward a blocked escalation.
+  case "$(orca_worker_liveness "$wt" 2>/dev/null)" in
+    live | exited) ;;
+    *) _afk_warn_unknown_state "$wt" "$issue" "crash ladder skipped"; return 0 ;;
+  esac
   lane="$(_afk_warned_lane reap)"                       # the default/reap lane (empty)
   _afk_warned_due "$issue" "" "$lane" || return 0       # inside the backoff — parked LAST silently
   attempts="$(_afk_warn_attempt "$issue" "$lane")"
