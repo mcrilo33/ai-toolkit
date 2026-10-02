@@ -243,6 +243,53 @@ def test_non_git_directory_exits_zero(tmp_path: Path) -> None:
     assert r.stderr.strip() != ""
 
 
+def test_sibling_of_a_live_concurrent_run_is_preserved(repo: Path, worktree: Path) -> None:
+    root = _spool_root(repo)
+    live = subprocess.Popen(["sleep", "30"])
+    try:
+        in_flight = root / f"{SPOKE_ID}.tmp.{live.pid}" / ".ai-toolkit"
+        in_flight.mkdir(parents=True)
+        (in_flight / "half-copied").write_text("x")
+        assert _run(worktree).returncode == 0
+        assert (in_flight / "half-copied").is_file()
+    finally:
+        live.kill()
+        live.wait()
+
+
+def _break_raw_bodies(worktree: Path) -> Path:
+    blocked = worktree / ".ai-toolkit" / "raw-bodies" / "req-1.json"
+    blocked.chmod(0o000)
+    return blocked
+
+
+def test_failed_copy_restores_the_previous_spool_and_leaves_a_marker(
+    repo: Path, worktree: Path
+) -> None:
+    root = _spool_root(repo)
+    old = root / f"{SPOKE_ID}.old.99999" / ".ai-toolkit"
+    old.mkdir(parents=True)
+    (old / "spoke-run-id").write_text("previous")
+    blocked = _break_raw_bodies(worktree)
+    try:
+        if os.access(blocked, os.R_OK):
+            pytest.skip("running as a user that ignores file permissions")
+        r = _run(worktree)
+    finally:
+        blocked.chmod(0o644)
+    assert r.returncode == 0
+    assert (root / SPOKE_ID / ".ai-toolkit" / "spoke-run-id").read_text() == "previous"
+    assert "could not copy" in (root / f"{SPOKE_ID}.failed").read_text()
+
+
+def test_successful_run_clears_an_earlier_failure_marker(repo: Path, worktree: Path) -> None:
+    root = _spool_root(repo)
+    root.mkdir(parents=True)
+    (root / f"{SPOKE_ID}.failed").write_text("earlier failure")
+    assert _run(worktree).returncode == 0
+    assert [p.name for p in root.iterdir()] == [SPOKE_ID]
+
+
 def test_completes_under_five_seconds_on_realistic_bodies(repo: Path, worktree: Path) -> None:
     bodies = worktree / ".ai-toolkit" / "raw-bodies"
     blob = "x" * 20_000
