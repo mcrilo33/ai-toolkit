@@ -31,7 +31,13 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from _gate_broker_support import _DISPLAY_CASE, _PANE_PID, _agent_ps_stub, _fake_tmux_pane
+from _gate_broker_support import (
+    _DISPLAY_CASE,
+    _PANE_PID,
+    _agent_ps_stub,
+    _fake_tmux_pane,
+    _write_warmed_stub,
+)
 from _orca_stub import install_orca_stub
 from bash_session import BashSession, fresh_call
 
@@ -2242,148 +2248,6 @@ def test_decide_and_act_healthy_answer_mentioning_auth_is_not_a_failure(
     assert not _rl.exists() or "could not refresh" not in _rl.read_text()
     assert "could not refresh" not in result.stderr
     assert "human" in result.stderr, result.stderr
-
-
-# ── the --remote launcher (issue #73) ─────────────────────────────────────────
-# `/afk --remote` launches a detached, caffeinate-wrapped `/afk drain` on a configured
-# always-on Mac over SSH (Tailscale hostname), confirms the tmux session started, and
-# prints the reattach command. The remote command is built purely (build_remote_launch_cmd)
-# and ssh is stubbed via AFK_SSH so the orchestration runs without a real host.
-
-
-def _ssh_recorder(tmp_path: Path, log_name: str = "ssh.log", *, exit_code: int = 0) -> Path:
-    """An ssh stub that appends its args to a log and exits with exit_code."""
-    log = tmp_path / log_name
-    stub = tmp_path / "ssh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit {exit_code}\n')
-    stub.chmod(0o755)
-    return stub
-
-
-def test_build_remote_launch_cmd_contains_all_parts() -> None:
-    result = _call("build_remote_launch_cmd '/home/me/ai-toolkit' 'afk' 'bash hub-afk.sh drain'")
-
-    out = result.stdout
-    assert "cd '/home/me/ai-toolkit'" in out
-    assert "tmux new -d -s 'afk'" in out
-    assert "caffeinate -s" in out
-    assert "bash hub-afk.sh drain" in out
-
-
-def test_build_remote_launch_cmd_preserves_drain_args() -> None:
-    # AFK_REMOTE_DRAIN_CMD may carry args/flags; they must reach the remote command
-    # unquoted so the remote shell runs them as separate words, not one mis-quoted arg.
-    result = _call(
-        "build_remote_launch_cmd /repo afk 'claude --dangerously-skip-permissions \"/afk drain\"'"
-    )
-
-    assert 'caffeinate -s claude --dangerously-skip-permissions "/afk drain"' in result.stdout
-
-
-def test_remote_reattach_cmd() -> None:
-    result = _call("remote_reattach_cmd mac-home afk")
-
-    assert result.stdout.strip() == "ssh mac-home -t 'tmux attach -t afk'"
-
-
-def test_remote_launch_requires_host() -> None:
-    env = {"AFK_REMOTE_HOST": "", "AFK_REMOTE_REPO": "/repo", "AFK_REMOTE_CONF": "/nonexistent"}
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode != 0
-    assert "AFK_REMOTE_HOST" in result.stderr
-
-
-def test_remote_launch_requires_repo() -> None:
-    env = {"AFK_REMOTE_HOST": "mac-home", "AFK_REMOTE_REPO": "", "AFK_REMOTE_CONF": "/nonexistent"}
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode != 0
-    assert "AFK_REMOTE_REPO" in result.stderr
-
-
-def test_remote_launch_invokes_ssh_and_prints_reattach(tmp_path: Path) -> None:
-    ssh_stub = _ssh_recorder(tmp_path)
-    env = {
-        "AFK_REMOTE_HOST": "mac-home",
-        "AFK_REMOTE_REPO": "/home/me/ai-toolkit",
-        "AFK_REMOTE_SESSION": "afk",
-        "AFK_SSH": str(ssh_stub),
-        "AFK_REMOTE_CONF": "/nonexistent",
-    }
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode == 0, result.stderr
-    log = (tmp_path / "ssh.log").read_text()
-    assert "mac-home" in log  # launched on the host
-    assert "caffeinate -s" in log  # kept awake for the drain
-    assert "tmux new -d -s" in log
-    # The default launched command runs the supervisor SCRIPT directly (self-driving,
-    # unattended) — NOT an interactive `claude "/afk drain"` that would stall on a prompt.
-    assert "hub-afk.sh drain" in log
-    assert "has-session" in log  # confirmed the session is up
-    assert "ssh mac-home -t 'tmux attach -t afk'" in result.stdout  # reattach hint
-
-
-def test_remote_launch_fails_when_session_absent(tmp_path: Path) -> None:
-    # ssh launch succeeds but the confirm (has-session) fails → non-zero, no false success.
-    ssh_stub = tmp_path / "ssh"
-    ssh_stub.write_text(
-        '#!/usr/bin/env bash\ncase "$*" in *has-session*) exit 1 ;; *) exit 0 ;; esac\n'
-    )
-    ssh_stub.chmod(0o755)
-    env = {
-        "AFK_REMOTE_HOST": "mac-home",
-        "AFK_REMOTE_REPO": "/repo",
-        "AFK_SSH": str(ssh_stub),
-        "AFK_REMOTE_CONF": "/nonexistent",
-    }
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode != 0
-    assert "not found" in result.stderr
-
-
-def test_remote_launch_reads_conf_file_when_env_unset(tmp_path: Path) -> None:
-    conf = tmp_path / "afk-remote"
-    conf.write_text("AFK_REMOTE_HOST=mac-home\nAFK_REMOTE_REPO=/srv/ai-toolkit\n")
-    ssh_stub = _ssh_recorder(tmp_path)
-    env = {
-        "AFK_REMOTE_HOST": "",
-        "AFK_REMOTE_REPO": "",
-        "AFK_SSH": str(ssh_stub),
-        "AFK_REMOTE_CONF": str(conf),
-    }
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode == 0, result.stderr
-    log = (tmp_path / "ssh.log").read_text()
-    assert "mac-home" in log
-    assert "/srv/ai-toolkit" in log
-
-
-def test_remote_launch_env_overrides_conf_file(tmp_path: Path) -> None:
-    conf = tmp_path / "afk-remote"
-    conf.write_text("AFK_REMOTE_HOST=from-file\nAFK_REMOTE_REPO=/from/file\n")
-    ssh_stub = _ssh_recorder(tmp_path)
-    env = {
-        "AFK_REMOTE_HOST": "from-env",
-        "AFK_REMOTE_REPO": "/from/file",
-        "AFK_SSH": str(ssh_stub),
-        "AFK_REMOTE_CONF": str(conf),
-    }
-
-    result = _call("remote_launch", env=env)
-
-    assert result.returncode == 0, result.stderr
-    log = (tmp_path / "ssh.log").read_text()
-    assert "from-env" in log
-    assert "from-file" not in log
 
 
 # ── in-flight scope exclusion (issue #74, defect 3) ───────────────────────────
@@ -4900,7 +4764,7 @@ def test_preflight_exports_resolved_auth_for_spoke_inheritance(tmp_path: Path) -
 
 
 def test_preflight_resolves_auth_from_conf_file(tmp_path: Path) -> None:
-    # Env auth absent but the optional conf file (mirroring ~/.afk-remote) supplies it ⇒
+    # Env auth absent but the optional conf file (~/.afk-telemetry) supplies it ⇒
     # resolve from the file, export it, and arm.
     conf = tmp_path / "afk-telemetry"
     conf.write_text('LANGFUSE_BASIC_AUTH="Basic-from-file"\n')
@@ -4920,8 +4784,8 @@ def test_preflight_resolves_auth_from_conf_file(tmp_path: Path) -> None:
 
 
 def test_preflight_env_auth_wins_over_conf_file(tmp_path: Path) -> None:
-    # An explicit env LANGFUSE_BASIC_AUTH outranks the conf file (same precedence as
-    # _load_remote_conf): the env value is what spokes inherit.
+    # An explicit env LANGFUSE_BASIC_AUTH outranks the conf file: the env value is
+    # what spokes inherit.
     conf = tmp_path / "afk-telemetry"
     conf.write_text('LANGFUSE_BASIC_AUTH="Basic-from-file"\n')
     up_dir = tmp_path / "ports"
@@ -5194,14 +5058,13 @@ def _reaper_tmux(
     log = tmp_path / "tmux.log"
     panes = tmp_path / "panes.txt"
     panes.write_text(f"afk:1\t{pane_path}\n" if pane_path is not None else "")
-    (fake_bin / "tmux").write_text(
-        "#!/usr/bin/env bash\n"
+    _write_warmed_stub(
+        fake_bin / "tmux",
         f'printf "%s\\n" "$*" >> "{log}"\n'
         f'if [ "$1" = "list-panes" ]; then cat "{panes}"; fi\n'
         f'if [ "$1" = "display-message" ]; then printf "{_PANE_PID}\\n"; fi\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin, log
 
@@ -5233,8 +5096,7 @@ def _reaper_env(
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    _write_warmed_stub(ready_stub, f'printf "%s\\n" "$*" >> "{ready_log}"\n')
 
     statedir = tmp_path / "statedir"
     statedir.mkdir()
@@ -5270,6 +5132,17 @@ def _reaper_env(
         "AFK_INJECT_POLL_SECONDS": "0",
     }
     return expr, env, ready_log, statedir
+
+
+def test_reaper_stubs_are_warmed_before_the_reap_runs(tmp_path: Path) -> None:
+    # #375: reap_pass execs the tmux and `ps` stubs dozens of times, and a freshly written
+    # script's FIRST exec can take seconds under xdist (macOS vets each new executable). Both
+    # are exec'd once when built, so the pass only ever pays ~10ms re-execs.
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=tmp_path)
+
+    assert (fake_bin / "tmux.warm").exists(), "the tmux stub must be exec'd once up front"
+    assert (fake_bin / "ps.warm").exists(), "the ps stub must be exec'd once up front"
+    assert not tmux_log.exists(), "the warm-up exec must not look like a tmux call"
 
 
 def test_afk_resume_command_reuses_run_id_and_plain_prompt(tmp_path: Path) -> None:
@@ -8109,27 +7982,33 @@ def test_reap_pass_clears_offline_marker_when_network_recovers(tmp_path: Path) -
     # A prior outage left an offline marker; this tick the network is back and auth is healthy,
     # so reap_pass proceeds normally AND clears the stale outage marker (consecutive-offline reset).
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
     expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
     _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1"})
     env["AFK_NET_PROBE_CMD"] = "true"  # network back up (auth stub in _reaper_env is healthy)
 
-    start = time.monotonic()
-    _call(expr, env=env)
-    elapsed = time.monotonic() - start
+    # #330: the marker clear happens at the TOP of reap_pass (clear_offline_since), before
+    # _reap_or_resume's nudge path enters inject_and_verify -> _transcript_advanced, which
+    # polls up to AFK_INJECT_VERIFY_SECONDS (60s) plus a bounded retry (~122s total against
+    # the stub tmux that never advances the transcript). The fix zeroes the inject-verify
+    # budget in _reaper_env's returned env. #375: witness the skipped poll directly instead of
+    # a wall-clock budget (cold stub execs made any bound flaky under xdist). The poll's step
+    # is `sleep <AFK_INJECT_POLL_SECONDS>`; a `sleep` shim records every call and no-ops the
+    # 2s default step, so a regressed pass loops instantly and leaves its trace in the log.
+    sleep_log = tmp_path / "sleep.log"
+    shim = (
+        f'sleep() {{ printf "%s\\n" "$*" >> "{sleep_log}"; [ "$1" = 2 ] || command sleep "$@"; }}; '
+    )
+    _call(shim + expr, env=env)
 
     assert not (statedir / "offline-since.epoch").exists(), (
         "network recovery must clear the outage marker so --status stops reporting OFFLINE"
     )
-    # #330: the marker clear happens at the TOP of reap_pass (clear_offline_since), before
-    # _reap_or_resume's nudge path enters inject_and_verify -> _transcript_advanced, which
-    # polls up to AFK_INJECT_VERIFY_SECONDS (60s) plus a bounded retry (~122s total against
-    # the stub tmux that never advances the transcript). Bound the whole pass so a regression
-    # that reintroduces that dead wait fails loudly instead of silently capping the full-suite
-    # wall-clock. The fix zeroes the inject-verify budget in _reaper_env's returned env.
-    assert elapsed < 10, (
-        f"reap_pass blocked on the injector poll ({elapsed:.1f}s); the fixed path is ~2s, so "
-        "anything near the 122s pre-fix wait is a regression"
+    assert "send-keys" in tmux_log.read_text(), "the pass must reach the inject path it bounds"
+    polled = sleep_log.read_text().split() if sleep_log.exists() else []
+    assert "2" not in polled, (
+        "reap_pass entered the injector verify poll (default 2s step); with the budget zeroed "
+        f"it is skipped, so a poll step means the ~122s pre-fix wait is back (sleeps: {polled})"
     )
 
 
@@ -9124,19 +9003,6 @@ def test_recover_dead_panes_over_ceiling_near_complete_still_revives(tmp_path: P
 # So `_revive_spoke` captures a best-effort, bounded bundle to
 # <git-common-dir>/hang-forensics/<issue>-<epoch>/ BEFORE the kill. A crashed pane (no live
 # process) has nothing to capture and skips gracefully.
-
-
-def _write_warmed_stub(path: Path, body: str) -> None:
-    """Write an executable bash stub (`body` follows the shebang) and exec it once, `--warm`.
-
-    A freshly written script's FIRST exec can take seconds under xdist (macOS vets each new
-    executable) while a re-exec takes ~10ms (#374) -- longer than the bounded waits the stubbed
-    commands run under. The warm-up exec leaves a `<path>.warm` marker and runs none of `body`.
-    """
-    guard = '[ "${1:-}" = "--warm" ] && { : > "$0.warm"; exit 0; }\n'
-    path.write_text("#!/usr/bin/env bash\n" + guard + body)
-    path.chmod(0o755)
-    subprocess.run([str(path), "--warm"], check=True)
 
 
 def _forensics_bin(

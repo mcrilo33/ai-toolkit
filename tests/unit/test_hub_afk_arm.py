@@ -1,6 +1,6 @@
 """Mirror tests for hub-afk-arm.sh (issue #307 split).
 
-The ARM-time lane extracted from hub-afk.sh: the --remote launch, the telemetry preflight,
+The ARM-time lane extracted from hub-afk.sh: the telemetry preflight,
 the sleep-inhibitor/power status warnings, and the arm-time liveness probes + preconditions
 + the ONE arm verdict + the self-check. A behaviour-neutral MOVE, so these tests assert the
 functions are reachable through the entry and physically located in the module file.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _hub_afk_support import HUB_SCRIPTS_DIR, _call, function_source_file
@@ -18,8 +19,6 @@ from _orca_stub import install_orca_stub
 MODULE = "hub-afk-arm.sh"
 
 ARM_FUNCTIONS = [
-    "remote_launch",
-    "build_remote_launch_cmd",
     "afk_telemetry_enabled",
     "afk_resolve_telemetry_auth",
     "afk_telemetry_preflight",
@@ -59,15 +58,6 @@ def test_module_file_is_present_and_executable() -> None:
     assert os.access(mod, os.X_OK), f"{MODULE} is not executable"
 
 
-def test_build_remote_launch_cmd_is_pure() -> None:
-    # A pure helper: sanity that the moved code still renders the detached tmux launch.
-    out = _call("build_remote_launch_cmd /repo afk 'bash x drain'").stdout
-
-    assert "cd '/repo'" in out
-    assert "tmux new -d -s 'afk'" in out
-    assert "caffeinate -s bash x drain" in out
-
-
 def test_arm_claude_check_default_probe_runs_on_haiku() -> None:
     # #358: the auth probe spends an Opus call on a two-token `ok` liveness ping — pure
     # waste. The default AFK_AUTH_PROBE_CMD belongs on the cheap tier (Haiku), never the
@@ -84,7 +74,7 @@ def test_arm_claude_check_default_probe_runs_on_haiku() -> None:
 # relaunch it in tmux. So arming is refused, naming #365 (S6), until the supervisor moves to Orca.
 
 
-def _orca_env(tmp_path: Path, **kw: str) -> dict[str, str]:
+def _orca_env(tmp_path: Path, **kw: Any) -> dict[str, str]:
     bindir = tmp_path / "bin"
     bindir.mkdir()
     env = install_orca_stub(bindir, **kw)
