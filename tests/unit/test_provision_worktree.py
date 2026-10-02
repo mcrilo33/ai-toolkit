@@ -862,3 +862,17 @@ def test_askuserquestion_is_denied_for_afk_spokes_only(
     assert _run(wt, stubs, *_explicit(hub, wt, mode)).returncode == 0
 
     assert ("AskUserQuestion" in _settings(wt)["permissions"].get("deny", [])) is denied
+
+
+def test_a_foreign_orca_worktree_id_in_the_environment_never_overwrites_the_record(
+    hub: Path, wt: Path, stubs: Path, tmp_path: Path
+) -> None:
+    # Every Orca terminal exports ORCA_WORKTREE_ID for ITS worktree (the dispatching hub's); it
+    # only describes this worktree when ORCA_WORKTREE_PATH names it (Orca's setup hook).
+    assert _run(wt, stubs, *_explicit(hub, wt), "--orca-worktree-id", "wt-9").returncode == 0
+    hub_terminal = {"ORCA_WORKTREE_ID": "the-hubs-id", "ORCA_WORKTREE_PATH": str(hub)}
+
+    result = _run(tmp_path, stubs, *_explicit(hub, wt), "--identity-only", env=hub_terminal)
+
+    assert result.returncode == 0, result.stderr
+    assert _identity(wt)["orca_worktree_id"] == "wt-9"

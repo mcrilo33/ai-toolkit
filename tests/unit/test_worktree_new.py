@@ -172,10 +172,19 @@ def _gh_calls(tmp_path: Path) -> list[str]:
 
 
 # ── the Orca sequence ──
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("8", "some-slug"),
+        ("8", "some-slug", "--mode", "afk"),
+        ("263", "some-slug", "--subtasks", "265"),
+        ("adhoc", "--prompt", "x"),
+    ],
+)
 def test_dispatch_runs_the_orca_sequence_and_never_the_retired_paths(
-    hub: Path, tmp_path: Path
+    hub: Path, tmp_path: Path, args: tuple[str, ...]
 ) -> None:
-    proc = _run_new(hub, tmp_path, "8", "some-slug")
+    proc = _run_new(hub, tmp_path, *args, extra_env={"AFK_STATE_DIR": str(tmp_path / "afk-state")})
 
     assert proc.returncode == 0, proc.stderr
     steps = [" ".join(c[:2]) for c in _calls(tmp_path) if c[0] != "--version"]
@@ -345,7 +354,9 @@ def test_worker_start_waits_for_the_agent_to_exist(hub: Path, tmp_path: Path) ->
     assert proc.returncode == 0, proc.stderr
     kinds = [" ".join(c[:2]) for c in _calls(tmp_path)]
     assert kinds.index("terminal show") < kinds.index("orchestration worker-start")
-    assert kinds.count("terminal show") == 2
+    # two polls to see the agent, then one re-check right before the seed is sent
+    assert kinds.count("terminal show") == 3
+    assert kinds[kinds.index("orchestration worker-start") - 1] == "terminal show"
 
 
 def test_an_agent_that_never_starts_fails_loud_without_sending_the_seed(
@@ -902,3 +913,47 @@ def test_the_chain_note_reaches_default_and_explicit_prompts(
     spec = _spec(tmp_path)
     assert "265 270" in spec
     assert (prompt is None) or spec.startswith(prompt)
+
+
+def test_a_failed_launch_leaves_no_subtask_queue_behind(hub: Path, tmp_path: Path) -> None:
+    scenario = {
+        "orchestration worker-start": [
+            {"rc": 1, "out": {"ok": False, "error": {"code": "consumer_fenced"}}}
+        ]
+    }
+
+    proc = _run_new(
+        hub,
+        tmp_path,
+        "263",
+        "some-slug",
+        "--subtasks",
+        "265,270",
+        extra_env=_packed(tmp_path),
+        scenario=scenario,
+    )
+
+    assert proc.returncode != 0
+    assert not _queued(tmp_path, "263").exists()
+
+
+def test_a_missing_dispatch_id_warns_but_does_not_fail_a_live_spoke(
+    hub: Path, tmp_path: Path
+) -> None:
+    scenario = {"orchestration worker-start": [{"out": {"ok": True, "result": {"state": "ready"}}}]}
+
+    proc = _run_new(hub, tmp_path, "8", "some-slug", scenario=scenario)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "dispatch id" in proc.stderr
+    assert any(c.startswith("issue edit 8 ") for c in _gh_calls(tmp_path))
+    assert _identity(tmp_path, "8-some-slug")["orca_dispatch_id"] == ""
+
+
+def test_adhoc_settings_wt_spoke_matches_the_launch_prefix(hub: Path, tmp_path: Path) -> None:
+    proc = _run_new(hub, tmp_path, "My Fix", "--prompt", "x")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "WT_SPOKE=my-fix " in _launch_cmd(tmp_path)
+    settings = json.loads((_wt(tmp_path, "my-fix") / ".claude/settings.local.json").read_text())
+    assert settings["env"]["WT_SPOKE"] == "my-fix"
