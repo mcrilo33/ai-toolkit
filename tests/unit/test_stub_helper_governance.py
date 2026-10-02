@@ -23,11 +23,7 @@ _EXEC_BIT_NAMES = {"S_IEXEC", "S_IXUSR", "S_IXGRP", "S_IXOTH"}
 # "<path relative to tests/>" (whole file) or "<path>::<function>" -> why a raw exec bit is
 # correct there.
 ALLOWLIST: dict[str, str] = {
-    "unit/test_hub_afk.py": "pending #375 (converting this file concurrently); follow-up sweep",
     "unit/test_archive_worktree.py::test_unwritable_spool_root_exits_zero_with_stderr_only": (
-        "chmods a directory read-only, not a stub"
-    ),
-    "unit/test_hub_watchdog.py::test_intervene_revive_refuses_to_spawn_when_the_budget_cannot_be_recorded": (
         "chmods a directory read-only, not a stub"
     ),
     "unit/test_commit_hooks.py::test_docs_executable_md_still_requires_anchor": (

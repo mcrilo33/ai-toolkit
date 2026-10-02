@@ -16,22 +16,27 @@ from running on import) and drive its layers directly:
 
 from __future__ import annotations
 
-import contextlib
 import datetime
 import hashlib
 import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
+import _stubs
 import pytest
-from _gate_broker_support import _DISPLAY_CASE, _PANE_PID, _agent_ps_stub, _fake_tmux_pane
+from _gate_broker_support import (
+    _DISPLAY_CASE,
+    _PANE_PID,
+    _agent_ps_stub,
+    _fake_tmux_pane,
+)
+from _stubs import write_stub
 from bash_session import BashSession, fresh_call
 
 # hub-afk.sh targets the macOS control plane: it reads transcript mtimes with BSD
@@ -85,22 +90,12 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # it when refactoring these self-copy tests.
     monkeypatch.delenv("AFK_RUNNING_COPY", raising=False)
     monkeypatch.delenv("AFK_SELF_COPY", raising=False)
-    # Same isolation for the #243 hang-forensics bundle root: the reaper's revive path now
-    # captures a bundle under <git-common-dir>/hang-forensics before it kills the pane, so
-    # without this pin any reap/revive test would write into the REAL repo's .git.
-    monkeypatch.setenv("AFK_HANG_FORENSICS_DIR", str(tmp_path / "hang-forensics"))
     # Neutralize the #252 duplicate-lineage scan by default: `_status` runs the real host
     # `pgrep -fl hub-afk` scan whenever AFK_SUPERVISOR_PIDS_CMD is unset, so on a macOS dev box
     # with 2+ live `/afk drain` lineages every `_status`-driving test that asserts exact output
     # (e.g. `== "/afk: off"`) would flakily gain a WARNING line. Pin it to a silent scan; the
     # dedicated duplicate-lineage tests override it explicitly with their own pid list.
     monkeypatch.setenv("AFK_SUPERVISOR_PIDS_CMD", "true")
-    # Neutralize the #251 tier-2 hub-watchdog co-arm by default: _afk_spawn_watchdog now
-    # co-arms the OS-level hub-watchdog, and without this pin the real-path spawn test would
-    # nohup a real daemon writing a pidfile into the REAL <git-common-dir>. A no-op seam keeps
-    # every test daemon-free; the dedicated co-arm tests override HUB_WATCHDOG_ARM_CMD with a
-    # recording stub.
-    monkeypatch.setenv("HUB_WATCHDOG_ARM_CMD", ":")
     # Neutralize the #249 network reachability probe by default: `_afk_network_is_down` (the
     # third outcome ahead of the auth-dead conclusion) runs a real `curl` to api.anthropic.com
     # when AFK_NET_PROBE_CMD is unset, so without this pin every reap/auth-halt test would make
@@ -519,8 +514,7 @@ def _blocked_recording_ready(tmp_path: Path) -> tuple[Path, Path]:
     """A spoke-ready.sh stub that records its args — so escalation (--blocked) is observable."""
     log = tmp_path / "ready.log"
     stub = tmp_path / "spoke-ready.sh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
     return stub, log
 
 
@@ -1022,21 +1016,19 @@ def test_decide_and_act_stamps_answer_attempt(spoke_repo: Path, tmp_path: Path) 
     jsonl = pd / "session.jsonl"
     os.utime(jsonl, (1_000_000_000, 1_000_000_000))
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, "#!/usr/bin/env bash\nexit 0\n")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
-    (fake_bin / "tmux").write_text(
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
         f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
@@ -1153,15 +1145,15 @@ def _recording_tmux(tmp_path: Path, *, agent_alive: bool = True) -> tuple[Path, 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     log = tmp_path / "tmux.log"
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'case "$1" in\n'
         f"{_DISPLAY_CASE}"
         "esac\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin, log
 
@@ -1314,7 +1306,8 @@ def _injector_tmux(
         )
     else:
         submit_cmd = ":"
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'case "$1" in\n'
@@ -1338,9 +1331,8 @@ def _injector_tmux(
         "    fi\n"
         "  fi\n"
         "fi\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
     return fake_bin, log
 
@@ -1377,8 +1369,7 @@ def test_composer_shows_text_false_when_capture_fails(tmp_path: Path) -> None:
     # so the caller escalates rather than wedge-respawning a pane it cannot see.
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
-    (fake_bin / "tmux").write_text("#!/usr/bin/env bash\nexit 1\n")
-    (fake_bin / "tmux").chmod(0o755)
+    write_stub(fake_bin / "tmux", "#!/usr/bin/env bash\nexit 1\n")
 
     result = _call(
         "_composer_shows_text 'afk:1' 'use Redis'; echo RC=$?",
@@ -1497,10 +1488,8 @@ def _wedge_env(spoke: Path, tmp_path: Path, fake_bin: Path) -> tuple[dict[str, s
     os.utime(pd / "session.jsonl", (1_000_000_000, 1_000_000_000))
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
         "SPOKE_READY": str(ready_stub),
@@ -1913,14 +1902,12 @@ def stub_env(tmp_path: Path, spoke_repo: Path) -> dict[str, str]:
     # Recording stub for spoke-ready.sh: append its args to a log.
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
 
     # Fake gh so build_answerer_prompt is hermetic (no network).
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
 
     return {
         "CLAUDE_PROJECTS_DIR": str(projects),
@@ -1978,13 +1965,11 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
     # Fake tmux: list-panes maps a pane to this worktree; the submitting Enter records the
     # pasted answer as a user turn — the shared stub, so this test drives the same delivery
     # contract as every other inject test (a bare mtime bump has not proven delivery since
@@ -2025,13 +2010,11 @@ def test_decide_and_act_consumes_gate_tag_on_inject(spoke_repo: Path, tmp_path: 
     os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # backdate so the reaction is newer
 
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, "#!/usr/bin/env bash\nexit 0\n")
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
     # The shared stub: the submitting Enter records the answer as a user turn, which is what
     # proves delivery since #281 (a bare mtime bump no longer does).
     _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
@@ -2069,22 +2052,20 @@ def test_decide_and_act_warns_when_answer_does_not_register(
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", '#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
     # Pane maps, send-keys succeeds, but the transcript is never advanced.
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
         f"{_DISPLAY_CASE}"
-        "esac\nexit 0\n"
+        "esac\nexit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin)
 
     env = {
@@ -2258,8 +2239,7 @@ def _gh_stub(tmp_path: Path, body: str) -> Path:
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
-    (fake_bin / "gh").write_text(f'#!/usr/bin/env bash\nprintf "%b\\n" "{body}"\n')
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", f'#!/usr/bin/env bash\nprintf "%b\\n" "{body}"\n')
     return fake_bin
 
 
@@ -2297,19 +2277,18 @@ def test_dispatch_batch_holds_back_inflight_scope_overlap(tmp_path: Path) -> Non
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text(
+    write_stub(
+        fake_bin / "gh",
         "#!/usr/bin/env bash\n"
         'case "$1 $2" in\n'
         '  "issue view") printf "body\\nScope: a.py\\n" ;;\n'
         '  "repo view") echo "octo ai-toolkit" ;;\n'
         f'  "api graphql") cat "{backlog}" ;;\n'
-        "esac\n"
+        "esac\n",
     )
-    (fake_bin / "gh").chmod(0o755)
     dispatched = tmp_path / "dispatched.log"
     wt_new = tmp_path / "wtnew.sh"
-    wt_new.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{dispatched}"\n')
-    wt_new.chmod(0o755)
+    write_stub(wt_new, f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{dispatched}"\n')
 
     batch_plan = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.sh"
     expr = 'inflight_issues() { printf "72\\n"; }; inflight_worktrees() { :; }; dispatch_batch'
@@ -2338,19 +2317,18 @@ def test_dispatch_batch_stamps_mode_afk(tmp_path: Path) -> None:
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text(
+    write_stub(
+        fake_bin / "gh",
         "#!/usr/bin/env bash\n"
         'case "$1 $2" in\n'
         '  "issue view") printf "body\\nScope: d.py\\n" ;;\n'
         '  "repo view") echo "octo ai-toolkit" ;;\n'
         f'  "api graphql") cat "{backlog}" ;;\n'
-        "esac\n"
+        "esac\n",
     )
-    (fake_bin / "gh").chmod(0o755)
     dispatched = tmp_path / "dispatched.log"
     wt_new = tmp_path / "wtnew.sh"
-    wt_new.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{dispatched}"\n')
-    wt_new.chmod(0o755)
+    write_stub(wt_new, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{dispatched}"\n')
 
     batch_plan = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.sh"
     expr = "inflight_issues() { :; }; inflight_worktrees() { :; }; dispatch_batch"
@@ -2378,8 +2356,7 @@ def _land_recorder(tmp_path: Path) -> tuple[Path, Path]:
     """A land-script stub that records the issue it was asked to land."""
     land_log = tmp_path / "land.log"
     stub = tmp_path / "wtland.sh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\n')
     return stub, land_log
 
 
@@ -2417,8 +2394,7 @@ def _escalation_recorder(tmp_path: Path) -> tuple[Path, Path]:
     """A spoke-ready.sh stub recording its args, to assert a blocked/<issue> escalation."""
     ready_log = tmp_path / "ready.log"
     stub = tmp_path / "spoke-ready.sh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     return stub, ready_log
 
 
@@ -2510,8 +2486,7 @@ def test_auto_land_delegates_to_the_lock_holding_land_script(
     _seed_clean_review(spoke_repo)
     land_log = tmp_path / "land-argv.log"
     stub = tmp_path / "wtland.sh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{land_log}"\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{land_log}"\n')
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
 
@@ -2742,8 +2717,9 @@ def _land_stub(tmp_path: Path, exit_code: int) -> tuple[Path, Path]:
     """A worktree-land stub that logs the issue it was asked to land, then exits `exit_code`."""
     land_log = tmp_path / "land-calls.log"
     stub = tmp_path / "wtland.sh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\nexit {exit_code}\n')
-    stub.chmod(0o755)
+    write_stub(
+        stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\nexit {exit_code}\n'
+    )
     return stub, land_log
 
 
@@ -2962,14 +2938,14 @@ def test_auto_land_precondition_reattempts_and_lands_after_push(
     # A stub that exits 5 on the first call (unpushed) and 0 on the second (the push arrived).
     stub = tmp_path / "wtland.sh"
     counter = tmp_path / "n"
-    stub.write_text(
+    write_stub(
+        stub,
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$1" >> "{land_log}"\n'
         f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); printf "%s" "$n" > "{counter}"\n'
         f'[ "$n" -ge 2 ] && exit 0\n'
-        f"exit {_WT_LAND_PRECONDITION_EXIT}\n"
+        f"exit {_WT_LAND_PRECONDITION_EXIT}\n",
     )
-    stub.chmod(0o755)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
@@ -3023,14 +2999,14 @@ def _guarded_land_stub(tmp_path: Path, land_log: Path) -> Path:
     landed issue on a clean hub — so a lane that does NOT clean the hub first can never land.
     """
     stub = tmp_path / "wtland.sh"
-    stub.write_text(
+    write_stub(
+        stub,
         "#!/usr/bin/env bash\n"
         'if [ -n "$(git -C "$MAIN_ROOT" status --porcelain -uno 2>/dev/null)" ]; then\n'
         '  echo "hub checkout is dirty" >&2; exit 1\n'
         "fi\n"
-        f'printf "%s\\n" "$1" >> "{land_log}"\n'
+        f'printf "%s\\n" "$1" >> "{land_log}"\n',
     )
-    stub.chmod(0o755)
     return stub
 
 
@@ -3112,8 +3088,7 @@ def test_auto_land_unstashable_dirty_hub_escalates(spoke_repo: Path, tmp_path: P
     _seed_clean_review(spoke_repo)
     land_log = tmp_path / "land.log"
     stub = tmp_path / "wtland.sh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\n')
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     expr = (
@@ -3273,8 +3248,7 @@ def test_auto_land_failure_does_not_increment_tally(spoke_repo: Path, tmp_path: 
     # Clean review so the LAND (exit 1) is what escalates, not the default-on gate.
     _seed_clean_review(spoke_repo)
     wt_land = tmp_path / "wtland.sh"
-    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")
-    wt_land.chmod(0o755)
+    write_stub(wt_land, "#!/usr/bin/env bash\nexit 1\n")
     ready_stub, _ready_log = _escalation_recorder(tmp_path)
     countfile = tmp_path / "landed-count"
     statedir = tmp_path / "statedir"
@@ -3549,8 +3523,7 @@ def test_auto_land_keeps_heartbeat_fresh_during_slow_land(spoke_repo: Path, tmp_
     _seed_clean_review(spoke_repo)
     land_log = tmp_path / "land.log"
     wt_land = tmp_path / "wtland.sh"
-    wt_land.write_text(f'#!/usr/bin/env bash\nsleep 3\nprintf "%s\\n" "$1" >> "{land_log}"\n')
-    wt_land.chmod(0o755)
+    write_stub(wt_land, f'#!/usr/bin/env bash\nsleep 3\nprintf "%s\\n" "$1" >> "{land_log}"\n')
     hb = tmp_path / "heartbeat"
     hb.write_text("999 1000\n")
     statedir = tmp_path / "statedir"
@@ -3582,12 +3555,10 @@ def test_auto_land_failing_land_still_warns_through_wrapper(
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     _seed_clean_review(spoke_repo)
     wt_land = tmp_path / "wtland.sh"
-    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")
-    wt_land.chmod(0o755)
+    write_stub(wt_land, "#!/usr/bin/env bash\nexit 1\n")
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     statedir = tmp_path / "statedir"
 
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
@@ -3684,8 +3655,7 @@ def _land_argv_recorder(tmp_path: Path) -> tuple[Path, Path]:
     """A land-script stub recording its FULL argv (not just $1), to assert threaded flags."""
     land_log = tmp_path / "land.log"
     stub = tmp_path / "wtland.sh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{land_log}"\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{land_log}"\n')
     return stub, land_log
 
 
@@ -3759,8 +3729,7 @@ def test_auto_land_ready_blocked_rewarns_on_repeat_failure(
     subprocess.run(["git", "tag", "blocked/5"], cwd=spoke_repo, check=True, capture_output=True)
     _seed_clean_review(spoke_repo)  # gate on by default: the failing land is what re-escalates
     wt_land = tmp_path / "wtland.sh"
-    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")  # land still fails
-    wt_land.chmod(0o755)
+    write_stub(wt_land, "#!/usr/bin/env bash\nexit 1\n")  # land still fails
     ready_stub, ready_log = _escalation_recorder(tmp_path)
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
@@ -3793,8 +3762,7 @@ def test_auto_land_does_not_block_when_land_reports_cleanup_incomplete(
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     _seed_clean_review(spoke_repo)  # gate on by default: reach the land so exit 3 is exercised
     wt_land = tmp_path / "wtland.sh"
-    wt_land.write_text("#!/usr/bin/env bash\nexit 3\n")  # sentinel: main advanced, cleanup failed
-    wt_land.chmod(0o755)
+    write_stub(wt_land, "#!/usr/bin/env bash\nexit 3\n")  # sentinel: main advanced, cleanup failed
     ready_stub, ready_log = _escalation_recorder(tmp_path)
     statedir = tmp_path / "statedir"
     landed = tmp_path / "landed"
@@ -3826,8 +3794,7 @@ def test_auto_land_warns_on_a_pre_merge_failure(spoke_repo: Path, tmp_path: Path
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     _seed_clean_review(spoke_repo)  # gate on by default: the exit-1 land is what escalates
     wt_land = tmp_path / "wtland.sh"
-    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")
-    wt_land.chmod(0o755)
+    write_stub(wt_land, "#!/usr/bin/env bash\nexit 1\n")
     ready_stub, ready_log = _escalation_recorder(tmp_path)
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
@@ -4373,65 +4340,6 @@ def test_spawn_watchdog_spawns_when_none_alive(tmp_path: Path) -> None:
     assert marker.exists(), "no live watchdog ⇒ one must be spawned"
 
 
-# ── tier-2 hub-watchdog co-arm (issue #251) ───────────────────────────────────
-# _afk_spawn_watchdog co-arms the OS-level hub-watchdog alongside the keeper so it runs
-# "alongside the drain" (AC#1) and is re-armed if it died. The HUB_WATCHDOG_ARM_CMD seam
-# stands in for the real `hub-watchdog.sh --arm` launch.
-
-
-def test_spawn_watchdog_co_arms_the_hub_watchdog(tmp_path: Path) -> None:
-    wf = tmp_path / "watchdog"  # absent ⇒ real spawn path runs → reaches the co-arm
-    coarm = tmp_path / "coarmed"
-    env = {"AFK_WATCHDOG_FILE": str(wf), "HUB_WATCHDOG_ARM_CMD": f"touch {coarm}"}
-
-    _call("_afk_spawn_watchdog", env=env)
-
-    assert coarm.exists(), "spawning the keeper must co-arm the tier-2 hub-watchdog"
-
-
-def test_hub_watchdog_co_arm_is_opt_outable(tmp_path: Path) -> None:
-    coarm = tmp_path / "coarmed"
-    env = {"HUB_WATCHDOG_COARM": "0", "HUB_WATCHDOG_ARM_CMD": f"touch {coarm}"}
-
-    _call("_afk_arm_hub_watchdog", env=env)
-
-    assert not coarm.exists(), "HUB_WATCHDOG_COARM=0 disables the co-arm"
-
-
-def test_arm_hub_watchdog_hands_over_the_origin_script(tmp_path: Path) -> None:
-    # #296 mechanism 1: hub-afk.sh normally runs from its own frozen self-copy (#133), so
-    # _afk_find_script resolves hub-watchdog.sh to that SAME copy dir — a bundle no land ever
-    # rewrites. Without an origin handoff, hub-watchdog.sh's self-recycle hashes the frozen
-    # copy forever (structurally dead, the ORIGINAL #296 bug). AFK_ORIG_SCRIPT (the origin
-    # checkout hub-afk.sh carries for ITSELF) must be used to derive hub-watchdog.sh's origin
-    # sibling and hand it over as HUB_WATCHDOG_ORIG_SCRIPT — bypassing HUB_WATCHDOG_ARM_CMD
-    # (which stubs out the real launch entirely) to exercise the actual invocation.
-    origin_dir = tmp_path / "origin"
-    origin_dir.mkdir()
-    (origin_dir / "hub-afk.sh").write_text("# origin hub-afk\n")
-    (origin_dir / "hub-watchdog.sh").write_text("# origin hub-watchdog\n")
-
-    stub = tmp_path / "copy" / "hub-watchdog.sh"
-    stub.parent.mkdir()
-    dump = tmp_path / "seen-orig"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s" "$HUB_WATCHDOG_ORIG_SCRIPT" > "{dump}"\n')
-    stub.chmod(0o755)
-
-    env = {
-        "AFK_ORIG_SCRIPT": str(origin_dir / "hub-afk.sh"),
-        "HUB_WATCHDOG_BIN": str(stub),
-        "HUB_WATCHDOG_ARM_CMD": "",  # override the autouse no-op stub pin below
-    }
-
-    _call("_afk_arm_hub_watchdog", env=env)
-
-    assert dump.exists(), "the real --arm invocation must run (not a stubbed CMD)"
-    assert dump.read_text() == str(origin_dir / "hub-watchdog.sh"), (
-        "HUB_WATCHDOG_ORIG_SCRIPT must point at the ORIGIN checkout's sibling, not the frozen "
-        "copy _afk_find_script resolved $wd to"
-    )
-
-
 def test_spawn_watchdog_spawns_when_recorded_pid_dead(tmp_path: Path) -> None:
     wf = tmp_path / "watchdog"
     marker = tmp_path / "spawned"
@@ -4556,13 +4464,10 @@ def test_reconcile_refuses_when_telemetry_preflight_fails(tmp_path: Path) -> Non
 
 def test_reconcile_does_not_run_the_arm_selfcheck(tmp_path: Path) -> None:
     # #279 cadence: the liveness self-check is ARM-ONLY. Reconcile looks like a re-arm but is
-    # the RECOVERY path -- hub-watchdog.sh's _wd_intervene_rearm recovers a crashed drain via
-    # `bash hub-afk.sh --reconcile >/dev/null 2>&1 || true`, discarding output AND exit code.
-    # Gating that on live judge/claude/gh probes would let a transient outage (the thing most
-    # likely to be happening around a crash) SILENTLY block recovery: the watchdog would record
-    # the intervention, the refusal would go to /dev/null, and every in-flight spoke would
-    # strand with no answerer or lander -- the ~10h overnight strand afk_reconcile exists to
-    # prevent (#202 A). Resuming degraded beats refusing to resume; the #268 judge halt and the
+    # the RECOVERY path. Gating it on live judge/claude/gh probes would let a transient outage
+    # (the thing most likely to be happening around a crash) SILENTLY block recovery, and every
+    # in-flight spoke would strand with no answerer or lander -- the ~10h overnight strand
+    # afk_reconcile exists to prevent (#202 A). Resuming degraded beats refusing to resume; the #268 judge halt and the
     # #241 §9 auth halt already catch a dependency that dies mid-window.
     resp, wsp, wf = tmp_path / "resp", tmp_path / "wsp", tmp_path / "wf"
     env = _reconcile_env(tmp_path, resp=resp, wsp=wsp, wf=wf)
@@ -4579,8 +4484,8 @@ def test_reconcile_does_not_run_the_arm_selfcheck(tmp_path: Path) -> None:
     result = _call(expr, env=env)
 
     assert not probed.exists(), (
-        "reconcile must NOT run the liveness self-check: it is the watchdog's crash-recovery "
-        "path, and a refusal there is discarded, leaving the drain silently dead"
+        "reconcile must NOT run the liveness self-check: it is the crash-recovery "
+        "path, and a refusal there would leave the drain silently dead"
     )
     assert result.returncode == 0, "a healthy reconcile must re-arm"
     assert resp.exists(), "recovery must not be blocked by the arm-time gate"
@@ -5051,14 +4956,14 @@ def _reaper_tmux(
     log = tmp_path / "tmux.log"
     panes = tmp_path / "panes.txt"
     panes.write_text(f"afk:1\t{pane_path}\n" if pane_path is not None else "")
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         f'if [ "$1" = "list-panes" ]; then cat "{panes}"; fi\n'
         f'if [ "$1" = "display-message" ]; then printf "{_PANE_PID}\\n"; fi\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin, log
 
@@ -5090,8 +4995,7 @@ def _reaper_env(
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
 
     statedir = tmp_path / "statedir"
     statedir.mkdir()
@@ -5127,6 +5031,24 @@ def _reaper_env(
         "AFK_INJECT_POLL_SECONDS": "0",
     }
     return expr, env, ready_log, statedir
+
+
+def test_reaper_stubs_are_warmed_before_the_reap_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #375: reap_pass execs the tmux and `ps` stubs dozens of times, and a freshly written
+    # script's FIRST exec can take seconds under xdist (macOS vets each new executable). Both
+    # are warmed via tests/_stubs when built, so the pass only ever pays ~10ms re-execs.
+    warmed: list[str] = []
+    real_warm = _stubs.warm_stubs
+    monkeypatch.setattr(
+        _stubs, "warm_stubs", lambda paths: (warmed.extend(p.name for p in paths), real_warm(paths))
+    )
+
+    _, tmux_log = _reaper_tmux(tmp_path, pane_path=tmp_path)
+
+    assert {"tmux", "ps"} <= set(warmed), "the tmux and ps stubs must be warmed up front"
+    assert not tmux_log.exists(), "the warm-up exec must not look like a tmux call"
 
 
 def test_afk_resume_command_reuses_run_id_and_plain_prompt(tmp_path: Path) -> None:
@@ -5242,8 +5164,7 @@ def _failing_ready_stub(tmp_path: Path) -> tuple[Path, Path]:
     """A spoke-ready.sh stub that records each call and exits NONZERO (push refused)."""
     log = tmp_path / "ready.log"
     stub = tmp_path / "spoke-ready.sh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 1\n')
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 1\n')
     return stub, log
 
 
@@ -5286,8 +5207,7 @@ def test_escalate_no_local_record_when_push_succeeds(spoke_repo: Path, tmp_path:
     # A succeeding spoke-ready stub (exit 0) ⇒ the tag is the durable record; no local file.
     log = tmp_path / "ready.log"
     stub = tmp_path / "spoke-ready.sh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\n')  # exit 0
-    stub.chmod(0o755)
+    write_stub(stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\n')  # exit 0
     statedir = tmp_path / "statedir"
     env = {"SPOKE_READY": str(stub), "AFK_STATE_DIR": str(statedir), "AFK_ESCALATE_SLEEP": "0"}
 
@@ -5492,8 +5412,7 @@ def _recover_env(
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
 
     statedir = tmp_path / "statedir"
     statedir.mkdir()
@@ -5615,12 +5534,12 @@ def test_spoke_pane_alive_reads_an_unprovable_probe_as_alive(tmp_path: Path) -> 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     # list-panes maps the pane, but nothing answers the pane-pid probe: rc 2, unprovable.
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         f'if [ "$1" = "list-panes" ]; then printf "afk:1\\t%s\\n" "{spoke}"; fi\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
 
     result = _call(f"_spoke_pane_alive '{spoke}' && echo ALIVE || echo DEAD", env=env)
@@ -5765,15 +5684,15 @@ def _stateful_reaper_tmux(tmp_path: Path) -> tuple[Path, Path]:
     log = tmp_path / "tmux.log"
     panes = tmp_path / "panes.txt"
     panes.write_text("")  # pane dead initially
-    (fake_bin / "tmux").write_text(
+    write_stub(
+        fake_bin / "tmux",
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         f'if [ "$1" = list-panes ]; then cat "{panes}"; fi\n'
         'if [ "$1" = new-window ]; then p=""; while [ "$#" -gt 0 ]; do '
         f'if [ "$1" = -c ]; then p="$2"; fi; shift; done; printf "afk:1\\t%s\\n" "$p" > "{panes}"; fi\n'
-        "exit 0\n"
+        "exit 0\n",
     )
-    (fake_bin / "tmux").chmod(0o755)
     return fake_bin, log
 
 
@@ -5791,8 +5710,7 @@ def test_recover_then_reap_does_not_block_a_just_resumed_idle_spoke(tmp_path: Pa
     os.utime(pd / "session.jsonl", (1_000_000, 1_000_000))  # ancient ⇒ idle
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
+    write_stub(ready_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
@@ -6409,18 +6327,15 @@ def test_drain_survives_source_rewrite_mid_run(spoke_repo: Path, tmp_path: Path)
     orig_dir = tmp_path / "orig"
     orig_dir.mkdir()
     script = orig_dir / "hub-afk.sh"
-    script.write_text(HUB_AFK.read_text())
-    script.chmod(0o755)
+    write_stub(script, HUB_AFK.read_text())
     # A real checkout carries the hub-afk-<lane>.sh modules next to the entry (the #307 split),
     # and the self-copy globs them along; stage them so the drain resolves them from orig_dir
     # (the rewrite below only garbles hub-afk.sh, leaving the already-sourced modules intact).
     for _mod in HUB_AFK.parent.glob("hub-afk-*.sh"):
         dest = orig_dir / _mod.name
-        dest.write_text(_mod.read_text())
-        dest.chmod(0o755)
+        write_stub(dest, _mod.read_text())
     bp = tmp_path / "batch-plan.sh"
-    bp.write_text("#!/usr/bin/env bash\nsleep 3\n")
-    bp.chmod(0o755)
+    write_stub(bp, "#!/usr/bin/env bash\nsleep 3\n")
     state = tmp_path / "state"
     env = {
         **os.environ,
@@ -6596,11 +6511,11 @@ def test_with_timeout_uses_timeout_binary_when_present(tmp_path: Path) -> None:
     # the seconds arg and runs the rest.
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "timeout").write_text(
+    write_stub(
+        fake_bin / "timeout",
         '#!/usr/bin/env bash\n[ "$1" = "-k" ] && shift 2\n'
-        'printf "TIMEOUT_CALLED %s\\n" "$1"; shift; "$@"\n'
+        'printf "TIMEOUT_CALLED %s\\n" "$1"; shift; "$@"\n',
     )
-    (fake_bin / "timeout").chmod(0o755)
 
     result = _call(
         "_afk_with_timeout 7 printf 'HI\\n'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"}
@@ -6631,8 +6546,7 @@ def _planner_stub(tmp_path: Path, *, exit_code: int, out: str = "") -> Path:
     bp = tmp_path / "batch-plan.sh"
     # %b so a "\n" in <out> expands to a real newline (the planner prints newline-joined
     # issue numbers), while an empty <out> prints nothing (the drained state).
-    bp.write_text(f'#!/usr/bin/env bash\nprintf "%b" {json.dumps(out)}\nexit {exit_code}\n')
-    bp.chmod(0o755)
+    write_stub(bp, f'#!/usr/bin/env bash\nprintf "%b" {json.dumps(out)}\nexit {exit_code}\n')
     return bp
 
 
@@ -6642,8 +6556,7 @@ def test_dispatch_batch_skips_when_planner_times_out(tmp_path: Path) -> None:
     bp = _planner_stub(tmp_path, exit_code=124)
     dispatched = tmp_path / "dispatched.log"
     wt_new = tmp_path / "wtnew.sh"
-    wt_new.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{dispatched}"\n')
-    wt_new.chmod(0o755)
+    write_stub(wt_new, f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{dispatched}"\n')
     expr = "inflight_issues() { :; }; inflight_worktrees() { :; }; dispatch_batch"
 
     result = _call(
@@ -6661,8 +6574,7 @@ def test_inflight_scope_args_marks_scope_exclusive_when_gh_fails(tmp_path: Path)
     # never a silent empty scope that would let an overlapping ready issue co-dispatch.
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "gh").write_text("#!/usr/bin/env bash\nexit 1\n")  # gh always fails
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", "#!/usr/bin/env bash\nexit 1\n")  # gh always fails
     expr = 'inflight_issues() { printf "72\\n"; }; _inflight_scope_args'
 
     result = _call(expr, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
@@ -6900,8 +6812,7 @@ def test_kill_wedged_supervisor_kills_the_whole_hung_tree(tmp_path: Path) -> Non
     hb = tmp_path / "heartbeat"
     childf = tmp_path / "childpid"
     wedged = tmp_path / "wedged.sh"
-    wedged.write_text(f'#!/usr/bin/env bash\nsleep 300 & echo $! > "{childf}"\nsleep 300\n')
-    wedged.chmod(0o755)
+    write_stub(wedged, f'#!/usr/bin/env bash\nsleep 300 & echo $! > "{childf}"\nsleep 300\n')
     expr = (
         f"bash -c 'exec -a hub-afk-wedged bash \"{wedged}\"' & wedged=$!; "
         f'for _ in $(seq 1 50); do [ -s "{childf}" ] && break; sleep 0.1; done; '
@@ -6927,10 +6838,10 @@ def test_kill_wedged_supervisor_sigkills_a_term_ignoring_child(tmp_path: Path) -
     wedged = tmp_path / "wedged.sh"
     # The child traps (ignores) TERM and only dies on KILL; the parent (default disposition)
     # dies on TERM, so after the grace the child survives only via the pid snapshot.
-    wedged.write_text(
-        f'#!/usr/bin/env bash\nbash -c \'trap "" TERM; echo $$ > "{childf}"; sleep 300\' &\nsleep 300\n'
+    write_stub(
+        wedged,
+        f'#!/usr/bin/env bash\nbash -c \'trap "" TERM; echo $$ > "{childf}"; sleep 300\' &\nsleep 300\n',
     )
-    wedged.chmod(0o755)
     expr = (
         f"bash -c 'exec -a hub-afk-wedged bash \"{wedged}\"' & wedged=$!; "
         f'for _ in $(seq 1 50); do [ -s "{childf}" ] && break; sleep 0.1; done; '
@@ -7036,8 +6947,7 @@ def _clean_hub(tmp_path: Path, *, branch: str = "main") -> Path:
 def _gh_auth_stub(tmp_path: Path, *, exit_code: int) -> Path:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
-    (fake_bin / "gh").write_text(f"#!/usr/bin/env bash\nexit {exit_code}\n")
-    (fake_bin / "gh").chmod(0o755)
+    write_stub(fake_bin / "gh", f"#!/usr/bin/env bash\nexit {exit_code}\n")
     return fake_bin
 
 
@@ -7370,15 +7280,15 @@ def _gh_api_stub(tmp_path: Path, *, auth_exit: int, api_exit: int) -> Path:
     """A `gh` whose `auth status` and `api` outcomes are set independently."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
-    (fake_bin / "gh").write_text(
+    write_stub(
+        fake_bin / "gh",
         "#!/usr/bin/env bash\n"
         'case "${1:-}" in\n'
         f"  auth) exit {auth_exit} ;;\n"
         f"  api) exit {api_exit} ;;\n"
         "  *) exit 0 ;;\n"
-        "esac\n"
+        "esac\n",
     )
-    (fake_bin / "gh").chmod(0o755)
     return fake_bin
 
 
@@ -7429,8 +7339,7 @@ def _venv_pytest(tmp_path: Path, *, help_text: str, exit_code: int = 0) -> Path:
     repo = tmp_path / "repo"
     (repo / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
     runner = repo / ".venv" / "bin" / "pytest"
-    runner.write_text(f"#!/usr/bin/env bash\ncat <<'HELP'\n{help_text}\nHELP\nexit {exit_code}\n")
-    runner.chmod(0o755)
+    write_stub(runner, f"#!/usr/bin/env bash\ncat <<'HELP'\n{help_text}\nHELP\nexit {exit_code}\n")
     return repo
 
 
@@ -7746,10 +7655,9 @@ def _ceiling_env(tmp_path: Path, *, wt_new_exit: int) -> tuple[str, dict[str, st
     bp = _planner_stub(tmp_path, exit_code=0, out="5\n")
     attempts = tmp_path / "attempts.log"
     wt_new = tmp_path / "wtnew.sh"
-    wt_new.write_text(
-        f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{attempts}"\nexit {wt_new_exit}\n'
+    write_stub(
+        wt_new, f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{attempts}"\nexit {wt_new_exit}\n'
     )
-    wt_new.chmod(0o755)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     expr = "inflight_issues() { :; }; inflight_worktrees() { :; }; "
@@ -7788,8 +7696,7 @@ def test_dispatch_failure_count_resets_on_success(tmp_path: Path) -> None:
     # A wt_new that fails while a flag file is absent, then succeeds once it appears.
     flag = tmp_path / "succeed"
     wt_new = tmp_path / "wtnew.sh"
-    wt_new.write_text(f'#!/usr/bin/env bash\n[ -e "{flag}" ] && exit 0\nexit 1\n')
-    wt_new.chmod(0o755)
+    write_stub(wt_new, f'#!/usr/bin/env bash\n[ -e "{flag}" ] && exit 0\nexit 1\n')
     env = {
         "BATCH_PLAN": str(bp),
         "WT_NEW": str(wt_new),
@@ -7890,8 +7797,7 @@ def test_afk_network_is_down_default_probe_is_head_without_fail(tmp_path: Path) 
     bin_dir.mkdir()
     arglog = tmp_path / "curl-args.txt"
     fake_curl = bin_dir / "fakecurl"
-    fake_curl.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "{arglog}"\nexit 0\n')
-    fake_curl.chmod(0o755)
+    write_stub(fake_curl, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "{arglog}"\nexit 0\n')
 
     _call("_afk_network_is_down", env={"AFK_NET_PROBE_CMD": "", "AFK_CURL_BIN": str(fake_curl)})
 
@@ -7946,27 +7852,33 @@ def test_reap_pass_clears_offline_marker_when_network_recovers(tmp_path: Path) -
     # A prior outage left an offline marker; this tick the network is back and auth is healthy,
     # so reap_pass proceeds normally AND clears the stale outage marker (consecutive-offline reset).
     spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
     expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
     _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1"})
     env["AFK_NET_PROBE_CMD"] = "true"  # network back up (auth stub in _reaper_env is healthy)
 
-    start = time.monotonic()
-    _call(expr, env=env)
-    elapsed = time.monotonic() - start
+    # #330: the marker clear happens at the TOP of reap_pass (clear_offline_since), before
+    # _reap_or_resume's nudge path enters inject_and_verify -> _transcript_advanced, which
+    # polls up to AFK_INJECT_VERIFY_SECONDS (60s) plus a bounded retry (~122s total against
+    # the stub tmux that never advances the transcript). The fix zeroes the inject-verify
+    # budget in _reaper_env's returned env. #375: witness the skipped poll directly instead of
+    # a wall-clock budget (cold stub execs made any bound flaky under xdist). The poll's step
+    # is `sleep <AFK_INJECT_POLL_SECONDS>`; a `sleep` shim records every call and no-ops the
+    # 2s default step, so a regressed pass loops instantly and leaves its trace in the log.
+    sleep_log = tmp_path / "sleep.log"
+    shim = (
+        f'sleep() {{ printf "%s\\n" "$*" >> "{sleep_log}"; [ "$1" = 2 ] || command sleep "$@"; }}; '
+    )
+    _call(shim + expr, env=env)
 
     assert not (statedir / "offline-since.epoch").exists(), (
         "network recovery must clear the outage marker so --status stops reporting OFFLINE"
     )
-    # #330: the marker clear happens at the TOP of reap_pass (clear_offline_since), before
-    # _reap_or_resume's nudge path enters inject_and_verify -> _transcript_advanced, which
-    # polls up to AFK_INJECT_VERIFY_SECONDS (60s) plus a bounded retry (~122s total against
-    # the stub tmux that never advances the transcript). Bound the whole pass so a regression
-    # that reintroduces that dead wait fails loudly instead of silently capping the full-suite
-    # wall-clock. The fix zeroes the inject-verify budget in _reaper_env's returned env.
-    assert elapsed < 10, (
-        f"reap_pass blocked on the injector poll ({elapsed:.1f}s); the fixed path is ~2s, so "
-        "anything near the 122s pre-fix wait is a regression"
+    assert "send-keys" in tmux_log.read_text(), "the pass must reach the inject path it bounds"
+    polled = sleep_log.read_text().split() if sleep_log.exists() else []
+    assert "2" not in polled, (
+        "reap_pass entered the injector verify poll (default 2s step); with the budget zeroed "
+        f"it is skipped, so a poll step means the ~122s pre-fix wait is back (sleeps: {polled})"
     )
 
 
@@ -8243,7 +8155,8 @@ def _status_label_env(
     bindir.mkdir()
     edit_log = tmp_path / "edits.log"
     gh = bindir / "gh"
-    gh.write_text(
+    write_stub(
+        gh,
         "#!/usr/bin/env bash\n"
         'sub="${1:-}"; shift 2>/dev/null || true\n'
         'case "$sub" in\n'
@@ -8256,12 +8169,10 @@ def _status_label_env(
         "      *) exit 0 ;;\n"
         "    esac ;;\n"
         "  *) exit 0 ;;\n"
-        "esac\n"
+        "esac\n",
     )
-    gh.chmod(0o755)
     bp = tmp_path / "batch-plan-stub.sh"
-    bp.write_text('#!/usr/bin/env bash\nprintf "%s" "$AFK_TEST_DESIRED"\n')
-    bp.chmod(0o755)
+    write_stub(bp, '#!/usr/bin/env bash\nprintf "%s" "$AFK_TEST_DESIRED"\n')
     env = {
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "BATCH_PLAN": str(bp),
@@ -8365,14 +8276,12 @@ def _blocked_label_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     Returns (env, ready_log, gh_log)."""
     ready_log = tmp_path / "ready.log"
     ready = tmp_path / "spoke-ready.sh"
-    ready.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready.chmod(0o755)
+    write_stub(ready, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     bindir = tmp_path / "ghbin"
     bindir.mkdir()
     gh_log = tmp_path / "gh-calls.log"
     gh = bindir / "gh"
-    gh.write_text('#!/bin/sh\n{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n')
-    gh.chmod(0o755)
+    write_stub(gh, '#!/bin/sh\n{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n')
     env = {
         "SPOKE_READY": str(ready),
         "PATH": f"{bindir}:{os.environ['PATH']}",
@@ -8411,10 +8320,10 @@ def test_afk_escalate_label_flip_is_best_effort(spoke_repo: Path, tmp_path: Path
     # A failing gh (offline) must never fail the escalation.
     env, _ready_log, _gh_log = _blocked_label_env(tmp_path)
     failing = tmp_path / "ghbin" / "gh"
-    failing.write_text(
-        '#!/bin/sh\n{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\nexit 1\n'
+    write_stub(
+        failing,
+        '#!/bin/sh\n{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\nexit 1\n',
     )
-    failing.chmod(0o755)
 
     result = _call(f"_afk_escalate_blocked '{spoke_repo}' 103 'stuck'", env=env)
 
@@ -8465,8 +8374,7 @@ def _ingest_stub_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
     """A logging telemetry-ingest stub wired via AFK_INGEST_BIN. Returns (env, ingest_log)."""
     ingest_log = tmp_path / "ingest.log"
     ingest = tmp_path / "ingest.sh"
-    ingest.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ingest_log}"\n')
-    ingest.chmod(0o755)
+    write_stub(ingest, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ingest_log}"\n')
     return {"AFK_INGEST_BIN": str(ingest), "AFK_INGEST_TIMEOUT": "5"}, ingest_log
 
 
@@ -8717,8 +8625,7 @@ def test_reap_pass_pushed_but_unmarked_warns_not_reaps(tmp_path: Path) -> None:
     expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
     push_log = tmp_path / "push.log"
     push_stub = tmp_path / "spoke-push.sh"
-    push_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{push_log}"\n')
-    push_stub.chmod(0o755)
+    write_stub(push_stub, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{push_log}"\n')
     env["SPOKE_PUSH"] = str(push_stub)
     # Force the pushed-but-unmarked signal deterministically (a real upstream is elaborate).
     expr = "_afk_pushed_but_unmarked() { return 0; }; " + expr
@@ -8955,331 +8862,6 @@ def test_recover_dead_panes_over_ceiling_near_complete_still_revives(tmp_path: P
     )
 
 
-# ── issue #243: hang-forensics bundle before the reaper tears down a frozen spoke ──
-# A live-but-frozen claude spoke is REVIVED (#241) by killing its pane and relaunching —
-# which DESTROYS the evidence needed to characterize the hang or file an upstream report.
-# So `_revive_spoke` captures a best-effort, bounded bundle to
-# <git-common-dir>/hang-forensics/<issue>-<epoch>/ BEFORE the kill. A crashed pane (no live
-# process) has nothing to capture and skips gracefully.
-
-
-def _write_warmed_stub(path: Path, body: str) -> None:
-    """Write an executable bash stub (`body` follows the shebang) and exec it once, `--warm`.
-
-    A freshly written script's FIRST exec can take seconds under xdist (macOS vets each new
-    executable) while a re-exec takes ~10ms (#374) -- longer than the bounded waits the stubbed
-    commands run under. The warm-up exec leaves a `<path>.warm` marker and runs none of `body`.
-    """
-    guard = '[ "${1:-}" = "--warm" ] && { : > "$0.warm"; exit 0; }\n'
-    path.write_text("#!/usr/bin/env bash\n" + guard + body)
-    path.chmod(0o755)
-    subprocess.run([str(path), "--warm"], check=True)
-
-
-def _forensics_bin(
-    tmp_path: Path,
-    *,
-    pane_path: Path | None,
-    pane_pid: str | None = None,
-    pane_text: str = "frozen composer: [pasted 4096 chars]",
-) -> tuple[Path, Path]:
-    """A tmux + `sample` PATH stub for the hang-capture path. `tmux` answers list-panes with
-    one pane at `pane_path` (or nothing ⇒ dead pane), display-message with the pid / pane-meta,
-    and capture-pane with `pane_text`. `sample` is stubbed so no real 2s sampler runs and the
-    `command -v sample` gate is exercised deterministically. Returns (fake_bin, tmux_log).
-    """
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir(exist_ok=True)
-    log = tmp_path / "tmux.log"
-    panes = tmp_path / "panes.txt"
-    panes.write_text(f"afk:1\t{pane_path}\n" if pane_path is not None else "")
-    pid = pane_pid if pane_pid is not None else str(os.getpid())
-    _write_warmed_stub(
-        fake_bin / "tmux",
-        f'printf "%s\\n" "$*" >> "{log}"\n'
-        'case "$1" in\n'
-        f'  list-panes) cat "{panes}" ;;\n'
-        f'  capture-pane) printf "%s\\n" "{pane_text}" ;;\n'
-        "  display-message)\n"
-        '    if printf "%s" "$*" | grep -q "pane_in_mode"; then\n'
-        '      printf "pane_in_mode=0 pane_current_command=node\\n"\n'
-        '    elif printf "%s" "$*" | grep -q "pane_pid"; then\n'
-        f'      printf "%s\\n" "{pid}"\n'
-        "    fi ;;\n"
-        "esac\n"
-        "exit 0\n",
-    )
-    _write_warmed_stub(fake_bin / "sample", 'printf "Sample stub for pid %s\\n" "$1"\nexit 0\n')
-    # #301: a hung-but-LIVE pane is a frozen AGENT, not a dead one — the liveness probe must
-    # read it alive. Point the stubbed agent at the pane pid this builder advertises so the
-    # ancestor-walk resolves. Only when a real pane maps: pane_path=None is the older
-    # window-gone shape and must keep reading dead.
-    if pane_path is not None:
-        _agent_ps_stub(fake_bin, pane_pid=int(pid))
-    return fake_bin, log
-
-
-def test_capture_hang_forensics_writes_bundle_for_live_pane(tmp_path: Path) -> None:
-    # AC1/AC2: a live-but-frozen pane leaves a bundle with the process/pane/transcript/
-    # fingerprint evidence, and the bundle path is echoed for the caller's journal line.
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    _write_transcript(
-        pd,
-        [
-            {
-                "type": "assistant",
-                "version": "1.2.3",
-                "message": {"model": "claude-opus-4-8", "content": []},
-            },
-            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
-        ],
-    )
-    fake_bin, _ = _forensics_bin(tmp_path, pane_path=spoke)
-    forensics = tmp_path / "hang-forensics"
-
-    result = _call(
-        f"_afk_capture_hang_forensics '{spoke}' 5",
-        env={
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "AFK_HANG_FORENSICS_DIR": str(forensics),
-            "AFK_NOW": "1700000000",
-            "AI_TOOLKIT_OTEL": "1",
-            "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317",
-        },
-    )
-
-    assert result.returncode == 0, result.stderr
-    bundle = Path(result.stdout.strip())
-    assert bundle.is_dir(), f"expected an echoed bundle dir, got {result.stdout!r}"
-    assert bundle.parent == forensics and bundle.name == "5-1700000000"
-    assert (bundle / "process-tree.txt").exists()
-    assert (bundle / "pane.txt").read_text().strip() != "", "the frozen pane must be captured"
-    assert (bundle / "pane-meta.txt").exists()
-    assert "frozen composer" in (bundle / "pane.txt").read_text()
-    assert "[pasted" in (bundle / "pane.txt").read_text(), "the wedged-paste symptom is preserved"
-    tail = (bundle / "transcript-tail.jsonl").read_text()
-    assert '"text": "hi"' in tail or '"text":"hi"' in tail
-    fp = (bundle / "fingerprint.txt").read_text()
-    assert "AI_TOOLKIT_OTEL=1" in fp, "the OTEL env fingerprint must be recorded"
-    assert "http://localhost:4317" in fp
-    # version + model come from the transcript (no `claude --version` fork of the hung binary).
-    assert "claude_version=1.2.3" in fp
-    assert "model=claude-opus-4-8" in fp
-
-
-def test_capture_hang_forensics_includes_process_tree_and_sample(tmp_path: Path) -> None:
-    # The process-tree snapshot carries the pane pid's ps row (etime/stat/wchan) and, on macOS,
-    # a `sample`; both are best-effort but must land when available.
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    _write_transcript(pd, [{"type": "assistant", "message": {"content": []}}])
-    fake_bin, _ = _forensics_bin(tmp_path, pane_path=spoke, pane_pid=str(os.getpid()))
-
-    result = _call(
-        f"_afk_capture_hang_forensics '{spoke}' 5",
-        env={
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "AFK_HANG_FORENSICS_DIR": str(tmp_path / "hang-forensics"),
-            "AFK_NOW": "1700000000",
-        },
-    )
-
-    tree = (Path(result.stdout.strip()) / "process-tree.txt").read_text()
-    assert str(os.getpid()) in tree, "the pane pid's ps row must be captured"
-    assert "Sample stub" in tree, "a macOS `sample` is appended when available"
-
-
-# ── issue #298: the hang bundle's stat probe must be GNU-first (the #289 class) ──
-#
-# _afk_capture_hang_forensics probed BSD `stat -f %m` FIRST — the exact ordering #289
-# reversed in gate-broker-detect.sh and hub-inject.sh, and #132 reversed in worktree-lib.sh.
-# On GNU coreutils `-f` selects filesystem-status mode and takes no inline format, so `%m` is
-# read as a file operand: GNU errors on it yet still PRINTS a multi-line fs block for the real
-# file and exits nonzero, so the `||` fallback ALSO runs and the capture holds the garbage AND
-# the epoch. That multi-line string then fails _afk_write_fingerprint's all-digits guard, so
-# transcript_silence_seconds records `unknown` — the transcript-activity-vs-UI-freeze delta
-# is the hang's tell and the single signal the bundle exists to record. BSD rejects `-c`
-# cleanly (usage error, empty stdout), so GNU-first is correct on both flavors.
-#
-# Stubs local to this module, mirroring the pair in test_gate_broker_detect.py /
-# test_hub_inject.py, so the ordering is pinned on any host rather than only where CI runs.
-
-_GNU_STAT_STUB = (
-    "#!/bin/sh\n"
-    'if [ "$1" = "-c" ]; then\n'
-    '  case "$2" in\n'
-    "    %Y) echo 1000003500; exit 0 ;;\n"
-    "    %s) echo 4096; exit 0 ;;\n"
-    "  esac\n"
-    "fi\n"
-    'if [ "$1" = "-f" ]; then\n'
-    '  echo "  File: \\"$3\\""\n'
-    '  echo "    ID: b505c8e079f9471 Namelen: 255     Type: ext2/ext3"\n'
-    '  echo "  Block size: 4096       Fundamental block size: 4096"\n'
-    '  echo "stat: cannot read file system information for $2" >&2\n'
-    "  exit 1\n"
-    "fi\n"
-    "exit 1\n"
-)
-
-_BSD_STAT_STUB = (
-    "#!/bin/sh\n"
-    'if [ "$1" = "-c" ]; then echo "stat: illegal option -- c" >&2; exit 1; fi\n'
-    'if [ "$1" = "-f" ]; then\n'
-    '  case "$2" in\n'
-    "    %m) echo 1000003500; exit 0 ;;\n"
-    "    %z) echo 4096; exit 0 ;;\n"
-    "  esac\n"
-    "fi\n"
-    "exit 1\n"
-)
-
-
-@pytest.mark.parametrize("stub", [_GNU_STAT_STUB, _BSD_STAT_STUB], ids=["gnu", "bsd"])
-def test_hang_forensics_records_silence_on_both_stat_flavors(tmp_path: Path, stub: str) -> None:
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    projects = tmp_path / "projects"
-    _write_transcript(
-        _project_dir_for(projects, spoke), [{"type": "assistant", "message": {"content": []}}]
-    )
-    fake_bin, _ = _forensics_bin(tmp_path, pane_path=spoke)
-    (fake_bin / "stat").write_text(stub)
-    (fake_bin / "stat").chmod(0o755)
-
-    result = _call(
-        f"_afk_capture_hang_forensics '{spoke}' 5",
-        env={
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "CLAUDE_PROJECTS_DIR": str(projects),
-            "AFK_HANG_FORENSICS_DIR": str(tmp_path / "hang-forensics"),
-            "AFK_NOW": "1000003600",
-        },
-    )
-
-    assert result.returncode == 0, result.stderr
-    fp = (Path(result.stdout.strip()) / "fingerprint.txt").read_text()
-    assert "transcript_mtime=1000003500\n" in fp, (
-        f"the mtime must be captured as a BARE epoch, with no fs-status block: {fp!r}"
-    )
-    assert "transcript_silence_seconds=100\n" in fp, (
-        "the silence delta is the hang's tell — a polluted mtime fails the all-digits "
-        f"guard and strands it as `unknown`: {fp!r}"
-    )
-
-
-def test_hang_sample_pid_prefers_the_agent_descendant(tmp_path: Path) -> None:
-    # The pane is `sh -c "<cmd>; exec zsh"`, so pane_pid is a wrapper shell blocked in wait4() —
-    # `sample` must target the claude/node descendant that is actually hung, not the shell.
-    ps_stub = 'ps() { case "${@: -1}" in 300) echo node ;; *) echo bash ;; esac; }; '
-
-    result = _call(ps_stub + "_afk_hang_sample_pid 100 200 300")
-
-    assert result.stdout.strip() == "300", "must sample the claude/node descendant, not the shell"
-
-
-def test_hang_sample_pid_falls_back_to_first_descendant(tmp_path: Path) -> None:
-    # No descendant matches claude/node ⇒ the pane shell's direct child (first descendant) is the
-    # launched claude, so sample that rather than the wrapper shell (pane_pid).
-    ps_stub = "ps() { echo bash; }; "
-
-    result = _call(ps_stub + "_afk_hang_sample_pid 100 200 300")
-
-    assert result.stdout.strip() == "200", "with no comm match, sample the first descendant"
-
-
-def test_hang_sample_pid_falls_back_to_pane_pid_without_descendants(tmp_path: Path) -> None:
-    # No descendants at all (a bare process) ⇒ sample pane_pid itself, never nothing.
-    result = _call("ps() { echo bash; }; _afk_hang_sample_pid 100")
-
-    assert result.stdout.strip() == "100"
-
-
-def test_capture_hang_forensics_skips_dead_pane(tmp_path: Path) -> None:
-    # AC1: a clean reap (crashed pane, no live process) leaves NO bundle and does not error.
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _ = _forensics_bin(tmp_path, pane_path=None)  # empty list-panes ⇒ dead pane
-    forensics = tmp_path / "hang-forensics"
-
-    result = _call(
-        f'_afk_capture_hang_forensics "{spoke}" 5; echo "RC=$?"',
-        env={
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_HANG_FORENSICS_DIR": str(forensics),
-            "AFK_NOW": "1700000000",
-        },
-    )
-
-    assert "RC=0" in result.stdout, "a dead pane skips gracefully, never errors"
-    assert result.stdout.replace("RC=0", "").strip() == "", (
-        "no bundle path is echoed for a dead pane"
-    )
-    assert not forensics.exists() or not any(forensics.iterdir()), "no bundle for a crashed reap"
-
-
-def test_reap_pass_hung_spoke_captures_forensics_and_journals_path(tmp_path: Path) -> None:
-    # AC3: reaping a live-but-frozen spoke leaves a bundle AND the revive journal line names it.
-    # #255: a genuine hang is frozen MID-TOOL_USE (trailing unresolved tool_use) → revived,
-    # not the finished-turn-idle shape (nudged).
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, _ = _forensics_bin(tmp_path, pane_path=spoke)  # pane ALIVE (frozen)
-    expr, env, _ready_log, statedir = _reaper_env(
-        spoke, tmp_path, fake_bin, idle=True, transcript=[_bash_tool_record("pytest -x")]
-    )
-    forensics = tmp_path / "hang-forensics"
-    env["AFK_HANG_FORENSICS_DIR"] = str(forensics)
-
-    _call(expr, env=env)
-
-    bundles = list(forensics.glob("5-*")) if forensics.exists() else []
-    assert bundles, "a reaped hung live pane must leave a forensics bundle"
-    journal = (statedir / "decision-journal.jsonl").read_text()
-    assert "revive" in journal
-    assert "hang forensics" in journal, "the revive journal line must surface the bundle location"
-    assert str(bundles[0]) in journal, "the journal line names the exact bundle path"
-
-
-def test_status_surfaces_hang_forensics_line_when_bundles_exist(tmp_path: Path) -> None:
-    # AC3: --status carries a one-line hang-forensics summary when bundles exist.
-    forensics = tmp_path / "hang-forensics"
-    (forensics / "232-1700000000").mkdir(parents=True)
-    (forensics / "240-1700000300").mkdir(parents=True)
-    state = _armed_state(tmp_path, "drain")
-    hb = tmp_path / "heartbeat"
-    expr = f'printf "%s 1700000560\\n" "$$" > "{hb}"; _status'
-
-    result = _call(
-        expr,
-        env={
-            "AFK_STATE": str(state),
-            "AFK_HEARTBEAT": str(hb),
-            "AFK_HANG_FORENSICS_DIR": str(forensics),
-            "AFK_NOW": "1700000600",
-            "AI_TOOLKIT_OTEL": "0",
-        },
-    )
-
-    assert "hang-forensics" in result.stdout
-    assert "2" in result.stdout, "the count of captured bundles is surfaced"
-    assert str(forensics) in result.stdout
-
-
-def test_hang_forensics_status_silent_when_no_bundles(tmp_path: Path) -> None:
-    # No bundles ⇒ no line (never a noisy "0 bundles" on every status read).
-    forensics = tmp_path / "hang-forensics"  # absent
-
-    result = _call(
-        "afk_hang_forensics_status",
-        env={"AFK_HANG_FORENSICS_DIR": str(forensics)},
-    )
-
-    assert result.stdout.strip() == "", "no hang-forensics line when nothing was captured"
-
-
 # ── issue #241 S7: auto_land review-gate / land-retry / land-failure warn, not block ──
 # The land pass never parks a spoke blocked/<issue>. An unclean review verdict warns + retries
 # by default (or warns + LANDS with AFK_REVIEW_GATE_ON_UNCLEAN=land, never silent block); a land
@@ -9352,8 +8934,7 @@ def test_auto_land_failure_warns_retries_not_blocks(spoke_repo: Path, tmp_path: 
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     _write_review(spoke_repo, "ok", "APPROVE", "2026-07-05T01:00:00Z")
     wt_land = tmp_path / "worktree-land.sh"
-    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")  # land always fails
-    wt_land.chmod(0o755)
+    write_stub(wt_land, "#!/usr/bin/env bash\nexit 1\n")  # land always fails
     ready_stub, ready_log = _escalation_recorder(tmp_path)
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
@@ -9386,8 +8967,9 @@ def test_auto_land_failure_is_backoff_paced_not_every_tick(
     _write_review(spoke_repo, "ok", "APPROVE", "2026-07-05T01:00:00Z")
     lands = tmp_path / "lands.count"
     wt_land = tmp_path / "worktree-land.sh"
-    wt_land.write_text(f'#!/usr/bin/env bash\nprintf x >> "{lands}"\nexit 1\n')  # land always fails
-    wt_land.chmod(0o755)
+    write_stub(
+        wt_land, f'#!/usr/bin/env bash\nprintf x >> "{lands}"\nexit 1\n'
+    )  # land always fails
     ready_stub, ready_log = _escalation_recorder(tmp_path)
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
@@ -9703,170 +9285,6 @@ def test_decide_and_act_auth_failure_warns_not_blocks(
     assert "FLAG=1" in result.stdout, "the global halt flag must still be raised"
 
 
-# ── the local sleep inhibitor (issue #242) ────────────────────────────────────
-# While a drain is armed the Mac must not sleep: arming ties a `caffeinate -is -w
-# <supervisor pid>` to the supervisor's lifetime (caffeinate -w self-exits when that
-# pid dies, so /afk off needs no teardown). caffeinate is stubbed via AFK_CAFFEINATE_BIN
-# so no real inhibitor is spawned; the pidfile is pinned via AFK_INHIBITOR_FILE.
-
-
-def _caffeinate_stub(tmp_path: Path, log_name: str = "caffeinate.log") -> tuple[Path, Path]:
-    """A caffeinate stub: record args, then `exec sleep` so the recorded pid stays alive.
-
-    `exec` keeps the SAME pid the launching shell captured in `$!`, so the pidfile's
-    caffeinate pid maps to a live process exactly as a real `caffeinate -w` would.
-
-    Built via `_write_warmed_stub` (#374): a cold first exec could outlast `_wait_lines`.
-    """
-    log = tmp_path / log_name
-    stub = tmp_path / "caffeinate"
-    _write_warmed_stub(stub, f'printf "%s\\n" "$*" >> "{log}"\nexec sleep 600\n')
-    return stub, log
-
-
-def _wait_lines(path: Path, n: int = 1, timeout: float = 3.0) -> None:
-    """Poll until `path` has at least `n` non-empty lines (the caffeinate stub logs async)."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if path.exists() and len([ln for ln in path.read_text().splitlines() if ln.strip()]) >= n:
-            return
-        time.sleep(0.02)
-
-
-def _pid_alive(pid: int) -> bool:
-    """True when `pid` is a live process (signal 0 probes without delivering)."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def _kill_inhibitor(pidfile: Path) -> None:
-    """SIGKILL the caffeinate-stub pid the pidfile records, so no stub leaks past a test."""
-    if not pidfile.exists():
-        return
-    for tok in pidfile.read_text().split():
-        if tok.isdigit():
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(int(tok), signal.SIGKILL)
-            return
-
-
-def test_caffeinate_stub_is_warmed_before_the_arm_runs(tmp_path: Path) -> None:
-    # #374: a freshly written script's FIRST exec can take seconds under xdist (macOS vets each
-    # new executable), longer than the arm tests' log poll. The stub is exec'd once
-    # synchronously when built, so the exec the arm backgrounds is a ~10ms re-exec.
-    stub, log = _caffeinate_stub(tmp_path)
-
-    assert (tmp_path / "caffeinate.warm").exists(), "the stub must be exec'd once up front"
-    assert not log.exists(), "the warm-up exec must not look like an arm"
-    assert stub.stat().st_mode & 0o111
-
-
-def test_arm_inhibitor_spawns_one_caffeinate_tied_to_the_pid(tmp_path: Path) -> None:
-    # AC1: arming spawns exactly one `caffeinate -is -w <supervisor pid>`, recorded in the
-    # pidfile so a later tick can tell it is already armed.
-    stub, log = _caffeinate_stub(tmp_path)
-    pidfile = tmp_path / "sleep-inhibit"
-    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
-    try:
-        result = _call("_afk_arm_inhibitor 424242; echo RC=$?", env=env)
-
-        assert "RC=0" in result.stdout, result.stderr
-        _wait_lines(log)
-        assert log.exists(), "caffeinate must have been launched"
-        assert log.read_text().strip() == "-is -w 424242", log.read_text()
-        rec = pidfile.read_text().split()
-        assert len(rec) == 2 and rec[1] == "424242", pidfile.read_text()
-        assert rec[0].isdigit()
-    finally:
-        _kill_inhibitor(pidfile)
-
-
-def test_arm_inhibitor_second_arm_does_not_stack(tmp_path: Path) -> None:
-    # AC1: a second arm for the SAME supervisor pid, with the inhibitor still alive, is a
-    # no-op — it must not spawn a second caffeinate (exactly one per checkout).
-    stub, log = _caffeinate_stub(tmp_path)
-    pidfile = tmp_path / "sleep-inhibit"
-    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
-    try:
-        _call("_afk_arm_inhibitor 424242; _afk_arm_inhibitor 424242", env=env)
-
-        _wait_lines(log)
-        _wait_lines(log, 2, timeout=0.5)  # a stacked second spawn (warm stub) logs within ms
-        assert log.read_text().splitlines() == ["-is -w 424242"], (
-            "a second arm must not stack a second caffeinate"
-        )
-    finally:
-        _kill_inhibitor(pidfile)
-
-
-def test_arm_inhibitor_reties_to_new_supervisor_pid(tmp_path: Path) -> None:
-    # AC2: a watchdog respawn re-ties the inhibitor to the NEW supervisor pid — arming with a
-    # different pid replaces the pidfile entry (the old `caffeinate -w <old pid>` self-dies).
-    stub, log = _caffeinate_stub(tmp_path)
-    pidfile = tmp_path / "sleep-inhibit"
-    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
-    try:
-        _call("_afk_arm_inhibitor 111111; _afk_arm_inhibitor 222222", env=env)
-
-        # The pidfile re-ties to the NEW supervisor pid, and a live caffeinate for it is what
-        # is recorded (the old inhibitor is dropped on re-tie — its `-w <old pid>` self-dies).
-        _wait_lines(log)
-        assert "-is -w 222222" in log.read_text(), "the new inhibitor must have been armed"
-        rec = pidfile.read_text().split()
-        assert rec[1] == "222222", "the pidfile must re-tie to the new supervisor pid"
-        assert _pid_alive(int(rec[0])), "the recorded caffeinate for the new pid must be live"
-    finally:
-        _kill_inhibitor(pidfile)
-
-
-def test_arm_inhibitor_no_caffeinate_is_silent_and_never_fails(tmp_path: Path) -> None:
-    # AC5: on a host without caffeinate (non-macOS) the arm PROCEEDS — the ensure is a silent
-    # no-op (no pidfile, no spam), never a failure that would abort arming.
-    pidfile = tmp_path / "sleep-inhibit"
-    env = {
-        "AFK_CAFFEINATE_BIN": str(tmp_path / "definitely-not-a-real-binary"),
-        "AFK_INHIBITOR_FILE": str(pidfile),
-    }
-
-    result = _call("_afk_arm_inhibitor 424242; echo RC=$?", env=env)
-
-    assert "RC=0" in result.stdout, result.stderr
-    assert not pidfile.exists(), "no inhibitor pidfile when caffeinate is absent"
-
-
-def test_watchdog_live_arms_the_inhibitor(tmp_path: Path) -> None:
-    # The watchdog re-checks the inhibitor each interval alongside the supervisor: on a live
-    # (non-wedged) supervisor it (re-)arms the inhibitor tied to the heartbeat (supervisor) pid,
-    # so a killed caffeinate is re-armed between the supervisor's slower ticks.
-    stub, _log = _caffeinate_stub(tmp_path)
-    state = tmp_path / "state"
-    state.write_text("drain\n")
-    hb = tmp_path / "heartbeat"
-    pidfile = tmp_path / "sleep-inhibit"
-    marker = tmp_path / "respawned"
-    expr = f'printf "%s 1700000000\\n" "$$" > "{hb}"; watchdog_tick'
-    env = {
-        "AFK_STATE": str(state),
-        "AFK_HEARTBEAT": str(hb),
-        "AFK_INHIBITOR_FILE": str(pidfile),
-        "AFK_CAFFEINATE_BIN": str(stub),
-        "AFK_RESPAWN_CMD": f"touch {marker}",
-        "AFK_NOW": "1700000060",  # recent heartbeat ⇒ live, not wedged
-    }
-    try:
-        result = _call(expr, env=env)
-
-        assert result.stdout.strip() == "live"
-        assert not marker.exists(), "a live supervisor must not be respawned"
-        assert pidfile.exists(), "the watchdog must arm the inhibitor on a live supervisor"
-        assert pidfile.read_text().split()[0].isdigit()
-    finally:
-        _kill_inhibitor(pidfile)
-
-
 # ── #279: main() refuses to arm when the liveness self-check hard-fails ───────
 # The issue's central acceptance criterion. afk_arm_selfcheck is chained BEFORE
 # afk_write_state, so a hard-fail leaves NO state file: nothing to reconcile, no half-armed
@@ -9886,7 +9304,7 @@ def _arm_neuter() -> str:
     """
     return (
         "afk_arm_preconditions() { return 0; }; supervise_tick() { return 0; }; "
-        "dispatch_batch() { :; }; _afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; "
+        "dispatch_batch() { :; }; _afk_spawn_watchdog() { :; }; "
         "afk_done() { return 1; }; afk_interruptible_sleep() { exit 0; }; "
     )
 
@@ -9984,222 +9402,6 @@ def test_main_selfcheck_runs_after_the_static_preconditions(tmp_path: Path) -> N
     assert not state.exists()
 
 
-# ── the inhibitor --status line + arm-time power warnings (issue #242) ─────────
-# --status surfaces the sleep-inhibitor state, and arming warns loudly about the two
-# limits caffeinate -s cannot cover (battery power, a lid-close) plus a non-macOS host
-# with no caffeinate. pmset/caffeinate are stubbed via AFK_PMSET_BIN / AFK_CAFFEINATE_BIN.
-
-
-def _pmset_stub(tmp_path: Path, source: str) -> Path:
-    """A pmset stub whose `-g batt` prints the given power source line."""
-    pm = tmp_path / "pmset"
-    pm.write_text(f'#!/usr/bin/env bash\nprintf "Now drawing from \\x27{source}\\x27\\n"\n')
-    pm.chmod(0o755)
-    return pm
-
-
-def test_inhibitor_status_active_names_the_pid(tmp_path: Path) -> None:
-    # AC4: --status reports the inhibitor as active with its caffeinate pid when it is running.
-    stub, _log = _caffeinate_stub(tmp_path)
-    pidfile = tmp_path / "sleep-inhibit"
-    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
-    try:
-        result = _call("_afk_arm_inhibitor 424242; afk_inhibitor_status", env=env)
-
-        assert re.search(r"sleep-inhibit: active \(pid \d+\)", result.stdout), result.stdout
-    finally:
-        _kill_inhibitor(pidfile)
-
-
-def test_inhibitor_status_missing_when_recorded_pid_is_dead(tmp_path: Path) -> None:
-    # AC4: caffeinate present but the recorded inhibitor pid is gone ⇒ MISSING (machine may sleep).
-    stub, _log = _caffeinate_stub(tmp_path)
-    pidfile = tmp_path / "sleep-inhibit"
-    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
-    # A reaped subshell pid is reliably dead (mirrors the DRAIN DEAD status tests).
-    expr = f'dead=$(sh -c "echo \\$$"); printf "%s 111111\\n" "$dead" > "{pidfile}"; afk_inhibitor_status'
-
-    result = _call(expr, env=env)
-
-    assert "sleep-inhibit: MISSING" in result.stdout
-    assert "machine may sleep" in result.stdout
-
-
-def test_inhibitor_status_unavailable_without_caffeinate(tmp_path: Path) -> None:
-    # AC4/AC5: on a host with no caffeinate the status line says unavailable and names the Linux
-    # equivalent, rather than claiming MISSING (which would imply caffeinate could have run).
-    pidfile = tmp_path / "sleep-inhibit"
-    env = {
-        "AFK_CAFFEINATE_BIN": str(tmp_path / "no-such-caffeinate"),
-        "AFK_INHIBITOR_FILE": str(pidfile),
-    }
-
-    result = _call("afk_inhibitor_status", env=env)
-
-    assert "sleep-inhibit: unavailable" in result.stdout
-    assert "systemd-inhibit" in result.stdout
-
-
-def test_warn_power_warns_on_battery_naming_both_limits(tmp_path: Path) -> None:
-    # AC4: on battery, arming warns that caffeinate -s holds only on AC and a lid-close sleeps
-    # regardless — both limits named so the operator plugs in and keeps the lid open.
-    pm = _pmset_stub(tmp_path, "Battery Power")
-
-    result = _call("afk_warn_power", env={"AFK_PMSET_BIN": str(pm)})
-
-    assert "WARNING" in result.stderr
-    assert "battery" in result.stderr.lower()
-    assert "AC" in result.stderr
-    assert "lid" in result.stderr.lower()
-
-
-def test_warn_power_silent_on_ac_power(tmp_path: Path) -> None:
-    # On AC power there is nothing to warn about — no spurious WARNING at arm.
-    pm = _pmset_stub(tmp_path, "AC Power")
-
-    result = _call("afk_warn_power", env={"AFK_PMSET_BIN": str(pm)})
-
-    assert "WARNING" not in result.stderr
-
-
-def test_warn_power_silent_without_pmset(tmp_path: Path) -> None:
-    # No pmset (non-macOS) ⇒ the battery check is a silent no-op, never a failure.
-    result = _call(
-        "afk_warn_power; echo RC=$?", env={"AFK_PMSET_BIN": str(tmp_path / "no-such-pmset")}
-    )
-
-    assert "RC=0" in result.stdout
-    assert "WARNING" not in result.stderr
-
-
-def test_warn_no_inhibitor_names_systemd_equivalent(tmp_path: Path) -> None:
-    # AC5: a non-macOS host (no caffeinate) is warned once at arm — arming proceeds, and the
-    # warning names the systemd-inhibit equivalent so the limitation is not silent.
-    result = _call(
-        "_afk_warn_no_inhibitor", env={"AFK_CAFFEINATE_BIN": str(tmp_path / "no-such-caffeinate")}
-    )
-
-    assert "WARNING" in result.stderr
-    assert "systemd-inhibit" in result.stderr
-
-
-def test_warn_no_inhibitor_silent_when_caffeinate_present(tmp_path: Path) -> None:
-    # With caffeinate present there is no non-macOS warning to emit.
-    stub, _log = _caffeinate_stub(tmp_path)
-
-    result = _call("_afk_warn_no_inhibitor", env={"AFK_CAFFEINATE_BIN": str(stub)})
-
-    assert result.stderr.strip() == ""
-
-
-def test_status_surfaces_inhibitor_line_for_live_drain(tmp_path: Path) -> None:
-    # AC4: a live drain's --status includes the sleep-inhibitor line alongside the state line.
-    stub, _log = _caffeinate_stub(tmp_path)
-    state = _armed_state(tmp_path, "drain")
-    hb = tmp_path / "heartbeat"
-    pidfile = tmp_path / "sleep-inhibit"
-    env = {
-        "AFK_STATE": str(state),
-        "AFK_HEARTBEAT": str(hb),
-        "AFK_CAFFEINATE_BIN": str(stub),
-        "AFK_INHIBITOR_FILE": str(pidfile),
-        "AFK_NOW": "1700000600",
-        "AI_TOOLKIT_OTEL": "0",
-    }
-    try:
-        expr = f'printf "%s 1700000560\\n" "$$" > "{hb}"; _afk_arm_inhibitor "$$"; _status'
-        result = _call(expr, env=env)
-
-        assert "sleep-inhibit:" in result.stdout
-    finally:
-        _kill_inhibitor(pidfile)
-
-
-def test_status_off_has_no_inhibitor_line(tmp_path: Path) -> None:
-    # When off, --status reports off and does not probe/print the inhibitor line.
-    stub, _log = _caffeinate_stub(tmp_path)
-    statef = tmp_path / "state"  # absent ⇒ off
-    env = {
-        "AFK_STATE": str(statef),
-        "AFK_CAFFEINATE_BIN": str(stub),
-        "AFK_INHIBITOR_FILE": str(tmp_path / "sleep-inhibit"),
-        "AI_TOOLKIT_OTEL": "0",
-    }
-
-    result = _call("_status", env=env)
-
-    assert "/afk: off" in result.stdout
-    assert "sleep-inhibit" not in result.stdout
-
-
-def test_arm_emits_power_warnings_on_fresh_arm(tmp_path: Path) -> None:
-    # AC4 end-to-end: a fresh arm on battery emits the loud power warning (the arm-branch
-    # wiring, not just the unit function). The supervisor loop is neutered so main() arms then
-    # exits on the first tick; the inhibitor is stubbed so no real caffeinate spawns.
-    pm = _pmset_stub(tmp_path, "Battery Power")
-    state = tmp_path / "state"
-    neuter = (
-        "supervise_tick() { return 0; }; _afk_spawn_watchdog() { :; }; "
-        "_afk_arm_inhibitor() { :; }; afk_done() { return 0; }; sleep() { exit 0; }"
-    )
-
-    result = _call(
-        f"{neuter}; main 30m",
-        env={
-            "AFK_STATE": str(state),
-            "AFK_PMSET_BIN": str(pm),
-            "AFK_ARM_PRECHECK": "0",  # skip the #170 live/dirty/branch/gh gate
-            "AI_TOOLKIT_OTEL": "0",  # telemetry preflight is a no-op
-            "AFK_NOW": "1700000000",
-        },
-    )
-
-    assert "WARNING" in result.stderr, result.stderr
-    assert "battery" in result.stderr.lower()
-    assert "AC" in result.stderr and "lid" in result.stderr.lower()
-
-
-def test_once_tick_does_not_emit_power_warnings(tmp_path: Path) -> None:
-    # A --once cron tick is not a fresh arm: it must NOT emit the arm-time power warnings.
-    pm = _pmset_stub(tmp_path, "Battery Power")
-    neuter = (
-        "supervise_tick() { return 0; }; _afk_spawn_watchdog() { :; }; "
-        "_afk_arm_inhibitor() { :; }; sleep() { exit 0; }"
-    )
-
-    result = _call(
-        f"{neuter}; main --once",
-        env={
-            "AFK_STATE": str(tmp_path / "state"),
-            "AFK_PMSET_BIN": str(pm),
-            "AFK_ARM_PRECHECK": "0",
-            "AI_TOOLKIT_OTEL": "0",
-            "AFK_NOW": "1700000000",
-        },
-    )
-
-    assert "WARNING" not in result.stderr, result.stderr
-
-
-def test_arm_inhibitor_converges_from_a_blank_pidfile(tmp_path: Path) -> None:
-    # Regression guard for the concurrency `continue` branch (#242 review): a blank pidfile is
-    # the shape a concurrent peer leaves in the O_EXCL-create -> content-write gap. The reconcile
-    # loop must NOT rm+respawn-loop on it — it converges and records exactly one live entry.
-    stub, _log = _caffeinate_stub(tmp_path)
-    pidfile = tmp_path / "sleep-inhibit"
-    pidfile.write_text("")  # a 0-byte incumbent (the mid-create window a peer would leave)
-    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
-    try:
-        result = _call("_afk_arm_inhibitor 424242; echo RC=$?", env=env)
-
-        assert "RC=0" in result.stdout, result.stderr  # terminated, never spun forever
-        rec = pidfile.read_text().split()
-        assert len(rec) == 2 and rec[1] == "424242", pidfile.read_text()
-        assert _pid_alive(int(rec[0])), "must record exactly one live inhibitor"
-    finally:
-        _kill_inhibitor(pidfile)
-
-
 # ── #252: arm-generation token (singleton guard for a fast off/re-arm recycle) ──
 # The arming process IS the supervisor loop. A fast `--off -> re-arm` used to leave the old
 # (mid-tick-sleep) supervisor draining alongside the new one: `--off` cleared `.afk-state`, but
@@ -10278,7 +9480,7 @@ def test_fresh_arm_writes_a_new_arm_epoch(tmp_path: Path) -> None:
     cap = tmp_path / "epoch-mid-run"  # captured DURING the tick (drain-complete later clears it)
     neuter = (
         f'supervise_tick() {{ cat "{epoch}" > "{cap}" 2>/dev/null; return 0; }}; '
-        "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; "
+        "_afk_spawn_watchdog() { :; }; "
         "afk_done() { return 0; }; afk_interruptible_sleep() { :; }"
     )
     result = _call(
@@ -10310,7 +9512,7 @@ def test_no_arg_resume_adopts_existing_arm_epoch(tmp_path: Path) -> None:
     neuter = (
         f'supervise_tick() {{ printf "%s" "$_AFK_ARM_EPOCH" > "{bound}"; '
         f'cat "{epoch}" > "{cap}" 2>/dev/null; return 0; }}; '
-        "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; "
+        "_afk_spawn_watchdog() { :; }; "
         "afk_done() { return 0; }; afk_interruptible_sleep() { :; }"
     )
     result = _call(
@@ -10343,7 +9545,7 @@ def test_supervisor_steps_down_when_superseded_mid_run(tmp_path: Path) -> None:
         f'echo "$c" > "{count}"; [ "$c" -ge 2 ] && exit 1; afk_write_arm_epoch NEWGEN; }}'
     )
     neuter = (
-        f"{tick}; _afk_spawn_watchdog() {{ :; }}; _afk_arm_inhibitor() {{ :; }}; "
+        f"{tick}; _afk_spawn_watchdog() {{ :; }}; "
         "afk_done() { return 1; }; afk_interruptible_sleep() { :; }"
     )
     result = _call(
@@ -10749,34 +9951,6 @@ def test_detect_selfupdate_flags_config_only_diff(tmp_path: Path) -> None:
     assert flag.read_text().strip() == "236", "the flag records the triggering issue"
 
 
-def test_paths_in_scope_matches_watchdog_basename() -> None:
-    # #296: a watchdog-only land (hub-watchdog.sh) must flag a redeploy too — mirrors #291's
-    # ai-toolkit.yml pin. Without this, a land touching only the watchdog never even sets the
-    # pending-self-update flag, so mechanism 3 of #296 (the missing scope entry) stays broken.
-    result = _call("_afk_paths_in_scope 'shared/skills/hub/scripts/hub-watchdog.sh'")
-
-    assert result.returncode == 0, result.stderr
-
-
-def test_detect_selfupdate_flags_watchdog_only_diff(tmp_path: Path) -> None:
-    # #296: a land whose merged diff touches only hub-watchdog.sh must flag a pending
-    # self-update, so the redeploy actually happens for a watchdog-only fix.
-    repo = _su_repo(tmp_path)
-    before = _su_git(repo, "rev-parse", "HEAD")
-    after = _su_commit(repo, "shared/skills/hub/scripts/hub-watchdog.sh", "# changed\n")
-    statedir = tmp_path / "sd"
-
-    result = _call(
-        f"_afk_detect_selfupdate {before} {after} 296 '{repo}'",
-        env={"AFK_STATE_DIR": str(statedir)},
-    )
-
-    assert result.returncode == 0, result.stderr
-    flag = statedir / "self-update-pending"
-    assert flag.exists(), "a watchdog-only land must flag a pending self-update"
-    assert flag.read_text().strip() == "296", "the flag records the triggering issue"
-
-
 # ── #250: afk self-update — DEPLOY (validate + smoke + resync + in-place exec) ──
 # At a tick boundary the drain validates + smoke-tests the SOURCE, re-syncs the gitignored
 # scripts, journals, then execs in place onto the new code. The SOURCE is proven healthy
@@ -10930,7 +10104,7 @@ def test_self_deploy_failed_sync_fails_safe(tmp_path: Path) -> None:
 
 _SU_LOOP_NEUTER = (
     "afk_arm_preconditions() { return 0; }; afk_telemetry_preflight() { return 0; }; "
-    "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; dispatch_batch() { :; }; "
+    "_afk_spawn_watchdog() { :; }; dispatch_batch() { :; }; "
     "afk_done() { return 1; }; "  # never "done" — so the loop reaches the boundary deploy check
 )
 
@@ -11002,7 +10176,7 @@ def test_main_loop_deploys_before_done_check_on_final_land(tmp_path: Path) -> No
     hb = tmp_path / "hb"
     neuter = (
         "afk_arm_preconditions() { return 0; }; afk_telemetry_preflight() { return 0; }; "
-        "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; dispatch_batch() { :; }; "
+        "_afk_spawn_watchdog() { :; }; dispatch_batch() { :; }; "
         "afk_done() { return 0; }; "  # backlog drained THIS tick
         "supervise_tick() { _afk_mark_selfupdate_pending 236; }; "
         f'_afk_self_deploy() {{ touch "{deployed}"; exit 0; }}; '
@@ -11182,8 +10356,7 @@ def _grouped_planner(tmp_path: Path, *, batch: str = "", routes: str = "") -> Pa
     bp = tmp_path / "batch-plan.sh"
     out = batch + "\n" if batch else ""
     out += "".join(f"route:{r.replace(',', ' ')}\n" for r in routes.split() if r)
-    bp.write_text(f'#!/usr/bin/env bash\nprintf "%b" {json.dumps(out)}\nexit 0\n')
-    bp.chmod(0o755)
+    write_stub(bp, f'#!/usr/bin/env bash\nprintf "%b" {json.dumps(out)}\nexit 0\n')
     return bp
 
 
@@ -11196,10 +10369,10 @@ def _wt_new_logger(tmp_path: Path) -> tuple[Path, Path]:
     log = tmp_path / "dispatched.log"
     log.touch()  # pre-created: a run that spawns NOTHING must read as empty, not as missing
     wt_new = tmp_path / "wtnew.sh"
-    wt_new.write_text(
-        f'#!/usr/bin/env bash\n{{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; }} >> "{log}"\n'
+    write_stub(
+        wt_new,
+        f'#!/usr/bin/env bash\n{{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; }} >> "{log}"\n',
     )
-    wt_new.chmod(0o755)
     return wt_new, log
 
 
@@ -11320,8 +10493,7 @@ def test_dispatch_batch_ignores_a_malformed_route_line(tmp_path: Path) -> None:
     # half-applied: queueing under an empty spoke key would write queued-/<issue>, which no
     # spoke ever reads and afk_done would then count as pending work forever.
     bp = tmp_path / "batch-plan.sh"
-    bp.write_text('#!/usr/bin/env bash\nprintf "%b" "route:264\\nroute:oops 263\\n"\nexit 0\n')
-    bp.chmod(0o755)
+    write_stub(bp, '#!/usr/bin/env bash\nprintf "%b" "route:264\\nroute:oops 263\\n"\nexit 0\n')
     wt_new, log = _wt_new_logger(tmp_path)
     state = tmp_path / "afk-state"
     expr = (
@@ -11529,8 +10701,7 @@ def test_warn_parked_last_escalates_past_bound_with_dependents(tmp_path: Path) -
     (statedir / "warned-state-5").write_text("3\t1\n")  # attempt 3 (>= bound), next-due long past
     ready_log = tmp_path / "ready.log"
     ready = tmp_path / "spoke-ready.sh"
-    ready.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready.chmod(0o755)
+    write_stub(ready, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "WT": str(spoke),
         "AFK_STATE_DIR": str(statedir),
@@ -11554,8 +10725,7 @@ def test_warn_parked_last_no_escalate_without_dependents(tmp_path: Path) -> None
     (statedir / "warned-state-5").write_text("3\t1\n")
     ready_log = tmp_path / "ready.log"
     ready = tmp_path / "spoke-ready.sh"
-    ready.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready.chmod(0o755)
+    write_stub(ready, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "WT": str(spoke),
         "AFK_STATE_DIR": str(statedir),
@@ -11584,8 +10754,7 @@ def test_warn_parked_last_attended_never_escalates(tmp_path: Path) -> None:
     (statedir / "warned-state-5").write_text("9\t1\n")  # well past any bound
     ready_log = tmp_path / "ready.log"
     ready = tmp_path / "spoke-ready.sh"
-    ready.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready.chmod(0o755)
+    write_stub(ready, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     env = {
         "WT": str(spoke),
         "AFK_STATE_DIR": str(statedir),
@@ -11613,8 +10782,7 @@ def _crash_ready_env(tmp_path: Path, spoke: Path, statedir: Path) -> dict[str, s
     statedir.mkdir(exist_ok=True)
     ready_log = tmp_path / "ready.log"
     ready = tmp_path / "spoke-ready.sh"
-    ready.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready.chmod(0o755)
+    write_stub(ready, f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     return {
         "WT": str(spoke),
         "AFK_STATE_DIR": str(statedir),

@@ -55,6 +55,15 @@ Plus two control subcommands:
 - `/afk status` — report the active window and time remaining, `off`, or **`STALE`** when
   the window is armed but the supervisor process has died (see below).
 
+## Prerequisite: keep the Mac awake (Orca)
+
+`/afk` no longer holds the machine awake itself. Turn on Orca's
+**`keepComputerAwakeWhileAgentsRun`** setting before an unattended window: system sleep
+freezes the supervisor, every spoke, and the OTel stack mid-run, and wall-clock timers (reap
+ceilings, staleness checks) misfire on wake. Caveat: the setting only holds **while an agent
+is running**, so a drain idling between spokes (waiting on a gate, a land, or the next tick)
+can still sleep — plug in and keep the lid open for a long window.
+
 ## Staying alive: heartbeat + watchdog
 
 The supervisor is a long-running loop, and a silent crash (it once exited `0`
@@ -88,10 +97,10 @@ drain redeploys onto the new code with **zero operator commands** — no `off �
 re-arm` recycle. After the land, the drain flags a self-update; at the **next tick
 boundary** (never mid-tick) it validates + smoke-tests the merged source, re-syncs the
 gitignored `.ai-toolkit/scripts`, then `exec`s itself in place as a no-arg resume onto the
-new code. `exec` preserves the pid, so `caffeinate` and the heartbeat survive untouched and
-the watchdog keeps reading `live`; the resume **re-adopts** in-flight spokes. A broken new
+new code. `exec` preserves the pid, so the heartbeat survives untouched and
+the keeper keeps reading `live`; the resume **re-adopts** in-flight spokes. A broken new
 version fails safe — the source is proven healthy **before** the re-sync, so the synced copy
-the watchdog respawns is never overwritten with broken code, and the drain stays on the old
+the keeper respawns is never overwritten with broken code, and the drain stays on the old
 code with a loud warning. Every self-deploy is journaled. `AFK_SELFUPDATE_SCOPE` overrides
 the trigger set.
 

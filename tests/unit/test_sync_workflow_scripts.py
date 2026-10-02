@@ -147,37 +147,10 @@ def test_transition_log_source_exists_and_is_executable() -> None:
     assert os.access(TRANSITION_LOG, os.X_OK), "transition-log.sh is not executable"
 
 
-# ── hub-watchdog.sh registration (issue #251) ─────────────────────────────────
-# The tier-2 supervision daemon is a hub-skill script; it must sync into a target's
-# .ai-toolkit/scripts/ so /afk / the hub skill can arm it, and take the hub-skill case mapping.
-HUB_WATCHDOG = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-watchdog.sh"
-
-
-def test_hub_watchdog_registered_in_sync_loop() -> None:
-    assert "hub-watchdog.sh" in _for_name_list(), (
-        "hub-watchdog.sh is not registered in sync_workflow_scripts() — it would not sync to a "
-        "target's .ai-toolkit/scripts/ and /afk could not arm the tier-2 watchdog there"
-    )
-
-
-def test_hub_watchdog_takes_the_hub_skill_source_case() -> None:
-    body = _sync_workflow_scripts_body()
-    hub_case = re.search(r"\n\s*([\w.|-]*hub-watchdog\.sh[\w.|-]*)\)\s+src=", body)
-    assert hub_case is not None, (
-        "hub-watchdog.sh must have the hub-skill case mapping "
-        '(src="$SHARED_DIR/skills/hub/scripts/$name"), not the toolkit-root default'
-    )
-
-
-def test_hub_watchdog_source_exists_and_is_executable() -> None:
-    assert HUB_WATCHDOG.is_file(), "shared/skills/hub/scripts/hub-watchdog.sh missing"
-    assert os.access(HUB_WATCHDOG, os.X_OK), "hub-watchdog.sh is not executable"
-
-
 # ── gate-broker functional modules (issue #275) ───────────────────────────────
 # gate-broker.sh sources each gate-broker-<stage>.sh as a co-located sibling; a module absent
 # from a synced target fails the deny-wall CLOSED. So every module must be in the loop, take
-# the hub-skill case mapping, and exist executable — mirroring the hub-inject/hub-watchdog guards.
+# the hub-skill case mapping, and exist executable — mirroring the hub-inject guards.
 @pytest.mark.parametrize("module", GB_MODULES)
 def test_gate_broker_module_registered_in_sync_loop(module: str) -> None:
     assert f"gate-broker-{module}.sh" in _for_name_list(), (
@@ -234,40 +207,6 @@ def test_hub_afk_module_source_exists_and_is_executable(module: str) -> None:
     src = HUB_SCRIPTS_DIR / f"hub-afk-{module}.sh"
     assert src.is_file(), f"shared/skills/hub/scripts/hub-afk-{module}.sh missing"
     assert os.access(src, os.X_OK), f"hub-afk-{module}.sh is not executable"
-
-
-# ── hub-watchdog functional modules (issue #308) ──────────────────────────────
-# hub-watchdog.sh sources each hub-watchdog-<lane>.sh as a co-located sibling; a module
-# absent from a synced target sets _WD_MODULES_OK=0 and the daemon refuses to run there
-# (a silently-blind watchdog no-ops every detector — AFK Design Principle 2). So every
-# module must be in the loop, take the hub-skill case mapping, and exist executable —
-# mirroring the gate-broker/hub-afk module guards. Extend this tuple as each lane splits.
-HUB_WATCHDOG_MODULES = ("detect", "intervene")
-
-
-@pytest.mark.parametrize("module", HUB_WATCHDOG_MODULES)
-def test_hub_watchdog_module_registered_in_sync_loop(module: str) -> None:
-    assert f"hub-watchdog-{module}.sh" in _for_name_list(), (
-        f"hub-watchdog-{module}.sh is not registered in sync_workflow_scripts() — the entry "
-        "lib would source a missing sibling in a synced target and the daemon would refuse to run"
-    )
-
-
-@pytest.mark.parametrize("module", HUB_WATCHDOG_MODULES)
-def test_hub_watchdog_module_takes_the_hub_skill_source_case(module: str) -> None:
-    body = _sync_workflow_scripts_body()
-    hub_case = re.search(rf"\n\s*([\w.|-]*hub-watchdog-{module}\.sh[\w.|-]*)\)\s+src=", body)
-    assert hub_case is not None, (
-        f"hub-watchdog-{module}.sh must have the hub-skill case mapping "
-        '(src="$SHARED_DIR/skills/hub/scripts/$name"), not the toolkit-root default'
-    )
-
-
-@pytest.mark.parametrize("module", HUB_WATCHDOG_MODULES)
-def test_hub_watchdog_module_source_exists_and_is_executable(module: str) -> None:
-    src = HUB_SCRIPTS_DIR / f"hub-watchdog-{module}.sh"
-    assert src.is_file(), f"shared/skills/hub/scripts/hub-watchdog-{module}.sh missing"
-    assert os.access(src, os.X_OK), f"hub-watchdog-{module}.sh is not executable"
 
 
 # ── telemetry package registration (issue #319) ───────────────────────────────
@@ -510,3 +449,25 @@ def test_sync_workflow_scripts_generates_orca_yaml() -> None:
     assert "orca.yaml" in _sync_workflow_scripts_body(), (
         "sync_workflow_scripts() must generate <target>/orca.yaml (issue #362)"
     )
+
+
+# ── retired tmux-era drain backstops (issue #372) ─────────────────────────────
+RETIRED_SCRIPTS = (
+    "hub-watchdog.sh",
+    "hub-watchdog-detect.sh",
+    "hub-watchdog-intervene.sh",
+    "spoke-relaunch.sh",
+)
+
+
+@pytest.mark.parametrize("name", RETIRED_SCRIPTS)
+def test_retired_script_is_not_synced_and_not_in_the_selfupdate_scope(name: str) -> None:
+    assert name not in _for_name_list(), f"{name} was deleted (#372) but is still synced"
+    assert name not in _sync_workflow_scripts_body(), f"{name} still has a sync case mapping"
+    supervise = (HUB_SCRIPTS_DIR / "hub-afk-supervise.sh").read_text()
+    assert name not in supervise, f"{name} is still named in the supervisor's self-update scope"
+
+
+def test_afk_skill_names_the_orca_keep_awake_prerequisite() -> None:
+    skill = (REPO_ROOT / "shared" / "skills" / "afk" / "SKILL.md").read_text()
+    assert "keepComputerAwakeWhileAgentsRun" in skill
