@@ -256,3 +256,81 @@ def test_blocked_reason_is_extracted_from_any_depth(tmp_path: Path) -> None:
     proc, _ = _run(tmp_path, f"ORCA_OUT='{out}'; orca_blocked_reason")
 
     assert proc.stdout.strip() == "agent-trust-workspace"
+
+
+def test_field_extraction_never_kills_a_set_e_caller_on_non_json(tmp_path: Path) -> None:
+    proc, _ = _run(
+        tmp_path,
+        "set -e; ORCA_OUT='Error: closed the connection'; x=\"$(orca_wt_path)\"; echo alive",
+    )
+
+    assert proc.stdout.strip() == "alive"
+
+
+def test_a_closed_connection_reported_only_on_stderr_settles_through_the_probe(
+    tmp_path: Path,
+) -> None:
+    scenario = {
+        "worktree create": [
+            {"rc": 1, "out": "", "stderr": "orca: the runtime closed the connection"}
+        ],
+        "worktree list": [
+            {
+                "out": {
+                    "ok": True,
+                    "result": {"worktrees": [{"id": "r::/w", "path": "/w", "displayName": "n1"}]},
+                }
+            }
+        ],
+    }
+
+    proc, _ = _run(
+        tmp_path,
+        "probe() { orca_worktree_by_name n1; }; orca_call_settled probe worktree create --name n1",
+        scenario=scenario,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_giving_up_leaves_the_original_error_in_orca_out(tmp_path: Path) -> None:
+    scenario = {
+        "orchestration worker-start": [
+            {
+                "rc": 1,
+                "out": {
+                    "ok": False,
+                    "error": {
+                        "code": "outcome_unknown",
+                        "data": {"orchestrationRequestId": "req-3"},
+                    },
+                },
+            }
+        ],
+        "orchestration request-show": [{"out": {"ok": True, "result": {"state": "absent"}}}],
+    }
+
+    proc, _ = _run(
+        tmp_path,
+        'orca_call_settled "" orchestration worker-start; orca_field ".error.code"',
+        scenario=scenario,
+    )
+
+    assert proc.stdout.strip() == "outcome_unknown"
+
+
+def test_with_no_request_id_and_no_probe_an_unsettled_call_is_unknown_at_once(
+    tmp_path: Path,
+) -> None:
+    scenario = {
+        "orchestration worker-start": [
+            {"rc": 1, "out": {"ok": False, "error": {"code": "runtime_unavailable"}}}
+        ]
+    }
+
+    proc, bindir = _run(
+        tmp_path, 'orca_call_settled "" orchestration worker-start', scenario=scenario
+    )
+
+    assert proc.returncode == 1
+    assert [c[:2] for c in orca_calls(bindir)] == [["orchestration", "worker-start"]]

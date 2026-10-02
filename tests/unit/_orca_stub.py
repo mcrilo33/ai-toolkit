@@ -47,6 +47,11 @@ def ok(result):
     return {"ok": True, "result": result}
 
 
+for snap in scenario.get("_snapshot", []):
+    if snap["key"] == key:
+        f = Path(snap["path"])
+        with (HOME / "snapshots.jsonl").open("a") as fh:
+            fh.write(json.dumps({**snap, "content": f.read_text() if f.exists() else None}) + "\n")
 seq = scenario.get(key)
 if seq is not None:
     i = state["n"].get(key, 0)
@@ -69,6 +74,8 @@ if key == "worktree create":
     emit(0, ok({"worktree": wt}))
 if key == "worktree list":
     emit(0, ok({"worktrees": state["wts"]}))
+if key == "skills installed":
+    emit(0, [{"name": "orca-cli"}, {"name": "orchestration"}])
 if key == "worktree set":
     emit(0, ok({}))
 if key == "worktree ps":
@@ -152,6 +159,13 @@ def install_forbidden_stubs(bindir: Path) -> Path:
     )
     git.chmod(0o755)
     return log
+
+
+def install_dispatch_env(bindir: Path, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Return an env that lets worktree-new.sh dispatch against the stub (no real Orca)."""
+    env = {**(base if base is not None else os.environ), **install_orca_stub(bindir)}
+    env.update(ORCA_TERMINAL_HANDLE="term_hub", ORCA_SETTLE_SLEEP="0", ORCA_AGENT_SLEEP="0")
+    return stub_env(bindir, env)
 
 
 def stub_env(bindir: Path, base: dict[str, str] | None = None) -> dict[str, str]:
