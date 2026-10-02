@@ -43,14 +43,16 @@ fi
 # identity.sh (#361): the hub-side readers take the issue from a worktree's recorded identity
 # (`<wt>/.ai-toolkit/identity`) before inferring it from the branch slug. THIS is the one loader
 # the gate-broker modules rely on (gate-broker.sh sources us before them). Same dual layout as the
-# siblings -- co-located in a synced target, shared/hooks/lib/ in the checkout -- plus the
-# _AFK_TOPLEVEL fallbacks a self-copy drain needs (its temp dir carries neither). Absent => the
-# reader is simply undefined and every site keeps its branch-slug inference.
+# siblings -- co-located in a synced target, shared/hooks/lib/ in the checkout, hooks/scripts/lib/
+# beside a synced .claude/skills/hub/scripts/ -- plus the _AFK_TOPLEVEL fallbacks a self-copy
+# drain needs (its temp dir carries neither). Absent => the reader is simply undefined and every
+# site keeps its branch-slug inference.
 if ! declare -F ai_toolkit_identity_issue_at >/dev/null 2>&1; then
   _hi_top="${_AFK_TOPLEVEL:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
   for _cand in \
     "$HUB_INJECT_SCRIPT_DIR/identity.sh" \
     "$HUB_INJECT_SCRIPT_DIR/../../../hooks/lib/identity.sh" \
+    "$HUB_INJECT_SCRIPT_DIR/../../../hooks/scripts/lib/identity.sh" \
     "${_hi_top:+$_hi_top/shared/hooks/lib/identity.sh}" \
     "${_hi_top:+$_hi_top/.ai-toolkit/scripts/identity.sh}"; do
     if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; break; fi
