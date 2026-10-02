@@ -112,7 +112,9 @@ jobs:
     # job loud if a future image drops it too. Making the canaries
     # locale-agnostic is a separate change, out of this ci.yml-only scope.
     runs-on: macos-15
-    timeout-minutes: 15
+    # The subset ran >11 min serially and had not finished (#379); xdist
+    # should land it well inside this, the margin only bounds a hang.
+    timeout-minutes: 25
     env:
       LANG: fr_FR.UTF-8
       LC_ALL: fr_FR.UTF-8
@@ -174,8 +176,19 @@ jobs:
           echo "$subset" | sed 's/^/  /'
           # Intentional word-split on the newline-separated file list; paths
           # carry no spaces. Default macOS /bin/bash is 3.2 (no mapfile).
+          # Two phases, the same split the push gate and sweep run (#328):
+          # the parallel-safe bulk under `-n auto -m "not serial"`, then the
+          # ref-mutating serial tail single-process. The serial single-process
+          # leg exits 5 ("no tests collected") when none of its tests
+          # are in the subset, which is green. Serially the subset had not
+          # finished in 15 min on the 3-vCPU runner (#379), hence xdist. -rfE lists failures in the
+          # summary and --durations surfaces the slow suites to narrow next.
           # shellcheck disable=SC2086
-          python -m pytest $subset -q
+          python -m pytest $subset -q -n auto -m "not serial" -rfE --durations=15
+          rc=0
+          # shellcheck disable=SC2086
+          python -m pytest $subset -q -m serial -rfE || rc=$?
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 5 ]
 
   # A permanently red check is noise that hides the day it fails for a real
   # reason (#129): on any red gate job, land the failure in the backlog as a
