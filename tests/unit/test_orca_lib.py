@@ -354,3 +354,233 @@ def test_the_worktree_probe_is_scoped_to_the_given_repo(tmp_path: Path) -> None:
 
     assert proc.stdout.strip() == "/w"
     assert orca_calls(bindir) == [["worktree", "list", "--repo", "path:/the/repo", "--json"]]
+
+
+# --- the drain's reads and writes (#365) -----------------------------------------------------
+
+
+def _wt(tmp_path: Path, **identity: str) -> Path:
+    wt = tmp_path / "wt"
+    (wt / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (wt / ".ai-toolkit" / "identity").write_text(
+        "".join(f"{k}={v}\n" for k, v in identity.items())
+    )
+    return wt
+
+
+def _ps(path: Path, *agents: dict) -> dict:
+    return {"out": {"ok": True, "result": {"worktrees": [{"path": str(path), "agents": list(agents)}]}}}
+
+
+def _workers(*rows: dict) -> dict:
+    return {"out": {"ok": True, "result": {"workers": list(rows)}}}
+
+
+def _worker(did: str, path: Path, verdict: str = "live", handle: str = "term_w", **extra) -> dict:
+    return {
+        "dispatchId": did,
+        "taskId": "task_1",
+        "agentTerminalHandle": handle,
+        "resource": {"worktreeId": f"repo::{path}"},
+        "projection": {"liveness": {"verdict": verdict}},
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    ("agents", "want"),
+    [
+        ([{"state": "working"}], "working"),
+        ([{"state": "done"}, {"state": "working"}], "working"),
+        ([{"state": "working"}, {"state": "waiting"}], "waiting"),
+        ([{"state": "done"}], "done"),
+        ([], "none"),
+    ],
+)
+def test_agent_state_reads_ps(tmp_path: Path, agents: list[dict], want: str) -> None:
+    wt = _wt(tmp_path)
+
+    proc, _ = _run(tmp_path, f'orca_agent_state "{wt}"', scenario={"worktree ps": [_ps(wt, *agents)]})
+
+    assert proc.stdout.strip() == want
+    assert proc.returncode == 0
+
+
+def test_agent_state_is_unknown_when_ps_fails_or_omits_the_worktree(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+    failed = {"worktree ps": [{"rc": 1, "out": {"ok": False}}]}
+    unlisted = {"worktree ps": [{"out": {"ok": True, "result": {"worktrees": []}}}]}
+
+    for scenario in (failed, unlisted):
+        proc, _ = _run(tmp_path, f'orca_agent_state "{wt}"', scenario=scenario)
+
+        assert proc.stdout.strip() == "unknown"
+        assert proc.returncode == 2
+
+
+def test_agent_field_returns_the_waiting_agents_tool_input(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+    agents = [
+        {"state": "working", "toolName": "Read", "toolInput": "/a"},
+        {"state": "waiting", "toolName": "Bash", "toolInput": {"command": "git push"}},
+    ]
+
+    proc, _ = _run(
+        tmp_path,
+        f'orca_agent_field "{wt}" toolName; orca_agent_field "{wt}" toolInput',
+        scenario={"worktree ps": [_ps(wt, *agents)]},
+    )
+
+    assert proc.stdout.splitlines() == ["Bash", '{"command":"git push"}']
+
+
+def test_tick_cache_makes_one_ps_call_until_reset(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+    snippet = (
+        f'orca_tick_reset; orca_agent_state "{wt}"; x="$(orca_agent_state "{wt}")"; '
+        f'orca_agent_field "{wt}" state; orca_tick_reset; orca_agent_state "{wt}"'
+    )
+
+    _, bindir = _run(tmp_path, snippet, scenario={"worktree ps": [_ps(wt, {"state": "done"})]})
+
+    assert orca_calls(bindir).count(["worktree", "ps", "--json"]) == 2
+
+
+def test_worker_liveness_matches_the_identity_dispatch_then_the_path(tmp_path: Path) -> None:
+    wt = _wt(tmp_path, orca_dispatch_id="ctx_new")
+    other = tmp_path / "other"
+    rows = _workers(
+        _worker("ctx_old", wt, "exited"), _worker("ctx_new", wt, "live"), _worker("ctx_x", other)
+    )
+
+    by_id, _ = _run(tmp_path, f'orca_worker_liveness "{wt}"', scenario={"orchestration worker-list": [rows]})
+    bare = _wt(tmp_path / "b")
+    by_path, _ = _run(
+        tmp_path / "b",
+        f'orca_worker_liveness "{bare}"',
+        scenario={"orchestration worker-list": [_workers(_worker("ctx_9", bare, "unverifiable"))]},
+    )
+
+    assert by_id.stdout.strip() == "live"
+    assert by_path.stdout.strip() == "unverifiable"
+
+
+def test_worker_liveness_of_an_absent_record_is_unknown_never_exited(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+    failed = {"orchestration worker-list": [{"rc": 1, "out": {"ok": False}}]}
+    absent = {"orchestration worker-list": [_workers()]}
+
+    for scenario, rc in ((failed, 2), (absent, 1)):
+        proc, _ = _run(tmp_path, f'orca_worker_liveness "{wt}"', scenario=scenario)
+
+        assert proc.stdout.strip() == "unknown"
+        assert proc.returncode == rc
+
+
+def test_inbox_question_joins_the_sender_handle_to_the_spoke(tmp_path: Path) -> None:
+    wt = _wt(tmp_path, run_id="run_1")
+    inbox = {
+        "out": {
+            "ok": True,
+            "result": {
+                "messages": [
+                    {"id": "m_other", "type": "question", "from_handle": "term_z", "body": "no", "created_at": 1},
+                    {"id": "m_late", "type": "question", "from_handle": "term_w", "body": "b", "created_at": 9},
+                    {"id": "m_early", "type": "question", "from_handle": "term_w", "body": "plan?", "created_at": 5},
+                ]
+            },
+        }
+    }
+    scenario = {"orchestration worker-list": [_workers(_worker("ctx_1", wt))], "orchestration check": [inbox]}
+
+    proc, bindir = _run(
+        tmp_path,
+        f'orca_inbox_question "{wt}" id; orca_inbox_question "{wt}" body',
+        scenario=scenario,
+    )
+
+    assert proc.stdout.splitlines() == ["m_early", "plan?"]
+    assert ["orchestration", "check", "--peek", "--types", "question", "--run", "run_1", "--json"] in orca_calls(bindir)
+
+
+def test_inbox_question_is_rc1_when_empty_and_rc2_when_unknown(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+    workers = {"orchestration worker-list": [_workers(_worker("ctx_1", wt))]}
+    empty = {**workers, "orchestration check": [{"out": {"ok": True, "result": {"messages": []}}}]}
+    broken = {**workers, "orchestration check": [{"rc": 1, "out": {"ok": False}}]}
+
+    for scenario, rc in ((empty, 1), (broken, 2)):
+        proc, _ = _run(tmp_path, f'orca_inbox_question "{wt}" id', scenario=scenario)
+
+        assert proc.returncode == rc
+        assert proc.stdout == ""
+
+
+def test_every_mutation_carries_json_and_its_own_retry_request(tmp_path: Path) -> None:
+    snippet = (
+        'orca_reply m1 yes run_1; orca_send_text term_w hello 15 1 >/dev/null; '
+        "orca_worker_stop d1; orca_worker_abandon d2; orca_worker_release d3"
+    )
+
+    _, bindir = _run(tmp_path, snippet)
+
+    calls = orca_calls(bindir)
+    assert [c[:2] for c in calls] == [
+        ["orchestration", "reply"],
+        ["terminal", "send"],
+        ["orchestration", "worker-stop"],
+        ["orchestration", "worker-abandon"],
+        ["orchestration", "worker-release"],
+    ]
+    ids = [c[c.index("--retry-request") + 1] for c in calls]
+    assert all(c[-1] == "--json" for c in calls)
+    assert len(set(ids)) == 5
+
+
+def test_send_text_prints_the_observed_stages_in_one_call(tmp_path: Path) -> None:
+    proc, bindir = _run(tmp_path, "orca_send_text term_w hi 20 1")
+
+    assert proc.stdout.strip() == "input_accepted,turn_started"
+    (call,) = orca_calls(bindir)
+    assert call[:7] == ["terminal", "send", "--terminal", "term_w", "--text", "hi", "--enter"]
+    assert call[call.index("--wait-submit") + 1] == "20"
+
+
+def test_send_text_without_enter_or_wait_sends_only_the_text(tmp_path: Path) -> None:
+    _, bindir = _run(tmp_path, "orca_send_text term_w x 0 0 >/dev/null")
+
+    (call,) = orca_calls(bindir)
+    assert "--enter" not in call
+    assert "--wait-submit" not in call
+
+
+def test_send_text_failure_is_rc1_and_never_resent(tmp_path: Path) -> None:
+    scenario = {"terminal send": [{"rc": 1, "out": {"ok": False, "error": {"code": "terminal_gone"}}}]}
+
+    proc, bindir = _run(tmp_path, "orca_send_text term_w hi", scenario=scenario)
+
+    assert proc.returncode == 1
+    assert len(orca_calls(bindir)) == 1
+
+
+def test_worker_done_sends_the_outcome_with_the_dispatch_and_task(tmp_path: Path) -> None:
+    wt = _wt(tmp_path, orca_dispatch_id="ctx_1")
+    scenario = {"orchestration worker-list": [_workers(_worker("ctx_1", wt))]}
+
+    proc, bindir = _run(tmp_path, f'orca_worker_done "{wt}" succeeded "ready/365"', scenario=scenario)
+
+    assert proc.returncode == 0, proc.stderr
+    send = next(c for c in orca_calls(bindir) if c[:2] == ["orchestration", "send"])
+    assert send[send.index("--type") + 1] == "worker_done"
+    assert send[send.index("--outcome") + 1] == "succeeded"
+    assert send[send.index("--dispatch-id") + 1] == "ctx_1"
+    assert send[send.index("--task-id") + 1] == "task_1"
+
+
+def test_worker_done_without_a_recorded_dispatch_is_a_quiet_rc1(tmp_path: Path) -> None:
+    wt = _wt(tmp_path)
+
+    proc, bindir = _run(tmp_path, f'orca_worker_done "{wt}" failed "blocked/365"')
+
+    assert proc.returncode == 1
+    assert orca_calls(bindir) == []

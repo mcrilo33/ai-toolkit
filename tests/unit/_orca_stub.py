@@ -155,6 +155,15 @@ if key == "worktree set":
     emit(0, ok({}))
 if key == "worktree ps":
     emit(0, ok({"worktrees": []}))
+if key == "orchestration worker-list":
+    emit(0, ok({"workers": []}))
+if key == "orchestration check":
+    emit(0, ok({"messages": []}))
+if key == "terminal send":
+    emit(0, ok({"stages": ["input_accepted", "turn_started"]}))
+if key in ("orchestration reply", "orchestration send", "orchestration worker-stop",
+           "orchestration worker-abandon"):
+    emit(0, ok({}))
 if key == "orchestration run-current":
     emit(0, ok({"run": {"id": "run_stub"}}))
 if key == "terminal create":
