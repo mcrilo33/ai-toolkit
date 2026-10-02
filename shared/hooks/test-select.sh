@@ -1,33 +1,31 @@
 #!/usr/bin/env bash
-# test-select.sh — tiered, diff-aware test selector for the native pre-push hook.
+# test-select.sh — the FAST tier of the native pre-push gate.
 #
-# THE MODEL (issue #19): the pre-push hook is the SINGLE owner of test execution.
-# "One push = one run." This script classifies the diff a push carries and runs
-# the cheapest sufficient suite, with DEFAULT-TO-FULL safety — anything not
-# provably docs-only or python-only runs the full suite, and a missing testmon
-# falls back to the full suite rather than silently skipping python tests.
+# THE MODEL (issue #378, option B): CI is the gate; the local machine only runs
+# the fast tier. This hook classifies the diff a push carries and runs the cheap,
+# diff-aware tests — mapped/selected files, the control-plane coverage meta-test
+# and `pytest --testmon` — and NEVER the whole suite. The full suite runs in CI on
+# every branch push; spoke-ready.sh and the land script wait for it to go green.
+# Where a diff used to escalate to the full suite (an unmapped change, testmon
+# absent, an unresolvable range) the hook now runs the mapped tests that exist and
+# prints that CI is the full gate.
 #
-# TIERS (over the set of changed files):
+# WHAT RUNS (over the set of changed files):
 #   • every changed file is docs-only (*.md, docs/, LICENSE, *.rst, images)
 #     or exempt (repo-root .test-select-exempt)
 #       → run NOTHING
-#   • every non-doc/non-exempt changed file is *.py
-#       → pytest --testmon (+ the control-plane coverage meta-test, #123)
-#   • every non-python changed file maps to referencing tests (reverse index,
+#   • a non-python changed file that maps to referencing tests (reverse index,
 #     issue #123)
-#       → run exactly the mapped test files (+ meta-test; + --testmon when
-#         the diff also touches python)
-#   • anything else (an unmapped, non-exempt file)
-#       → the FULL suite (which contains the meta-test natively)
+#       → exactly the mapped test files, under `-n auto`
+#   • a python change with testmon installed
+#       → `pytest --testmon` (never under xdist: testmon is single-writer)
+#   • the control-plane coverage meta-test (#123) rides along whenever anything
+#     non-doc changed: an unmapped script stays red there until a test names it
 #
-# SAFE FALLBACKS (all fail CLOSED — a demand we can't prove blocks, never waves
-# through):
-#   • testmon not installed  → full suite (never silently skip python tests)
-#   • no pytest resolvable    → block the push (issue #213): a docs-only/empty
-#     diff needs no runner and exits 0, but a diff that demands tests with no
-#     runner can't be proven green, so it fails closed (nonzero) rather than
-#     shipping untested — TEST_SELECT_SKIP is the explicit override
-#   • a diff range that can't be resolved → full suite (can't prove safe)
+# FAIL-CLOSED:
+#   • no pytest resolvable → block the push (issue #213): a diff that demands
+#     tests with no runner can't be proven green — TEST_SELECT_SKIP is the
+#     explicit override
 #
 # INPUT: git feeds a pre-push hook the pushed refs on stdin, one per line:
 #   <local ref> <local sha> <remote ref> <remote sha>
@@ -35,19 +33,11 @@
 # remote sha) falls back to merge-base(default-branch, local_sha); a deletion
 # (all-zero local sha) contributes nothing.
 #
-# ENV ESCAPE HATCHES (threaded from worktree-land.sh so the hook stays the single
-# executor — keeps land's --skip-tests / --test-cmd working without a land-side
-# run):
-#   • TEST_SELECT_SKIP non-empty → run nothing (the --skip-tests path)
-#   • TEST_SELECT_CMD  non-empty → run that command verbatim (the --test-cmd path)
-#
-# GREEN-TREE STAMPS (issue #122): a gate pass stamps the tier that ran, keyed by
-# `git rev-parse HEAD^{tree}` under <git-common-dir>/.gate-stamps/ (see
-# lib/gate-stamp.sh). A later gate on the SAME clean tree with an equal-or-weaker
-# demand skips the suite with a loud note — distinct from TEST_SELECT_SKIP; a
-# stronger demand runs and upgrades the stamp. A dirty working tree, either
-# escape hatch above, a failing run, or a runner-fingerprint mismatch never
-# consumes or mints.
+# ENV ESCAPE HATCHES (threaded from the land and ready scripts so this hook stays
+# the single executor of local tests):
+#   • TEST_SELECT_SKIP non-empty → run nothing
+#   • TEST_SELECT_CMD  non-empty → run that command verbatim (the land script's
+#     --test-cmd / --local-gate, spoke-ready's --local-gate)
 #
 # EXIT: the selected suite's exit code IS this script's exit code, so a failing
 # suite returns non-zero and aborts the push (the blocking ship gate).
@@ -57,21 +47,10 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/utils.sh
 source "$HOOK_DIR/lib/utils.sh"
 
-# Green-tree stamps (issue #122): skip a suite already proven on this exact
-# tree. The lib may be absent in an installed hook copy that predates it (the
-# #45 stale-hook trap) — degrade to no stamps rather than breaking the gate.
-STAMPS=0
-if [ -f "$HOOK_DIR/lib/gate-stamp.sh" ]; then
-  # shellcheck source=lib/gate-stamp.sh
-  source "$HOOK_DIR/lib/gate-stamp.sh"
-  STAMPS=1
-fi
-
 # Reverse index (issue #123): map changed non-python files to the test files
-# that reference them, so a shell/config diff runs its mapped tests instead of
-# the full suite. Absent in a stale installed hook copy (the same #45 trap as
-# above) — degrade to no index, which the tier logic below treats as "nothing
-# mapped", i.e. today's full-suite escalation.
+# that reference them, so a shell/config diff runs its mapped tests. Absent in a
+# stale installed hook copy (the #45 stale-hook trap) — degrade to no index, which
+# the logic below treats as "nothing mapped".
 RINDEX=0
 if [ -f "$HOOK_DIR/lib/test-reverse-index.sh" ]; then
   # shellcheck source=lib/test-reverse-index.sh
@@ -145,7 +124,7 @@ if command -v ai_toolkit_hook_enabled >/dev/null 2>&1; then
   fi
 fi
 
-# ── Env escape hatches (worktree-land's --skip-tests / --test-cmd) ──────────────
+# ── Env escape hatches (the land script's --skip-tests / --test-cmd / --local-gate) ─
 if [ -n "${TEST_SELECT_SKIP:-}" ]; then
   note "TEST_SELECT_SKIP set — skipping tests"
   exit 0
@@ -153,9 +132,9 @@ fi
 if [ -n "${TEST_SELECT_CMD:-}" ]; then
   note "running custom suite (TEST_SELECT_CMD)"
   rc=0
-  # The custom suite is a test command too (worktree-land --test-cmd) — run it
-  # under the same git-hook env strip so it can't reach the real repo either, and
-  # under the repo-integrity tripwire (issue #31) so an escape still aborts.
+  # The custom suite is a test command too — run it under the same git-hook env
+  # strip so it can't reach the real repo either, and under the repo-integrity
+  # tripwire (issue #31) so an escape still aborts.
   run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" bash -c "$TEST_SELECT_CMD" || rc=$?
   exit "$rc"
 fi
@@ -180,11 +159,8 @@ is_shell() { case "$1" in *.sh) return 0 ;; *) return 1 ;; esac; }
 
 # Exempt handling (issue #123): the parser lives in lib/test-reverse-index.sh
 # (reverse_index_is_exempt) so this gate and the commit-time nudge share one
-# definition of "exempt". Note the list's own basename (.test-select-exempt)
-# can never be a filename-shaped token, so editing it is unmapped by
-# construction and escalates to the full suite: high-stakes changes to what
-# the gate ignores always pay the maximum price. Without the lib (a stale
-# installed hook) there are no exemptions — conservative, like the index.
+# definition of "exempt". Without the lib (a stale installed hook) there are no
+# exemptions — conservative, like the index.
 if [ "$RINDEX" = "1" ]; then
   is_exempt() { reverse_index_is_exempt "$1"; }
 else
@@ -193,11 +169,9 @@ fi
 
 # The control-plane coverage meta-test (issue #123): a milliseconds static
 # scan asserting every control-plane script has a referencing test or an
-# exemption. It rides every tier that runs pytest — SELECTED appends it to
-# the selection, the testmon tier adds a separate invocation, and the full
-# suite contains it natively — so an unmapped script can never land: its push
-# escalates to FULL and the meta-test there is red until a test references
-# it. Guarded on file existence: synced repos without the file are unaffected.
+# exemption. It rides every push that changes non-doc files, so an unmapped
+# script can never ship green: the meta-test is red until a test references it.
+# Guarded on file existence: synced repos without the file are unaffected.
 META_TEST_FILE="tests/unit/test_test_reverse_index.py"
 META_TEST_NODE="$META_TEST_FILE::TestControlPlaneCoverage"
 
@@ -242,27 +216,26 @@ while read -r _lref lsha _rref rsha; do
   if changed="$(git diff --name-only "$range" 2>/dev/null)"; then
     FILES="$FILES$changed"$'\n'
   else
-    CANNOT_PROVE=1   # range unresolved → can't prove safe
+    CANNOT_PROVE=1   # range unresolved → nothing provable locally; CI is the gate
   fi
 done <<< "$STDIN"
 
 # ── Tag-only marker push: carries no code, skip the suite (issue #45) ────────────
 # A push whose every ref is refs/tags/* (no branch refs) only moves a pointer —
-# the shipped unit is the branch push, which runs the suite on its own. So
+# the shipped unit is the branch push, which runs the fast tier on its own. So
 # emitting a marker (ready/N completion, gate/N PLAN-gate park) never re-runs the
-# ~5-min suite for a tag that introduces nothing. Guards a hand-typed
+# tests for a tag that introduces nothing. Guards a hand-typed
 # `git push origin <tag>` too, not just spoke-ready.sh.
 if [ "$SAW_TAG_REF" = "1" ] && [ "$SAW_NONTAG_REF" = "0" ]; then
   note "tag-only push (no branch refs) — marker carries no code, skipping suite"
   exit 0
 fi
 
-# ── Decide the tier ─────────────────────────────────────────────────────────────
+# ── Classify the diff ───────────────────────────────────────────────────────────
 # A *.py file is code even when it lives under docs/ (e.g. docs/conf.py): classify
 # it python so testmon can judge its impact, rather than skipping it as a doc.
 has_py=0
 has_other=0
-UNMAPPED=0
 UNMAPPED_FILE=""
 UNMAPPED_SH=""
 MAPPED_TESTS=""
@@ -272,10 +245,8 @@ while IFS= read -r f; do
   if is_py "$f"; then has_py=1; continue; fi
   if is_doc "$f"; then continue; fi
   # Reverse-index lookup FIRST, exemption second (B-review hardening): an
-  # exempt entry can only mute the escalation of a file the index cannot map —
-  # it can never hide existing mapped coverage. Every mapped non-python file
-  # adds its referencing tests to the selection; a single unmapped, non-exempt
-  # file escalates the whole push to the full suite (default-to-full).
+  # exempt entry can only mute the warning for a file the index cannot map —
+  # it can never hide existing mapped coverage.
   mapped=""
   if [ "$RINDEX" = "1" ]; then
     mapped="$(reverse_index_tests_for "$f")"
@@ -287,60 +258,27 @@ while IFS= read -r f; do
     EXEMPT_SKIPPED=$((EXEMPT_SKIPPED + 1))
   else
     has_other=1
-    UNMAPPED=1
     [ -n "$UNMAPPED_FILE" ] || UNMAPPED_FILE="$f"
     # Witness signal (issue #191): a changed *.sh with no referencing test is
-    # the testmon blind spot this gate exists to close — testmon tracks python
-    # imports only, so a bash-only edit re-exercised by subprocess/source
-    # (test_hub_afk and friends) is invisible to it. The unmapped file already
-    # escalates to the full suite below, but the full suite has no
-    # subprocess-sourcing suite for THIS script either, so it stays untested.
-    # Collect each such script for a distinct, greppable warning (fed to #187's
-    # fail-open audit as a witness); non-shell unmapped files don't qualify.
+    # the testmon blind spot — testmon tracks python imports only, so a bash-only
+    # edit re-exercised by subprocess/source is invisible to it. Collect each such
+    # script for a distinct, greppable warning (fed to #187's fail-open audit as a
+    # witness); non-shell unmapped files don't qualify.
     if is_shell "$f"; then
       UNMAPPED_SH="$UNMAPPED_SH$f"$'\n'
     fi
   fi
 done <<< "$FILES"
 
-# Emit the bash blind-spot witness (issue #191) before the tier decision so it
-# surfaces even when a green-tree stamp later short-circuits the run: the
-# coverage gap it names is a property of the diff, not of whether the suite ran.
-# Dedup with sort -u (as MAPPED_TESTS is above) so a script carried by two
-# pushed refs — the same path twice in FILES — is named once, not doubled into
-# the #187 audit stream.
+# Emit the bash blind-spot witness (issue #191). Dedup with sort -u so a script
+# carried by two pushed refs — the same path twice in FILES — is named once, not
+# doubled into the #187 audit stream.
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   note "WARNING (witness: unmapped-shell) $f — shell change with no referencing test; testmon is blind to shell, nothing re-exercises it. Add a test referencing its basename or a .test-select-exempt entry."
 done <<< "$(printf '%s' "$UNMAPPED_SH" | sort -u)"
 
-# The selection: deduped, and every entry must still exist — a mapping to a
-# vanished test proves nothing, so it escalates instead.
-SELECTED_TESTS=""
-if [ "$has_other" = "1" ] && [ "$UNMAPPED" = "0" ]; then
-  SELECTED_TESTS="$(printf '%s' "$MAPPED_TESTS" | sort -u)"
-  while IFS= read -r t; do
-    [ -n "$t" ] || continue
-    if [ ! -f "$t" ]; then
-      UNMAPPED=1
-      UNMAPPED_FILE="$t (mapped test missing)"
-    fi
-  done <<< "$SELECTED_TESTS"
-fi
-
-if [ "$CANNOT_PROVE" = "1" ]; then
-  DECISION=FULL
-elif [ "$has_other" = "1" ] && [ "$UNMAPPED" = "1" ]; then
-  DECISION=FULL
-elif [ "$has_other" = "1" ]; then
-  DECISION=SELECTED
-elif [ "$has_py" = "1" ]; then
-  DECISION=PYTHON
-else
-  DECISION=NOTHING
-fi
-
-if [ "$DECISION" = "NOTHING" ]; then
+if [ "$has_py" = "0" ] && [ "$has_other" = "0" ] && [ "$CANNOT_PROVE" = "0" ]; then
   if [ "$EXEMPT_SKIPPED" -gt 0 ]; then
     note "docs/exempt-only diff ($EXEMPT_SKIPPED exempt file(s), .test-select-exempt) — no tests to run"
   else
@@ -349,232 +287,86 @@ if [ "$DECISION" = "NOTHING" ]; then
   exit 0
 fi
 
-# ── A runner is required for PYTHON/SELECTED/FULL; none → fail closed (issue #213) ─
-# By here DECISION is PYTHON, SELECTED, or FULL — the NOTHING (docs-only/empty)
-# tier already exited 0 above, needing no runner. This diff demands tests but no
-# pytest resolves, so the tree CANNOT be proven green. Exiting 0 here would ship
-# an untested python diff on a silent pass — and mint no green-tree stamp, so the
-# post-land sweep never fires either. Fail closed instead, exactly as the bad-sha
-# path escalates rather than waving a diff through. TEST_SELECT_SKIP (handled
-# above) stays the explicit override for a runner-less checkout.
+# ── The fast selection: mapped test files that still exist + the meta-test ──────
+# A mapping to a vanished test proves nothing, so it is dropped rather than run.
+SEL_ARR=()
+MAPPED_FILES=()
+while IFS= read -r t; do
+  [ -n "$t" ] || continue
+  if [ -f "$t" ]; then
+    SEL_ARR+=("$t"); MAPPED_FILES+=("$t")
+  else
+    note "mapped test $t is missing — skipped"
+  fi
+done <<< "$(printf '%s' "$MAPPED_TESTS" | sort -u)"
+if [ -f "$META_TEST_FILE" ]; then
+  SEL_ARR+=("$META_TEST_NODE")
+fi
+
+# CI is the full gate: say so wherever the old gate would have escalated.
+[ "$CANNOT_PROVE" = "0" ] || note "diff range unresolved — running the mapped tests that exist; CI is the full gate"
+[ -z "$UNMAPPED_FILE" ] || note "unmapped non-exempt change ($UNMAPPED_FILE) — no mapped tests to run; CI is the full gate. Add a test referencing it or a .test-select-exempt entry."
+
+# ── A runner is required for anything that runs; none → fail closed (issue #213) ─
+# This diff demands tests but no pytest resolves, so the tree CANNOT be proven
+# green locally. Fail closed rather than shipping an untested diff on a silent
+# pass. TEST_SELECT_SKIP (handled above) stays the explicit override.
 RUNNER="$(detect_pytest "." || true)"
 if [ -z "$RUNNER" ]; then
-  note "no pytest available but this $DECISION diff demands tests — cannot prove the tree green; blocking the push. Install pytest (pip install -r requirements-dev.txt) or set TEST_SELECT_SKIP=1 to override deliberately."
+  note "no pytest available but this diff demands tests — cannot prove the tree green; blocking the push. Install pytest (pip install -r requirements-dev.txt) or set TEST_SELECT_SKIP=1 to override deliberately."
   exit 1
 fi
 read -r -a RUNNER_ARR <<< "$RUNNER"
 
-# pytest-xdist on the non-testmon legs (issue #276): the FULL suite and the SELECTED
-# mapped-files leg are I/O-bound and embarrassingly parallel, so run them under
-# `-n auto` (one worker per core). This is NEVER spliced into the `--testmon` legs:
-# testmon serializes a single-writer DB and `pytest --testmon -n auto` is unsupported.
-# Guarded on the plugin actually being present — an installed venv without pytest-xdist
-# degrades to single-process rather than erroring the push ("unrecognized -n").
-XDIST=()
-runner_has_xdist() {
+# Probe the runner's `--help` for a plugin flag. Capture the help text rather than
+# piping into grep: under pipefail an early -q match would SIGPIPE the (longer, real)
+# pytest --help into a non-zero exit and falsely report the plugin absent.
+runner_has() {
   local help=""
   help="$("${RUNNER_ARR[@]}" --help 2>/dev/null || true)"
   case "$help" in
-    *"-n numprocesses"*|*"--numprocesses"*) return 0 ;;
+    *"$1"*) return 0 ;;
     *) return 1 ;;
   esac
 }
-if runner_has_xdist; then
+
+# pytest-xdist on the mapped leg (issue #276): embarrassingly parallel, so run it under
+# `-n auto`. NEVER spliced into the `--testmon` leg: testmon serializes a single-writer DB.
+# Guarded on the plugin being present — a venv without pytest-xdist degrades to
+# single-process rather than erroring the push ("unrecognized -n").
+XDIST=()
+if runner_has "-n numprocesses" || runner_has "--numprocesses"; then
   XDIST=(-n auto)
 fi
 
-# Two-phase full run (issue #328): the serial tail. Tests that escape isolation and
-# rewrite real shared refs (the tripwire family) cannot run under xdist workers safely,
-# so a bare `-n auto` over the whole suite caps how well the parallel majority scales.
-# Split it: the parallel-safe bulk under `-n auto -m "not serial"`, then the ref-mutating
-# tail single-process under `-m serial` (never `-n`). Both bracketed by the SAME scoped
-# tripwire; the combined rc is the gate's verdict. The serial leg exits 5 ("no tests
-# collected") when nothing is marked serial (a fresh checkout, or a synced repo with no
-# serial tests) — a GREEN outcome, normalized so it never blocks a clean push.
-# $@ = the pytest prefix (GIT_HOOK_UNSET + RUNNER_ARR); XDIST / PUSH_SCOPE are read live.
-run_full_two_phase() {
-  local rc=0 rc2=0
-  note "full suite phase 1/2 — parallel bulk (-m 'not serial', ${XDIST[*]:-off})"
-  run_under_tripwire_scoped "$PUSH_SCOPE" "$@" ${XDIST[@]+"${XDIST[@]}"} -m "not serial" || rc=$?
-  note "full suite phase 2/2 — serial tail (single process, -m serial)"
-  run_under_tripwire_scoped "$PUSH_SCOPE" "$@" -m serial || rc2=$?
-  # Exit 5 = "no tests collected" — a GREEN outcome on EITHER leg: the serial leg when
-  # nothing is marked serial (a fresh checkout / a synced repo with none), and the
-  # parallel leg in the symmetric case of a suite with only serial tests. Normalize both
-  # so an empty phase never blocks a clean push.
-  [ "$rc" = "5" ] && rc=0
-  [ "$rc2" = "5" ] && rc2=0
-  [ "$rc" -ne 0 ] || rc=$rc2
-  return "$rc"
-}
-
-runner_has_testmon() {
-  # testmon advertises --testmon in `pytest --help` when its plugin is installed.
-  # Capture the help text rather than piping into grep: under pipefail an early
-  # -q match would SIGPIPE the (longer, real) pytest --help into a non-zero exit
-  # and falsely report testmon absent.
-  local help=""
-  help="$("${RUNNER_ARR[@]}" --help 2>/dev/null || true)"
-  case "$help" in
-    *--testmon*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# A mixed SELECTED diff needs testmon for its python part; without testmon the
-# python part demands the full suite (the same fallback as the PYTHON tier).
-if [ "$DECISION" = "SELECTED" ] && [ "$has_py" = "1" ] && ! runner_has_testmon; then
-  note "mixed diff but testmon not installed — full suite"
-  DECISION=FULL
-fi
-
-# ── Green-tree stamp consult (issue #122; set-aware selected tier #123-D) ───────
-# TIER_TO_RUN names the suite this gate is about to execute — that is both the
-# demand a stamp must cover and the tier a passing run proves. A python diff
-# without testmon runs (and therefore proves) the FULL suite. A SELECTED run's
-# proof is the exact set that ran (comma-joined), plus testmon for a mixed
-# diff — both travel with the demand and the mint.
-SET_CSV=""
-if [ "$DECISION" = "SELECTED" ]; then
-  TIER_TO_RUN=selected
-  SET_CSV="$(printf '%s' "$SELECTED_TESTS" | tr '\n' ',')"
-  SET_CSV="${SET_CSV%,}"
-elif [ "$DECISION" = "PYTHON" ] && runner_has_testmon; then
-  TIER_TO_RUN=testmon
-else
-  TIER_TO_RUN=full
-fi
-
-# The stamp env fingerprint is the resolved runner's own --version line (this
-# repo has been bitten by `pytest`-on-PATH and `python3.12 -m pytest` being
-# different interpreters). Probing INVOKES the runner outside the tripwire
-# bracket below, so it is deferred to the two spots that truly need it: a
-# candidate stamp to consume (pre-run) or a green run to mint (post-run).
-runner_fingerprint() { "${RUNNER_ARR[@]}" --version 2>/dev/null | head -n 1 || true; }
-
-# Consume: skip only when a stamp at least as strong as TIER_TO_RUN exists for
-# the CURRENT clean tree under the SAME runner fingerprint. A dirty working
-# tree yields no key (the suite would run against a tree other than HEAD's), so
-# it neither consumes here nor mints below — logged distinctly, exactly like
-# the stamp skip itself is distinct from the TEST_SELECT_SKIP hatch.
-STAMP_TREE=""
-STAMP_ENV=""
-STAMP_ENV_PROBED=0
-if [ "$STAMPS" = "1" ]; then
-  if STAMP_TREE="$(gate_stamp_tree)"; then
-    if gate_stamp_has "$STAMP_TREE"; then
-      STAMP_ENV="$(runner_fingerprint)"
-      STAMP_ENV_PROBED=1
-      # The two trailing args matter only for a selected demand (the set and
-      # whether the diff is mixed); full/testmon demands ignore them. An
-      # installed stamp lib predating #123-D also just ignores them.
-      if gate_stamp_check "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV" "$SET_CSV" "$has_py"; then
-        if [ "$TIER_TO_RUN" = "selected" ]; then
-          note "green-tree stamp covers tree $STAMP_TREE (this selection already proven for this env) — skipping suite"
-        else
-          note "green-tree stamp covers tree $STAMP_TREE (proven ≥ $TIER_TO_RUN for this env) — skipping suite"
-        fi
-        exit 0
-      fi
-    fi
-  else
-    STAMP_TREE=""
-    note "green-tree stamp: working tree dirty — no stamp consult or mint this run (suite runs as usual)"
-  fi
-fi
-
-# Every tier runs pytest under the repo-integrity tripwire (issue #31), scoped
-# to the refs this push updates (PUSH_SCOPE, issue #188): the run is bracketed
-# by a snapshot/verify of the pushed ref tips + HEAD + core.bare/worktree, so a
-# test that escapes isolation and mutates what this push ships aborts the push
-# (and the snapshot is restored — without ever rewinding a ref that only gained
-# commits; issue #135) instead of corrupting it silently. Refs outside the push
-# are concurrent-spoke territory (sibling commits, marker tags, completing
-# pushes) and are neither checked nor restored (#135, #188). Only
-# TEST_SELECT_SKIP (handled above) bypasses the gate.
+# Every leg runs pytest under the repo-integrity tripwire (issue #31), scoped to the
+# refs this push updates (PUSH_SCOPE, issue #188): a test that escapes isolation and
+# mutates what this push ships aborts the push (the snapshot is restored without ever
+# rewinding a ref that only gained commits; issue #135) instead of corrupting it.
 rc=0
-case "$DECISION" in
-  PYTHON)
-    if [ "$TIER_TO_RUN" = "testmon" ]; then
-      note "python-only diff — pytest --testmon"
-      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc=$?
-      # The meta-test rides along as its own invocation: mixing an explicit
-      # node id into --testmon would let testmon deselect it.
-      if [ -f "$META_TEST_FILE" ]; then
-        note "control-plane coverage meta-test"
-        rc2=0
-        run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "$META_TEST_NODE" || rc2=$?
-        [ "$rc" -ne 0 ] || rc=$rc2
-      fi
-    else
-      note "python-only diff but testmon not installed — full suite (parallel: ${XDIST[*]:-off})"
-      run_full_two_phase "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
-    fi
-    ;;
-  SELECTED)
-    SEL_ARR=()
-    while IFS= read -r t; do
-      [ -n "$t" ] && SEL_ARR+=("$t")
-    done <<< "$SELECTED_TESTS"
-    if [ -f "$META_TEST_FILE" ]; then
-      SEL_ARR+=("$META_TEST_NODE")
-    fi
-    note "mapped diff — selected test files: ${SEL_ARR[*]} (parallel: ${XDIST[*]:-off})"
-    run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" ${XDIST[@]+"${XDIST[@]}"} "${SEL_ARR[@]}" || rc=$?
-    if [ "$has_py" = "1" ]; then
-      # Dedup (issue #270): the mapped test files ALREADY ran, in full, above. When
-      # the changed .py IS a mapped mirror test (the common tooling shape: a *.sh
-      # and its test_*.py edited together), testmon would reselect that same file
-      # here because it changed — running the heaviest suite twice. --ignore each
-      # mapped file (and the meta file) so testmon collects everything EXCEPT them:
-      # any impacted test inside a mapped file already ran above, so nothing is
-      # missed and nothing double-runs. (--ignore, not an explicit node list, so
-      # testmon can never deselect a mapped node — the line-438 hazard is avoided.)
-      IGNORE_ARR=()
-      while IFS= read -r t; do
-        [ -n "$t" ] && IGNORE_ARR+=("--ignore=$t")
-      done <<< "$SELECTED_TESTS"
-      if [ -f "$META_TEST_FILE" ]; then
-        IGNORE_ARR+=("--ignore=$META_TEST_FILE")
-      fi
-      note "mixed diff — pytest --testmon for the python part (mapped files ran above; --ignore'd here so testmon can't double-run them)"
-      rc2=0
-      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon "${IGNORE_ARR[@]}" || rc2=$?
-      # Exit 5 = "no tests collected": when the mapped files ARE testmon's whole
-      # impact set, --ignore leaves testmon nothing to run. That is a GREEN outcome
-      # (everything testmon would run already ran above), the only exit-5 source on
-      # this leg — normalize it to success so the dedup never blocks a clean push.
-      if [ "$rc2" = "5" ]; then
-        note "mixed diff — testmon leg collected no tests after --ignore (mapped files were its whole impact set) — treating as green"
-        rc2=0
-      fi
-      [ "$rc" -ne 0 ] || rc=$rc2
-    fi
-    ;;
-  FULL)
-    if [ -n "$UNMAPPED_FILE" ]; then
-      note "unmapped non-exempt change ($UNMAPPED_FILE) — full suite; add a test referencing it or a .test-select-exempt entry (parallel: ${XDIST[*]:-off})"
-    else
-      note "non-python or unrecognized changes — full suite (parallel: ${XDIST[*]:-off})"
-    fi
-    run_full_two_phase "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
-    ;;
-esac
+if [ "${#SEL_ARR[@]}" -gt 0 ]; then
+  note "selected tests: ${SEL_ARR[*]} (parallel: ${XDIST[*]:-off})"
+  run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" ${XDIST[@]+"${XDIST[@]}"} "${SEL_ARR[@]}" || rc=$?
+fi
 
-# Mint: record only what a green run just proved (only the gate mints — the
-# scripted control plane). The stamp is a cache, never a gate: a failed write
-# must not block a legitimately green push.
-if [ "$rc" -eq 0 ] && [ "$STAMPS" = "1" ] && [ -n "$STAMP_TREE" ]; then
-  if [ "$STAMP_ENV_PROBED" = "0" ]; then
-    STAMP_ENV="$(runner_fingerprint)"
+if [ "$has_py" = "1" ]; then
+  if runner_has "--testmon"; then
+    # Dedup (issue #270): the selected files ALREADY ran, in full, above. --ignore each
+    # (and the meta file) so testmon collects everything EXCEPT them: any impacted test
+    # inside a selected file already ran, so nothing is missed and nothing double-runs.
+    # (--ignore, not an explicit node list, so testmon can never deselect a mapped node.)
+    IGNORE_ARR=()
+    for t in ${MAPPED_FILES[@]+"${MAPPED_FILES[@]}"}; do IGNORE_ARR+=("--ignore=$t"); done
+    [ ! -f "$META_TEST_FILE" ] || IGNORE_ARR+=("--ignore=$META_TEST_FILE")
+    note "python change — pytest --testmon (selected files ran above; --ignore'd so testmon can't double-run them)"
+    rc2=0
+    run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon ${IGNORE_ARR[@]+"${IGNORE_ARR[@]}"} || rc2=$?
+    # Exit 5 = "no tests collected": when the selected files ARE testmon's whole impact
+    # set, --ignore leaves it nothing to run — a GREEN outcome, never a block.
+    [ "$rc2" != "5" ] || rc2=0
+    [ "$rc" -ne 0 ] || rc=$rc2
+  else
+    note "python change but testmon not installed — only the selected tests ran; CI is the full gate"
   fi
-  # A selected mint records the set that ran; MINT_TESTMON=1 marks a mixed
-  # green run whose --testmon leg also passed (both legs share rc).
-  MINT_TESTMON=""
-  if [ "$DECISION" = "SELECTED" ] && [ "$has_py" = "1" ]; then
-    MINT_TESTMON=1
-  fi
-  gate_stamp_mint "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV" "$SET_CSV" "$MINT_TESTMON" \
-    || note "green-tree stamp: mint failed (non-fatal — next gate re-runs the suite)"
 fi
 exit "$rc"
