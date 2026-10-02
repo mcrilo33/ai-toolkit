@@ -508,13 +508,14 @@ _afk_landing_changed_files() {
 # resolver (inflight_issues + _afk_issue_scope -> the shared _afk_scope_line_of, #5/AC3). A gh
 # fetch failure emits an EMPTY scope, which _afk_scope_owner reads as fail-closed (AC4).
 _afk_live_scopes() {
-  local landing="$1" m scope
+  local landing="$1" m scope ms
+  ms="$(inflight_issues)" || { printf '?\t\n'; return 0; }   # #364: unknown set => empty-scope owner => refuse
   while IFS= read -r m; do
     [ -n "$m" ] || continue
     [ "$m" = "$landing" ] && continue
     scope="$(_afk_issue_scope "$m")" || scope=""   # gh fail -> empty -> fail-closed downstream
     printf '%s\t%s\n' "$m" "$scope"
-  done < <(inflight_issues)
+  done <<<"$ms"
 }
 
 # _afk_scope_owner <file> <map> -> the FIRST sibling number in <map> (from _afk_live_scopes)

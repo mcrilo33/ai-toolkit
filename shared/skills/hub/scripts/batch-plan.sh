@@ -997,14 +997,10 @@ _batch_inflight_issue_nums() {
   }
   printf '%s' "$out" | LC_ALL=C python3 -c '
 import json, sys
-try:
-    rows = json.load(sys.stdin)["result"]["worktrees"]
-except (ValueError, KeyError, TypeError):
-    sys.stderr.write("batch-plan: unparseable orca worktree list reply -- in-flight attribution dropped\n")
-    sys.exit(0)
-for row in rows:
+for row in json.load(sys.stdin)["result"]["worktrees"]:
     if not row.get("isMainWorktree") and row.get("linkedIssue") is not None:
-        print(row["linkedIssue"])'
+        print(row["linkedIssue"])' 2>/dev/null \
+    || echo "batch-plan: unparseable orca worktree list reply -- in-flight attribution dropped" >&2
 }
 
 # main — fetch the open backlog and print the next concurrent batch. Pass through any
