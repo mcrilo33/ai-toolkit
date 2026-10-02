@@ -47,8 +47,8 @@ After ANCHOR and before writing any code, a PLAN-gated spoke:
    is the message itself, never an empty or abbreviated stub deferred to an
    approval card.
 2. **Parks** by emitting the `gate/<issue>` marker (below) — which then **blocks in
-   `orca orchestration ask`** with an explicit "reply to approve, or tell me what to
-   change" until the coordinator replies — all **before writing code**. The hub planned the *what/why* (the issue); the PLAN gate is the *how*
+   `orca orchestration ask`** with an explicit ask to reply to approve, or tell me what to
+   change, until the coordinator replies — all **before writing code**. The hub planned the *what/why* (the issue); the PLAN gate is the *how*
    (it needs the codebase in front of it), so scope is not re-litigated twice.
 3. On approval, proceeds into the RED → GREEN → REVIEW → PUSH cycle below.
 
