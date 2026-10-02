@@ -458,3 +458,47 @@ def test_parked_allows_write_with_env_override(parked_spoke: Path) -> None:
     )
 
     assert result.returncode == ALLOW, result.stdout + result.stderr
+
+
+# ── Identity record (#360): the record names the issue, the branch slug is the fallback ──
+
+
+def _write_identity(root: Path, text: str) -> None:
+    (root / ".ai-toolkit").mkdir(exist_ok=True)
+    (root / ".ai-toolkit" / "identity").write_text(text)
+
+
+def test_identity_record_names_the_issue_on_a_non_slug_branch(spoke: Path) -> None:
+    # Orca "half spoke": branch `orca-migration` carries no issue number, the record does.
+    _git(spoke, "branch", "-m", "orca-migration")
+    _write_identity(spoke, "issue=360\n")
+    _git(spoke, "tag", "-a", "gate/360", "-m", "plan")
+
+    result = run_guard(_edit_payload("Write"), spoke)
+
+    assert result.returncode == BLOCK, result.stdout + result.stderr
+
+
+def test_identity_record_wins_over_a_contradicting_branch_slug(parked_spoke: Path) -> None:
+    # Branch slug says 173 (and gate/173 is at the tip), the record says 360 → not parked.
+    _write_identity(parked_spoke, "issue=360\n")
+
+    result = run_guard(_edit_payload("Write"), parked_spoke)
+
+    assert result.returncode == ALLOW, result.stdout + result.stderr
+
+
+def test_no_identity_record_falls_back_to_the_branch_slug(parked_spoke: Path) -> None:
+    assert not (parked_spoke / ".ai-toolkit" / "identity").exists()
+
+    result = run_guard(_edit_payload("Write"), parked_spoke)
+
+    assert result.returncode == BLOCK, result.stdout + result.stderr
+
+
+def test_empty_identity_issue_falls_back_to_the_branch_slug(parked_spoke: Path) -> None:
+    _write_identity(parked_spoke, "issue=\nlane=spoke\n")
+
+    result = run_guard(_edit_payload("Write"), parked_spoke)
+
+    assert result.returncode == BLOCK, result.stdout + result.stderr

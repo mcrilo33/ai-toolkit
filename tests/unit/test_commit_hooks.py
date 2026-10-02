@@ -282,6 +282,35 @@ def test_anchor_in_branch_passes(on_branch: Callable[[str], Path]) -> None:
     assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: y"', cwd=repo) == ALLOW
 
 
+def _write_identity(repo: Path, text: str) -> None:
+    (repo / ".ai-toolkit").mkdir(exist_ok=True)
+    (repo / ".ai-toolkit" / "identity").write_text(text)
+
+
+def test_anchor_in_identity_record_passes_on_an_unanchored_branch(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Orca "half spoke": the branch names no issue, the record does.
+    repo = on_branch("orca-migration")
+    _write_identity(repo, "issue=360\n")
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: y"', cwd=repo) == ALLOW
+
+
+def test_anchor_empty_identity_issue_falls_back_to_the_branch(
+    on_branch: Callable[[str], Path],
+) -> None:
+    repo = on_branch("orca-migration")
+    _write_identity(repo, "issue=\nlane=express\n")
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: y"', cwd=repo) == BLOCK
+
+
+def test_anchor_without_identity_record_still_reads_the_branch(
+    on_branch: Callable[[str], Path],
+) -> None:
+    repo = on_branch("feat/PROJ-12-thing")
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: y"', cwd=repo) == ALLOW
+
+
 def test_anchor_substring_keyword_does_not_count(on_branch: Callable[[str], Path]) -> None:
     repo = on_branch("no-issue-here")
     # "prefix #5" must not satisfy the "ref" keyword as a substring.
