@@ -131,7 +131,7 @@ issue's `-250` target; the net is still negative and tests shrink by far more.
 | `scripts/orca-lib.sh` (new) | 0 | 102 | +102 |
 | `scripts/worktree-new.sh` | 599 | 469 | -130 |
 | `scripts/worktree-quick.sh` | 162 | 125 | -37 |
-| `scripts/worktree-lib.sh` (`wt_workspace_add`, module loop) | 844 | 837 | -7 |
+| `scripts/worktree-lib.sh` (review-workspace add helper, module loop) | 844 | 837 | -7 |
 | `scripts/provision-worktree.sh` (flags, `--identity-only`, `WT_SPOKE`) | 581 | 612 | +31 |
 | `hub-afk-arm.sh` (Orca guard) | 531 | 546 | +15 |
 | `hub-otel-watch.sh` | 270 | 268 | -2 |

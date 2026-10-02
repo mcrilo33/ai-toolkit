@@ -1064,9 +1064,9 @@ reap_pass() {
 
 # _redispatch_dead_pane <wt> <issue> -> tear down a clean, empty crashed worktree so its
 # issue returns to the backlog and re-dispatches next tick. Kills the window, then removes
-# the worktree via worktree-done.sh (--force since the pane is dead; --no-code skips the
-# editor-workspace edit). Records the once-per-window stamp on success. AFK_REDISPATCH_CMD
-# overrides the teardown for tests. rc 1 when the teardown can't run (caller escalates).
+# the worktree via worktree-done.sh (--force since the pane is dead). Records the once-per-window
+# stamp on success. AFK_REDISPATCH_CMD overrides the teardown for tests. rc 1 when the teardown
+# can't run (caller escalates).
 _redispatch_dead_pane() {
   local wt="$1" issue="$2" wt_done run
   # #300 step 3: read the run id BEFORE the teardown — worktree-done.sh removes the worktree,
@@ -1083,7 +1083,7 @@ _redispatch_dead_pane() {
   fi
   wt_done="$(_afk_find_script "${WT_DONE:-}" worktree-done.sh)" \
     || { log "  worktree-done.sh not found — cannot re-dispatch #$issue"; return 1; }
-  if bash "$wt_done" "$issue" --force --no-code >/dev/null 2>&1; then
+  if bash "$wt_done" "$issue" --force >/dev/null 2>&1; then
     _afk_mark_redispatched "$issue"
     AFK_TLOG_RUN="$run" wt_tlog_transition "$issue" redispatched hub-afk.sh \
       "pane crashed with no work to preserve — tore down the empty worktree to re-dispatch" \

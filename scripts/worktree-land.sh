@@ -6,11 +6,10 @@
 # branch, after the spoke has pushed — never from inside a worktree.
 #
 # Usage:
-#   scripts/worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--local] [--force-land] [--test-cmd <cmd>]
+#   scripts/worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--local] [--force-land] [--test-cmd <cmd>]
 #
 #   <issue|slug|branch|path>  anything that identifies the task worktree
 #   --skip-tests              skip the pre-push test gate (threads TEST_SELECT_SKIP=1)
-#   --keep-branch             keep the branch after landing (passed to worktree-done.sh)
 #   --local                   micro-spoke path: skip upstream guards and accept a bare
 #                             local branch with no registered worktree (the hub's diff
 #                             review is the gate; merge+push is what ships the work)
@@ -36,8 +35,8 @@
 #   merge   --ff-only when possible, else a merge commit (plain `git merge`)
 #   ship    push origin <default> — the pre-push hook is the test gate; a rejected
 #           push (gate failed or remote refused) rolls back `git reset --keep`.
-#           Then worktree-done.sh → `gh issue close` (numeric ids)
-#   tmux    kill the task's window in the project session when its pane path is gone
+#           Then ingest → worker-release → worktree-done.sh (`orca worktree rm`) → `gh issue close`
+#   release the spoke's Orca worker (`worker-release`), then tear down via worktree-done.sh --no-hooks
 #
 set -euo pipefail
 
@@ -194,26 +193,24 @@ WT_T0="$(wt_now_ms)"
 
 TARGET=""
 SKIP_TESTS=""
-KEEP_BRANCH=""
 LOCAL=""
 FORCE_LAND=""
 TEST_CMD=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --skip-tests)  SKIP_TESTS=1; shift ;;
-    --keep-branch) KEEP_BRANCH=1; shift ;;
     --local)       LOCAL=1; shift ;;
     --force-land)  FORCE_LAND=1; shift ;;
     --test-cmd)    [ "$#" -ge 2 ] || wt_die "--test-cmd needs a value"; TEST_CMD="$2"; shift 2 ;;
     --test-cmd=*)  TEST_CMD="${1#--test-cmd=}"; shift ;;
-    -*)            wt_die "unknown option: $1 (supported: --skip-tests, --keep-branch, --local, --force-land, --test-cmd)" ;;
+    -*)            wt_die "unknown option: $1 (supported: --skip-tests, --local, --force-land, --test-cmd)" ;;
     *)
       [ -z "$TARGET" ] || wt_die "unexpected extra argument: $1"
       TARGET="$1"; shift
       ;;
   esac
 done
-[ -n "$TARGET" ] || wt_die "usage: worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--local] [--force-land] [--test-cmd <cmd>]"
+[ -n "$TARGET" ] || wt_die "usage: worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--local] [--force-land] [--test-cmd <cmd>]"
 
 # --- guards: the hub ----------------------------------------------------------
 git rev-parse --git-dir >/dev/null 2>&1 || wt_die "run this from inside your checkout (cd into the repo first)"
@@ -239,50 +236,6 @@ HUB_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
 # LAND_LOCK_WAIT_MAX.
 acquire_land_lock
 
-# wt_pane_stranded <path> -> a tmux pane's cwd is teardown RESIDUE, not a live
-# worktree: it is gone, OR its only surviving entries are the gitignored scratch
-# dirs (.ai-toolkit telemetry / .claude) that a still-running spoke's OTel exporter
-# recreates by absolute path AFTER the worktree is removed (issue #273). The
-# pre-#273 sweeps killed only on a fully-vanished dir, so a recreated .ai-toolkit
-# read as "live" and kept the zombie window alive. worktree-new.sh git-excludes
-# both dirs, so neither is ever tracked worktree content. Force LC_ALL=C so a stray
-# non-ASCII filename can't break the match on this non-C dev host.
-wt_pane_stranded() {
-  local path="$1" rest
-  # A gone (or empty/unreadable) pane cwd is stranded, as the pre-#273 sweeps had it.
-  [ -d "$path" ] || return 0
-  rest="$(LC_ALL=C ls -A "$path" 2>/dev/null | LC_ALL=C grep -vxE '\.ai-toolkit|\.claude' || true)"
-  [ -z "$rest" ]
-}
-
-# kill_spoke_windows <tag> -> SIGKILL the landed spoke's tmux window(s) by NAME (the
-# reap-path shape of _kill_spoke_window in hub-afk.sh), UNCONDITIONALLY. Called on
-# the land teardown AFTER the post-run telemetry ingest has read the settled state
-# but BEFORE worktree-done.sh removes the worktree — so the spoke's OTel exporter is
-# dead and cannot recreate <wt>/.ai-toolkit by absolute path (issue #273), which
-# would else make the dir-existence sweeps keep the window and strand a zombie
-# claude. Unconditional for the landed issue: its spoke is finished by definition at
-# land time (the guards above proved it pushed + carries the ready marker). Scoped
-# to <tag> so a sibling issue's genuinely-live window is never touched.
-kill_spoke_windows() {
-  command -v tmux >/dev/null 2>&1 || return 0
-  local tag="$1" sess win name path
-  [ -n "$tag" ] || return 0
-  sess="$(wt_tmux_session "$REPO_ROOT")"
-  while IFS=$'\t' read -r win name path; do
-    [ -n "$win" ] || continue
-    case "$name" in
-      "$tag"|"$tag"-*) ;;
-      *) continue ;;
-    esac
-    if tmux kill-window -t "$win" 2>/dev/null; then
-      echo "✓ killed landed spoke's tmux window '$name' ($win)"
-    else
-      wt_warn "couldn't kill tmux window '$name' ($win) — close it by hand"
-    fi
-  done < <(tmux list-windows -t "=$sess" -F $'#{window_id}\t#{window_name}\t#{pane_current_path}' 2>/dev/null || true)
-}
-
 # land_resume_finalize <target> -> clean up the residue of a spoke whose land was
 # killed AFTER the worktree was removed but BEFORE its branch/tag/issue were cleaned up
 # (issue #151): a caller-timeout mid-teardown. Engages ONLY when <target> is a bare
@@ -298,7 +251,7 @@ kill_spoke_windows() {
 # It NEVER re-merges or re-pushes. Returns 1 (no-op) when no resume signal exists, so
 # the caller aborts exactly as before.
 land_resume_finalize() {
-  local target="$1" issue marker_sha fetch_ok br br_tip state sess win name path
+  local target="$1" issue marker_sha fetch_ok br br_tip state
   [[ "$target" =~ ^[0-9]+$ ]] || return 1
   issue="$target"
   marker_sha="$(git rev-parse -q --verify "refs/tags/ready/${issue}^{commit}" 2>/dev/null || true)"
@@ -364,17 +317,6 @@ land_resume_finalize() {
     fi
   fi
 
-  # Kill the stranded tmux window: its pane cwd vanished with the worktree, or a
-  # still-live exporter recreated it as .ai-toolkit-only scratch (issue #273).
-  if command -v tmux >/dev/null 2>&1; then
-    sess="$(wt_tmux_session "$REPO_ROOT")"
-    while IFS=$'\t' read -r win name path; do
-      [ -n "$win" ] || continue
-      case "$name" in "$issue" | "$issue"-*) ;; *) continue ;; esac
-      wt_pane_stranded "$path" && tmux kill-window -t "$win" 2>/dev/null || true
-    done < <(tmux list-windows -t "=$sess" -F $'#{window_id}\t#{window_name}\t#{pane_current_path}' 2>/dev/null || true)
-  fi
-
   echo "✓ finalized partially-landed issue #$issue (resumed teardown)"
   return 0
 }
@@ -383,13 +325,8 @@ land_resume_finalize() {
 WT_DIR=""
 WT_BRANCH=""
 if WT_DIR="$(wt_resolve "$TARGET" "$REPO_ROOT")"; then
-  # Normal worktree path: resolve branch from the registered worktree list.
-  while IFS=$'\t' read -r wt br; do
-    if [ "$wt" = "$WT_DIR" ]; then
-      WT_BRANCH="$br"
-      break
-    fi
-  done < <(wt_task_worktrees "$REPO_ROOT")
+  # Normal worktree path: the branch is the one Orca lists for it.
+  WT_BRANCH="$(wt_branch_of "$WT_DIR" "$REPO_ROOT")"
   [ -n "$WT_BRANCH" ] || wt_die "worktree $WT_DIR is on a detached HEAD — nothing to land"
 
   # Untracked files count as dirty: `git worktree remove` would refuse them later,
@@ -1005,7 +942,7 @@ fi
 # An OTel spoke (AI_TOOLKIT_OTEL=1) only streams native traces live; the loaded-
 # context itemization (#87) and transcript backfill (#92) are post-run steps that
 # must read a SETTLED state, so run them now — after the push lands but BEFORE the
-# tmux/worktree teardown SIGKILLs the spoke (dropping in-flight spans) and removes
+# worker release / worktree teardown stops the spoke (dropping in-flight spans) and removes
 # the worktree (taking its spoke-run-id + raw request bodies with it). The helper
 # self-gates (not-an-OTel spoke, no LANGFUSE_BASIC_AUTH) and is best-effort: it
 # never fails the land, so it never blocks shipping. No worktree (--local) → no-op.
@@ -1043,17 +980,20 @@ fi
 # at the end so the caller can tell "nothing shipped" (1) from "shipped, cleanup incomplete" (3).
 CLEANUP_INCOMPLETE=""
 if [ -n "$WT_DIR" ]; then
-  # Reap the spoke's tmux window (SIGHUP-ing its pane claude) NOW — after the ingest
-  # above read the settled state, but BEFORE worktree-done.sh removes the worktree —
-  # so the exporter is dead and cannot recreate <wt>/.ai-toolkit by absolute path
-  # (issue #273). Doing it here, by name, replaces the dir-existence heuristic the
-  # end-of-land cleanup_tmux relied on, which a recreated .ai-toolkit defeated.
-  kill_spoke_windows "${ISSUE:-$BSLUG}"
-  # WT_DONE seams the teardown for tests (default: the sibling worktree-done.sh). A failure is
-  # post-ship residue, not a land failure — warn and flag the sentinel, never abort under set -e.
-  bash "${WT_DONE:-$SCRIPT_DIR/worktree-done.sh}" "$WT_DIR" ${KEEP_BRANCH:+--keep-branch} \
+  # Release the spoke's Orca worker NOW -- after the ingest above read the settled state, before the
+  # removal -- so its terminal closes and the OTel exporter stops (the old tmux reap's job, #273).
+  # No recorded dispatch (a non-Orca lane) => nothing to release; a failure warns and goes on.
+  DISPATCH_ID="$(ai_toolkit_identity_get orca_dispatch_id "$WT_DIR" 2>/dev/null || true)"
+  if [ -n "$DISPATCH_ID" ]; then
+    orca_json orchestration worker-release --dispatch "$DISPATCH_ID" \
+      || wt_warn "orca worker-release failed for dispatch $DISPATCH_ID -- continuing: ${ORCA_ERR:-$ORCA_OUT}"
+  fi
+  # WT_DONE seams the teardown for tests (default: the sibling worktree-done.sh). --no-hooks: this land
+  # already ingested, so Orca's archive hook would ingest the spoke a second time. A failure is
+  # post-ship residue, not a land failure -- warn and flag the sentinel, never abort under set -e.
+  bash "${WT_DONE:-$SCRIPT_DIR/worktree-done.sh}" "$WT_DIR" --no-hooks \
     || { wt_warn "worktree-done teardown failed for $WT_DIR — main already advanced ($MERGED_SHA is on $DEFAULT); finish the teardown by hand"; CLEANUP_INCOMPLETE=1; }
-elif [ -z "$KEEP_BRANCH" ]; then
+else
   # Bare-branch mode: the worktree is already gone; just delete the merged local branch.
   # Safe — just merged; warn rather than abort if deletion fails.
   git branch -d "$WT_BRANCH" \
@@ -1111,37 +1051,6 @@ if [ -n "$ISSUE" ]; then
   rm -rf "${AFK_STATE_DIR:-$_q_common/ai-toolkit-afk}/queued-$ISSUE" 2>/dev/null || true
   unset _q_common
 fi
-
-# --- tmux: kill the task's stranded window in the project session -----------------
-# Spokes live as windows of the project's tmux session (issue #39: derived from
-# the repo root, '<parent>-<base>'), named "<id>" or "<id>-<slug>". A window is
-# stranded when its pane's cwd vanished with the worktree — or was recreated as
-# .ai-toolkit-only scratch by a live exporter (issue #273); live windows are kept.
-# The primary reap above (kill_spoke_windows) already handles this issue's window
-# before teardown; this end-sweep is the backstop. The session name MUST match
-# worktree-new.sh's spawn target, so derive it the same way ('=' pins the exact
-# match so a sibling session can't be enumerated).
-TAG="${ISSUE:-$BSLUG}"
-cleanup_tmux() {
-  command -v tmux >/dev/null 2>&1 || return 0
-  local sess win name path
-  sess="$(wt_tmux_session "$REPO_ROOT")"
-  while IFS=$'\t' read -r win name path; do
-    [ -n "$win" ] || continue
-    case "$name" in
-      "$TAG"|"$TAG"-*) ;;
-      *) continue ;;
-    esac
-    if wt_pane_stranded "$path"; then
-      if tmux kill-window -t "$win" 2>/dev/null; then
-        echo "✓ killed stranded tmux window '$name' ($win)"
-      else
-        wt_warn "couldn't kill tmux window '$name' ($win) — close it by hand"
-      fi
-    fi
-  done < <(tmux list-windows -t "=$sess" -F $'#{window_id}\t#{window_name}\t#{pane_current_path}' 2>/dev/null || true)
-}
-cleanup_tmux
 
 # --- conditional post-land background sweep (issue #124) --------------------------
 # If the gate that certified the landed tree ran a PRUNED set (a testmon/selected

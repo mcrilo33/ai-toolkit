@@ -118,7 +118,8 @@ path, which resolves identically in the ai-toolkit checkout and in the synced ta
 so no sync-time path rewrite is needed.
 
 The scripts locate the main checkout by git introspection (`wt_main_root` via
-`git worktree list`) and source their siblings by their own directory, so they run
+`git worktree list`), look task worktrees up through `orca worktree list` (identity.sh
+rides along for the issue column), and source their siblings by their own directory, so they run
 unmodified from `.ai-toolkit/scripts/` in a foreign repo. After a sync, run `/hub` in
 `my-project` and the dashboard, dispatch, and land commands work there directly.
 
@@ -219,11 +220,10 @@ issue #119) so the multi-minute in-push gate can't stale the connection (the
 completion-marker tag push stays plain — tag-only pushes skip the gate on a fresh
 connection); if the gate ran green and the transfer still died, the land retries once
 with `TEST_SELECT_SKIP=1` — loudly — and a failed gate never retries. On success it
-calls
-`worktree-done.sh` for the teardown mirror of creation — `code --remove` drops the
-folder from the review window (S5, #364, moves teardown onto Orca), and the now-merged branch is pruned local + origin
-(`--keep-branch` to keep it). An unmerged branch is never pruned. It then closes the
-issue via `gh` and kills the task's stranded tmux window.
+releases the spoke's Orca worker (`worker-release`, which closes its terminal) and calls
+`worktree-done.sh --no-hooks` — an `orca worktree rm` — then the now-merged branch is
+pruned local + origin. An unmerged branch is never pruned. It then closes the issue via
+`gh`. Orca refusing the removal exits 3 (shipped, cleanup incomplete), never 1.
 
 Landing is hub-owned by **role**, not directory. `worktree-new.sh` stamps each spoke
 session with a `WT_SPOKE=<issue-or-slug>` env var that rides every command it runs, so
@@ -287,27 +287,29 @@ dropped. `[type]` must be `feature` (default), `fix`, or `chore`.
 ## `worktree-done.sh` reference
 
 ```
-scripts/worktree-done.sh <issue|slug|branch|path> [--force] [--no-code] [--keep-branch]
+scripts/worktree-done.sh <issue|slug|branch|path> [--force] [--no-hooks]
 ```
 
-Resolves the target against the live `git worktree list` — by issue number, slug,
-branch name, or path — and removes it. On no match or an ambiguous match it **lists the
-existing worktrees** instead of failing with a dead-end error.
+Resolves the target against `orca worktree list` — by issue (Orca's `linkedIssue`, else the
+identity record), full branch, branch leaf, Orca display name, or path — and removes it with
+`orca worktree rm`. On no match or an ambiguous match it **lists the existing worktrees**
+instead of failing with a dead-end error. If Orca cannot answer (missing, unreachable, repo
+unregistered) it stops loudly: an empty list is never assumed.
 
-Teardown then mirrors `worktree-new.sh`: it folds the folder out of the VS Code review
-window (`code --remove`) and prunes the worktree's branch. The branch is pruned **only
-when it is fully merged** into the hub's current branch — local *and* `origin/<branch>`
-are deleted automatically. An unmerged branch is kept untouched, with a push/merge-first
-hint. `code` and remote failures warn but never abort: the worktree removal still
-succeeds.
+The branch is pruned **only when it is fully merged** into the hub's base branch — local
+*and* `origin/<branch>` are deleted. Orca may delete the local branch of its own accord, so
+the tip and merged-ness are recorded before the removal and an unmerged branch is put back
+afterwards, with a push/merge-first hint. If Orca refuses the removal the script exits
+non-zero with Orca's error; a CLI drop (`runtime_unavailable`) is settled by checking that the
+worktree is gone, never by re-issuing the removal.
 
 | Flag | Effect |
 |------|--------|
 | `--force` | remove a worktree with uncommitted or untracked changes |
-| `--no-code` | don't fold the folder out of VS Code (`code --remove`) |
-| `--keep-branch` | keep the branch even when it is fully merged |
+| `--no-hooks` | skip Orca's archive hook (`worktree-land.sh` passes it: land ingested already) |
 
-All three flags are position-independent.
+Both flags are position-independent. Removals outside a land (abandoning a spoke) run the
+archive hook, which spools the spoke's raw bodies for the telemetry consumer.
 
 ## tmux
 

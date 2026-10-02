@@ -614,14 +614,14 @@ sync_workflow_scripts() {
     local dst_dir="$TARGET/.ai-toolkit/scripts"
     make_dir "$dst_dir"
 
-    # telemetry.sh and base-branch.sh are co-located here (not only under
+    # telemetry.sh, base-branch.sh, enabled.sh and identity.sh are co-located here (not only under
     # hooks/lib/) so the worktree scripts can source them as siblings — see
     # worktree-lib.sh's telemetry and base-branch blocks.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh orca-lib.sh worktree-otel-lib.sh worktree-gh-lib.sh worktree-quick.sh ensure-test-venv.sh provision-worktree.sh archive-worktree.sh spoke-push.sh spoke-ready.sh spoke-relaunch.sh gate-sweep.sh travel-local.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh hub-afk-land.sh hub-afk-dispatch.sh hub-afk-arm.sh hub-afk-supervise.sh hub-afk-recover.sh hub-afk-state.sh hub-agent.sh gate-broker.sh gate-broker-markers.sh gate-broker-detect.sh gate-broker-classify.sh gate-broker-danger.sh gate-broker-answerer.sh gate-broker-permission.sh transition-log.sh hub-inject.sh hub-watchdog.sh hub-watchdog-detect.sh hub-watchdog-intervene.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh orca-lib.sh worktree-otel-lib.sh worktree-gh-lib.sh worktree-quick.sh ensure-test-venv.sh provision-worktree.sh archive-worktree.sh spoke-push.sh spoke-ready.sh spoke-relaunch.sh gate-sweep.sh travel-local.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh hub-afk-land.sh hub-afk-dispatch.sh hub-afk-arm.sh hub-afk-supervise.sh hub-afk-recover.sh hub-afk-state.sh hub-agent.sh gate-broker.sh gate-broker-markers.sh gate-broker-detect.sh gate-broker-classify.sh gate-broker-danger.sh gate-broker-answerer.sh gate-broker-permission.sh transition-log.sh hub-inject.sh hub-watchdog.sh hub-watchdog-detect.sh hub-watchdog-intervene.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh identity.sh; do
         case "$name" in
             hub-status.sh|hub-ready-watch.sh|hub-notify.sh|hub-otel-watch.sh|hub-afk.sh|hub-afk-land.sh|hub-afk-dispatch.sh|hub-afk-arm.sh|hub-afk-supervise.sh|hub-afk-recover.sh|hub-afk-state.sh|hub-agent.sh|gate-broker.sh|gate-broker-markers.sh|gate-broker-detect.sh|gate-broker-classify.sh|gate-broker-danger.sh|gate-broker-answerer.sh|gate-broker-permission.sh|transition-log.sh|hub-inject.sh|hub-watchdog.sh|hub-watchdog-detect.sh|hub-watchdog-intervene.sh|batch-plan.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
-            telemetry.sh|base-branch.sh|enabled.sh)      src="$SHARED_DIR/hooks/lib/$name" ;;
+            telemetry.sh|base-branch.sh|enabled.sh|identity.sh)      src="$SHARED_DIR/hooks/lib/$name" ;;
             *)                                src="$SCRIPT_DIR/$name" ;;
         esac
         [ -f "$src" ] || continue
