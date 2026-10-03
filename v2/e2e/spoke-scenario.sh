@@ -68,7 +68,8 @@ cp "$V2"/scripts/*.sh "$S/.ai-toolkit/scripts/"; cp "$V2/bin/claude-spoke" "$S/.
 cp "$V2/settings/ai-toolkit.env" "$S/.ai-toolkit/ai-toolkit.env"
 echo '#!/bin/sh' > "$S/.claude/hooks/guard.sh"
 mkdir -p "$S/.claude/agents" "$S/.ai-toolkit/rules"   # what sync.sh will ship: the review agent and the answering rule
-cp "$V2/../shared/agents/code-review.md" "$S/.claude/agents/"; cp "$V2/../shared/rules/on-demand/afk-answering.md" "$S/.ai-toolkit/rules/"
+SH="$V2/shared"; [ -d "$SH" ] || SH="$V2/../shared"   # shared/ sits beside v2/ until the cutover, inside the root after it
+cp "$SH/agents/code-review.md" "$S/.claude/agents/"; cp "$SH/rules/on-demand/afk-answering.md" "$S/.ai-toolkit/rules/"
 # Stub GitHub for dispatch/land/setup: AI_TOOLKIT_GH in the local env (setup runs in Orca's terminal, not this PATH).
 body="Create hello.txt in the repo root containing exactly the word hello, then commit it.\n\nScope: hello.txt\nGate: plan\nModel: $SPOKE_MODEL ${E2E_EFFORT:-low}"
 jq -n --arg b "$(printf '%b' "$body")" '{number: 1, title: "Add hello.txt", body: $b}' > "$E/issue.json"
