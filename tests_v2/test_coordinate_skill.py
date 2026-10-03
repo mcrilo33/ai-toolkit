@@ -28,7 +28,7 @@ def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
     "orca orchestration run-use --id", "orca orchestration run-create", "--from $H", "check --run", "--ack", "reply --run", "--id <message-id>",
     '"approve"', '"revise: ', "land.sh --review", "dispatch.sh --address", "dispatch.sh --next", "coordinator.sh --status",
     "/coordinate auto", "--answer auto", "--until HH:MM", "--drain", "/coordinate attended", "coordinator.sh --stop --run", "You have", "heartbeat",
-    "land.sh --cleanup-only", "worker-release", "blocked"])
+    "land.sh --cleanup-only", "worker-release", "blocked", "thread_id", "a land is in flight"])
 def test_the_skill_covers_each_mechanic_of_the_brief(needle):
     assert needle in SKILL
 
@@ -65,3 +65,12 @@ def test_afk_and_hub_point_at_coordinate_instead_of_duplicating_it():
 def test_the_architecture_doc_describes_both_modes_the_switch_and_the_attended_flow():
     doc = Path(ROOT / "docs/v2/architecture.md").read_text()
     assert all(w in doc for w in ("/coordinate", "attended", "--stop", "taken back", "```mermaid"))
+
+
+def test_between_stop_and_its_exit_the_session_handles_nothing():
+    attended = section("`/coordinate attended`")
+    assert re.search(r"must not (check|handle)", attended) and re.search(r"exits? 0", attended)
+
+
+def test_hub_lands_with_the_review():
+    assert "land.sh --review" in (SHARED / "skills/hub/SKILL.md").read_text()

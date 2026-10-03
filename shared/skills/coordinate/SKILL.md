@@ -38,7 +38,9 @@ orca orchestration check --run <run> --terminal $H --ack <deliveryId> --json    
 The ack call may return the next batch: handle it the same way. A batch of only `heartbeat` or `status` messages: ack and say nothing.
 The issue of a message: its `dispatchId` (payload) in `orca orchestration worker-list --run <run> --json` gives `.resource.worktreeId`
 (path after `::`), whose `.linkedIssue` is in `orca worktree list --json`. After a hand-over the Run replays the batch the loop did not
-ack: a `worker_done` whose issue is already closed (`gh issue view <n> --json state`) or a question already answered is ack-and-ignore.
+ack. Ack-and-ignore a `worker_done` whose issue is already closed (`gh issue view <n> --json state`) and a question already answered (in
+`orca orchestration inbox --full --json` a message of this Run whose `thread_id` is the question's id). A `worker_done` whose issue is still
+OPEN while `coordinator.sh --status` says `coordinator.sh` holds the Run means a land is in flight: wait, never land it yourself.
 
 **`question`** (a worker's PLAN gate): show the issue (`gh issue view <n>`, its `Scope:`/`Gate:` footer), the plan, and what bears on it
 (the files it touches, the acceptance criteria, conflicts with other live issues). Say what you would answer and why, then discuss. Never approve blindly: no reply before the user decided, unless they said in this conversation to approve a class of plans. Turn their
@@ -100,7 +102,8 @@ ready and no worker is live.
 ```
 
 This terminal takes the Run back (Orca fences the loop, which exits 0 with "taken back by") and the command waits until the loop is gone;
-exit 1 = still finishing a step (a land): wait and run it again. Then `check` the Run (it replays what the loop left unacked) and summarize
+exit 1 = still finishing a step (a land): run it again until it exits 0. Until then you must not check, handle or land anything: the loop
+may be mid-land and a second land would race it. Once `--stop` exits 0, `check` the Run (it replays what the loop left unacked) and summarize
 what happened while away **from Orca, git and GitHub only** (never from files the loop keeps), since the switch time:
 
 - Landed: `git fetch` then `git log --since=<switch time> --oneline origin/<base>`; `gh issue list --state closed --search "closed:>=<date>"`.
@@ -115,4 +118,3 @@ Present blocked issues and pending questions first, then lands, then running wor
 - A bare `orca orchestration reply` only works from the bound terminal: when the loop holds the Run, a human answers with
   `coordinator.sh --run <run> --reply <message-id> approve`; the loop sends it at its next wake.
 - Surface what the user must decide (gates, blocked issues, rejected reviews) before what runs fine; one recommendation, not a menu.
-- Shared state changes (labels, comments, re-dispatch, worktree removal) come from the scripts above, never hand-rolled git.

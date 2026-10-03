@@ -95,7 +95,8 @@ returns `consumer_fenced` at once. So re-binding IS the stop mechanism: no signa
 the top of a tick, before each message, before the ack, before it would label an issue `blocked`), logs `Run <id> taken back by <handle>` and exits 0: it never
 retries and never acks, the unfinished batch replays to the new holder (the session ignores a replay for an issue already closed). `--stop` also waits (bounded) until
 the loop has really exited, because a land may be in flight; exit 1 means it is still finishing a step. `--status` prints `held by: coordinator.sh (<mode>)`,
-`held by: a session (<handle>)` or `held by: nobody`: the mode comes from `holder.<pid>` in the spool dir (display only, a dead pid or another handle is ignored).
+`held by: a session (<handle>)` or `held by: nobody`: the mode comes from `holder.<pid>` in the spool dir. That file is also what `--stop` waits on (never `run-show`, which already names the caller on a second `--stop`):
+`--stop` returns 0 only when no live `coordinator.sh` (its pid's command must still say so) is bound as another handle. A replayed `worker_done` for a closed issue is acked as already landed.
 
 ## Coordinator runbook
 

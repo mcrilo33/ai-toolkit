@@ -43,7 +43,7 @@ unconfirmed; those change shared state and are hard to undo.
 
 - **Dispatch**: `.ai-toolkit/scripts/dispatch.sh <n>` or `--next` (picks the next ready issue).
 - **Answer a gate, handle a finished worker**: `/coordinate` (`coordinate` skill): this session holds the Run, discusses the plan with the user, replies.
-- **Land**: `.ai-toolkit/scripts/land.sh <n>`.
+- **Land**: `.ai-toolkit/scripts/land.sh --review <n>` (the independent review, then CI on the exact tip, then FF).
 - **Unattended**: `/coordinate auto` (alias `/afk`) hands the Run to the coordinator loop instead of hand-driving each step.
 - **Teardown** (abandoned or finished by hand): `orca worktree rm --worktree issue:<n> --run-hooks`.
 
