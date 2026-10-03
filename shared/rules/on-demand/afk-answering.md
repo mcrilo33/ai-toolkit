@@ -69,5 +69,7 @@ Reason as long as you need, then end with this block, each on its own line (noth
   issue and sends a desktop notification.
 - `ANSWER: approve` or `ANSWER: revise: <the change>`: replied verbatim to the spoke; the first word decides the
   recorded `gate_answer_class` (approve = 1, revise = 2). It is always an answer, never a hand-off to a human.
+  `ANSWER: approve` carries nothing after the word (any extra instruction makes it a `revise:`); `answer.sh` rejects a
+  line that is not exactly one of the two forms and escalates it to the human, so a stray sentence costs a stalled gate.
 
 Everything above the block is your reasoning and is not sent.
