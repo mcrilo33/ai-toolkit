@@ -3,7 +3,7 @@
 # SHA, real Orca, real claude. The only GitHub repo this script writes to: it refuses any other origin. A stable clone ($G) is registered in
 # Orca ONCE (never unregistered), reset per run to the `e2e-base-3` tag (a force-push of the e2e main) and synced from this checkout (--local-only).
 # Phases (E2E_PHASES, default "next happy negative"): next = `dispatch.sh --next` order on 5 real issues; happy = issue A (Gate: plan) through
-# gate, review, CI, FF land; negative = issue B, a REVIEW_CMD wrapper rejects it every time -> 2 rounds -> `blocked`. E2E_ANSWER=human: the gate
+# gate, review, CI, FF land; negative = issue B, a REVIEW_CMD wrapper rejects it every time with a new, actionable blocker -> 2 rounds -> `blocked`. E2E_ANSWER=human: the gate
 # is answered with `coordinator.sh --reply` (scripted, or E2E_HUMAN_WAIT=1: it prints the line and waits for a REAL human). Run from an Orca terminal.
 set -euo pipefail
 V2="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -83,7 +83,7 @@ phase negative && { B=$(mkissue "Add calc.py with a tested double function" "$(p
 renv="NOTIFY_CMD=true"; [ -z "${E2E_HUMAN_WAIT:-}" ] || renv=""
 if [ -n "$B" ]; then   # the real reviewer for A, a stub that always rejects B (a real one would accept the fix in round 1)
   # shellcheck disable=SC2016
-  printf '#!/bin/sh\n[ "$1" = %s ] && { echo "BLOCKER: stub reviewer rejects issue %s on purpose"; exit 3; }\nexec bash %s/.ai-toolkit/scripts/review.sh "$@"\n' "$B" "$B" "$G" > "$E/review.sh"
+  printf '#!/bin/sh\n[ "$1" = %s ] && { n=$(($(cat %s/n 2>/dev/null || echo 0) + 1)); echo $n > %s/n; echo "BLOCKER: calc.py:1 - add the comment line # review round $n at the top of calc.py"; exit 3; }\nexec bash %s/.ai-toolkit/scripts/review.sh "$@"\n' "$B" "$E" "$E" "$G" > "$E/review.sh"
   chmod +x "$E/review.sh"; renv="$renv REVIEW_CMD=$E/review.sh"
 fi
 # The coordinator's own terminal shows its output (a human reads the gate question there) and tees it to the log.
