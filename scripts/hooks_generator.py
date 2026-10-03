@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+from typing import Any
 
 TOOL_NAMES = {"copilot", "cursor", "claude"}
 
@@ -341,7 +342,7 @@ def generate_claude(hooks: dict[str, dict], script_prefix: str | None = None) ->
         # Claude groups hooks by matcher within an event
         # Find or create a matcher group
         event_hooks = config.setdefault(event, [])
-        group = None
+        group: dict[str, Any] | None = None
         for existing in event_hooks:
             if existing.get("matcher") == matcher:
                 group = existing

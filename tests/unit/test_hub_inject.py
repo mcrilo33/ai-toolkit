@@ -120,11 +120,6 @@ def _sends(orca_bin: Path) -> list[list[str]]:
     return [c for c in orca_calls(orca_bin) if c[:2] == ["terminal", "send"]]
 
 
-def _tlog(state_dir: Path, issue: int) -> str:
-    p = state_dir / "transitions" / f"{issue}.jsonl"
-    return p.read_text() if p.is_file() else ""
-
-
 def test_deliver_reply_acks_the_recorded_message_id(tmp_path: Path, orca_bin: Path) -> None:
     wt = _wt(tmp_path, run_id="run_1")
     _scenario(orca_bin, wt)

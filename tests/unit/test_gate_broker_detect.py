@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _gate_broker_support import (
@@ -539,7 +540,7 @@ def test_slot_state_permission_dialog_is_waiting_and_names_its_command(
     ],
 )
 def test_slot_state_exited_worker_with_a_lingering_park_is_not_waiting(
-    spoke_repo: Path, tmp_path: Path, orca_bin: Path, park: dict[str, str]
+    spoke_repo: Path, tmp_path: Path, orca_bin: Path, park: dict[str, Any]
 ) -> None:
     # The #296/#299/#301 shape: the gate tag and the park signal outlived the worker.
     _tag_gate_at_head(spoke_repo, 5)

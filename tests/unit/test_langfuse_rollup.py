@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
@@ -313,7 +313,7 @@ def test_make_delete_issues_bulk_delete_with_trace_ids(monkeypatch: Any) -> None
         captured["method"] = request.get_method()
         captured["url"] = request.full_url
         captured["auth"] = request.headers.get("Authorization")
-        captured["body"] = json.loads(request.data.decode())
+        captured["body"] = json.loads(cast(bytes, request.data).decode())
         return _Resp()
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)

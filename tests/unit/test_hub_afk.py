@@ -27,6 +27,7 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _gate_broker_support import _write_warmed_stub
@@ -1030,7 +1031,7 @@ def test_is_seed_replay_false_for_novel_long_answer(tmp_path: Path) -> None:
     assert result.stdout.strip() == "RC=1", result.stdout + result.stderr
 
 
-def _orca_flip_to(orca_bin: Path, wt: Path, tmp_path: Path, **park: object) -> str:
+def _orca_flip_to(orca_bin: Path, wt: Path, tmp_path: Path, **park: Any) -> str:
     """A shell prefix that swaps the Orca stub scenario when the answerer runs.
 
     It models the spoke changing state while the answerer reasons: `park` takes `orca_park`'s
