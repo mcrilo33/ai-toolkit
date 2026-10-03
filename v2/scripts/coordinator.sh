@@ -99,7 +99,7 @@ on_question() {
     log "#$issue gate answered: $body"
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; notify "#$issue: $warns"; }
   else   # human mode, or the answerer gave nothing usable: never a blind approve. The question stays in the inbox.
-    comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply: orca orchestration reply --id $id --body approve   (or --body 'revise: ...')"
+    comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply: orca orchestration reply --run $run --id $id --body approve   (or --body 'revise: ...')"
     notify "#$issue: a gate question is waiting for you"
   fi
 }

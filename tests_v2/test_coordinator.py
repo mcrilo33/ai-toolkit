@@ -115,7 +115,7 @@ def test_the_human_path_notifies_and_comments_the_reply_command_without_replying
     C.mail([msg("question", "msg_q", question="q")])
     C.go("--answer", mode)
     assert not C.calls("orca orchestration reply") and C.stubs.calls("notify") and C.calls("orca orchestration check ack")
-    assert "orca orchestration reply --id msg_q --body approve" in C.calls("gh issue comment")[0][-1]
+    assert "orca orchestration reply --run run_t --id msg_q --body approve" in C.calls("gh issue comment")[0][-1]
     assert (len(C.stubs.calls("answer.sh")) == 1) == (mode == "auto")
 
 
@@ -177,6 +177,9 @@ def test_a_worker_that_exited_without_worker_done_is_retried_once_on_the_tenth_e
     assert not C.stubs.calls("dispatch.sh")
     C.go("--cap", "1", COORD_MAX_TICKS=10)
     assert C.stubs.calls("dispatch.sh")[-1] == ["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]
+    C.workers(C.row(st="completed", lv="exited"))   # a settled worker's process is expected to be gone
+    C.go("--cap", "0", COORD_MAX_TICKS=10)
+    assert len(C.stubs.calls("dispatch.sh")) == 1
     C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2", lv="live"))   # the relaunched worker is alive: left alone
     C.go("--cap", "1", COORD_MAX_TICKS=10)
     assert len(C.stubs.calls("dispatch.sh")) == 1 and not C.calls("gh issue edit")

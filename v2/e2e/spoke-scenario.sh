@@ -107,7 +107,10 @@ asked() { [ -n "$(question)" ]; }
 wait_for 600 asked || fail "no question within 10 min"
 if [ "${E2E_ANSWER:-auto}" = human ]; then   # the human: reply AFTER the coordinator acked the question without replying
   wait_for 60 grep -q 'waiting for you' "$E/coord.log" || fail "the coordinator did not hand the question to the human"
-  sleep 5; orca_mutate orchestration reply --id "$(question)" --body approve > /dev/null || fail "human reply"
+  sleep 5   # run the very command the coordinator put in the issue comment (gh.log): the human's reply after the ack
+  cmd="$(sed -n 's/.*Reply: \(orca orchestration reply --run [^ ]* --id [^ ]* --body approve\).*/\1/p' "$E/gh.log" | head -n 1)"
+  [ -n "$cmd" ] || fail "no reply command in the issue comment"
+  out="$($cmd 2>&1)" || fail "human reply failed: $out"
 fi
 wait_for 300 replied || fail "the question was never replied"
 
