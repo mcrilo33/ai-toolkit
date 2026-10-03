@@ -3,7 +3,7 @@
 # push-guard: PreToolUse(Bash). Denies pushes to the base branch, force pushes, --no-verify, core.hooksPath
 # overrides and `git checkout <base>` from a linked worktree. Exit 2 + stderr = deny; any crash (bad JSON, no jq)
 # is exit 2 too, since every other code is non-blocking. A pattern deny-list, not a sandbox (D8).
-set -euo pipefail
+set -Eeuo pipefail
 deny() { echo "push-guard: blocked: $*" >&2; exit 2; }
 trap 'deny "cannot parse the tool payload (fail-closed)"' ERR
 set -f; shopt -s nocasematch # macOS is case-insensitive: GIT, ORCA.YAML and Main are the same files
