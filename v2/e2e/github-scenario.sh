@@ -67,11 +67,11 @@ bash "$V2/scripts/install.sh" "$G" > /dev/null 2>&1 || fail "install.sh failed"
 cd "$G"
 if phase next; then
   step=2; say "--next with real GraphQL: pick order priority, then number; hold and blocked-by are skipped until the blocker closes"
-  X=$(mkissue "e2e next X" "plain"); K=$(mkissue "e2e next K" "blocked by X"); H=$(mkissue "e2e next H" "on hold" hold)
+  K=$(mkissue "e2e next K" "blocked by X"); X=$(mkissue "e2e next X" "plain"); H=$(mkissue "e2e next H" "on hold" hold)   # K < X: only the blocked-by keeps K behind X
   Rr=$(mkissue "e2e next R" "plain"); P=$(mkissue "e2e next P" "urgent" priority); mine="$mine $X $K $H $Rr $P"
-  ghe api -X POST "repos/$R/issues/$K/dependencies/blocked_by" -F "issue_id=$(ghe api "repos/$R/issues/$X" --jq .id)" --silent || fail "cannot set blocked-by"
+  gh api -X POST "repos/$R/issues/$K/dependencies/blocked_by" -F "issue_id=$(gh api "repos/$R/issues/$X" --jq .id)" --silent || fail "cannot set blocked-by"
   pick() { RUN=run_pick bash "$V2/scripts/dispatch.sh" --next --dry-run 2> /dev/null || true; }
-  for want in $P $X $Rr $K ""; do
+  for want in $P $X $K $Rr ""; do
     got="$(pick)"; [ "$got" = "$want" ] || fail "--next picked '$got', expected '$want' (order P=$P X=$X R=$Rr K=$K, hold H=$H)"
     [ -z "$want" ] || ghe issue close "$want" > /dev/null
   done
