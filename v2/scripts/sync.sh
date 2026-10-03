@@ -69,7 +69,7 @@ scripts:
   setup: bash "$ORCA_ROOT_PATH/.ai-toolkit/scripts/setup.sh"
   archive: bash "$ORCA_ROOT_PATH/.ai-toolkit/scripts/archive.sh"
 EOF
-put "$TMP" orca.yaml bak
+[ "$TARGET" = "$V2" ] || put "$TMP" orca.yaml bak   # the toolkit syncing into itself keeps its tracked ./scripts/setup.sh orca.yaml
 
 # drop <rel>: remove one synced file and its now-empty parents. An absolute or climbing path is
 # never touched (a manifest is data in the target, not trusted).

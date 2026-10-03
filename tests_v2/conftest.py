@@ -5,7 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-V2 = Path(__file__).resolve().parent.parent / "v2"
+ROOT = Path(__file__).resolve().parent.parent
+V2 = ROOT / "v2" if (ROOT / "v2").is_dir() else ROOT  # cutover.sh moves v2/* to the root
 # records argv (US-separated) + env; replays <name>.<arg1>_<arg2>.<call#> > <name>.<arg1>_<arg2> > <name>
 STUB = """#!/bin/sh
 n=$(basename "$0"); d=$STUB_DIR; env > "$d/$n.env"
