@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# pre-commit: no commits on the base branch in the main checkout (work happens in worktrees). The first commit of a repo
+# and AI_TOOLKIT_ALLOW_BASE_COMMIT=1 (a human's escape hatch) pass.
+set -euo pipefail
+[ -z "${AI_TOOLKIT_ALLOW_BASE_COMMIT:-}" ] || exit 0
+git rev-parse -q --verify HEAD >/dev/null || exit 0
+[ "$(git rev-parse --path-format=absolute --git-dir)" = "$(git rev-parse --path-format=absolute --git-common-dir)" ] || exit 0
+cur="$(git symbolic-ref -q --short HEAD || true)"
+base="${BASE_BRANCH:-$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)}"; base="${base#origin/}"; base="${base:-main}"
+[ "$cur" != "$base" ] || { echo "pre-commit: no commits on $base in the main checkout: use a worktree (or AI_TOOLKIT_ALLOW_BASE_COMMIT=1)" >&2; exit 1; }
