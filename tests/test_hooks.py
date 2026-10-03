@@ -202,11 +202,84 @@ def test_spoke_only_protections_do_not_bind_the_human_session(shared):
         dg("root", 0, file_path=p)
     dg("root", 0, "Bash", command="echo > .claude/settings.json")
     dg("root", 0, "Bash", command="rm -rf .claude")
-    dg("root", 2, file_path=".github/workflows/ci.yml")
     dg("root", 2, file_path="{home}/.claude/settings.json")
     dg("root", 0, "AskUserQuestion", questions="[]")
     dg("wt", 0, "AskUserQuestion", questions="[]")
     dg("spoke", 2, "AskUserQuestion", questions="[]")
+
+
+SHIM = """#!/bin/bash
+[ "${SHIM_RC:-0}" = 0 ] || exit "$SHIM_RC"
+case "$1 $2" in
+  "orchestration worker-list") printf '%s' "${SHIM_WORKERS-}" ;;
+  "orchestration run-show") printf '%s' "${SHIM_RUN-}" ;;
+  "terminal show") printf '%s' "${SHIM_TERM-}" ;;
+esac
+"""
+ROW = {"agentTerminalHandle": "term_w", "dispatchStatus": "dispatched", "runId": "run_1"}
+
+
+def shim_env(*, workers=(ROW,), holder="term_h", identity="claude", rc=0, raw=None, handle="term_w"):
+    """The orca answers a spoke's guard reads: its worker row -> the Run -> the holder terminal -> its agentIdentity."""
+    out = {"SHIM_RC": str(rc), "SHIM_WORKERS": json.dumps({"result": {"workers": list(workers)}}),
+           "SHIM_RUN": json.dumps({"result": {"run": {"coordinator_handle": holder} if holder else {}}}),
+           "SHIM_TERM": json.dumps({"result": {"terminal": {"agentIdentity": identity} if identity else {}}})}
+    if raw is not None:
+        out.update(SHIM_WORKERS=raw, SHIM_RUN=raw, SHIM_TERM=raw)
+    return {**out, "ORCA_TERMINAL_HANDLE": handle} if handle else out
+
+
+@pytest.fixture(scope="module")
+def shim_bin(tmp_path_factory):
+    d = tmp_path_factory.mktemp("shim")
+    (d / "orca").write_text(SHIM)
+    (d / "orca").chmod(0o755)
+    return d
+
+
+# where, orca answers, does a workflows write ask? (every other protected path is denied whatever the answers)
+WF_SCENARIOS = {
+    "no-run-main-checkout": ("root", None, True), "no-run-plain-worktree": ("wt", None, True),
+    "session-holds-the-run": ("spoke", shim_env(), True),
+    "auto-loop-holds-the-run": ("spoke", shim_env(identity=""), False),
+    "other-agent-holds-the-run": ("spoke", shim_env(identity="codex"), False),
+    "orca-fails": ("spoke", shim_env(rc=1), False), "orca-prints-garbage": ("spoke", shim_env(raw="not json"), False),
+    "no-worker-row": ("spoke", shim_env(workers=()), False), "row-not-dispatched": ("spoke", shim_env(workers=({**ROW, "dispatchStatus": "completed"},)), False),
+    "other-terminals-row": ("spoke", shim_env(workers=({**ROW, "agentTerminalHandle": "term_x"},)), False),
+    "no-terminal-handle": ("spoke", shim_env(handle=""), False), "no-holder": ("spoke", shim_env(holder=""), False),
+}
+# tool, tool_input, the path the ask must name ("" = a protected path that never asks)
+WF_LANES = [
+    ("Write", {"file_path": ".github/workflows/ci.yml"}, ".github/workflows/ci.yml"),
+    ("MultiEdit", {"file_path": "sub/../.github/workflows/ci.yml"}, ".github/workflows/ci.yml"),
+    ("NotebookEdit", {"notebook_path": ".github/workflows/n.ipynb"}, ".github/workflows/n.ipynb"),
+    ("Bash", {"command": "echo x > .github/workflows/ci.yml"}, ".github/workflows"),
+    ("Bash", {"command": "sed -i s/a/b/ .github/workflows/ci.yml"}, ".github/workflows"),
+    ("Bash", {"command": "cd .github/workflows && echo x > ci.yml"}, ".github/workflows"),
+    ("Bash", {"command": "echo x > .github/workflows/ci.yml; rm -rf /usr"}, ""),
+    ("Bash", {"command": "echo x > .github/workflows/ci.yml && echo y > orca.yaml"}, ""),
+    ("Write", {"file_path": "orca.yaml"}, ""), ("Write", {"file_path": "{home}/.claude/settings.json"}, ""),
+    ("Bash", {"command": "echo x > orca.yaml"}, ""), ("Bash", {"command": "cp x ~/.claude/settings.json"}, ""),
+    ("Write", {"file_path": ".claude/settings.json"}, ""), ("Write", {"file_path": ".claude/hooks/push-guard.sh"}, ""),
+    ("Write", {"file_path": ".ai-toolkit/spoke-run-id"}, ""), ("Bash", {"command": "rm .claude/settings.local.json"}, ""),
+]
+
+
+@pytest.mark.parametrize("scenario", WF_SCENARIOS)
+@pytest.mark.parametrize("tool,ti,named", WF_LANES)
+def test_danger_guard_workflow_writes_ask_only_when_a_session_attends(shared, shim_bin, scenario, tool, ti, named):
+    where, answers, asks = WF_SCENARIOS[scenario]
+    if where != "spoke" and (".claude/" in str(ti) or "spoke-run-id" in str(ti)):
+        pytest.skip("spoke-only protections")
+    ti = {k: v.replace("{spoke}", str(shared["spoke"])).replace("{home}", str(shared["home"])) for k, v in ti.items()}
+    env = {**shared["env"], "PATH": f"{shim_bin}:{os.environ['PATH']}", **(answers or {})}
+    r = call("danger-guard.sh", shared[where], tool, env=env, **ti)
+    if asks and named:
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        assert (r.returncode, out["hookEventName"], out["permissionDecision"]) == (0, "PreToolUse", "ask"), r.stderr
+        assert named in out["permissionDecisionReason"] and "danger-guard" in out["permissionDecisionReason"]
+    else:
+        assert r.returncode == 2 and r.stdout == "" and "danger-guard: blocked" in r.stderr, (r.returncode, r.stdout, r.stderr)
 
 
 def test_danger_guard_uses_the_project_dir_for_the_marker_and_the_worktree_root(shared):
@@ -325,5 +398,5 @@ def test_pre_commit_allows_the_first_commit_of_a_repo(tmp_path):
 
 def test_hook_line_budgets():
     n = lambda *g: sum(len(f.read_text().splitlines()) for q in g for f in HOOKS.glob(q))  # noqa: E731
-    assert n("claude/*.sh") <= 150 and n("git/*") <= 40
+    assert n("claude/*.sh") <= 175 and n("git/*") <= 40
     assert len((V2 / "settings/claude/settings.json").read_text().splitlines()) <= 40

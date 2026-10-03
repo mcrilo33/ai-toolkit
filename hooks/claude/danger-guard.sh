@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2086  # `check $seg` splits a segment into words on purpose (globbing is off: set -f)
 # danger-guard: PreToolUse(Bash|Write|Edit|MultiEdit|NotebookEdit|AskUserQuestion). Yolo mode (D8) has no prompts, so this
-# deny-list is the brake: rm -r outside the worktree, git reset --hard in the main checkout, writes to .github/workflows/,
-# orca.yaml, ~/.claude/settings.json and, in a spoke, the project .claude/{settings*.json,hooks/}; AskUserQuestion in a spoke.
+# deny-list is the brake: rm -r outside the worktree, git reset --hard in the main checkout, writes to orca.yaml,
+# ~/.claude/settings.json and, in a spoke, the project .claude/{settings*.json,hooks/}; AskUserQuestion in a spoke.
 # Exit 2 + stderr = deny; a crash (bad JSON, no jq) is exit 2 too (fail-closed). A pattern list, not a sandbox.
+# Writes to .github/workflows/ ASK instead (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode)
+# when a human attends, and are denied like the rest when nobody does. Attended = outside a spoke (no Run), or in a spoke when the
+# terminal holding its Run is a Claude session. Read from Orca: worker-list (this terminal's dispatched row -> Run), run-show
+# (-> holder terminal), terminal show (-> agentIdentity claude). Anything else (the `coordinator.sh --answer auto` loop is a plain
+# shell, a missing handle, orca failing or timing out, an unreadable answer) is unattended: deny. The ask is emitted last, so a
+# deny anywhere in a compound command still wins.
 set -Eeuo pipefail
 deny() { echo "danger-guard: blocked: $*" >&2; exit 2; }
 trap 'deny "cannot parse the tool payload (fail-closed)"' ERR
@@ -11,6 +17,27 @@ set -f; shopt -s nocasematch # macOS is case-insensitive: RM, ORCA.YAML and .Git
 in="$(cat)"
 j() { jq -r "$1 // empty" <<<"$in"; }
 phys() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+orc() { # `orca ...` stdout, killed after 5s: a hung CLI must deny, not time the hook out into an allow
+  local o p w; o="$(mktemp)"; orca "$@" > "$o" 2> /dev/null & p=$!; { sleep 5; kill $p; } > /dev/null 2>&1 & w=$!
+  wait $p || { kill $w 2> /dev/null; rm -f "$o"; return 1; }; kill $w 2> /dev/null; cat "$o"; rm -f "$o"
+}
+attended() { # 0 = a human attends (outside a spoke, or a Claude session holds the spoke's Run)
+  [ -n "$spoke" ] || return 0
+  local h="${ORCA_TERMINAL_HANDLE:-}" run holder
+  [ -n "$h" ] || return 1
+  run="$(orc orchestration worker-list --json --limit 100 | jq -r --arg h "$h" '[.result.workers[] | select(.agentTerminalHandle == $h and .dispatchStatus == "dispatched")][0].runId // empty')" || return 1
+  [ -n "$run" ] || return 1
+  holder="$(orc orchestration run-show --id "$run" --json | jq -r '.result.run.coordinator_handle // empty')" || return 1
+  [ -n "$holder" ] || return 1
+  [ "$(orc terminal show --terminal "$holder" --json | jq -r '.result.terminal.agentIdentity // empty')" = claude ]
+}
+wf=""; wfd="write to a protected path (.github/workflows, orca.yaml, claude settings/hooks)" # a .github/workflows/ write (what, deny text), settled by finish()
+finish() {
+  [ -n "$wf" ] || exit 0
+  if attended; then jq -nc --arg r "danger-guard: write to .github/workflows needs your approval: $wf" \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: $r}}'; exit 0; fi
+  deny "$wfd"
+}
 cwd="$(j .cwd)"; cwd="${cwd:-$PWD}" # root = the project dir, not the cwd: a `cd` out of the repo must not move it
 root="$(phys "${CLAUDE_PROJECT_DIR:-$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "$cwd")}")"
 home="$(phys "$HOME")"; spoke=""; if [ -e "$root/.ai-toolkit/spoke-run-id" ]; then spoke=1; fi
@@ -21,20 +48,22 @@ canon() { local p="$1"; case "$p" in \~ | \~/*) p="$HOME${p#\~}";; esac; case "$
   while [ "$p" != / ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
   local rest="" d="$p"; while [ ! -d "$d" ]; do rest="/${d##*/}$rest"; d="$(dirname "$d")"; done
   rest="$(printf '%s' "$rest" | sed -E -e ':a' -e 's#/[^/]+/\.\./#/#' -e 'ta')"; printf '%s%s' "$(phys "$d")" "$rest"; }
-prot() { case "$1" in "$root/orca.yaml" | "$root/.github/workflows" | "$root/.github/workflows/"* | "$home/.claude/settings.json") return 0;; esac
+prot() { case "$1" in "$root/orca.yaml" | "$home/.claude/settings.json") return 0;; esac
   [ -n "$spoke" ] && case "$1" in "$root/.claude/settings.json" | "$root/.claude/settings.local.json" | "$root/.claude/hooks" | "$root/.claude/hooks/"* | "$root/.ai-toolkit/spoke-run-id") return 0;; esac
   return 1; }
 fp="$(j '.tool_input.file_path // .tool_input.notebook_path')"
-if [ -n "$fp" ] && prot "$(canon "$fp")"; then deny "write to a protected path ($fp)"; fi
-cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || exit 0
+if [ -n "$fp" ]; then fc="$(canon "$fp")"; if prot "$fc"; then deny "write to a protected path ($fp)"; fi
+  case "$fc" in "$root/.github/workflows" | "$root/.github/workflows/"*) wf="$fp"; wfd="write to a protected path ($fp)";; esac; fi
+cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || finish
 
 c=" $(printf '%s' "$cmd" | sed -E "s/[\"'\\\\]//g; s/[0-9&]*>+ *(\/dev\/null|&[0-9])//g; s/[[:space:]>]/& /g")" # writes to a protected path
 pre="((^|[^[:alnum:]_./-])(\./)?|$root/|\\\$\{?(PWD|CLAUDE_PROJECT_DIR)\}?/|\\\$\(pwd\)/)"; e="([^[:alnum:]_./-]|$)" # project-root paths only: v2/orca.yaml is fine
-p="$pre(\.github/workflows|orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$home)/\.claude/settings\.json"
+p="$pre(orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$home)/\.claude/settings\.json"
 if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e|\.ai-toolkit/spoke-run-id)"; fi
 w="(>|[[:space:]](tee|cp|mv|rm|touch|ln|dd|install|rsync|truncate|patch|chmod|python[0-9.]*|perl|ruby|node)[[:space:]]|[[:space:]]sed[[:space:]][^;|&]*(-[a-z]*i|--in-place))"
-re="(${w}[^;|&]*|[[:space:]](cd|pushd)[[:space:]][^;|&]*)($p)" # a verb before the path, or a cd into it
-if [[ $c =~ $re ]]; then deny "write to a protected path (.github/workflows, orca.yaml, claude settings/hooks)"; fi
+va="${w}[^;|&]*|[[:space:]](cd|pushd)[[:space:]][^;|&]*" # a verb before the path, or a cd into it
+if [[ $c =~ ($va)($p) ]]; then deny "write to a protected path (orca.yaml, claude settings/hooks)"; fi
+if [[ $c =~ ($va)($pre\.github/workflows) ]]; then wf="${cmd:0:200}"; fi
 
 target() { # one `rm -r` target: inside the worktree, or strictly below a temp root
   local p="$1" v; for v in HOME TMPDIR; do p="${p/#\$$v/${!v:-}}"; p="${p/#\$\{$v\}/${!v:-}}"; done
@@ -66,3 +95,4 @@ check() { # the words of one command segment
 for sc in "s/[\"'\\\\]//g" "s/([^[:space:]])[\"'\\\\]+([[:alnum:]])/\\1 \\2/g; s/[\"'\\\\]//g"; do
   while IFS= read -r seg; do check $seg; done < <(printf '%s\n' "$cmd" | sed -E "$sc" | tr ';|&()`<>' '\n')
 done
+finish
