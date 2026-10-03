@@ -235,3 +235,59 @@ def test_review_runs_first_and_a_non_approval_exits_3(L, tmp_path):
     n = len(L.trail())
     assert L.go("--review", "9", REVIEW_CMD=rev).returncode == 0
     assert [t[:3] for t in L.trail()[n:n + 3]] == [("orca", "worktree", "show"), ("gh", "review", "9"), ("gh", "run", "list")]
+
+
+def test_local_main_ahead_of_origin_is_refused_so_nothing_ungated_ships(L):
+    commit(L.root, "ungated.txt")   # a local main commit that never ran the gate
+    before = main_sha(L)
+    r = L.go("9")
+    assert r.returncode == 2 and "local main is not at origin/main" in r.stderr
+    no_side_effects(L, before)
+    assert not [t for t in L.trail() if t[0] == "git"]
+
+
+def test_a_branch_pushed_after_the_gate_is_not_deleted(L):
+    late = f"echo late > late.txt && git add late.txt && git commit -qm late && git push -q origin HEAD:{BRANCH}"
+    r = L.go("--local-gate", "9", CHECK_CMD=late)
+    assert r.returncode == 6 and "cleanup" in r.stderr
+    assert main_sha(L) == L.tip   # the gated tip landed; the late commit did not
+    assert git(L.origin, "rev-parse", BRANCH) != L.tip   # and the worker's late push is still there
+
+
+def test_refuses_a_spoke_on_the_base_branch(L):
+    L.stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(L.wt), "branch": "refs/heads/main"}}}))
+    r = L.go("9")
+    assert r.returncode == 2 and "base branch" in r.stderr and not [t for t in L.trail() if t[0] != "orca"]
+
+
+def test_a_worktree_rm_that_failed_but_took_effect_is_not_a_cleanup_failure(L):
+    L.stubs.reply("orca.worktree_rm", '{"error":"cli dropped"}', rc=1)
+    L.stubs.reply("orca.worktree_show", '{"error":"not found"}', rc=1, n=2)   # gone on the re-check
+    assert L.go("9").returncode == 0
+
+
+def test_a_worktree_rm_that_really_failed_is_reported(L):
+    L.stubs.reply("orca.worktree_rm", '{"error":"archive hook failed"}', rc=1)
+    r = L.go("9")
+    assert r.returncode == 6 and "cleanup" in r.stderr
+
+
+def test_cleanup_only_finishes_the_post_push_steps_after_exit_6(L):
+    L.stubs.reply("gh.issue_close", "boom", rc=1)
+    assert L.go("9").returncode == 6
+    L.stubs.reply("gh.issue_close", "")
+    n = len(L.trail())
+    r = L.go("--cleanup-only", "9")
+    assert r.returncode == 0, r.stderr
+    t = L.trail()[n:]
+    assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close")] and t[1][3:] == ("9", "-c", f"landed in {L.tip}")
+    assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "show"), ("orca", "orchestration", "worker-list"),
+                                                      ("orca", "orchestration", "worker-release"), ("orca", "worktree", "rm")]
+    assert not [x for x in t if x[0] == "git"]   # branch already deleted: nothing to push, main untouched
+
+
+def test_cleanup_only_refuses_a_branch_that_has_not_landed(L):
+    before = main_sha(L)
+    r = L.go("--cleanup-only", "9")
+    assert r.returncode == 2 and "not landed" in r.stderr
+    no_side_effects(L, before)

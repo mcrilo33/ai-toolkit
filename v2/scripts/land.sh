@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# land.sh [--local-gate] [--review] [--dispatch D] <issue>: land one finished spoke (06 section 4 steps 11-14).
+# land.sh [--local-gate] [--review] [--dispatch D] [--cleanup-only] <issue>: land one finished spoke (06 section 4 steps 11-14).
 # Run it from the main checkout, on BASE_BRANCH. Gate on the EXACT tip that will be merged: CI (`gh run list --commit`)
 # or, before cutover, --local-gate = $CHECK_CMD in the spoke worktree on the merged tip. Main moved -> merge it on the
 # spoke, push, gate again. Then ff main, push, close the issue, delete the branch, release the worker, remove the worktree.
+# --cleanup-only finishes close/delete/release/rm idempotently for an issue already on main (after exit 6).
 # --review is WP2's hook: $REVIEW_CMD (default review.sh) <issue> must exit 0 on APPROVE; skipped by default until WP2.
 # Exit: 0 landed, 1 error, 2 refused (precondition), 3 review not approved, 4 gate red/timeout, 5 merge conflict,
 #       6 landed but a cleanup step failed (main is already pushed; finish by hand).
@@ -11,17 +12,18 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-local_gate=0; review=0; disp=""; n=""
+local_gate=0; review=0; co=0; disp=""; n=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --local-gate) local_gate=1 ;;
     --review) review=1 ;;
+    --cleanup-only) co=1 ;;
     --dispatch) disp="${2:-}"; shift ;;
     [0-9]*) n="$1" ;;
-    *) usage_exit "usage: land.sh [--local-gate] [--review] [--dispatch D] <issue>" ;;
+    *) usage_exit "usage: land.sh [--local-gate] [--review] [--dispatch D] [--cleanup-only] <issue>" ;;
   esac; shift
 done
-[ -n "$n" ] || usage_exit "usage: land.sh [--local-gate] [--review] [--dispatch D] <issue>"
+[ -n "$n" ] || usage_exit "usage: land.sh [--local-gate] [--review] [--dispatch D] [--cleanup-only] <issue>"
 bail() { local rc="$1"; shift; printf '%s: %s\n' "${0##*/}" "$*" >&2; exit "$rc"; }
 
 # --- preconditions (exit 2): nothing is touched before these hold
@@ -32,14 +34,16 @@ abs() { git rev-parse --path-format=absolute "$1"; }
 o="$(orca_json worktree show --worktree "issue:$n")" || bail 2 "refused: no Orca worktree is linked to issue $n"
 wt="$(printf '%s' "$o" | jq -r '.result.worktree.path')"
 branch="$(printf '%s' "$o" | jq -r '.result.worktree.branch | sub("^refs/heads/"; "")')"
+[ "$branch" != "$BASE_BRANCH" ] || bail 2 "refused: issue $n's worktree is on the base branch $BASE_BRANCH"
 [ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] || bail 2 "refused: the spoke worktree is dirty"
-git fetch -q origin
+git fetch -q --prune origin
 tip="$(git -C "$wt" rev-parse HEAD)"
-[ "$(git rev-parse -q --verify "refs/remotes/origin/$branch" || true)" = "$tip" ] || bail 2 "refused: $branch is not pushed (origin/$branch != spoke HEAD)"
+# Behind origin/main is fine (the gated tip contains it); ahead or diverged would ship commits that never ran the gate.
+git merge-base --is-ancestor HEAD "origin/$BASE_BRANCH" || bail 2 "refused: local $BASE_BRANCH is not at origin/$BASE_BRANCH (ahead or diverged)"
+if [ "$co" = 1 ]; then git merge-base --is-ancestor "$tip" "origin/$BASE_BRANCH" || bail 2 "refused: $branch is not landed on $BASE_BRANCH"
+else [ "$(git rev-parse -q --verify "refs/remotes/origin/$branch" || true)" = "$tip" ] || bail 2 "refused: $branch is not pushed (origin/$branch != spoke HEAD)"; fi
 
 # --- review (WP2 hook point), then the merge-and-gate loop
-if [ "$review" = 1 ]; then "${REVIEW_CMD:-$here/review.sh}" "$n" || bail 3 "review did not approve issue $n"; fi
-
 ci_state=""
 ci_poll() {   # 0 once the runs for $1 have settled (ci_state = green|red), 1 while none exist yet or any is still running
   ci_state="$(gh run list --commit "$1" --json status,conclusion,url | jq -r '
@@ -56,35 +60,52 @@ gate() {   # $1 = the exact sha under test
   fi
 }
 moved() { git fetch -q origin || die "git fetch origin failed"; ! git merge-base --is-ancestor "origin/$BASE_BRANCH" "$tip"; }
-
-for round in 1 2 3; do
-  if moved; then
-    git -C "$wt" merge -q --no-edit "origin/$BASE_BRANCH" > /dev/null \
-      || { git -C "$wt" merge --abort; bail 5 "merge conflict: $BASE_BRANCH into $branch; resolve on the spoke, push, land again"; }
-    git -C "$wt" push -q origin "HEAD:refs/heads/$branch" || die "cannot push the merged $branch"
-    tip="$(git -C "$wt" rev-parse HEAD)"
+gate_loop() {
+  local _
+  for _ in 1 2 3; do
+    if moved; then
+      git -C "$wt" merge -q --no-edit "origin/$BASE_BRANCH" > /dev/null \
+        || { git -C "$wt" merge --abort; bail 5 "merge conflict: $BASE_BRANCH into $branch; resolve on the spoke, push, land again"; }
+      git -C "$wt" push -q origin "HEAD:refs/heads/$branch" || die "cannot push the merged $branch"
+      tip="$(git -C "$wt" rev-parse HEAD)"
+    fi
+    gate "$tip"
+    moved || return 0
+  done
+  bail 4 "$BASE_BRANCH keeps moving; land again"
+}
+land() {   # ff main to the gated tip and push it; anything else on main is refused and rolled back
+  local before
+  before="$(git rev-parse HEAD)"
+  git merge -q --ff-only "origin/$BASE_BRANCH" || bail 2 "refused: local $BASE_BRANCH is not at origin/$BASE_BRANCH"
+  git merge -q --ff-only "$tip" || bail 2 "refused: local $BASE_BRANCH has diverged from $branch"
+  [ "$(git rev-parse HEAD)" = "$tip" ] || { git reset -q --hard "$before"; bail 2 "refused: $BASE_BRANCH is not at the gated tip $tip"; }
+  if ! git push -q origin "$BASE_BRANCH"; then
+    git reset -q --hard "$before"
+    die "push of $BASE_BRANCH was rejected; local $BASE_BRANCH restored, nothing closed"
   fi
-  gate "$tip"
-  moved || break
-  [ "$round" -lt 3 ] || bail 4 "$BASE_BRANCH keeps moving; land again"
-done
-
-# --- land: from here on main is the source of truth, so a cleanup failure is reported, not fatal
-before="$(git rev-parse HEAD)"
-git merge -q --ff-only "$tip" || bail 2 "refused: local $BASE_BRANCH has diverged from $branch"
-if ! git push -q origin "$BASE_BRANCH"; then
-  git reset -q --hard "$before"
-  die "push of $BASE_BRANCH was rejected; local $BASE_BRANCH restored, nothing closed"
+}
+if [ "$co" = 0 ]; then
+  if [ "$review" = 1 ]; then "${REVIEW_CMD:-$here/review.sh}" "$n" || bail 3 "review did not approve issue $n"; fi
+  gate_loop
+  land
 fi
-sha="$(git rev-parse HEAD)"; bad=0
+
+# --- cleanup: main is the source of truth from here on, so a failure is reported (exit 6), not fatal
+sha="$tip"; bad=0
 step() { "$@" > /dev/null || { warn "cleanup failed: $*"; bad=1; }; }
 step gh issue close "$n" -c "landed in $sha"
-step git push -q origin --delete "$branch"
+# Delete the remote branch only while it is still at the gated tip: a later worker push must not be dropped.
+if git rev-parse -q --verify "refs/remotes/origin/$branch" > /dev/null; then
+  step git push -q --force-with-lease="refs/heads/$branch:$tip" origin ":refs/heads/$branch"
+fi
 if [ -z "$disp" ]; then
   disp="$(orca_json orchestration worker-list ${RUN:+--run "$RUN"} | jq -r --arg p "::$wt" '[.result.workers[] | select(.resource.worktreeId | endswith($p)) | .dispatchId] | .[]')" || disp=""
 fi
 for d in $disp; do step orca_mutate orchestration worker-release --dispatch "$d"; done
 [ -n "$disp" ] || { warn "no dispatch found for $wt: worker-release skipped"; bad=1; }
-step orca_json worktree rm --worktree "issue:$n" --run-hooks
+# The CLI can drop a long rm (~30 s) while Orca finishes it: a worktree that is gone counts as removed.
+orca_json worktree rm --worktree "issue:$n" --run-hooks > /dev/null || ! orca_json worktree show --worktree "issue:$n" > /dev/null 2>&1 \
+  || { warn "cleanup failed: worktree rm issue:$n"; bad=1; }
 printf 'landed #%s in %s\n' "$n" "$sha"
 [ "$bad" = 0 ] || bail 6 "landed $sha but cleanup is incomplete"
