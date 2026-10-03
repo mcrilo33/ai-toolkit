@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# ai-toolkit v2 sync: copy policy + lifecycle into a target repo. Claude Code only (D4): no per-platform
+# projection, the frontmatter lives in the source files. Idempotent; files a previous run wrote and this
+# run did not are removed (manifest GC). Usage: sync.sh <target-repo> [--local-only]
+#   rules/*.md (minus guidelines)  -> .claude/rules/    (no paths: = always on; paths: = conditional)
+#   rules/guidelines.md            -> CLAUDE.md         rules/on-demand/*.md -> .ai-toolkit/rules/ (never auto-loaded)
+#   skills/ agents/ prompts/       -> .claude/{skills,agents,commands}
+#   v2/{scripts,bin,hooks}, ai-toolkit.env -> .ai-toolkit/    settings/claude/settings.json -> .claude/settings.json
+#   orca.yaml generated (setup/archive run from $ORCA_ROOT_PATH, where a new worktree has no .ai-toolkit)
+set -euo pipefail
+# shellcheck source=lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+
+V2="$(cd "$AI_TOOLKIT_LIB_DIR/.." && pwd)"
+SHARED="${AI_TOOLKIT_SHARED:-$V2/shared}"
+[ -d "$SHARED" ] || SHARED="$V2/../shared"   # before cutover shared/ is one level above v2/
+TARGET="" LOCAL=0
+for a in "$@"; do
+  case "$a" in --local-only) LOCAL=1 ;; -*) die "unknown option: $a" ;; *) TARGET="$a" ;; esac
+done
+[ -n "$TARGET" ] || die "usage: sync.sh <target-repo> [--local-only]"
+git -C "$TARGET" rev-parse --git-dir > /dev/null 2>&1 || die "$TARGET is not a git repository"
+TARGET="$(cd "$TARGET" && pwd)"
+OLD="$TARGET/.ai-toolkit/sync-manifest"
+NEW="$(mktemp)"; TMP="$(mktemp)"
+trap 'rm -f "$NEW" "$TMP"' EXIT
+
+# put <src> <dst-rel> [bak]: copy when different (no mtime churn) and record it. bak = a singleton
+# (CLAUDE.md, settings.json, orca.yaml): an existing file this tool never wrote is kept once as <dst>.bak.
+put() {
+  local d="$TARGET/$2"
+  mkdir -p "$(dirname "$d")"
+  if ! cmp -s "$1" "$d"; then
+    if [ "${3:-}" = bak ] && [ -f "$d" ] && [ ! -e "$d.bak" ] && ! grep -qxF "$2" "$OLD" 2> /dev/null; then cp "$d" "$d.bak"; fi
+    cp "$1" "$d"
+  fi
+  echo "$2" >> "$NEW"
+}
+put_md() { # put_md <src-dir> <dst-rel-dir> [skip-name]: the *.md files of one directory
+  local f
+  for f in "$1"/*.md; do
+    [ -f "$f" ] || continue
+    [ "${f##*/}" = "${3:-}" ] || put "$f" "$2/${f##*/}"
+  done
+}
+put_tree() { # put_tree <src-dir> <dst-rel-dir>: everything below it, minus caches
+  local f
+  [ -d "$1" ] || return 0
+  while IFS= read -r f; do put "$1/$f" "$2/$f"; done < <(cd "$1" && find . -type f ! -name .DS_Store ! -name '*.pyc' ! -path '*/__pycache__/*' | sed 's|^\./||' | LC_ALL=C sort)
+}
+
+put_md "$SHARED/rules" .claude/rules guidelines.md
+put_md "$SHARED/rules/on-demand" .ai-toolkit/rules
+put "$SHARED/rules/guidelines.md" CLAUDE.md bak
+put_tree "$SHARED/skills" .claude/skills
+put_md "$SHARED/agents" .claude/agents
+put_md "$SHARED/prompts" .claude/commands
+put_tree "$V2/scripts" .ai-toolkit/scripts
+put_tree "$V2/bin" .ai-toolkit/bin
+put_tree "$V2/hooks" .ai-toolkit/hooks
+put "$V2/settings/ai-toolkit.env" .ai-toolkit/ai-toolkit.env
+if [ -f "$V2/settings/claude/settings.json" ]; then put "$V2/settings/claude/settings.json" .claude/settings.json bak
+else warn "$V2/settings/claude/settings.json is missing: .claude/settings.json (hooks) not synced"; fi
+cat > "$TMP" << 'EOF'
+setupAgentStartupPolicy: wait-for-setup
+scripts:
+  setup: bash "$ORCA_ROOT_PATH/.ai-toolkit/scripts/setup.sh"
+  archive: bash "$ORCA_ROOT_PATH/.ai-toolkit/scripts/archive.sh"
+EOF
+put "$TMP" orca.yaml bak
+
+# GC: what the previous manifest lists and this run did not write. An entry that is absolute or
+# climbs out of the target is never touched (the manifest is data in the target, not trusted).
+if [ -f "$OLD" ]; then
+  while IFS= read -r p; do
+    case "$p" in '' | /* | *..*) continue ;; esac
+    grep -qxF "$p" "$NEW" && continue
+    rm -f "$TARGET/$p"
+    (cd "$TARGET" && rmdir -p "$(dirname "$p")" 2> /dev/null) || true
+  done < "$OLD"
+fi
+mkdir -p "$TARGET/.ai-toolkit"
+LC_ALL=C sort -u "$NEW" > "$TMP"
+cmp -s "$TMP" "$OLD" || cp "$TMP" "$OLD"
+
+# Per-clone ignores, as a marked block in .git/info/exclude (never the tracked .gitignore):
+# .ai-toolkit/ always (holds ai-toolkit.local.env); --local-only also the deployment files.
+ex="$(git -C "$TARGET" rev-parse --path-format=absolute --git-path info/exclude)"
+mkdir -p "$(dirname "$ex")"
+{
+  sed '/^# >>> ai-toolkit sync/,/^# <<< ai-toolkit sync/d' "$ex" 2> /dev/null || true
+  echo '# >>> ai-toolkit sync'; echo '/.ai-toolkit/'
+  if [ "$LOCAL" -eq 1 ]; then printf '/.claude/\n/CLAUDE.md\n/orca.yaml\n'; fi
+  echo '# <<< ai-toolkit sync'
+} > "$TMP"
+cmp -s "$TMP" "$ex" || cp "$TMP" "$ex"
+echo "synced $(wc -l < "$OLD" | tr -d ' ') files into $TARGET"
