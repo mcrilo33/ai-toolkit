@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# commit-msg: a conventional type on line 1 and an issue anchor (#N) in the message. Merge/revert/fixup commits pass.
+set -euo pipefail
+msg="$(grep -vE '^#([[:space:]]|$)' "$1" || true)" # drop the editor's comment lines
+first="$(printf '%s\n' "$msg" | head -n 1)"
+case "$first" in Merge\ * | Revert\ * | fixup!\ * | squash!\ * | amend!\ *) exit 0 ;; esac
+re='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([A-Za-z0-9._/-]+\))?!?: .+'
+[[ $first =~ $re ]] || { echo "commit-msg: line 1 must be '<type>(<scope>): <subject>', type in feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert" >&2; exit 1; }
+[[ $msg =~ \#[0-9]+ ]] || { echo "commit-msg: add the issue anchor, e.g. 'Refs #123' (or '(#123)' in the subject)" >&2; exit 1; }
