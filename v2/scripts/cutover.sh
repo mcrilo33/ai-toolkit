@@ -34,12 +34,14 @@ echo "trim requirements-dev.txt to pytest, pytest-xdist, pyyaml; ignore /CLAUDE.
 [ "$dry" = 0 ] || exit 0
 
 git tag v1-final "$sha"
+KEEP="$(mktemp)"; trap 'rm -f "$KEEP"' EXIT   # what v2 tracks, at its new paths: `git add -A` alone would drop what the v1 .gitignore ignores (settings/*)
+{ git ls-files v2 | sed 's#^v2/##'; git ls-files tests_v2 | sed 's#^tests_v2/#tests/#'; printf '%s\n' docs/architecture.md docs/frontmatter.md; } > "$KEEP"
 for p in $DELETE; do rm -rf -- "$p"; done; find docs -type d -empty -delete   # plain file moves: `git add -A` below records them (and the renames)
 mvtree() { mkdir -p "$2"; cp -R "$1"/. "$2"/; rm -rf "$1"; }   # merges into an existing directory, dotfiles included; the tree is clean, so only ignored files ride along
 mvtree v2 .; mvtree tests_v2 tests; mvtree docs/v2 docs
 grep -E '^(pytest|pytest-xdist|pyyaml)([<>=~!]|$)' requirements-dev.txt > requirements-dev.new; mv requirements-dev.new requirements-dev.txt
 grep -qxF /CLAUDE.md .gitignore 2> /dev/null || echo /CLAUDE.md >> .gitignore
-git add -A
+git add -A; while IFS= read -r f; do [ ! -e "$f" ] || printf '%s\n' "$f"; done < "$KEEP" | git add -f --pathspec-from-file=-
 # Mechanical commit: the v1 hooks of the host checkout (commit-quality...) are for hand-written changes, so they are skipped here only.
 git -c core.hooksPath=/dev/null commit -q -m "chore!: v2 cutover: Orca owns execution, ai-toolkit keeps policy plus glue" -m "v1 is tagged v1-final (rollback: git reset --hard v1-final). See docs/architecture.md."
 [ "$push" = 0 ] || git push origin refs/tags/v1-final || die "committed, but pushing tag v1-final failed: push it by hand"

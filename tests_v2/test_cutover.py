@@ -33,6 +33,7 @@ def template(tmp_path_factory):
     git(root, "config", "user.name", "t"); git(root, "config", "user.email", "t@t")
     for rel in V1:
         put(root, rel)
+    put(root, ".gitignore", "settings/*\n.claude/\n")  # v1's real .gitignore ignores settings/*: the moved v2 settings must stay tracked
     put(root, "requirements-dev.txt", "pytest>=8,<9\npytest-testmon>=2,<3\npytest-xdist>=3,<4\npyyaml>=6,<7\nduckdb>=1,<2\n")
     git(root, "add", "-A"); git(root, "commit", "-qm", "v1"); git(root, "push", "-q", "origin", "main")
     git(root, "checkout", "-qb", "v2")
@@ -75,6 +76,8 @@ def test_cutover_makes_one_commit_with_the_v2_layout(cut):
     for p in ("scripts/new.sh", "settings/ai-toolkit.env", "orca.yaml", "README.md", "bin/b", "hooks/h", ".shellcheckrc", ".github/workflows/ci.yml",
               "tests/test_x.py", "docs/architecture.md", "docs/frontmatter.md", "shared/rules/a.md", "shared/skills/solo/SKILL.md", "shared/skills/hub/SKILL.md", "VERSION", ".gitignore"):
         assert (root / p).is_file(), p
+    tracked = set(git(root, "ls-files").splitlines())   # every file v2 tracked is still tracked at its new path, ignored or not
+    assert {"settings/ai-toolkit.env", "scripts/new.sh", "tests/test_x.py", "docs/architecture.md", ".github/workflows/ci.yml"} <= tracked
     assert (root / "orca.yaml").read_text() == "v2/orca.yaml\n"  # replaced by the v2 file, not merged
     assert (root / "requirements-dev.txt").read_text().split() == ["pytest>=8,<9", "pytest-xdist>=3,<4", "pyyaml>=6,<7"]
     assert "/CLAUDE.md" in (root / ".gitignore").read_text().splitlines()  # sync.sh generates it

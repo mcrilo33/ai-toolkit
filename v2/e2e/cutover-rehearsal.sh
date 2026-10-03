@@ -46,6 +46,7 @@ cd "$C"
 { [ "$(git rev-list --count "$before..HEAD")" = 1 ] && [ -z "$(git status --porcelain)" ] && [ "$(git rev-parse v1-final)" = "$(git rev-parse origin/main)" ]; } || fail "not one clean commit, or v1-final is not origin/main"
 for p in v2 tests_v2 mcp dashboard shared/hooks scripts/telemetry settings/ai-toolkit.yml; do [ ! -e "$p" ] || fail "$p survived the cutover"; done
 for p in scripts/coordinator.sh tests/conftest.py docs/architecture.md .github/workflows/ci.yml .shellcheckrc orca.yaml; do [ -e "$p" ] || fail "$p is missing"; done
+[ -z "$(git ls-tree -r --name-only "$before" -- v2 | sed 's#^v2/##' | LC_ALL=C sort | comm -23 - <(git ls-files | LC_ALL=C sort))" ] || fail "a file v2 tracked is untracked after the cutover (a v1 .gitignore rule?)"
 [ "$(grep -c . requirements-dev.txt)" = 3 ] || fail "requirements-dev.txt is not trimmed to 3 packages"
 cnt() { git ls-files "$@" | grep -v '\.DS_Store' | xargs cat 2> /dev/null | wc -l | tr -d ' '; }
 echo "lines after cutover: code=$(cnt 'scripts/*' 'bin/*' 'hooks/*') e2e=$(cnt 'e2e/*') config=$(cnt 'settings/*' 'langfuse/*' orca.yaml '.github/*') policy=$(cnt 'shared/*') tests=$(cnt 'tests/*') docs=$(cnt 'docs/*' README.md)"
