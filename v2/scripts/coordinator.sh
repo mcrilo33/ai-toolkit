@@ -12,24 +12,36 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0
+run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; reply=0; reply_id=""; reply_body=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;; --answer) answer="${2:-}"; shift ;;
     --cap) cap="${2:-}"; shift ;; --until) until="${2:-}"; shift ;;
     --drain) drain=1 ;; --status) status=1 ;;
-    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status]" ;;
+    --reply) reply=1; reply_id="${2:-}"; reply_body="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
+    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --reply <msg-id> approve|'revise: ...'" ;;
   esac; shift
 done
 case "$answer" in auto | human) ;; *) usage_exit "--answer takes auto or human" ;; esac
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
+# The only state v2 keeps: queued human replies, one file per question (name = message id, content = the reply line), in a 0700 dir
+# outside every worktree. Only the Run's bound terminal can reply (Orca attests terminal identity), so a human queues with --reply
+# from ANY terminal and the loop sends it at its next wake. AITK_STATE_DIR replaces the default dir.
+rdir() { echo "${AITK_STATE_DIR:-$HOME/.ai-toolkit/coordinator/$run/replies}"; }
+if [ "$reply" = 1 ]; then
+  [ -n "$run" ] || usage_exit "--reply needs --run <run-id>"
+  case "$reply_id" in '' | *[!A-Za-z0-9_-]*) usage_exit "bad message id '$reply_id'" ;; esac
+  case "$reply_body" in
+    approve) ;;
+    revise:*[![:space:]]*) reply_body="revise: $(sed 's/^[[:space:]]*//' <<< "${reply_body#revise:}")" ;;
+    *) usage_exit "the reply is 'approve' or 'revise: <change>'" ;;
+  esac
+  d="$(rdir)"; (umask 077; mkdir -p "$d"); chmod 700 "$d"
+  printf '%s\n' "$reply_body" > "$d/.$reply_id.tmp" && mv "$d/.$reply_id.tmp" "$d/$reply_id"
+  echo "reply to $reply_id queued: the coordinator sends it at its next wake"; exit 0
+fi
 : "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal on the main checkout}"
 H="$ORCA_TERMINAL_HANDLE"
-# Only the Run's bound terminal may reply (Orca attests terminal identity), so a human answers HERE, on the coordinator's own
-# terminal (COORD_HUMAN_IN replaces /dev/tty; set but empty = nobody to ask).
-if [ -z "${COORD_HUMAN_IN+x}" ]; then if [ -t 0 ]; then src=/dev/tty; else src=""; fi; else src="$COORD_HUMAN_IN"; fi
-[ -z "$src" ] || exec 4< "$src"
-[ "$answer" != human ] || [ -n "$src" ] || usage_exit "--answer human asks on this terminal: run me in an interactive Orca terminal"
 DISPATCH_CMD="${DISPATCH_CMD:-$here/dispatch.sh}"; LAND_CMD="${LAND_CMD:-$here/land.sh}"; ANSWER_CMD="${ANSWER_CMD:-$here/answer.sh}"
 cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
@@ -45,13 +57,17 @@ pj() { jq -r --arg k "$2" '(.payload // "{}" | if type == "string" then fromjson
 mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
 now_min() { mins "${AI_TOOLKIT_NOW:-$(date +%H:%M)}"; }
 
+pending() {   # JSON array of the Run's questions nobody has replied to: they are waiting for the human
+  orca_json orchestration inbox --limit 200 --full | jq -c --arg r "$run" '[.result.messages[] | select(.run_id == $r)] as $m
+    | [$m[] | select(.type == "question") | select(. as $q | $m | any(.id != $q.id and .thread_id == $q.id) | not)]'
+}
+replycmd() { printf 'bash %s --run %s --reply %s approve' "$here/coordinator.sh" "$run" "$1"; }
 if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to
   [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"
   log "run: $run"; echo "live workers:"
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "  \(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict)"'
   echo "pending questions:"
-  orca_json orchestration inbox --limit 200 --full | jq -r --arg r "$run" '[.result.messages[] | select(.run_id == $r)] as $m
-    | $m[] | select(.type == "question") | select(. as $q | $m | any(.id != $q.id and .thread_id == $q.id) | not) | "  \(.id) \(.body[0:100])"'
+  pending | jq -r '.[] | "\(.id) \(.body[0:100])"' | while read -r id txt; do echo "  $id $txt"; echo "    reply: $(replycmd "$id")   (or 'revise: <change>')"; done
   exit 0
 fi
 
@@ -91,34 +107,31 @@ redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds 
   comment "$issue" "round $((r + 1)): $2"
 }
 
-ask_human() {   # $1 = message id, $2 = question, $3 = seconds to wait (empty = until answered): type approve | revise: <change>
-  local line body
-  [ -n "$src" ] || return 1
-  printf '\n#%s gate question (%s):\n%s\nanswer (approve | revise: <change>): ' "$issue" "$1" "$2"
-  while IFS= read -r ${3:+-t "$3"} line <&4; do
-    case "$line" in
-      approve) body=approve ;;
-      revise:*[![:space:]]*) line="${line#revise:}"; body="revise: ${line#"${line%%[![:space:]]*}"}" ;;
-      *) printf 'type approve, or revise: <change>: '; continue ;;
-    esac
-    if orca_mutate orchestration reply --run "$run" --from "$H" --id "$1" --body "$body" > /dev/null; then log "#$issue gate answered by the human: $body"; return 0; fi
-    warn "reply to $1 failed"
+drain_replies() {   # send the queued human replies as the bound consumer; an unknown or already answered id is dropped, a failed send retried
+  local f id body q pend
+  ls "$(rdir)"/* > /dev/null 2>&1 || return 0
+  pend="$(pending)" || return 0
+  for f in "$(rdir)"/*; do
+    [ -f "$f" ] || continue
+    id="${f##*/}"; body="$(head -n 1 "$f")"; q="$(jq -c --arg i "$id" '[.[] | select(.id == $i)][0] // empty' <<< "$pend")"
+    if [ -z "$q" ]; then warn "reply to $id dropped: no such unanswered question"
+    elif orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
+      log "gate $id answered by the human: $body"; if ctx "$(pj "$q" dispatchId)"; then comment "$issue" "Gate answered by the human: $body"; fi
+    else warn "reply to $id failed, it stays queued"; continue; fi
+    rm -f "$f"
   done
-  return 1
 }
 on_question() {
-  local id q ans body warns wait=600
+  local id q ans body warns
   id="$(jq -r .id <<< "$1")"; q="$(pj "$1" question)"; [ -n "$q" ] || q="$(jq -r '.body // ""' <<< "$1")"
   ctx "$(pj "$1" dispatchId)" || { notify "gate question $id comes from an unknown worker: reply by hand"; return 1; }
   if [ "$answer" = auto ] && ans="$(printf '%s' "$q" | "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; notify "#$issue: $warns"; }
-  else   # human mode, no usable answer, or the reply failed: never a blind approve
-    if [ "$answer" = human ]; then wait=""; fi
-    comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Type approve (or revise: ...) in the coordinator terminal, or from anywhere: orca terminal send --terminal $H --text approve --enter. Unanswered, it stays parked: take over with orca orchestration run-use --id $run from your terminal, then reply --run $run --id $id --body approve, then restart the coordinator."
-    notify "#$issue: a gate question is waiting for you"
-    ask_human "$id" "$q" "$wait" || log "#$issue gate question $id left parked"
+  else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
+    comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: revise: <change>)"
+    notify "#$issue: gate question waiting: $(replycmd "$id")"
   fi
 }
 on_done() {
@@ -182,8 +195,10 @@ while :; do
   [ -z "${COORD_MAX_TICKS:-}" ] || [ "$tick" -le "$COORD_MAX_TICKS" ] || break
   fill
   if [ "$drain" = 1 ] && [ "$ready" = 0 ] && [ "$(wl | jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length')" = 0 ]; then log "drained"; break; fi
-  rc=0
-  out="$(orca_json orchestration check --run "$run" --terminal "$H" --wait --types question,worker_done,escalation --timeout-ms "${COORD_WAIT_MS:-300000}" 2> "$errf")" || rc=$?
+  drain_replies
+  rc=0; wait_ms="${COORD_WAIT_MS:-300000}"   # 30 s while a question waits for the human: its reply is picked up soon
+  [ "$(pending | jq length)" -eq 0 ] 2> /dev/null || wait_ms="${COORD_WAIT_PENDING_MS:-30000}"
+  out="$(orca_json orchestration check --run "$run" --terminal "$H" --wait --types question,worker_done,escalation --timeout-ms "$wait_ms" 2> "$errf")" || rc=$?
   case "$out$(cat "$errf")" in *consumer_fenced*) die "Run $run was taken over by another terminal (consumer_fenced)" ;; esac
   msgs="$(jq -c '.result.messages[]?' <<< "$out" 2> /dev/null)" || msgs=""
   if [ -z "$msgs" ]; then

@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import stat
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,15 @@ def C(stubs, repo, run, tmp_path):
 
     stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": wt, "linkedIssue": 1}]}}))
     stubs.reply("orca.orchestration_run_create", '{"result":{"run":{"id":"run_new"}}}')
+    def inbox(open_ids=(), answered=()):   # questions in the Run's inbox: unanswered ones are waiting for the human
+        rows = [{**msg("question", i), "run_id": "run_t", "thread_id": i} for i in [*open_ids, *answered]]
+        rows += [{"id": f"r_{i}", "type": "status", "run_id": "run_t", "thread_id": i, "body": "approve", "payload": None} for i in answered]
+        stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
+
+    def spool(mid, body):   # a queued human reply, as `coordinator.sh --reply` writes it
+        (tmp_path / "replies").mkdir(mode=0o700, exist_ok=True)
+        (tmp_path / "replies" / mid).write_text(body + "\n")
+
     stubs.reply("dispatch.sh", '{"issue":1}')
     stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "", rc=3)   # nothing ready
     stubs.reply("answer.sh", "approve\n")
@@ -61,7 +71,7 @@ def C(stubs, repo, run, tmp_path):
     def go(*args, run_id="run_t", **env):
         cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh", "notify")}
         return run(["bash", CO, *(["--run", run_id] if run_id else []), *args], cwd=repo.root,
-                   **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "COORD_HUMAN_IN": "", **cmd_env, **env})
+                   **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "replies", **cmd_env, **env})
 
     def trail():   # [("orca orchestration check ack", argv), ("gh issue edit", argv), ("land.sh", argv)...] in call order
         rows = (Path(os.environ["STUB_DIR"]) / "calls.log").read_text().splitlines()
@@ -76,7 +86,7 @@ def C(stubs, repo, run, tmp_path):
         return (any(a[3:] == ["--add-label", "blocked"] for a in calls("gh issue edit")) and "gh issue comment" in ks and "notify" in ks
                 and "orca orchestration worker-release" in ks and "--address" not in sum(stubs.calls("dispatch.sh"), []) and "orca worktree rm" not in ks)
 
-    return type("C", (), dict(go=staticmethod(go), mail=staticmethod(mail), workers=staticmethod(workers), row=staticmethod(row), wt=wt,
+    return type("C", (), dict(go=staticmethod(go), mail=staticmethod(mail), inbox=staticmethod(inbox), spool=staticmethod(spool), spooled=lambda m: (tmp_path / "replies" / m).exists(), workers=staticmethod(workers), row=staticmethod(row), wt=wt,
                               calls=staticmethod(calls), blocked=staticmethod(blocked), stubs=stubs, kinds=staticmethod(lambda: [k for k, _ in trail()]),
                               stdin=staticmethod(lambda n: (tmp_path / f"stubs/{n}.stdin").read_text())))
 
@@ -110,33 +120,65 @@ def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_ac
     assert arg(C.calls("orca orchestration check ack")[0], "--ack") == "d0" and "touches CI" in C.calls("gh issue comment")[0][-1] and C.stubs.calls("notify")
 
 
+REPLY = "bash {}/scripts/coordinator.sh --run run_t --reply msg_q approve".format(V2)
+
+
 @pytest.mark.parametrize("mode, rc", [("human", 0), ("auto", 1)])   # auto: the answerer found nothing usable. Never a blind approve
-def test_the_human_is_prompted_on_the_coordinator_terminal_and_what_is_typed_is_replied(C, tmp_path, mode, rc):
+def test_a_question_for_the_human_is_notified_with_the_exact_reply_command_and_acked_without_waiting(C, mode, rc):
     C.stubs.reply("answer.sh", "", rc=rc)
-    (tmp_path / "typed").write_text("maybe\nrevise:\nrevise:  use a tmp dir\n")   # two invalid lines are re-prompted
     C.mail([msg("question", "msg_q", question="PLAN?")])
-    r = C.go("--answer", mode, COORD_HUMAN_IN=tmp_path / "typed")
+    assert C.go("--answer", mode).returncode == 0
+    assert not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack") and (len(C.stubs.calls("answer.sh")) == 1) == (mode == "auto")
+    assert REPLY in C.calls("gh issue comment")[0][-1] and "revise:" in C.calls("gh issue comment")[0][-1] and "--reply msg_q" in C.stubs.calls("notify")[0][0]
+
+
+def test_reply_queues_a_one_line_request_in_a_private_spool_outside_any_worktree_and_needs_no_orca(C, tmp_path):
+    r = C.go("--reply", "msg_q", "revise:  use tmp", ORCA_TERMINAL_HANDLE="", AITK_STATE_DIR="")
+    d = tmp_path / "home/.ai-toolkit/coordinator/run_t/replies"
+    assert r.returncode == 0 and (d / "msg_q").read_text() == "revise: use tmp\n" and stat.S_IMODE(d.stat().st_mode) == 0o700
+    assert not C.stubs.calls("orca") and not list(d.glob(".*"))
+
+
+@pytest.mark.parametrize("args", [["--reply", "msg_q", "maybe"], ["--reply", "msg_q", "revise:"], ["--reply", "../x", "approve"], ["--reply", "msg_q"]])
+def test_reply_refuses_a_bad_message_id_or_body_and_a_missing_run(C, tmp_path, args):
+    assert C.go(*args).returncode == 2 and not C.spooled("msg_q") and not C.spooled("../x")
+    assert C.go("--reply", "msg_q", "approve", run_id=None).returncode == 2
+
+
+def test_a_queued_reply_is_sent_as_the_bound_consumer_deleted_and_commented_on_the_issue(C):
+    C.inbox(["msg_q"])
+    C.spool("msg_q", "revise: use tmp")
+    assert C.go().returncode == 0
     rep = C.calls("orca orchestration reply")[0]
-    assert (arg(rep, "--id"), arg(rep, "--body")) == ("msg_q", "revise: use a tmp dir") and "PLAN?" in r.stdout and C.stubs.calls("notify")
-    assert (len(C.stubs.calls("answer.sh")) == 1) == (mode == "auto") and "terminal send --terminal term_c" in C.calls("gh issue comment")[0][-1]
-    in_order(C.kinds(), "notify", "orca orchestration reply", "orca orchestration check ack")
+    assert (arg(rep, "--id"), arg(rep, "--body"), arg(rep, "--run"), arg(rep, "--from")) == ("msg_q", "revise: use tmp", "run_t", "term_c")
+    assert not C.spooled("msg_q") and "use tmp" in C.calls("gh issue comment")[0][-1]
 
 
-@pytest.mark.parametrize("mode, rc, typed", [("human", 0, ""), ("auto", 1, None)])
-def test_a_question_nobody_answers_is_acked_and_left_parked_with_the_takeover_hint(C, tmp_path, mode, rc, typed):
-    C.stubs.reply("answer.sh", "", rc=rc)
-    env = {}
-    if typed is not None:   # a terminal that gives no input (EOF), or none at all
-        (tmp_path / "typed").write_text(typed)
-        env = {"COORD_HUMAN_IN": tmp_path / "typed"}
-    C.mail([msg("question", "msg_q", question="q")])
-    C.go("--answer", mode, **env)
-    assert not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack") and C.stubs.calls("notify")
-    assert "run-use --id run_t" in C.calls("gh issue comment")[0][-1]
+def test_a_reply_for_an_unknown_or_already_answered_question_is_dropped_and_a_failed_one_stays_queued(C):
+    C.inbox(["msg_open"], answered=["msg_done"])
+    C.spool("msg_done", "approve")
+    C.spool("msg_nope", "approve")
+    r = C.go()
+    assert not C.calls("orca orchestration reply") and not C.spooled("msg_done") and not C.spooled("msg_nope") and r.stderr.count("dropped") == 2
+    C.stubs.reply("orca.orchestration_reply", "boom", rc=1)
+    C.spool("msg_open", "approve")
+    C.go()
+    assert C.spooled("msg_open")   # retried on the next wake
 
 
-def test_human_mode_without_a_terminal_to_ask_on_is_refused(C):
-    assert C.go("--answer", "human").returncode == 2
+@pytest.mark.parametrize("open_ids, ms", [([], "300000"), (["msg_q"], "30000")])
+def test_the_wait_is_30_s_while_a_human_question_is_pending_and_300_s_otherwise(C, open_ids, ms):
+    C.inbox(open_ids)
+    C.go()
+    assert arg(C.calls("orca orchestration check")[0], "--timeout-ms") == ms
+
+
+def test_a_pending_human_question_does_not_stop_dispatch_or_land(C):
+    C.inbox(["msg_q"])
+    C.stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "5\n")
+    C.mail([msg("worker_done", "msg_d", outcome="succeeded")])
+    C.go("--answer", "human", "--cap", "2")
+    assert ["5"] in C.stubs.calls("dispatch.sh") and C.stubs.calls("land.sh") == [["--review", "--dispatch", "ctx_1", "1"]]
 
 
 @pytest.mark.parametrize("kind, extra", [("worker_done", {"outcome": "failed"}), ("escalation", {})])
@@ -231,10 +273,8 @@ def test_until_stops_the_loop_at_the_clock_time_and_wraps_past_midnight(C, now, 
     assert bool(C.calls("orca orchestration check")) == runs
 
 
-def test_status_prints_the_run_workers_and_unanswered_questions_and_changes_nothing(C):
-    rows = [{**msg("question", i), "run_id": "run_t", "thread_id": i} for i in ("msg_q", "msg_a")]
-    rows.append({"id": "msg_r", "type": "status", "run_id": "run_t", "thread_id": "msg_a", "body": "approve", "payload": None})   # answers msg_a
-    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
+def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply_command_and_changes_nothing(C):
+    C.inbox(["msg_q"], answered=["msg_a"])
     r = C.go("--status")
-    assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and "msg_q" in r.stdout and "msg_a" not in r.stdout
+    assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and REPLY in r.stdout and "msg_a" not in r.stdout
     assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in ("worker-list", "inbox")] == []

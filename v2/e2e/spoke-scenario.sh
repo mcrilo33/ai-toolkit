@@ -37,6 +37,7 @@ cleanup() {   # also on failure: every terminal this script made (the coordinato
   [ -z "$coord" ] || orca terminal close --terminal "$coord" --json > /dev/null 2>&1 || true
   drop_worktrees
   [ -z "$repo_id" ] || orca terminal close --worktree "path:$S" --all --json > /dev/null 2>&1 || true
+  [ -z "$run" ] || rm -rf "$HOME/.ai-toolkit/coordinator/$run"
   rm -rf "$E"
 }
 trap cleanup EXIT
@@ -118,12 +119,15 @@ question() { inbox | jq -r '[.[] | select(.type == "question")][0].id // empty';
 replied() { inbox | jq -e '[.[] | select(.type == "status" and (.subject | startswith("Re:")))] | length > 0' > /dev/null; }
 asked() { [ -n "$(question)" ]; }
 wait_for 600 asked || fail "no question within 10 min"
-if [ "${E2E_ANSWER:-auto}" = human ]; then   # the coordinator asks on its own terminal (only the Run's bound terminal can reply): type there
-  wait_for 90 grep -q 'waiting for you' "$E/coord.log" || fail "the coordinator did not hand the question to the human"
-  grep -q 'terminal send --terminal' "$E/gh.log" || fail "the issue comment does not tell the human how to answer"
-  sleep 3; orca terminal send --terminal "$coord" --text approve --enter --json > /dev/null || fail "terminal send to the coordinator"
+if [ "${E2E_ANSWER:-auto}" = human ]; then   # only the Run's bound terminal can reply: queue it with --reply from THIS (another) terminal
+  wait_for 90 grep -q 'gate question waiting' "$E/coord.log" || fail "the coordinator did not hand the question to the human"
+  [ ! -e "$wt/hello.txt" ] || fail "the worker is not parked: hello.txt exists before the gate was answered"
+  cmd="$(sed -n 's/.*Reply from any terminal: \(bash [^ ]* --run [^ ]* --reply [^ ]* approve\).*/\1/p' "$E/gh.log" | head -n 1)"
+  [ -n "$cmd" ] || fail "no --reply command in the issue comment"
+  out="$($cmd 2>&1)" || fail "reply failed: $out"
 fi
 wait_for 300 replied || fail "the question was never replied"
+[ -z "$(ls "$HOME/.ai-toolkit/coordinator/$run/replies" 2> /dev/null)" ] || fail "a queued reply was left in the spool"
 
 step=6; say "worker_done succeeded, review APPROVE, coordinator drained (exit 0)"
 wait_for 2400 test -s "$E/coord.rc" || fail "the coordinator did not finish within 40 min"
