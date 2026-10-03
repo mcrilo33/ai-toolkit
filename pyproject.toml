@@ -7,6 +7,7 @@ pythonVersion = "3.12"
 typeCheckingMode = "standard"
 # Tests import scripts/ modules after a runtime sys.path.insert; mirror that
 # for static analysis so the commit gauntlet's typecheck sees what pytest sees.
+# tests/unit holds shared helpers (_orca_stub) that tests/integration imports the same way.
 extraPaths = ["scripts", "tests/unit"]
 
 [tool.pytest.ini_options]

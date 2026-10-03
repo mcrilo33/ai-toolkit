@@ -129,7 +129,7 @@ def test_no_job_is_allowed_to_fail_the_run_silently(workflow: dict[str, Any]) ->
     assert soft == []
 
 
-def test_the_macos_job_is_a_blocking_job_of_the_one_workflow(workflow: dict[str, Any]) -> None:
+def test_the_macos_job_lives_in_the_one_workflow_under_its_pinned_name(workflow: dict[str, Any]) -> None:
     # One workflow means one run-level conclusion for ready/land to read: the macOS job must live
     # here (not in a second workflow the `--workflow CI` query never sees) and gate the run.
     job = workflow["jobs"][MACOS_JOB]
