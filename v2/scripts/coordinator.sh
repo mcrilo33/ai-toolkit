@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status]: the Run loop (06 section 4,
+# coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop: the Run loop (06 section 4,
 # "The coordinator"). One foreground process in an Orca terminal on the main checkout, the single consumer of ONE Run
 # (--run re-binds it with run-use; none creates one). Loop: fill slots to --cap (dispatch.sh) -> check --wait -> route each message
 # -> ack the delivery. question: answer.sh (auto) or the human, who types the answer on this terminal; worker_done succeeded: land.sh
@@ -7,39 +7,28 @@
 # bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked. Every 10th empty wait: a sweep.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
 # back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD NOTIFY_CMD.
+# Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
+# consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
+# the Run from this terminal, then wait until the loop is gone.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; reply=0; reply_id=""; reply_body=""
+run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; reply=0; reply_id=""; reply_body=""; stop=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;; --answer) answer="${2:-}"; shift ;;
     --cap) cap="${2:-}"; shift ;; --until) until="${2:-}"; shift ;;
-    --drain) drain=1 ;; --status) status=1 ;;
+    --drain) drain=1 ;; --status) status=1 ;; --stop) stop=1 ;;
     --reply) reply=1; reply_id="${2:-}"; reply_body="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
-    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --reply <msg-id> approve|'revise: ...'" ;;
+    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'revise: ...'" ;;
   esac; shift
 done
 case "$answer" in auto | human) ;; *) usage_exit "--answer takes auto or human" ;; esac
+[ "$stop" = 0 ] || [ -n "$run" ] || usage_exit "--stop needs --run <run-id>"
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
-# The only state v2 keeps: queued human replies, one file per question (name = message id, content = the reply line), in a 0700 dir
-# outside every worktree. Only the Run's bound terminal can reply (Orca attests terminal identity), so a human queues with --reply
-# from ANY terminal and the loop sends it at its next wake. AITK_STATE_DIR replaces ~/.ai-toolkit/coordinator; <run-id>/replies is appended.
-rdir() { echo "${AITK_STATE_DIR:-$HOME/.ai-toolkit/coordinator}/$run/replies"; }
-if [ "$reply" = 1 ]; then
-  [ -n "$run" ] || usage_exit "--reply needs --run <run-id>"
-  case "$reply_id" in '' | *[!A-Za-z0-9_-]*) usage_exit "bad message id '$reply_id'" ;; esac
-  case "$reply_body" in
-    approve) ;;
-    revise:*[![:space:]]*) reply_body="${reply_body#revise:}"; reply_body="revise: ${reply_body#"${reply_body%%[![:space:]]*}"}" ;;
-    *) usage_exit "the reply is 'approve' or 'revise: <change>'" ;;
-  esac
-  d="$(rdir)"; (umask 077; mkdir -p "$d"); chmod 700 "$d"
-  printf '%s\n' "$reply_body" > "$d/.$reply_id.tmp" && mv "$d/.$reply_id.tmp" "$d/$reply_id"
-  echo "reply to $reply_id queued: the coordinator sends it at its next wake"; exit 0
-fi
+[ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid>)
 DISPATCH_CMD="${DISPATCH_CMD:-$here/dispatch.sh}"; LAND_CMD="${LAND_CMD:-$here/land.sh}"; ANSWER_CMD="${ANSWER_CMD:-$here/answer.sh}"
 cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
@@ -75,10 +64,19 @@ pending() {   # {open: questions nobody has replied to (waiting for the human), 
     | {open: [$m[] | select(.type == "question") | select(. as $q | $m | any(.id != $q.id and .thread_id == $q.id) | not)],
        answered: [$m[] | select(.thread_id != null and .thread_id != .id) | .thread_id], truncated: ($all | length >= 200)}'
 }
+holder() { orca_json orchestration run-show --id "$run" 2> /dev/null | jq -r '.result.run.coordinator_handle // empty'; }   # the terminal that holds the Run
+live_hold() {   # $1 = a handle: if a live coordinator.sh runs bound as it, print its mode and succeed (holder.<pid> = "<handle> <mode>")
+  local f; for f in "$(spool_dir "$run")"/holder.*; do [ -f "$f" ] && kill -0 "${f##*.}" 2> /dev/null && [ "$(cut -d' ' -f1 "$f")" = "$1" ] && { cut -d' ' -f2- "$f"; return 0; }; done; return 1
+}
+yield() {   # exit 0 when another terminal holds the Run. $1 set = Orca already said fenced: an unreadable holder is then "another terminal"
+  local h; h="$(holder)"; [ -n "$h" ] || h="${1:+another terminal}"
+  [ -z "$h" ] || [ "$h" = "${H:-}" ] || { log "Run $run taken back by $h: exiting; an unfinished batch replays to it"; exit 0; }
+}
 replycmd() { printf 'bash %s --run %s --reply %s approve' "$here/coordinator.sh" "$run" "$1"; }
 if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to
   [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"
-  log "run: $run"; echo "live workers:"
+  log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
+  echo "live workers:"
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "  \(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict)"'
   echo "pending questions:"
   pending | jq -c '.open[]' | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"; echo "    reply: $(replycmd "$id")   (or 'revise: <change>')"; done
@@ -87,16 +85,22 @@ fi
 
 : "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal on the main checkout}"
 H="$ORCA_TERMINAL_HANDLE"
-if [ -n "$run" ]; then
-  out="$(orca_mutate orchestration run-use --id "$run" --from "$H" 2>&1)" || case "$out" in
-    *consumer_fenced*) die "Run $run is held by another live terminal (consumer_fenced): stop that coordinator first" ;;
-    *) die "run-use failed: $out" ;;
-  esac
+prev=""; [ -z "$run" ] || prev="$(holder)"
+if [ -n "$run" ]; then out="$(orca_mutate orchestration run-use --id "$run" --from "$H" 2>&1)" || die "run-use failed: $out"
 else
   run="$(orca_mutate orchestration run-create --objective "ai-toolkit coordinator" --from "$H" | jq -r '.result.run.id // empty')"
   [ -n "$run" ] || die "run-create failed"
 fi
-log "run $run, cap $cap, answer $answer${until:+, until $until}"
+if [ "$stop" = 1 ]; then   # the caller holds the Run now: the loop's wait returned consumer_fenced and it exits 0 at the end of its current step
+  for ((i = 0; i < ${COORD_STOP_TRIES:-900}; i++)); do
+    live_hold "$prev" > /dev/null || { log "run $run bound to $H: no coordinator.sh holds it any more (stopped, or none was running)"; exit 0; }
+    sleep "${COORD_STOP_POLL:-1}"
+  done
+  die "run $run is bound to $H, but coordinator.sh is still finishing its step (a land?): it exits when done, see --status"
+fi
+mode="$answer${until:+ until $until}"; [ "$drain" = 0 ] || mode="$mode drain"
+sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'rm -f "$errf" "$hf"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
+log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
 
 # ctx <dispatch>: sets disp task term wtp issue from the worker's Orca row and the issue linked to its worktree.
 ctx() {
@@ -110,8 +114,8 @@ ctx() {
 }
 rounds() { wl | jq --arg p "::$wtp" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] | length - 1'; }   # dispatches so far - 1
 release() { [ -z "$1" ] || orca_mutate orchestration worker-release --dispatch "$1" > /dev/null 2>&1 || orca_mutate orchestration worker-stop --dispatch "$1" > /dev/null 2>&1 || true; }
-block() {   # $1 = why. Label, comment, notify, free the slot; the worktree stays for the human.
-  gh issue edit "$issue" --add-label blocked > /dev/null 2>&1 \
+block() {   # $1 = why. Label, comment, notify, free the slot; the worktree stays for the human. Never when the Run was taken back (yield).
+  yield; gh issue edit "$issue" --add-label blocked > /dev/null 2>&1 \
     || { gh label create blocked --color B60205 > /dev/null 2>&1 || true; gh issue edit "$issue" --add-label blocked > /dev/null || warn "cannot label #$issue"; }
   comment "$issue" "blocked: $1"; notify "#$issue blocked: $1"; release "$disp"
 }
@@ -125,9 +129,9 @@ redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds 
 
 drain_replies() {   # send the queued human replies as the bound consumer. Dropped: a malformed body, a question seen answered, or (page not full)
   local f id body q pend   # unknown. Kept and retried: a failed send, or an id the full inbox page does not show (it may be older than the page)
-  ls "$(rdir)"/* > /dev/null 2>&1 || return 0
+  ls "$sd/replies"/* > /dev/null 2>&1 || return 0
   pend="$(pending)" || return 0
-  for f in "$(rdir)"/*; do
+  for f in "$sd/replies"/*; do
     [ -f "$f" ] || continue
     id="${f##*/}"; body="$(head -n 1 "$f")"; q="$(jq -c --arg i "$id" '[.open[] | select(.id == $i)][0] // empty' <<< "$pend")"
     case "$body" in
@@ -194,7 +198,7 @@ fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --n
     case $rc in 0) ;; 3) ready=0; break ;; *) warn "dispatch --next failed ($rc)"; break ;; esac
     if out="$(RUN="$run" "$DISPATCH_CMD" "$n" 2>&1)"; then log "dispatched #$n"
     else   # may have left a half-made worktree behind: remove it and park the issue
-      warn "dispatch #$n failed: $out"; orca_json worktree rm --worktree "issue:$n" --force > /dev/null 2>&1 || true
+      warn "dispatch #$n failed: $out"; yield; orca_json worktree rm --worktree "issue:$n" --force > /dev/null 2>&1 || true
       issue="$n"; disp=""; block "dispatch failed: $(tail -n 1 <<< "$out")"
     fi
   done
@@ -210,10 +214,10 @@ sweep() {   # a worker whose process exited without worker_done (and was not rel
   done
 }
 
-tick=0; empties=0; start="$(now_min)"; budget=0; errf="$(mktemp)"; trap 'rm -f "$errf"' EXIT
+tick=0; empties=0; start="$(now_min)"; budget=0
 [ -z "$until" ] || budget=$(((($(mins "$until") - start) + 1440) % 1440))
 while :; do
-  tick=$((tick + 1))
+  tick=$((tick + 1)); yield
   if [ -n "$until" ] && [ $((($(now_min) - start + 1440) % 1440)) -ge "$budget" ]; then log "reached $until"; break; fi
   [ -z "${COORD_MAX_TICKS:-}" ] || [ "$tick" -le "$COORD_MAX_TICKS" ] || break
   fill
@@ -222,7 +226,7 @@ while :; do
   rc=0; wait_ms="${COORD_WAIT_MS:-300000}"   # 30 s while a question waits for the human: its reply is picked up soon
   [ "$(pending | jq '.open | length')" -eq 0 ] 2> /dev/null || wait_ms="${COORD_WAIT_PENDING_MS:-30000}"
   out="$(orca_json orchestration check --run "$run" --terminal "$H" --wait --types question,worker_done,escalation --timeout-ms "$wait_ms" 2> "$errf")" || rc=$?
-  case "$out$(cat "$errf")" in *consumer_fenced*) die "Run $run was taken over by another terminal (consumer_fenced)" ;; esac
+  case "$out$(cat "$errf")" in *consumer_fenced*) yield fenced ;; esac
   msgs="$(jq -c '.result.messages[]?' <<< "$out" 2> /dev/null)" || msgs=""
   if [ -z "$msgs" ]; then
     empties=$((empties + 1)); [ "$rc" = 0 ] || sleep "${AI_TOOLKIT_POLL:-3}"
@@ -230,7 +234,7 @@ while :; do
     continue
   fi
   # fd 3, not stdin: a handler that reads stdin (claude -p, ssh) must not swallow the rest of the batch.
-  while IFS= read -r m <&3; do handle "$m" || warn "message $(jq -r .id <<< "$m") not fully handled"; done 3<<< "$msgs"
+  while IFS= read -r m <&3; do yield; handle "$m" || warn "message $(jq -r .id <<< "$m") not fully handled"; done 3<<< "$msgs"
   # Always ack, after the whole batch: a replied question is replayed until acked (03 #20).
-  orca_json orchestration check --run "$run" --terminal "$H" --ack "$(jq -r '.result.deliveryId // empty' <<< "$out")" > /dev/null || warn "ack failed"
+  yield; orca_json orchestration check --run "$run" --terminal "$H" --ack "$(jq -r '.result.deliveryId // empty' <<< "$out")" > /dev/null || warn "ack failed"
 done

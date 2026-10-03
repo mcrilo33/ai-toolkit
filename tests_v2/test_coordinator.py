@@ -101,15 +101,6 @@ def test_a_given_run_is_rebound_without_one_a_run_is_created_and_every_wait_name
     assert arg(C.calls("orca orchestration check")[-1], "--run") == "run_new"
 
 
-def test_a_run_taken_over_by_another_terminal_stops_the_coordinator(C):
-    C.stubs.reply("orca.orchestration_run_use", '{"error":{"code":"consumer_fenced"}}', rc=1)
-    r = C.go()
-    assert r.returncode == 1 and "another" in r.stderr and not C.calls("orca orchestration check")
-    C.stubs.reply("orca.orchestration_run_use", "{}")
-    C.stubs.reply("orca.orchestration_check", '{"error":{"code":"consumer_fenced"}}', rc=1)
-    assert C.go().returncode == 1
-
-
 def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_acks(C):
     C.stubs.reply("answer.sh", "revise: drop the extra file\nWARN: touches CI\n")
     C.mail([msg("question", "msg_q", question="PLAN: do X?")])
@@ -309,7 +300,7 @@ def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply
     C.inbox(["msg_q"], answered=["msg_a"])
     r = C.go("--status", ORCA_TERMINAL_HANDLE="")   # read-only: no coordinator terminal needed
     assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and REPLY in r.stdout and "msg_a" not in r.stdout
-    assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in ("worker-list", "inbox")] == []
+    assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in ("worker-list", "inbox", "run-show")] == []
 
 
 LONG_Q = "\n".join(f"plan line {i}: " + "word " * 30 for i in range(40))   # long lines AND too many of them

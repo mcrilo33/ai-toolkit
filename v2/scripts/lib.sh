@@ -63,6 +63,9 @@ gh_issue() { gh issue view "$1" --json number,title,body; }
 # issue_footer <body> <Key>: value of the last `Key: value` line (Scope:, Gate:, Model:).
 issue_footer() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | tail -n 1; }
 
+# spool_dir <run-id>: the coordinator's only state, outside every worktree (AITK_STATE_DIR relocates it): replies/ queued human answers, holder.<pid> its mode.
+spool_dir() { echo "${AITK_STATE_DIR:-$HOME/.ai-toolkit/coordinator}/$1"; }
+
 # usage_exit <msg>: caller misuse, exit 2 (die is exit 1: a failed operation).
 usage_exit() { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 2; }
 
