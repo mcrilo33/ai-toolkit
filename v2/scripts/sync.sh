@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ai-toolkit v2 sync: copy policy + lifecycle into a target repo. Claude Code only (D4): no per-platform
 # projection, the frontmatter lives in the source files. Idempotent; files a previous run wrote and this
-# run did not are removed (manifest GC). Usage: sync.sh <target-repo> [--local-only]
+# run did not are removed (manifest GC). Usage: sync.sh <target-repo> [--local-only] [--migrate-v1]
 #   rules/*.md (minus guidelines)  -> .claude/rules/    (no paths: = always on; paths: = conditional)
 #   rules/guidelines.md            -> CLAUDE.md         rules/on-demand/*.md -> .ai-toolkit/rules/ (never auto-loaded)
 #   skills/ agents/ prompts/       -> .claude/{skills,agents,commands}
@@ -14,11 +14,11 @@ set -euo pipefail
 V2="$(cd "$AI_TOOLKIT_LIB_DIR/.." && pwd)"
 SHARED="${AI_TOOLKIT_SHARED:-$V2/shared}"
 [ -d "$SHARED" ] || SHARED="$V2/../shared"   # before cutover shared/ is one level above v2/
-TARGET="" LOCAL=0
+TARGET="" LOCAL=0 MIGRATE=0
 for a in "$@"; do
-  case "$a" in --local-only) LOCAL=1 ;; -*) die "unknown option: $a" ;; *) TARGET="$a" ;; esac
+  case "$a" in --local-only) LOCAL=1 ;; --migrate-v1) MIGRATE=1 ;; -*) die "unknown option: $a" ;; *) TARGET="$a" ;; esac
 done
-[ -n "$TARGET" ] || die "usage: sync.sh <target-repo> [--local-only]"
+[ -n "$TARGET" ] || die "usage: sync.sh <target-repo> [--local-only] [--migrate-v1]"
 git -C "$TARGET" rev-parse --git-dir > /dev/null 2>&1 || die "$TARGET is not a git repository"
 TARGET="$(cd "$TARGET" && pwd)"
 OLD="$TARGET/.ai-toolkit/sync-manifest"
@@ -70,15 +70,30 @@ scripts:
 EOF
 put "$TMP" orca.yaml bak
 
-# GC: what the previous manifest lists and this run did not write. An entry that is absolute or
-# climbs out of the target is never touched (the manifest is data in the target, not trusted).
+# drop <rel>: remove one synced file and its now-empty parents. An absolute or climbing path is
+# never touched (a manifest is data in the target, not trusted).
+drop() {
+  case "$1" in '' | /* | *..*) return 0 ;; esac
+  rm -f "$TARGET/$1"
+  (cd "$TARGET" && rmdir -p "$(dirname "$1")" 2> /dev/null) || true
+}
+# GC: what the previous manifest lists and this run did not write.
 if [ -f "$OLD" ]; then
   while IFS= read -r p; do
-    case "$p" in '' | /* | *..*) continue ;; esac
-    grep -qxF "$p" "$NEW" && continue
-    rm -f "$TARGET/$p"
-    (cd "$TARGET" && rmdir -p "$(dirname "$p")" 2> /dev/null) || true
+    grep -qxF "$p" "$NEW" || drop "$p"
   done < "$OLD"
+fi
+# A target a v1 sync filled (.cursor/, .github/, v1 .claude/ hooks): opt-in removal of what its manifest lists.
+if [ -f "$TARGET/.ai-toolkit-manifest.json" ]; then
+  if [ "$MIGRATE" -eq 1 ]; then
+    jq -r '.tools[][]' "$TARGET/.ai-toolkit-manifest.json" > "$TMP" || die "unreadable .ai-toolkit-manifest.json"
+    while IFS= read -r p; do
+      grep -qxF "$p" "$NEW" || drop "$p"
+    done < "$TMP"
+    rm -f "$TARGET/.ai-toolkit-manifest.json"
+  else
+    warn "v1 manifest found: --migrate-v1 removes the Cursor/Copilot/v1 files it lists"
+  fi
 fi
 mkdir -p "$TARGET/.ai-toolkit"
 LC_ALL=C sort -u "$NEW" > "$TMP"

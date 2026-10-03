@@ -1,3 +1,4 @@
+import json
 import shutil
 
 import pytest
@@ -178,3 +179,29 @@ def test_refuses_a_target_that_is_not_a_git_repo(sync, tmp_path):
 
 def test_rejects_unknown_option(sync):
     assert sync("--bogus").returncode != 0
+
+
+def v1_target(target):
+    """A target a v1 sync filled: manifest.json lists Cursor/Copilot/Claude outputs."""
+    listed = [".cursor/rules/a.mdc", ".github/agents/x.md", ".claude/hooks/scripts/old.sh", "../victim.txt"]
+    for rel in listed[:3]:
+        write(target / rel)
+    write(target / ".cursor" / "mine.json", "user")
+    write(target / ".ai-toolkit-manifest.json", json.dumps({"toolkit_rev": "x", "tools": {
+        "cursor": listed[:1], "copilot": listed[1:2], "claude": listed[2:]}}))
+
+
+def test_v1_files_are_kept_unless_migrating_and_a_hint_is_printed(sync, target):
+    v1_target(target)
+    r = sync()
+    assert (target / ".cursor" / "rules" / "a.mdc").exists() and "--migrate-v1" in r.stderr
+
+
+def test_migrate_v1_removes_what_the_v1_manifest_listed_and_nothing_else(sync, target, tmp_path):
+    v1_target(target)
+    victim = write(tmp_path / "victim.txt", "keep")
+    assert sync("--migrate-v1").returncode == 0
+    assert not (target / ".cursor" / "rules").exists() and not (target / ".github").exists()
+    assert not (target / ".claude" / "hooks").exists() and not (target / ".ai-toolkit-manifest.json").exists()
+    assert (target / ".cursor" / "mine.json").read_text() == "user" and victim.read_text() == "keep"
+    assert (target / ".claude" / "settings.json").is_file()  # the v2 output survives the GC
