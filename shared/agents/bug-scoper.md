@@ -124,8 +124,8 @@ prose parses to no status and scores nothing). Put the human-readable summary in
   "action": "filed | drafted | deduped",
   "issue": "<URL, or #N when deduped, else null>",
   "scope": "<the Scope: paths you derived>",
-  "gate": "none | plan",
-  "summary": "Action + how you derived the scope + Gate reason + labels applied and why."
+  "gate": "plan",
+  "summary": "Action + how you derived the scope + labels applied and why."
 }
 ```
 
@@ -137,14 +137,14 @@ prose parses to no status and scores nothing). Put the human-readable summary in
   and say why in `summary`. Keep the whole object under ~20k characters.
 - **`summary`** carries what the prose report used to: **Action** (filed with URL /
   drafted / deduped into #N), **Scope** (paths + one line on how you derived them),
-  **Gate** (`none`/`plan` + reason if `plan`), and **Labels** (the set applied and which
+  and **Labels** (the set applied and which
   heuristic triggered each non-`bug` one).
 
 ## Checklist
 
 - [ ] Defect located by reading the code, not guessed
 - [ ] `Scope:` is real file paths + their tests, as a footer line (not a header)
-- [ ] `Gate:` set (`plan` only when a design decision is needed)
+- [ ] `Gate: plan` (`none` only when the user asked for the light lane on this issue)
 - [ ] Open issues searched; no duplicate filed (deduped into an existing one if overlapping)
 - [ ] Body has Why / What (numbered) / Acceptance in house style
 - [ ] Labels applied (`bug` always; `priority`/`hold` per heuristic)

@@ -1,5 +1,5 @@
 ---
-description: "What a dispatchable issue must contain so `dispatch.sh --next` can pick and order it — a mandatory Scope: line of touched files/globs (missing or '*' means exclusive) plus a Gate: none|plan line, with genuine ordering expressed as native GitHub blocked-by dependencies rather than file overlap. Programmatic filers emit the footer too. Surfaced on demand when authoring issues, not auto-applied to every session."
+description: "What a dispatchable issue must contain so `dispatch.sh --next` can pick and order it — a mandatory Scope: line of touched files/globs (missing or '*' means exclusive) plus a Gate: plan line (none = the user-requested light lane), with genuine ordering expressed as native GitHub blocked-by dependencies rather than file overlap. Programmatic filers emit the footer too. Surfaced on demand when authoring issues, not auto-applied to every session."
 ---
 # Issue Hygiene
 

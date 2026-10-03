@@ -164,8 +164,8 @@ free prose parses to no status and scores nothing). Put the human-readable summa
   "action": "filed | drafted | deduped | deferred-to-parent | dropped",
   "issue": "<URL, or #N when deduped / deferred-to-parent, else null>",
   "scope": "<the Scope: paths you derived, or null when dropped>",
-  "gate": "none | plan | null",
-  "summary": "Action + grounding verdict + how you derived the scope + Gate reason + labels."
+  "gate": "plan | null",
+  "summary": "Action + grounding verdict + how you derived the scope + labels."
 }
 ```
 
@@ -178,8 +178,7 @@ free prose parses to no status and scores nothing). Put the human-readable summa
   text in `summary`. Keep the whole object under ~20k characters.
 - **`summary`** carries what the prose report used to: **Action** (filed with URL /
   drafted / deduped into #N / deferred to #N / dropped + why), **Grounding** (the three-part
-  verdict), **Scope** (paths + one line on how you derived them), **Gate** (`none`/`plan` +
-  reason if `plan`), and **Labels** (the set applied and which heuristic triggered `hold`).
+  verdict), **Scope** (paths + one line on how you derived them), and **Labels** (the set applied and which heuristic triggered `hold`).
 
 ## Checklist
 
@@ -187,7 +186,7 @@ free prose parses to no status and scores nothing). Put the human-readable summa
 - [ ] Not the parent's own deferred scope (else a comment / `UPGRADE` marker, not a new issue)
 - [ ] Work located by reading the code, not guessed
 - [ ] `Scope:` is real file paths + their tests, as a footer line (not a header)
-- [ ] `Gate:` set (`plan` only when a design decision is needed)
+- [ ] `Gate: plan` (`none` only when the user asked for the light lane on this issue)
 - [ ] Open issues searched; no duplicate filed (deduped into an existing one if overlapping)
 - [ ] Body has Why / What (numbered) / Acceptance in house style
 - [ ] Labels applied (`enhancement` always; `hold` per heuristic)

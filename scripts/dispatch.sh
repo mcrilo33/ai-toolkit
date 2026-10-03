@@ -58,7 +58,7 @@ pick_next() {
 
 seed() {   # $1 = gate: plan = full cycle; none = light lane (no PLAN gate, no in-worker review)
   local s="Read .ai-toolkit/task.md." review=" -> in-spoke code-review"
-  [ "$1" != plan ] || s="$s Gate: plan. Explore, write the plan, then run your preamble's ask command with the plan as the question and options approve,revise; do not edit code before approve (on revise, amend the plan and ask again)."
+  [ "$1" = none ] || s="$s Gate: plan. Explore, write the plan, then run your preamble's ask command with the plan as the question and options approve,revise; do not edit code before approve (on revise, amend the plan and ask again)."
   [ "$1" != none ] || review=""
   printf '%s' "$s Cycle per subtask: RED -> GREEN -> REFACTOR${review} -> git push -u origin HEAD. When the acceptance criteria hold: push, then send worker_done --outcome succeeded with a 3-sentence summary. Never merge or push the base branch."
 }
