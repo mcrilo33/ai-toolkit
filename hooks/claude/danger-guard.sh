@@ -5,11 +5,10 @@
 # ~/.claude/settings.json and, in a spoke, the project .claude/{settings*.json,hooks/}; AskUserQuestion in a spoke.
 # Exit 2 + stderr = deny; a crash (bad JSON, no jq) is exit 2 too (fail-closed). A pattern list, not a sandbox.
 # Writes to .github/workflows/ ASK instead (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode)
-# when a human attends, and are denied like the rest when nobody does. Attended = outside a spoke (no Run), or in a spoke when the
-# terminal holding its Run is a Claude session. Read from Orca: worker-list (this terminal's dispatched row -> Run), run-show
-# (-> holder terminal), terminal show (-> agentIdentity claude). Anything else (the `coordinator.sh --answer auto` loop is a plain
-# shell, a missing handle, orca failing or timing out, an unreadable answer) is unattended: deny. The ask is emitted last, so a
-# deny anywhere in a compound command still wins.
+# when a human attends, and are denied like the rest when nobody does. Attended = outside a spoke (no Run), or in a spoke when the Run's holder terminal
+# is a Claude session (orca worker-list -> run-show -> terminal show agentIdentity claude) that runs no coordinator.sh: Orca reports `claude` for the loop
+# terminal too (its headless `claude -p` children), so a live holder.<pid> marker ("<handle> <mode>", pid still coordinator.sh) on the holder means unattended.
+# Anything else (plain shell, no handle, orca failing or timing out, an unreadable answer) is unattended: deny. The ask is emitted last: a deny in a compound wins.
 set -Eeuo pipefail
 deny() { echo "danger-guard: blocked: $*" >&2; exit 2; }
 trap 'deny "cannot parse the tool payload (fail-closed)"' ERR
@@ -21,7 +20,12 @@ orc() { # `orca ...` stdout (empty on any failure), killed after 5s: a hung CLI 
   local o p w; o="$(mktemp)"; orca "$@" > "$o" 2> /dev/null & p=$!; { sleep 5; kill -9 $p; } > /dev/null 2>&1 & w=$!
   if wait $p 2> /dev/null; then cat "$o"; fi; kill $w 2> /dev/null; wait $w 2> /dev/null; rm -f "$o"; return 0
 }
-attended() { # 0 = a human attends (outside a spoke, or a Claude session holds the spoke's Run); every unreadable answer is empty
+loop_runs() { # 0 = a live coordinator.sh is bound to terminal $2 on Run $1: its holder.<pid> marker, the pid still running coordinator.sh
+  local f; while IFS= read -r f; do
+    [[ "$(LC_ALL=C ps -o command= -p "${f##*.}" 2> /dev/null || :)" == *coordinator.sh* && "$(cut -d' ' -f1 "$f" 2> /dev/null || :)" = "$2" ]] && return 0
+  done < <(find "${AITK_STATE_DIR:-$HOME/.ai-toolkit/coordinator}/${1//[^A-Za-z0-9_-]/_}" -name 'holder.*' 2> /dev/null || :); return 1
+}
+attended() { # 0 = a human attends (outside a spoke, or a Claude session that runs no loop holds the spoke's Run); every unreadable answer is empty
   [ -n "$spoke" ] || return 0
   local h="${ORCA_TERMINAL_HANDLE:-}" run holder
   [ -n "$h" ] || return 1
@@ -29,7 +33,7 @@ attended() { # 0 = a human attends (outside a spoke, or a Claude session holds t
   [ -n "$run" ] || return 1
   holder="$(orc orchestration run-show --id "$run" --json | jq -r '.result.run.coordinator_handle // empty' 2> /dev/null || :)"
   [ -n "$holder" ] || return 1
-  [ "$(orc terminal show --terminal "$holder" --json | jq -r '.result.terminal.agentIdentity // empty' 2> /dev/null || :)" = claude ]
+  ! loop_runs "$run" "$holder" && [ "$(orc terminal show --terminal "$holder" --json | jq -r '.result.terminal.agentIdentity // empty' 2> /dev/null || :)" = claude ]
 }
 wf=""; wfd="write to a protected path (.github/workflows, orca.yaml, claude settings/hooks)" # a .github/workflows/ write (what, deny text), settled by finish()
 finish() {
