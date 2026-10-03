@@ -2,13 +2,15 @@
 # dispatch.sh [--run R] (<issue> | --next [--dry-run]): one issue -> one supervised worker (06 section 4 steps 2, 3, 5, 6).
 # The Run is explicit (--run or $RUN, never inferred: a coordinator's Run must not be picked up by accident).
 # --retry-of D --task T <issue>: relaunch the issue's worker (a new claude-spoke terminal in its worktree) on the same task; Orca re-seeds the spec.
+# --address "<spec>" <issue>: same fresh terminal, but a NEW task whose spec is the text (a review/CI round: worker-start refuses --task with --spec,
+# and Orca does not accept a new task on an idle two-step terminal: agent_unconfigured).
 # Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; n=""; next=0; dry=0; retry_of=""; task=""; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
+run="${RUN:-}"; n=""; next=0; dry=0; retry_of=""; task=""; address=""; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;;
@@ -16,6 +18,7 @@ while [ $# -gt 0 ]; do
     --dry-run) dry=1 ;;
     --retry-of) retry_of="${2:-}"; shift ;;
     --task) task="${2:-}"; shift ;;
+    --address) address="${2:-}"; shift ;;
     [0-9]*) n="$1" ;;
     *) usage_exit "usage: dispatch.sh [--run R] <issue> | --next" ;;
   esac; shift
@@ -62,6 +65,7 @@ seed() {   # $1 = gate
 start_worker() {   # worker-start with the common flags; $@ = placement flags. Sets $disp.
   local out what=(--task-title "#$n $title" --spec "$(seed "$gate")")
   [ -z "$retry_of" ] || what=(--task "$task" --retry-of "$retry_of")
+  [ -z "$address" ] || what=(--task-title "#$n address" --spec "$address")
   out="$(orca_mutate orchestration worker-start --run "$run" --from "$ORCA_TERMINAL_HANDLE" "$@" "${what[@]}" --timeout-ms 120000)" \
     || die "worker-start failed: $(printf '%s' "$out" | jq -c '{state: .result.state, stage: .result.failedStage}' 2> /dev/null)"
   disp="$(printf '%s' "$out" | jq -r '.result.dispatchId // empty')"
@@ -101,7 +105,7 @@ dispatch() {
   case "$model$effort" in *[!A-Za-z0-9._-]*) die "issue $n: bad Model footer '$model $effort'" ;; esac
   slug="$(printf '%s' "$title" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
   name="$n-${slug:-issue}"
-  if [ -n "$retry_of" ]; then launch_retry; else "launch_${DISPATCH_LAUNCH:-twostep}"; fi
+  if [ -n "$retry_of$address" ]; then launch_retry; else "launch_${DISPATCH_LAUNCH:-twostep}"; fi
   orca_json worktree set --worktree "$sel" --issue "$n" --workspace-status in-progress > /dev/null || die "worktree set failed for $sel"
   jq -nc --argjson issue "$n" --arg dispatch "$disp" --arg worktree "$wt" --arg terminal "$term" \
     '{issue: $issue, dispatch: $dispatch, worktree: $worktree, terminal: $terminal}'

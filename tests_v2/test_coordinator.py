@@ -52,8 +52,8 @@ def C(stubs, repo, run, tmp_path):
 
     stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": wt, "linkedIssue": 1}]}}))
     stubs.reply("orca.orchestration_run_create", '{"result":{"run":{"id":"run_new"}}}')
-    stubs.reply("orca.terminal_show", '{"result":{"terminal":{"agentIdentity":"claude"}}}')
-    stubs.reply("dispatch.sh", "", rc=3)   # nothing ready
+    stubs.reply("dispatch.sh", '{"issue":1}')
+    stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "", rc=3)   # nothing ready
     stubs.reply("answer.sh", "approve\n")
     workers(row())
     mail()
@@ -74,7 +74,7 @@ def C(stubs, repo, run, tmp_path):
     def blocked():   # label + comment + notification + release; the worktree is kept and nothing is re-dispatched
         ks = [k for k, _ in trail()]
         return (any(a[3:] == ["--add-label", "blocked"] for a in calls("gh issue edit")) and "gh issue comment" in ks and "notify" in ks
-                and "orca orchestration worker-release" in ks and "orca orchestration worker-start" not in ks and "orca worktree rm" not in ks)
+                and "orca orchestration worker-release" in ks and "--address" not in sum(stubs.calls("dispatch.sh"), []) and "orca worktree rm" not in ks)
 
     return type("C", (), dict(go=staticmethod(go), mail=staticmethod(mail), workers=staticmethod(workers), row=staticmethod(row), wt=wt,
                               calls=staticmethod(calls), blocked=staticmethod(blocked), stubs=stubs, kinds=staticmethod(lambda: [k for k, _ in trail()]),
@@ -163,20 +163,10 @@ def test_a_rejected_land_re_dispatches_the_reason_to_the_same_worker_a_bounded_n
         C.workers(*[C.row(f"ctx_{i}", st="completed") for i in range(1, spent + 1)], C.row(f"ctx_{spent + 1}"))
         C.mail([msg("worker_done", dispatchId=f"ctx_{spent + 1}", outcome="succeeded")])
         C.go()
-        if spent < limit:
-            ws = C.calls("orca orchestration worker-start")[-1]
-            assert arg(ws, "--terminal") == "term_w" and arg(ws, "--worktree") == f"path:{C.wt}" and "--task" not in ws and "--retry-of" not in ws
-            assert arg(ws, "--spec").startswith("address:") and (rc != 3 or "(1) a.py:3 - bug (2) b.py:1" in arg(ws, "--spec"))
-            assert not C.calls("gh issue edit")
-    assert len(C.calls("orca orchestration worker-start")) == limit and C.calls("gh issue edit")[0][3:] == ["--add-label", "blocked"]   # then blocked
-
-
-def test_a_worker_terminal_that_is_no_longer_claude_blocks_instead_of_re_dispatching(C):
-    C.stubs.reply("land.sh", "BLOCKER: x\n", rc=3)
-    C.stubs.reply("orca.terminal_show", '{"result":{"terminal":{"agentIdentity":null}}}')
-    C.mail([msg("worker_done", outcome="succeeded")])
-    C.go(COORD_AGENT_TRIES=2)
-    assert C.blocked() and len(C.calls("orca terminal show")) == 2
+        if spent < limit:   # a fresh terminal through dispatch.sh (same launch path, shim env), a new Task whose spec is the reason
+            d = [a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"][-1]
+            assert d[1].startswith("address:") and d[2] == "1" and (rc != 3 or "(1) a.py:3 - bug (2) b.py:1" in d[1]) and not C.calls("gh issue edit")
+    assert len([a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"]) == limit and C.calls("gh issue edit")[0][3:] == ["--add-label", "blocked"]
 
 
 @pytest.mark.parametrize("rc, out", [(3, "no verdict\n"), (4, "land.sh: CI for abc timed out\n"), (4, "land.sh: main keeps moving; land again\n"),
@@ -201,7 +191,6 @@ def test_landed_but_cleanup_incomplete_finishes_once_and_parks_a_still_open_issu
 
 def test_a_worker_that_exited_without_worker_done_is_retried_once_on_the_tenth_empty_wait_then_blocked(C):
     C.workers(C.row(lv="exited"))
-    C.stubs.reply(key("dispatch.sh", "--retry-of", "ctx_1"), '{"issue":1}')
     C.go("--cap", "1", COORD_MAX_TICKS=9)
     assert not C.stubs.calls("dispatch.sh")
     C.go("--cap", "1", COORD_MAX_TICKS=10)

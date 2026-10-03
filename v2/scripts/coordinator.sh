@@ -83,12 +83,11 @@ block() {   # $1 = why. Label, comment, notify, free the slot; the worktree stay
     || { gh label create blocked --color B60205 > /dev/null 2>&1 || true; gh issue edit "$issue" --add-label blocked > /dev/null || warn "cannot label #$issue"; }
   comment "$issue" "blocked: $1"; notify "#$issue blocked: $1"; release "$disp"
 }
-redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds are spent. A new Task on the worker's own terminal:
-  local r out; r="$(rounds)"   # worker-start refuses --task together with --spec
-  [ "$r" -lt "$1" ] || { block "$3"; return 0; }   # Orca refuses an idle terminal it does not currently see as an agent: look first, as dispatch.sh does
-  wait_until "${COORD_AGENT_TRIES:-10}" "${AI_TOOLKIT_POLL:-3}" _agent_up "$term" || { block "the worker terminal $term is no longer running claude"; return 0; }
-  out="$(orca_mutate orchestration worker-start --run "$run" --from "$H" --worktree "path:$wtp" --terminal "$term" \
-    --task-title "#$issue address (round $((r + 1)))" --spec "$2" --timeout-ms 120000 2>&1)" || { warn "worker-start: $out"; block "re-dispatch failed"; return 0; }
+redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds are spent. A fresh terminal and a NEW Task (dispatch.sh --address):
+  local r out; r="$(rounds)"   # worker-start refuses --task with --spec, and Orca refuses a new task on the idle two-step terminal
+  [ "$r" -lt "$1" ] || { block "$3"; return 0; }
+  out="$(RUN="$run" "$DISPATCH_CMD" --address "$2" "$issue" 2>&1)" || { warn "re-dispatch: $out"; block "re-dispatch failed"; return 0; }
+  orca terminal close --terminal "$term" --json > /dev/null 2>&1 || true   # the old, idle terminal
   comment "$issue" "round $((r + 1)): $2"
 }
 

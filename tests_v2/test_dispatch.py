@@ -234,3 +234,14 @@ def test_retry_needs_a_task_and_an_existing_worktree(d):
     d.stubs.reply("orca.worktree_show", "no such worktree", rc=1)
     r = d.go("--retry-of", "ctx_old", "--task", "task_7", "7")
     assert r.returncode == 1 and not any(c[:2] == ["terminal", "create"] for c in d.orca())
+
+
+def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_the_existing_worktree(d):
+    d.stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(d.wt), "branch": f"refs/heads/{NAME}"}}}))
+    r = d.go("--address", "address: fix the blocker", "7")
+    assert r.returncode == 0, r.stderr
+    calls = d.orca()
+    assert [c[:2] for c in calls] == [["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
+    assert calls[1][7].endswith("/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")
+    assert calls[3] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}", "--terminal", "term_agent",
+                        "--task-title", "#7 address", "--spec", "address: fix the blocker", "--timeout-ms", "120000"]
