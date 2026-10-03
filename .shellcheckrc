@@ -1,2 +1,4 @@
 external-sources=true
 source-path=SCRIPTDIR
+# A && B || C is used deliberately as "check && check || fail" (the fail branch must also run when B fails).
+disable=SC2015

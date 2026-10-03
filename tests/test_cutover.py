@@ -28,7 +28,7 @@ def template(tmp_path_factory):
     """A v1 main (pushed to a bare origin) and a v2 branch on top of it, built once per module and copied per test."""
     base = tmp_path_factory.mktemp("tpl")
     origin, root = base / "origin.git", base / "clone"
-    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", "--initial-branch=main", str(origin)], check=True)
     subprocess.run(["git", "clone", "-q", str(origin), str(root)], check=True, capture_output=True)
     git(root, "config", "user.name", "t"); git(root, "config", "user.email", "t@t")
     for rel in V1:
@@ -126,7 +126,7 @@ def test_sync_into_itself_generates_claude_md_and_keeps_the_tracked_orca_yaml(tm
         shutil.copytree(V2 / d, root / d)
     put(root, "shared/rules/guidelines.md", "---\ndescription: g\n---\n# Guidelines\n")
     put(root, "orca.yaml", "setup: ./scripts/setup.sh\n")
-    git(root, "init", "-q")
+    git(root, "init", "-q", "--initial-branch=main")
     r = run(["bash", str(root / "scripts" / "sync.sh"), str(root)])
     assert r.returncode == 0, r.stderr
     assert (root / "CLAUDE.md").read_text() == "# Guidelines\n"
