@@ -62,7 +62,7 @@ mkdir -p "$TARGET"
 PYPROJECT_BLOCK="$(
   cat <<'EOF'
 [tool.pytest.ini_options]
-# The pre-push gate's two-phase full run splits on this marker: the parallel bulk
+# The two-phase full run of the pre-push gate splits on this marker: the parallel bulk
 # runs `-m "not serial"` under xdist, then the ref-mutating tail runs `-m serial`
 # single-process. Mark a test @pytest.mark.serial only when it mutates shared git
 # refs or otherwise cannot run under xdist workers. Do NOT put an xdist worker

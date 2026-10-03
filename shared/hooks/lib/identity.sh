@@ -28,7 +28,7 @@
 ai_toolkit_identity_get() {
   local key="${1:-}" root="${2:-.}" file line value=""
   file="$root/.ai-toolkit/identity"
-  case "$key" in "" | *[!a-z0-9_]*) return 1 ;; esac
+  case "$key" in "" | *[!abcdefghijklmnopqrstuvwxyz0123456789_]*) return 1 ;; esac
   [ -f "$file" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line%$'\r'}"
