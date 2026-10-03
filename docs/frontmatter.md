@@ -23,7 +23,7 @@ The frontmatter lives in each source file under `shared/`; `scripts/sync.sh` cop
   `low|medium|high|xhigh|max`. The read-only agents (`architect`, `planner`, `code-review`, `security-reviewer`, `bug-scoper`, `followup-scoper`) declare
   `disallowedTools: Edit, Write, NotebookEdit`. Tool names are Claude Code's (`Bash`, `Read`, `Grep`, `Glob`, `WebFetch`, `WebSearch`, `Agent`, `Edit`, `Write`, `NotebookEdit`).
 - **The `code-review` agent's last message is one JSON object** `{verdict, blockers, warnings, tdd_followed, tests_weakened, summary}`; `review.sh` rejects anything else.
-- **Size caps** (lines): `solo-cycle` 120, `hub` 60, `start-task` 60, `afk` 40, `land` 30, `quick` 30, `workflow` 100, `planning-hub` 50, `afk-answering` 120, `code-review` 110.
+- **Size caps** (lines): `solo-cycle` 120, `hub` 60, `start-task` 60, `afk` 40, `land` 30, `workflow` 100, `planning-hub` 50, `afk-answering` 120, `code-review` 110.
 - **No deleted mechanism.** Nothing under `shared/` may name `spoke-ready`, `review-stamp`, `tmux`, `.review/`, `hub-afk`, `metadata.yml`, Cursor or Copilot, and so on (the regex is `DELETED` in the lint).
   Nothing may point at a doc other than `docs/architecture.md` and `docs/frontmatter.md`.
 
