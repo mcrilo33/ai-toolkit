@@ -185,3 +185,28 @@ def test_generator_is_non_destructive(tmp_path: Path) -> None:
     assert conftest.read_text() == "# host-owned sentinel — must survive a re-run\n", (
         "generator overwrote an existing file (writes must guard on absence)"
     )
+
+
+def test_command_substitution_heredoc_carries_no_apostrophe() -> None:
+    """bash 3.2 (macOS /bin/bash) mis-parses an apostrophe inside a ``$(cat <<'EOF')`` body (#384).
+
+    ``/bin/bash -n`` then dies with "unexpected EOF while looking for matching" on the
+    macOS CI job while bash 5 (Linux) accepts the file, so pin the cause on every platform.
+    Heredocs fed straight to a function are not inside ``$()`` and are not affected.
+    """
+    in_substitution = in_heredoc = False
+    offenders: list[str] = []
+    for number, line in enumerate(SCRIPT.read_text().splitlines(), start=1):
+        if in_heredoc:
+            if line == "EOF":
+                in_heredoc = False
+            elif in_substitution and "'" in line:
+                offenders.append(f"{number}: {line}")
+        elif line.endswith("$("):
+            in_substitution = True
+        elif line.strip() in (")", ')"'):
+            in_substitution = False
+        elif "<<'EOF'" in line:
+            in_heredoc = True
+
+    assert offenders == []

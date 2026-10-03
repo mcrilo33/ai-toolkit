@@ -373,3 +373,12 @@ def test_issue_at_is_safe_under_set_euo_pipefail(tmp_path: Path) -> None:
     )
 
     assert result.stdout.strip() == "done", result.stderr
+
+
+def test_get_key_check_spells_the_alphabet_out_not_a_range() -> None:
+    """A bracket range collates by locale: under fr_FR.UTF-8 on macOS `a-z` also matches
+    uppercase, so `Issue` was accepted as a key (#384). The check must not use ranges."""
+    source = LIB.read_text()
+    body = source.split("ai_toolkit_identity_get() {", 1)[1].split("\n}\n", 1)[0]
+
+    assert "a-z" not in body
