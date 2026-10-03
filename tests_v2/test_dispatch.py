@@ -53,7 +53,7 @@ def test_two_step_launch_runs_the_exact_orca_calls_in_order(d):
     calls = d.orca()
     assert [c[:2] for c in calls] == [["worktree", "create"], ["terminal", "create"], ["terminal", "show"],
                                       ["orchestration", "worker-start"], ["worktree", "set"]]
-    assert calls[0] == ["worktree", "create", "--repo", f"path:{d.root}", "--name", NAME, "--base-branch", "origin/main", "--setup", "run"]
+    assert calls[0] == ["worktree", "create", "--repo", f"path:{d.root}", "--name", NAME, "--base-branch", "origin/main", "--issue", "7", "--setup", "run"]
     term = next(c for c in calls if c[:2] == ["terminal", "create"])
     assert term[2:6] == ["--worktree", f"path:{d.wt}", "--title", f"{NAME}-agent"]
     assert term[6] == "--command" and term[7].endswith(
@@ -180,6 +180,7 @@ NEXT = [
     ("an in-flight issue is not picked again", [issue(2), issue(3, "Scope: b.py")], [2], 3),
     ("an exclusive in-flight issue blocks everything", [issue(2, "Scope: *"), issue(3, "Scope: b.py")], [2], None),
     ("an exclusive candidate waits for an idle board", [issue(2, "no scope line"), issue(3, "Scope: b.py")], [3], None),
+    ("a glob token is not the exclusive star", [issue(2, "Scope: *.py"), issue(3, "Scope: b.py")], [2], 3),
     ("an exclusive candidate runs on an idle board", [issue(2, "Scope: *")], [], 2),
     ("nothing open", [], [], None),
 ]

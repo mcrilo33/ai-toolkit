@@ -28,7 +28,7 @@ base="origin/$BASE_BRANCH"
 # shellcheck disable=SC2016
 PICK='def scope: [(.body // "") | split("\n")[] | select(test("^\\s*[Ss]cope:"))] | .[-1]
     | if . == null then null else (sub("^\\s*[Ss]cope:"; "") | gsub(","; " ") | [splits(" +")] | map(select(. != "")))
-      | if length == 0 or contains(["*"]) then null else . end end;
+      | if length == 0 or index("*") != null then null else . end end;
   def clash($a; $b): $a == null or $b == null or (($a - ($a - $b)) | length > 0);
   def names: [.labels.nodes[].name];
   (map(select(.number as $x | ($busy | index($x)) != null) | scope)) as $held
@@ -74,7 +74,7 @@ start_worker() {   # worker-start with the common flags; $@ = placement flags. S
 # points at bin/claude-spoke, flip the default below to `override` (a single worker-start, no terminal step).
 launch_twostep() {
   local o bin
-  o="$(orca_json worktree create --repo "path:$main" --name "$name" --base-branch "$base" --setup run)" || die "worktree create failed: $o"
+  o="$(orca_json worktree create --repo "path:$main" --name "$name" --base-branch "$base" --issue "$n" --setup run)" || die "worktree create failed: $o"
   wt="$(printf '%s' "$o" | jq -r '.result.worktree.path // empty')"; [ -n "$wt" ] || die "worktree create returned no path: $o"
   wait_until "$tries" "$poll" test -f "$wt/.ai-toolkit/setup-done" || die "setup did not finish in $wt (see its Orca setup terminal)"
   bin="$(cd "$here/../bin" && pwd -P)/claude-spoke"
