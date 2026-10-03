@@ -118,18 +118,21 @@ RM_DENY = [
     "rm -rf /", "rm -rf /etc/x", "rm -rf ~", "rm -rf ~/x", "rm -rf $HOME/x", 'rm -rf "${HOME}/x"', "rm -fr /usr/local",
     "rm -r --force /usr", "rm --recursive /usr", "rm /usr/x -rf", "rm -rf ../../../../../../../..", "rm -rf .",
     "rm -rf {wt}", "rm -rf {home}/x", "rm -rf build /etc/x", "rm -rf $FOO/x", 'bash -c "rm -rf /usr"',
-    "echo hi && rm -rf /usr", "rm -rf /tmp", "rm -rf /private/tmp", "rm -rf /etc/absent/", "git clean -fdx", "git clean -xdf", "git clean -fdX",
+    "echo hi && rm -rf /usr", "rm -rf /tmp", "rm -rf /private/tmp", 'rm -rf "$HOME"/x', "bash -c'rm -rf /usr'", "'r'm -rf /usr", 'r""m -rf /usr',
+    "git stash -a", "git stash --all", "git stash push -a", "git stash push -au", "git -C . stash -a", "rm -rf /etc/absent/", "git clean -fdx", "git clean -xdf", "git clean -fdX",
     "git clean -f -x", "git -C . clean -fdx", "bash -c 'git clean -fdx'", "rm -rf $UNSET_TMP/x", "rm -rf ~root/x", "RM -rf /usr",
 ]
 RM_ALLOW = [
-    "rm -rf build", "rm -rf build/ dist/ .venv/ node_modules/", "rm -rf ./build/", "rm -rf /tmp/absent-x/",
+    "rm -rf build", 'rm -rf "$TMPDIR"/x', 'rm -rf "${TMPDIR}"/x', 'rm -rf "$TMPDIR"/claude-*', "rm -rf build/ dist/ .venv/ node_modules/", "rm -rf ./build/", "rm -rf /tmp/absent-x/",
     "rm -rf $TMPDIR/absent-x/", "rm -rf ./dist node_modules", "rm file.txt", "rm -rf /tmp/xyz", "rm -rf $TMPDIR/xyz",
     "rm -rf {spoke}/sub", "rm -rf src/*.pyc", "rm -rf build 2>/dev/null", "ls /etc",
 ]
 WRITE_DENY = [
     "echo x > .github/workflows/ci.yml", "echo x >> {spoke}/.github/workflows/ci.yml", "tee orca.yaml",
     "sed -i s/a/b/ orca.yaml", "sed -i '' s/a/b/ orca.yaml", "cp x ~/.claude/settings.json",
-    'cat y > "$HOME/.claude/settings.json"', "mv a {home}/.claude/settings.json", "echo x > ./orca.yaml", "echo x >orca.yaml", "rm -rf .claude", "rm -rf .claude/", "mv .claude {home}/x",
+    'cat y > "$HOME/.claude/settings.json"', "mv a {home}/.claude/settings.json", "echo x > ./orca.yaml", "echo x > $PWD/orca.yaml", "echo x > ${PWD}/orca.yaml", 'echo x > "$PWD"/orca.yaml',
+    "echo x > $CLAUDE_PROJECT_DIR/orca.yaml", 'echo x > "$(pwd)/orca.yaml"', "cp s.json $PWD/.claude/settings.json",
+    "tee ${CLAUDE_PROJECT_DIR}/.github/workflows/ci.yml", "echo x >orca.yaml", "rm -rf .claude", "rm -rf .claude/", "mv .claude {home}/x",
     "rm -rf .ai-toolkit", "rm -r .ai-toolkit/", "rm .ai-toolkit/spoke-run-id", "rm -rf .claude/hooks", "rm -rf .claude/hooks/",
     "mv .claude/hooks h", "rm -rf .claude; ls",
     "python3 -c \"open('orca.yaml','w')\"", "rm .github/workflows/ci.yml", 'bash -c "echo > orca.yaml"',
@@ -140,7 +143,7 @@ WRITE_DENY = [
 ]
 WRITE_ALLOW = [
     "touch sub/orca.yaml", "echo x > v2/orca.yaml", "cp a docs/.github/workflows/x.yml", "rm -rf .claude/cache", "ls .claude",
-    "cat .ai-toolkit/task.md", "git clean -fd", "git clean -n", "git clean -fd -e keep", "grep -n x 2>/dev/null orca.yaml",
+    "cat .ai-toolkit/task.md", "git clean -fd", "git clean -n", "git stash", "git stash push -u -m wip", "git stash list", "git stash pop", "git clean -fd -e keep", "grep -n x 2>/dev/null orca.yaml",
     "ls 2>&1 .github/workflows", "cat orca.yaml >/dev/null 2>&1", "echo x &>/dev/null; cat orca.yaml",
     "cat orca.yaml", "git add orca.yaml .github/workflows/ci.yml", "ls .github/workflows", "cat .claude/settings.json",
     "grep -n hooks .claude/settings.json", "echo hi > out.txt", "cat orca.yaml > /dev/null", "cat orca.yaml > out.txt",
