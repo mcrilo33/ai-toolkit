@@ -12,7 +12,6 @@ V2="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 . "$V2/scripts/lib.sh"
 load_env
 : "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal}"
-H="$ORCA_TERMINAL_HANDLE"
 # Fixed path: Claude's workspace-trust entry is keyed on the git root, so one path means one entry, ever.
 S=/private/tmp/aitk-e2e-scratch; E="$S.e2e"; rm -rf "$S" "$S.git" "$E"; mkdir -p "$S" "$E"
 repo_id=""; wt=""; run=""; coord=""; br=1-add-hello-txt; step=0
@@ -55,7 +54,7 @@ jq -c '[{number, body, labels: {nodes: []}, blockedBy: {nodes: []}}]' "$E/issue.
 # shellcheck disable=SC2016
 printf '#!/bin/sh\necho "$*" >> %s/gh.log\ncase "$1 $2" in "issue view") cat %s/issue.json ;; "api graphql") cat %s/nodes.json ;; esac\n' "$E" "$E" "$E" > "$E/gh"
 chmod +x "$E/gh"
-printf 'AI_TOOLKIT_GH=%s/gh\nCHECK_CMD="test -f hello.txt"\nANSWER_MODEL=%s\n' "$E" "${E2E_ANSWER_MODEL:-claude-sonnet-5-5}" > "$S/.ai-toolkit/ai-toolkit.local.env"
+printf 'AI_TOOLKIT_GH=%s/gh\nCHECK_CMD="test -f hello.txt"\nLOCAL_GATE=1\nANSWER_MODEL=%s\n' "$E" "${E2E_ANSWER_MODEL:-claude-sonnet-5-5}" > "$S/.ai-toolkit/ai-toolkit.local.env"
 # A target's .ai-toolkit/ is untracked (the user's global gitignore lists it), so a new worktree has no
 # copy: the hooks run from the main checkout. Orca's runner is a bash script, so $ORCA_ROOT_PATH expands.
 # shellcheck disable=SC2016

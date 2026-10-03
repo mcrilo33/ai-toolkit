@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # land.sh [--local-gate] [--review] [--dispatch D] [--cleanup-only] <issue>: land one finished spoke (06 section 4 steps 11-14).
+# LOCAL_GATE=1 (env or local env file) means --local-gate, for callers that pass no flags (the coordinator).
 # Run it from the main checkout, on BASE_BRANCH. Gate on the EXACT tip that will be merged: CI (`gh run list --commit`)
 # or, before cutover, --local-gate = $CHECK_CMD in the spoke worktree on the merged tip. Main moved -> merge it on the
 # spoke, push, gate again. Then ff main, push, close the issue, delete the branch, release the worker, remove the worktree.
@@ -13,7 +14,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-local_gate=0; review=0; co=0; disp=""; n=""; branch=""; tip=""; gone=0
+local_gate="${LOCAL_GATE:-0}"; review=0; co=0; disp=""; n=""; branch=""; tip=""; gone=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --local-gate) local_gate=1 ;;

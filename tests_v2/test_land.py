@@ -150,6 +150,12 @@ def test_local_gate_runs_check_cmd_on_the_merged_tip_instead_of_ci(L):
     assert not [t for t in L.trail() if t[:3] == ("gh", "run", "list")]
 
 
+def test_local_gate_env_switches_the_gate_without_the_flag(L):   # the coordinator lands with no flags: the local env file decides
+    r = L.go("9", LOCAL_GATE=1, CHECK_CMD="test -f feature.txt")
+    assert r.returncode == 0, r.stderr
+    assert not [t for t in L.trail() if t[:3] == ("gh", "run", "list")]
+
+
 def test_a_red_local_gate_merges_nothing(L):
     before = main_sha(L)
     r = L.go("--local-gate", "9", CHECK_CMD="exit 3")
