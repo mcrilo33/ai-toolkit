@@ -81,8 +81,9 @@ def _stub_selector(hooks: Path, *, exit_code: int, stdin_log: Path | None = None
     """Overwrite the copied test-select.sh with a stub of a known exit code."""
     sel = _scripts_dir(hooks) / "test-select.sh"
     body = "#!/bin/sh\n"
-    if stdin_log is not None:
-        body += f'cat >> "{stdin_log}"\n'
+    # Always consume stdin: the cage pipes the refs in under pipefail, so a stub that exits
+    # unread lets the writer hit EPIPE and abort the push at random (#385).
+    body += f'cat >> "{stdin_log}"\n' if stdin_log is not None else "cat > /dev/null\n"
     body += f"exit {exit_code}\n"
     write_stub(sel, body)
 

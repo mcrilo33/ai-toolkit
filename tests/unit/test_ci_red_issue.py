@@ -91,8 +91,19 @@ def test_newer_push_cancels_the_older_run_of_the_same_branch(
     workflow: dict[str, Any],
 ) -> None:
     concurrency = workflow["concurrency"]
-    assert concurrency["group"] == "ci-${{ github.ref }}"
+    assert concurrency["group"].startswith("ci-${{ github.ref }}")
     assert concurrency["cancel-in-progress"] is True
+
+
+def test_manual_dispatches_run_side_by_side_not_cancelling_each_other(
+    workflow: dict[str, Any],
+) -> None:
+    # The #385 proof is a batch of runs on one branch; if they shared the push group each
+    # dispatch would cancel the previous one. Only dispatches get the per-run suffix, so a
+    # push still cancels the older push run.
+    group = workflow["concurrency"]["group"]
+    assert "github.event_name == 'workflow_dispatch'" in group
+    assert "github.run_id" in group
 
 
 def test_pytest_suite_runs_two_phase_under_xdist(workflow: dict[str, Any]) -> None:

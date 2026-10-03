@@ -13,9 +13,10 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same ref cancels that ref's in-flight run.
+# A newer push to the same ref cancels that ref's in-flight run. A manual dispatch gets its own
+# group, so a batch of proof runs on one branch (#385) neither cancels itself nor a push run.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 jobs:
