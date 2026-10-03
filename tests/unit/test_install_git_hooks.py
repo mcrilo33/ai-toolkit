@@ -87,6 +87,24 @@ def _stub_selector(hooks: Path, *, exit_code: int, stdin_log: Path | None = None
     write_stub(sel, body)
 
 
+def test_stub_selector_consumes_the_refs_the_cage_pipes_into_it(tmp_path: Path) -> None:
+    # The cage feeds the selector with `printf refs | test-select.sh` under pipefail. A stub that
+    # exits without reading lets the writer hit EPIPE whenever the stub wins the race, which
+    # aborts the push at random under xdist load (#385). A megabyte cannot fit the pipe buffer,
+    # so a stub that ignores stdin fails here every time instead of once in a while.
+    hooks = tmp_path / "hooks"
+    _scripts_dir(hooks).mkdir(parents=True)
+    _stub_selector(hooks, exit_code=0)
+
+    selector = str(_scripts_dir(hooks) / "test-select.sh")
+    feed = subprocess.run(
+        ["bash", "-c", 'set -o pipefail; head -c 1000000 /dev/zero | "$1"', "_", selector],
+        capture_output=True,
+    )
+
+    assert feed.returncode == 0
+
+
 def _unpushed_commit(repo: Path, fname: str = "change.txt") -> str:
     """Make a commit to push BEFORE hooks exist (so commit-msg never fires)."""
     (repo / fname).write_text("work\n")
