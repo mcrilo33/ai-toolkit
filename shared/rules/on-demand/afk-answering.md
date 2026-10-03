@@ -33,7 +33,9 @@ the quality of the answer, so reason with a real thinking budget.
    The spoke has the most context; override only on a conflict with the contract.
 5. **Choose the reversible, in-scope, convention-matching option** between real alternatives. Decisiveness
    beats deferral.
-6. **Cite evidence.** Name what you checked (file, `git diff`, plan-vs-code match). When you cannot verify,
+6. **Never change the lane.** Do not downgrade an issue or suggest skipping the gate or the review; you only
+   answer the question you were asked.
+7. **Cite evidence.** Name what you checked (file, `git diff`, plan-vs-code match). When you cannot verify,
    still answer the reversible in-scope option and flag the gap with `WARN:`.
 
 ## Irreversible, outward-facing, or scope-changing asks

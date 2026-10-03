@@ -23,7 +23,7 @@ observation*. Draw the line by what you can prove:
   deliberate, a known trade-off, or the user's product choice. → Surface it in prose
   and let the human decide. That judgement is not the agent's to make.
 
-When unsure which side a finding falls on, a quick check against the code usually
+When unsure which side a finding falls on, a check against the code usually
 settles it. Bias toward filing once it's confirmed; bias toward asking only while
 intent is genuinely ambiguous.
 

@@ -32,16 +32,16 @@ orca.yaml                  Orca hooks of THIS repo (setup/archive); a synced tar
 
 ## Lifecycle of one issue
 
-1. **Issue.** `gh issue create` with a footer: `Scope: <paths>` (disjointness is the parallelism contract), `Gate: plan|none`, optional
+1. **Issue.** `gh issue create` with a footer: `Scope: <paths>` (disjointness is the parallelism contract), `Gate: plan` (default, the full cycle) or `none` (the light lane: no PLAN gate, no in-worker review; only the user sets it), optional
    `Model: <id> [effort]`; labels `priority`, `hold`, `blocked`. Blocked-by relations are GitHub's own.
 2. **Pick.** `dispatch.sh --next`: open, not `hold`/`blocked`, all blockers closed, not already linked to a worktree of this repo, `Scope`
    disjoint from the in-flight ones (a missing or `*` scope is exclusive); `priority` first, then the lowest number. Exit 3 = nothing ready.
 3. **Dispatch.** `dispatch.sh <n>`: `worktree create` (Orca runs `scripts/setup.sh` first: `.claude/` copied from the main checkout, `spoke-run-id`,
    `task.md` from the issue), a `claude-spoke` terminal (the two-step launch: Orca's own agent launch cannot carry the per-spoke OTel env), then `worker-start --terminal` with the seed prompt, then `worktree set --issue n
    --workspace-status in-progress`. Branch = Orca's `<n>-<slug>`.
-4. **Gate.** `Gate: plan`: the worker explores, then blocks in its preamble's `orchestration ask` with the plan (options approve, revise).
+4. **Gate.** Full lane (`Gate: plan`): the worker explores, then blocks in its preamble's `orchestration ask` with the plan (options approve, revise).
    The coordinator answers it (`answer.sh`, auto) or hands it to the human (below). No edit happens before `approve`.
-5. **Work.** Policy only inside the spoke: RED, GREEN, REFACTOR, in-spoke `code-review`, `git push -u origin HEAD`. Hooks deny base-branch
+5. **Work.** Policy only inside the spoke: RED, GREEN, REFACTOR, in-spoke `code-review` (not in the light lane), `git push -u origin HEAD`. Hooks deny base-branch
    pushes, force pushes, `--no-verify`, and the destructive shapes of D8. Then `worker_done --outcome succeeded` (or `failed`).
 6. **Review.** `review.sh <n>`: a fresh read-only Opus runs the `code-review` agent on `origin/<base>...<branch>`; its last message is one JSON
    verdict `{verdict, blockers, warnings, tdd_followed, tests_weakened, summary}`. `tests_weakened`, `tdd_followed: false` or any blocker beats an APPROVE.

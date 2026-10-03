@@ -1,5 +1,5 @@
 ---
-description: "Task lifecycle on Orca (issue, dispatch, PLAN gate, TDD cycle, push, worker_done, independent review, CI, land), the three lanes, commands, and the coordinator design principles"
+description: "Task lifecycle on Orca (issue, dispatch, PLAN gate, TDD cycle, push, worker_done, independent review, CI, land), the two lanes, commands, and the coordinator design principles"
 ---
 # Development Workflow
 
@@ -9,15 +9,15 @@ description: "Task lifecycle on Orca (issue, dispatch, PLAN gate, TDD cycle, pus
 HUB:    issue + dispatch (start-task)                      review → CI → land (land.sh)
             │ orca worker-start: worktree + agent + seed      ▲
             ▼                                                │ worker_done succeeded
-SPOKE:  task.md → PLAN gate (ask/reply) → RED → GREEN → REFACTOR → code-review → push   (solo-cycle)
+SPOKE:  task.md → [PLAN gate] → RED → GREEN → REFACTOR → [code-review] → push   (solo-cycle)
 ```
 
 | Step | Where | Outcome |
 |------|-------|---------|
 | ISSUE | hub | GitHub issue with `Scope:` / `Gate:` / `Model:` footer, `priority`/`hold`/blocked-by |
 | DISPATCH | hub | `dispatch.sh <n>`: Orca worktree `<n>-<slug>`, agent launched, seed prompt (Orca runs `setup.sh` first) |
-| PLAN | spoke | `Gate: plan`: the plan goes out as `orchestration ask`; coding starts after `approve` |
-| CYCLE | spoke | per subtask: RED, GREEN, REFACTOR, in-spoke `code-review` (advisory), `git push -u origin <branch>` |
+| PLAN | spoke | full lane: the plan goes out as `orchestration ask`; coding starts after `approve` (light: skipped) |
+| CYCLE | spoke | per subtask: RED, GREEN, REFACTOR, in-spoke `code-review` (advisory; full lane only), `git push -u origin <branch>` |
 | DONE | spoke | `worker_done --outcome succeeded` with a 3-sentence summary |
 | REVIEW | hub | `review.sh`: a different model, read-only; JSON verdict; REQUEST_CHANGES goes back (max 2 rounds) |
 | LAND | hub | CI green on the exact tip, FF merge, push, close issue, `worker-release`, `worktree rm` |
@@ -25,15 +25,16 @@ SPOKE:  task.md → PLAN gate (ask/reply) → RED → GREEN → REFACTOR → cod
 Enforced by machinery: CI on the branch, the independent review (`tdd_followed`, `tests_weakened`), the
 deny-list hooks. Everything else (TDD, the PLAN gate) is policy, measured rather than blocked.
 
-## Task triage: three lanes
+## Task triage: two lanes
 
-| Lane | Executor | Contract | Gates |
-|------|----------|----------|-------|
-| Micro | subagent with `isolation: worktree`, non-executable paths only (docs, comments, wording) | the prompt | hub reads the diff |
-| Quick (`/quick`) | its own worktree and Claude session, no issue | the conversation | CI |
-| Full | dispatched spoke from an issue | the issue | everything above |
+| Lane | Marker | PLAN gate | In-worker `code-review` | Land |
+|------|--------|-----------|-------------------------|------|
+| Full (default) | `Gate: plan`, or no `Gate:` line | yes | yes | `land.sh` |
+| Light | `Gate: none`, only when the user asked for it on that issue | no | no | `land.sh` |
 
-When unsure, or when the "why" should be findable later, use Full. A blocked-by chain with colliding `Scope:`
+Both lanes are an issue, `dispatch.sh`, its own worktree and branch, the `#<n>` commit anchor, and `land.sh` (the
+independent review, then CI on the exact tip). Nobody but the user picks light: not the filer, the hub, or
+`answer.sh`. A blocked-by chain with colliding `Scope:`
 is one issue with subtasks (`Split: intentional — <why>` records a deliberate split). Disjoint scopes run in
 parallel up to `CONCURRENCY_CAP` (~3-4: the usage window saturates).
 
@@ -45,7 +46,6 @@ parallel up to `CONCURRENCY_CAP` (~3-4: the usage window saturates).
 | `/start-task` | `start-task` | file the issue, dispatch the spoke |
 | `/afk` | `afk` | run the coordinator loop unattended |
 | `/land <n>` | `land` | review, CI, merge, teardown |
-| `/quick <slug>` | `quick` | small interactive fix in its own worktree |
 | `/cycle` | `solo-cycle` | the spoke's per-subtask cycle |
 
 ## Checklists

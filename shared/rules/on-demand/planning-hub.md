@@ -26,9 +26,8 @@ own branch, driven by its own agent. The hub thinks, decides, decomposes, dispat
 
 ## Hub must not
 
-- Edit any file on the main checkout, not even docs. Dispatch a spoke (or a micro-spoke: a subagent with
-  `isolation: worktree` for non-executable paths, whose diff you read before merging). `pre-commit` blocks
-  commits on the base branch in the main checkout.
+- Edit any file on the main checkout, not even docs. Dispatch a spoke, full or light, and never merge by hand.
+  `pre-commit` blocks commits on the base branch in the main checkout.
 - Create task branches on the main checkout; Orca creates them inside their worktrees.
 - Run a second consumer of the Run while `coordinator.sh` is live.
 

@@ -1,6 +1,6 @@
 ---
 name: solo-cycle
-description: "Per-subtask cycle for a dispatched spoke, PR-less: anchor to the issue, PLAN gate, RED test, GREEN implementation, REFACTOR, one in-spoke code-review per subtask, push, then worker_done. Use when working a task from .ai-toolkit/task.md, when the user says /cycle, or wants commit+push per subtask."
+description: "Per-subtask cycle for a dispatched spoke, PR-less: anchor to the issue, PLAN gate (full lane), RED test, GREEN implementation, REFACTOR, one in-spoke code-review per subtask, push, then worker_done. Use when working a task from .ai-toolkit/task.md, when the user says /cycle, or wants commit+push per subtask."
 argument-hint: "[subtask description or issue number]"
 ---
 # Solo Cycle
@@ -30,7 +30,8 @@ approach, test strategy, open questions) and `--options approve,revise`. It bloc
 | `revise: …` | amend the plan, `ask` again (max 2 rounds, then `worker_done --outcome failed` naming the blocker) |
 | the call times out | re-run the same `ask`; never start coding unanswered |
 
-`Gate: none` (trivial, mechanical) skips it. Never edit code, tests, or config before `approve`.
+`Gate: none` is the **light lane**, set only by the user for that issue: it skips this gate and the in-spoke
+`code-review` (step 5); anchor, RED/GREEN, push and the independent review at land all stay. Never edit code, tests, or config before `approve` on a `plan` issue.
 
 ## The cycle (per subtask)
 
@@ -40,7 +41,7 @@ approach, test strategy, open questions) and `--options approve,revise`. It bloc
 | 2 | RED | a failing test, committed alone; you saw it fail for the right reason |
 | 3 | GREEN | the minimal implementation; the new test and the existing suite pass |
 | 4 | REFACTOR | tidy with tests green; no behavior change |
-| 5 | REVIEW | the `code-review` subagent on the subtask's diff; fix every blocker, then re-review |
+| 5 | REVIEW | full lane only: the `code-review` subagent on the subtask's diff; fix every blocker, then re-review |
 | 6 | PUSH | `git push -u origin <branch>`, plain, one per subtask |
 
 Then the next subtask, from step 2.

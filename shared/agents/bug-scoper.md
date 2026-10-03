@@ -42,10 +42,9 @@ fix will touch, derived from reading the code — never a prose guess.
    Keep it tight and honest: list the files you actually expect to edit. If the
    defect genuinely spans the repo, use `Scope: *` (the deliberate exclusive,
    never-batched slow path) — but reach for it only when it is truly repo-wide.
-4. **Emit a `Gate:` footer line.** `Gate: none` for a mechanical fix with an
-   obvious approach; `Gate: plan` when the fix needs a design decision (competing
-   approaches, an interface choice, a data-model change) that a human should sign
-   off before implementation.
+4. **Emit `Gate: plan`.** Always: the full cycle is the default. `Gate: none` is the
+   light lane and only the user may ask for it, for that issue, in the conversation;
+   never choose it yourself, however mechanical the fix looks.
 
 Both are plain `Key: value` body lines at the foot of the issue.
 
@@ -75,7 +74,7 @@ Then the footer:
 
 ```
 Scope: <real paths + their tests>
-Gate: none | plan
+Gate: plan
 ```
 
 ## Phase 4: Labels

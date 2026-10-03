@@ -11,7 +11,7 @@ Hub to spoke: the **issue is the contract**. The worker starts with a fresh cont
 ## 1. Scope
 
 Restate the task as a draft issue: **title**, **body** (problem, proposal, acceptance criteria drawn from the
-conversation). Get a quick OK before filing; do not invent scope.
+conversation). Get an OK before filing; do not invent scope.
 
 ## 2. File the issue
 
@@ -28,7 +28,7 @@ The footer is the dispatch contract (see `.ai-toolkit/rules/issue-hygiene.md`):
 | Line | Rule |
 |------|------|
 | `Scope:` | mandatory, concrete files/globs; missing or `*` runs the issue alone. Overlap with an in-flight issue serializes it |
-| `Gate:` | `plan` (default: the worker `ask`s for approval of its plan) or `none` (very-clear, mechanical work) |
+| `Gate:` | `plan` (always, unless told otherwise: the worker `ask`s for approval of its plan). `none` is the light lane (no PLAN gate, no in-worker review): write it only when the user asked for light on this issue, never because the work looks small |
 | `Model:` | optional override of `SPOKE_MODEL`; reasoning-heavy work gets an Opus id |
 
 Labels: `priority` (dispatched first), `hold` (never dispatched). **Blocked-by**: answer "does this depend on
@@ -52,5 +52,4 @@ coordinator (`afk`) or you via `hub`.
 |-----------|--------|
 | Scope still fuzzy | stay in the hub; use `brainstorming` first |
 | Issue already exists | skip to step 3 |
-| Tiny or interactive fix | `quick` instead of an issue |
 | `dispatch.sh` fails | it retries once; the failing stage is printed; do not re-run blindly |

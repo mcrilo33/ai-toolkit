@@ -51,11 +51,12 @@ for human review:
 Gate: plan
 ```
 
-`Gate: none` runs the spoke autonomously straight to `worker_done`; `Gate: plan`
-(the default for all but very-clear work, and what an **omitted** line means) makes the
-spoke send its plan as an Orca question and wait for `approve` before any code is written. The line
+`Gate: plan` (the full cycle, and what an **omitted** line means) makes the spoke send its plan as an
+Orca question and wait for `approve` before any code is written. `Gate: none` is the **light lane**: no
+PLAN gate and no in-spoke review, same dispatch and same `land.sh`. Only the user chooses it, for that issue,
+in the conversation; no filer, agent, template or `answer.sh` ever writes or applies it by default. The line
 records *which* gate, not *who* answers it: `coordinator.sh --answer auto` (`answer.sh`) or
-`--answer human`, chosen per run. See the `start-task` skill's gate table for how to pick the level.
+`--answer human`, chosen per run.
 
 ## Programmatic filers emit the footer too
 

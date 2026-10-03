@@ -11,9 +11,9 @@ can schedule it (see the `issue-hygiene` rule):
   A missing line is the *accidental* exclusive (`dispatch.sh --next` names each ready
   scope-less issue in its output); `*` is the *deliberate* one. Write a concrete file
   list whenever you can.
-- **`Gate:`** — `none` or `plan`. `none` runs the spoke autonomously straight to `worker_done`;
-  `plan` (the default for non-trivial work) pauses the spoke for a human plan review
-  before it writes code. Omitting it defaults to `plan`.
+- **`Gate:`** — `plan` (the full cycle: the spoke pauses for a human plan review before it writes code;
+  omitting it means `plan`). `none` is the light lane (no PLAN gate, no in-worker review) and is written
+  only when the user asked for it on that issue.
 
 Both lines are plain `Key: value` body lines a scripted planner reads — not `##` headers.
 
@@ -46,7 +46,7 @@ Both lines are plain `Key: value` body lines a scripted planner reads — not `#
 [Any other relevant information]
 
 Scope: [files/globs this fix touches; '*' or omitted ⇒ exclusive]
-Gate: [none | plan — omitted ⇒ plan]
+Gate: plan
 ```
 
 ## Feature Request Template
@@ -73,7 +73,7 @@ Gate: [none | plan — omitted ⇒ plan]
 [Mockups, examples, or related issues]
 
 Scope: [files/globs this feature touches; '*' or omitted ⇒ exclusive]
-Gate: [none | plan — omitted ⇒ plan]
+Gate: plan
 ```
 
 ## Task Template
@@ -97,7 +97,7 @@ Gate: [none | plan — omitted ⇒ plan]
 [Additional context or considerations]
 
 Scope: [files/globs this task touches; '*' or omitted ⇒ exclusive]
-Gate: [none | plan — omitted ⇒ plan]
+Gate: plan
 ```
 
 ## Minimal Template
@@ -113,5 +113,5 @@ For simple issues:
 - [ ] [Task 2]
 
 Scope: [files/globs this issue touches; '*' or omitted ⇒ exclusive]
-Gate: [none | plan — omitted ⇒ plan]
+Gate: plan
 ```
