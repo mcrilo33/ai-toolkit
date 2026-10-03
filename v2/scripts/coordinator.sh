@@ -26,8 +26,8 @@ case "$answer" in auto | human) ;; *) usage_exit "--answer takes auto or human" 
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
 # The only state v2 keeps: queued human replies, one file per question (name = message id, content = the reply line), in a 0700 dir
 # outside every worktree. Only the Run's bound terminal can reply (Orca attests terminal identity), so a human queues with --reply
-# from ANY terminal and the loop sends it at its next wake. AITK_STATE_DIR replaces the default dir.
-rdir() { echo "${AITK_STATE_DIR:-$HOME/.ai-toolkit/coordinator/$run/replies}"; }
+# from ANY terminal and the loop sends it at its next wake. AITK_STATE_DIR replaces ~/.ai-toolkit/coordinator; <run-id>/replies is appended.
+rdir() { echo "${AITK_STATE_DIR:-$HOME/.ai-toolkit/coordinator}/$run/replies"; }
 if [ "$reply" = 1 ]; then
   [ -n "$run" ] || usage_exit "--reply needs --run <run-id>"
   case "$reply_id" in '' | *[!A-Za-z0-9_-]*) usage_exit "bad message id '$reply_id'" ;; esac
@@ -40,8 +40,6 @@ if [ "$reply" = 1 ]; then
   printf '%s\n' "$reply_body" > "$d/.$reply_id.tmp" && mv "$d/.$reply_id.tmp" "$d/$reply_id"
   echo "reply to $reply_id queued: the coordinator sends it at its next wake"; exit 0
 fi
-: "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal on the main checkout}"
-H="$ORCA_TERMINAL_HANDLE"
 DISPATCH_CMD="${DISPATCH_CMD:-$here/dispatch.sh}"; LAND_CMD="${LAND_CMD:-$here/land.sh}"; ANSWER_CMD="${ANSWER_CMD:-$here/answer.sh}"
 cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
@@ -52,14 +50,23 @@ notify() {   # one desktop notification (NOTIFY_CMD replaces it in tests); never
   else osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "ai-toolkit"' -e 'end run' "$1" > /dev/null 2>&1 || true; fi
 }
 comment() { gh issue comment "$1" -b "$2" > /dev/null || warn "cannot comment on #$1"; }
-wl() { orca_json orchestration worker-list --run "$run" --limit 100; }
+wl() {   # every page of the Run's workers (newest first, 100 a page), in the shape of one reply; live = dispatchStatus "dispatched"
+  local cur="" out all="[]"
+  while :; do
+    out="$(orca_json orchestration worker-list --run "$run" --limit 100 ${cur:+--cursor "$cur"})" || return 1
+    all="$(jq -c --argjson o "$out" '. + $o.result.workers' <<< "$all")"; cur="$(jq -r '.result.page.nextCursor // empty' <<< "$out")"
+    [ -n "$cur" ] || break
+  done
+  jq -nc --argjson w "$all" '{result: {workers: $w}}'
+}
 pj() { jq -r --arg k "$2" '(.payload // "{}" | if type == "string" then fromjson else . end)[$k] // empty' <<< "$1"; }   # payload field of a message
 mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
 now_min() { mins "${AI_TOOLKIT_NOW:-$(date +%H:%M)}"; }
 
-pending() {   # JSON array of the Run's questions nobody has replied to: they are waiting for the human
-  orca_json orchestration inbox --limit 200 --full | jq -c --arg r "$run" '[.result.messages[] | select(.run_id == $r)] as $m
-    | [$m[] | select(.type == "question") | select(. as $q | $m | any(.id != $q.id and .thread_id == $q.id) | not)]'
+pending() {   # {open: questions nobody has replied to (waiting for the human), answered: ids with a reply, truncated: the page was full}
+  orca_json orchestration inbox --limit 200 --full | jq -c --arg r "$run" '.result.messages as $all | [$all[] | select(.run_id == $r)] as $m
+    | {open: [$m[] | select(.type == "question") | select(. as $q | $m | any(.id != $q.id and .thread_id == $q.id) | not)],
+       answered: [$m[] | select(.thread_id != null and .thread_id != .id) | .thread_id], truncated: ($all | length >= 200)}'
 }
 replycmd() { printf 'bash %s --run %s --reply %s approve' "$here/coordinator.sh" "$run" "$1"; }
 if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to
@@ -67,10 +74,12 @@ if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the que
   log "run: $run"; echo "live workers:"
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "  \(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict)"'
   echo "pending questions:"
-  pending | jq -r '.[] | "\(.id) \(.body[0:100])"' | while read -r id txt; do echo "  $id $txt"; echo "    reply: $(replycmd "$id")   (or 'revise: <change>')"; done
+  pending | jq -r '.open[] | "\(.id) \(.body[0:100])"' | while read -r id txt; do echo "  $id $txt"; echo "    reply: $(replycmd "$id")   (or 'revise: <change>')"; done
   exit 0
 fi
 
+: "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal on the main checkout}"
+H="$ORCA_TERMINAL_HANDLE"
 if [ -n "$run" ]; then
   out="$(orca_mutate orchestration run-use --id "$run" --from "$H" 2>&1)" || case "$out" in
     *consumer_fenced*) die "Run $run is held by another live terminal (consumer_fenced): stop that coordinator first" ;;
@@ -107,14 +116,20 @@ redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds 
   comment "$issue" "round $((r + 1)): $2"
 }
 
-drain_replies() {   # send the queued human replies as the bound consumer; an unknown or already answered id is dropped, a failed send retried
-  local f id body q pend
+drain_replies() {   # send the queued human replies as the bound consumer. Dropped: a malformed body, a question seen answered, or (page not full)
+  local f id body q pend   # unknown. Kept and retried: a failed send, or an id the full inbox page does not show (it may be older than the page)
   ls "$(rdir)"/* > /dev/null 2>&1 || return 0
   pend="$(pending)" || return 0
   for f in "$(rdir)"/*; do
     [ -f "$f" ] || continue
-    id="${f##*/}"; body="$(head -n 1 "$f")"; q="$(jq -c --arg i "$id" '[.[] | select(.id == $i)][0] // empty' <<< "$pend")"
-    if [ -z "$q" ]; then warn "reply to $id dropped: no such unanswered question"
+    id="${f##*/}"; body="$(head -n 1 "$f")"; q="$(jq -c --arg i "$id" '[.open[] | select(.id == $i)][0] // empty' <<< "$pend")"
+    case "$body" in
+      approve | revise:*[![:space:]]*) ;;
+      *) warn "reply to $id dropped: malformed body"; rm -f "$f"; continue ;;
+    esac
+    if [ -z "$q" ]; then
+      if jq -e --arg i "$id" '(.answered | index($i)) != null or (.truncated | not)' <<< "$pend" > /dev/null; then warn "reply to $id dropped: no such unanswered question"
+      else warn "reply to $id kept: the inbox page is truncated and does not show that question"; continue; fi
     elif orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
       log "gate $id answered by the human: $body"; if ctx "$(pj "$q" dispatchId)"; then comment "$issue" "Gate answered by the human: $body"; fi
     else warn "reply to $id failed, it stays queued"; continue; fi
@@ -139,7 +154,8 @@ on_done() {
   ctx "$(pj "$1" dispatchId)" || return 1
   [ "$(pj "$1" outcome)" = succeeded ] || { block "worker_done failed: $(jq -r '.body // ""' <<< "$1")"; return 0; }
   branch="$(git -C "$wtp" branch --show-current)"
-  out="$(RUN="$run" "$LAND_CMD" --review --dispatch "$disp" "$issue" 2>&1)" || rc=$?
+  # No --dispatch: land finds and releases EVERY dispatch of the worktree, earlier address rounds included.
+  out="$(RUN="$run" "$LAND_CMD" --review "$issue" 2>&1)" || rc=$?
   printf '%s\n' "$out"; last="$(tail -n 1 <<< "$out")"
   case $rc in
     0) log "#$issue landed" ;;
@@ -197,7 +213,7 @@ while :; do
   if [ "$drain" = 1 ] && [ "$ready" = 0 ] && [ "$(wl | jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length')" = 0 ]; then log "drained"; break; fi
   drain_replies
   rc=0; wait_ms="${COORD_WAIT_MS:-300000}"   # 30 s while a question waits for the human: its reply is picked up soon
-  [ "$(pending | jq length)" -eq 0 ] 2> /dev/null || wait_ms="${COORD_WAIT_PENDING_MS:-30000}"
+  [ "$(pending | jq '.open | length')" -eq 0 ] 2> /dev/null || wait_ms="${COORD_WAIT_PENDING_MS:-30000}"
   out="$(orca_json orchestration check --run "$run" --terminal "$H" --wait --types question,worker_done,escalation --timeout-ms "$wait_ms" 2> "$errf")" || rc=$?
   case "$out$(cat "$errf")" in *consumer_fenced*) die "Run $run was taken over by another terminal (consumer_fenced)" ;; esac
   msgs="$(jq -c '.result.messages[]?' <<< "$out" 2> /dev/null)" || msgs=""

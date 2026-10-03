@@ -53,14 +53,15 @@ def C(stubs, repo, run, tmp_path):
 
     stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": wt, "linkedIssue": 1}]}}))
     stubs.reply("orca.orchestration_run_create", '{"result":{"run":{"id":"run_new"}}}')
-    def inbox(open_ids=(), answered=()):   # questions in the Run's inbox: unanswered ones are waiting for the human
+    def inbox(open_ids=(), answered=(), replies_only=(), pad=0):   # the Run's inbox: unanswered questions wait for the human
         rows = [{**msg("question", i), "run_id": "run_t", "thread_id": i} for i in [*open_ids, *answered]]
-        rows += [{"id": f"r_{i}", "type": "status", "run_id": "run_t", "thread_id": i, "body": "approve", "payload": None} for i in answered]
+        rows += [{"id": f"r_{i}", "type": "status", "run_id": "run_t", "thread_id": i, "body": "approve", "payload": None} for i in [*answered, *replies_only]]
+        rows += [{"id": f"x{i}", "type": "status", "run_id": "run_other", "thread_id": None, "body": "", "payload": None} for i in range(pad)]   # other Runs' mail
         stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
 
     def spool(mid, body):   # a queued human reply, as `coordinator.sh --reply` writes it
-        (tmp_path / "replies").mkdir(mode=0o700, exist_ok=True)
-        (tmp_path / "replies" / mid).write_text(body + "\n")
+        (tmp_path / "state/run_t/replies").mkdir(parents=True, mode=0o700, exist_ok=True)
+        (tmp_path / "state/run_t/replies" / mid).write_text(body + "\n")
 
     stubs.reply("dispatch.sh", '{"issue":1}')
     stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "", rc=3)   # nothing ready
@@ -71,7 +72,7 @@ def C(stubs, repo, run, tmp_path):
     def go(*args, run_id="run_t", **env):
         cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh", "notify")}
         return run(["bash", CO, *(["--run", run_id] if run_id else []), *args], cwd=repo.root,
-                   **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "replies", **cmd_env, **env})
+                   **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", **cmd_env, **env})
 
     def trail():   # [("orca orchestration check ack", argv), ("gh issue edit", argv), ("land.sh", argv)...] in call order
         rows = (Path(os.environ["STUB_DIR"]) / "calls.log").read_text().splitlines()
@@ -86,7 +87,7 @@ def C(stubs, repo, run, tmp_path):
         return (any(a[3:] == ["--add-label", "blocked"] for a in calls("gh issue edit")) and "gh issue comment" in ks and "notify" in ks
                 and "orca orchestration worker-release" in ks and "--address" not in sum(stubs.calls("dispatch.sh"), []) and "orca worktree rm" not in ks)
 
-    return type("C", (), dict(go=staticmethod(go), mail=staticmethod(mail), inbox=staticmethod(inbox), spool=staticmethod(spool), spooled=lambda m: (tmp_path / "replies" / m).exists(), workers=staticmethod(workers), row=staticmethod(row), wt=wt,
+    return type("C", (), dict(go=staticmethod(go), mail=staticmethod(mail), inbox=staticmethod(inbox), spool=staticmethod(spool), spooled=lambda m: (tmp_path / "state/run_t/replies" / m).exists(), workers=staticmethod(workers), row=staticmethod(row), wt=wt,
                               calls=staticmethod(calls), blocked=staticmethod(blocked), stubs=stubs, kinds=staticmethod(lambda: [k for k, _ in trail()]),
                               stdin=staticmethod(lambda n: (tmp_path / f"stubs/{n}.stdin").read_text())))
 
@@ -137,6 +138,7 @@ def test_reply_queues_a_one_line_request_in_a_private_spool_outside_any_worktree
     d = tmp_path / "home/.ai-toolkit/coordinator/run_t/replies"
     assert r.returncode == 0 and (d / "msg_q").read_text() == "revise: use tmp\n" and stat.S_IMODE(d.stat().st_mode) == 0o700
     assert not C.stubs.calls("orca") and not list(d.glob(".*"))
+    assert C.go("--reply", "msg_q", "approve", ORCA_TERMINAL_HANDLE="").returncode == 0 and C.spooled("msg_q")   # AITK_STATE_DIR is a base: <dir>/<run-id>/replies
 
 
 @pytest.mark.parametrize("args", [["--reply", "msg_q", "maybe"], ["--reply", "msg_q", "revise:"], ["--reply", "../x", "approve"], ["--reply", "msg_q"]])
@@ -166,6 +168,41 @@ def test_a_reply_for_an_unknown_or_already_answered_question_is_dropped_and_a_fa
     assert C.spooled("msg_open")   # retried on the next wake
 
 
+def test_a_queued_reply_is_only_dropped_when_its_question_is_seen_answered_or_the_inbox_page_was_not_truncated(C):
+    C.inbox(pad=200)   # a full page: msg_old may be older than everything shown
+    C.spool("msg_old", "approve")
+    r = C.go()
+    assert C.spooled("msg_old") and not C.calls("orca orchestration reply") and "truncated" in r.stderr   # kept and warned
+    C.inbox(replies_only=["msg_old"], pad=199)   # ...but its reply row is on the page: positively answered
+    C.go()
+    assert not C.spooled("msg_old")
+
+
+@pytest.mark.parametrize("body", ["rm -rf /", "revise:", "approve please", ""])
+def test_a_spool_file_with_a_tampered_body_is_dropped_unsent(C, body):
+    C.inbox(["msg_q"])
+    C.spool("msg_q", body)
+    r = C.go()
+    assert not C.spooled("msg_q") and not C.calls("orca orchestration reply") and "dropped" in r.stderr
+
+
+def test_worker_list_is_read_page_by_page_so_rounds_survive_more_than_a_page_of_dispatches(C):
+    (Path(os.environ["STUB_DIR"]) / "orca.orchestration_worker_list.count").unlink(missing_ok=True)
+    pages = [({"result": {"workers": [C.row("ctx_9", st="completed")], "page": {"nextCursor": "c1"}}}), ({"result": {"workers": [C.row("ctx_1")], "page": {"nextCursor": None}}})]
+    C.stubs.reply("orca.orchestration_worker_list", json.dumps(pages[0]), n=1)
+    C.stubs.reply("orca.orchestration_worker_list", json.dumps(pages[1]), n=2)
+    C.stubs.reply("land.sh", "BLOCKER: x\n", rc=3)
+    C.mail([msg("worker_done", outcome="succeeded")])
+    C.go("--cap", "0")
+    first, second = C.calls("orca orchestration worker-list")[:2]
+    assert "--cursor" not in first and arg(second, "--cursor") == "c1"
+    assert [a[0] for a in C.stubs.calls("dispatch.sh")].count("--address") == 1   # ctx_1 sits on page 2; the 2 rows count as one spent round
+
+
+def test_status_needs_no_orca_terminal_handle(C):
+    assert C.go("--status", ORCA_TERMINAL_HANDLE="").returncode == 0
+
+
 @pytest.mark.parametrize("open_ids, ms", [([], "300000"), (["msg_q"], "30000")])
 def test_the_wait_is_30_s_while_a_human_question_is_pending_and_300_s_otherwise(C, open_ids, ms):
     C.inbox(open_ids)
@@ -178,7 +215,7 @@ def test_a_pending_human_question_does_not_stop_dispatch_or_land(C):
     C.stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "5\n")
     C.mail([msg("worker_done", "msg_d", outcome="succeeded")])
     C.go("--answer", "human", "--cap", "2")
-    assert ["5"] in C.stubs.calls("dispatch.sh") and C.stubs.calls("land.sh") == [["--review", "--dispatch", "ctx_1", "1"]]
+    assert ["5"] in C.stubs.calls("dispatch.sh") and C.stubs.calls("land.sh") == [["--review", "1"]]
 
 
 @pytest.mark.parametrize("kind, extra", [("worker_done", {"outcome": "failed"}), ("escalation", {})])
@@ -192,7 +229,7 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
     C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # a failing handler must not stop the rest, nor the ack
     C.mail([msg("question", "msg_q", question="q"), msg("worker_done", "msg_d", outcome="succeeded")])
     C.go()
-    assert C.stubs.calls("land.sh") == [["--review", "--dispatch", "ctx_1", "1"]] and len(C.calls("orca orchestration check ack")) == 1
+    assert C.stubs.calls("land.sh") == [["--review", "1"]] and len(C.calls("orca orchestration check ack")) == 1
     assert "msg_q" in C.calls("gh issue comment")[0][-1] and C.stubs.calls("notify")   # the unreplied question is handed to the human
     in_order(C.kinds(), "orca orchestration reply", "land.sh", "orca orchestration check ack")
 
@@ -222,7 +259,7 @@ def test_a_land_that_the_worker_cannot_fix_blocks_at_once(C, rc, out):
 
 @pytest.mark.parametrize("cleanup_rc", [0, 6])
 def test_landed_but_cleanup_incomplete_finishes_once_and_parks_a_still_open_issue(C, cleanup_rc):
-    C.stubs.reply(key("land.sh", "--review", "--dispatch"), "land.sh: landed abc but cleanup is incomplete\n", rc=6)
+    C.stubs.reply(key("land.sh", "--review", "1"), "land.sh: landed abc but cleanup is incomplete\n", rc=6)
     C.stubs.reply(key("land.sh", "--cleanup-only", "--branch"), "", rc=cleanup_rc)
     C.mail([msg("worker_done", outcome="succeeded")])
     C.go()
