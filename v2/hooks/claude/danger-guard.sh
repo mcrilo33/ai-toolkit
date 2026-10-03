@@ -29,7 +29,7 @@ if [ -n "$fp" ] && prot "$(canon "$fp")"; then deny "write to a protected path (
 cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || exit 0
 
 c=" $(printf '%s' "$cmd" | sed -E "s/[\"'\\\\]//g; s/[0-9&]*>+ *(\/dev\/null|&[0-9])//g; s/[[:space:]>]/& /g")" # writes to a protected path
-pre="((^|[^[:alnum:]_./-])(\./)?|$root/)"; e="([^[:alnum:]_./-]|$)" # project-root paths only: v2/orca.yaml is fine
+pre="((^|[^[:alnum:]_./-])(\./)?|$root/|\\\$\{?(PWD|CLAUDE_PROJECT_DIR)\}?/|\\\$\(pwd\)/)"; e="([^[:alnum:]_./-]|$)" # project-root paths only: v2/orca.yaml is fine
 p="$pre(\.github/workflows|orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$home)/\.claude/settings\.json"
 if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e|\.ai-toolkit/spoke-run-id)"; fi
 w="(>|[[:space:]](tee|cp|mv|rm|touch|ln|dd|install|rsync|truncate|patch|chmod|python[0-9.]*|perl|ruby|node)[[:space:]]|[[:space:]]sed[[:space:]][^;|&]*(-[a-z]*i|--in-place))"
@@ -49,7 +49,7 @@ check() { # the words of one command segment
   [ $# -gt 0 ] || return 0
   local k="${1##*/}" d t="" rec="" a; shift
   if [[ $k == git ]]; then
-    if [[ " $* " == *" clean "* ]]; then for a in "$@"; do [[ $a =~ ^-[a-zA-Z]*x ]] && deny "git clean -x/-X deletes the ignored .claude/ and .ai-toolkit/"; done; fi
+    if [[ " $* " == *" clean "* || " $* " == *" stash "* ]]; then for a in "$@"; do [[ $a =~ ^(--all|-[a-zA-Z]*[xa][a-zA-Z]*)$ ]] && deny "git clean -x / stash -a remove the ignored .claude/ and .ai-toolkit/"; done; fi
     case " $* " in *" reset "*"--hard "*) ;; *) return 0;; esac
     case " $* " in *" --git-dir"* | *" --work-tree"*) deny "git reset --hard with --git-dir/--work-tree";; esac
     d="$(printf '%s' " $* " | sed -n 's/.* -C *\([^ ]*\).*/\1/p')"; d="${d:-.}"; case "$d" in /*) ;; *) d="$cwd/$d";; esac
@@ -61,6 +61,7 @@ check() { # the words of one command segment
   [ -z "$rec" ] || for a in $t; do target "$a"; done
   return 0
 }
-for q in '' ' '; do
-  while IFS= read -r seg; do check $seg; done < <(printf '%s\n' "$cmd" | sed "s/[\"'\\\\]/$q/g" | tr ';|&()`<>' '\n')
+# quotes dropped (pu""sh, "$TMPDIR"/x), then quotes glued between a word and a letter turned into a space (bash -c'rm ..')
+for sc in "s/[\"'\\\\]//g" "s/([^[:space:]])[\"'\\\\]+([[:alnum:]])/\\1 \\2/g; s/[\"'\\\\]//g"; do
+  while IFS= read -r seg; do check $seg; done < <(printf '%s\n' "$cmd" | sed -E "$sc" | tr ';|&()`<>' '\n')
 done
