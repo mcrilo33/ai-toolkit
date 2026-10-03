@@ -188,19 +188,14 @@ def test_a_spool_file_with_a_tampered_body_is_dropped_unsent(C, body):
 
 def test_worker_list_is_read_page_by_page_so_rounds_survive_more_than_a_page_of_dispatches(C):
     (Path(os.environ["STUB_DIR"]) / "orca.orchestration_worker_list.count").unlink(missing_ok=True)
-    pages = [({"result": {"workers": [C.row("ctx_9", st="completed")], "page": {"nextCursor": "c1"}}}), ({"result": {"workers": [C.row("ctx_1")], "page": {"nextCursor": None}}})]
-    C.stubs.reply("orca.orchestration_worker_list", json.dumps(pages[0]), n=1)
-    C.stubs.reply("orca.orchestration_worker_list", json.dumps(pages[1]), n=2)
+    for n, rows, cur in ((1, [C.row("ctx_9", st="completed")], "c1"), (2, [C.row("ctx_1")], None)):
+        C.stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": rows, "page": {"nextCursor": cur}}}), n=n)
     C.stubs.reply("land.sh", "BLOCKER: x\n", rc=3)
     C.mail([msg("worker_done", outcome="succeeded")])
     C.go("--cap", "0")
     first, second = C.calls("orca orchestration worker-list")[:2]
     assert "--cursor" not in first and arg(second, "--cursor") == "c1"
     assert [a[0] for a in C.stubs.calls("dispatch.sh")].count("--address") == 1   # ctx_1 sits on page 2; the 2 rows count as one spent round
-
-
-def test_status_needs_no_orca_terminal_handle(C):
-    assert C.go("--status", ORCA_TERMINAL_HANDLE="").returncode == 0
 
 
 @pytest.mark.parametrize("open_ids, ms", [([], "300000"), (["msg_q"], "30000")])
@@ -312,6 +307,6 @@ def test_until_stops_the_loop_at_the_clock_time_and_wraps_past_midnight(C, now, 
 
 def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply_command_and_changes_nothing(C):
     C.inbox(["msg_q"], answered=["msg_a"])
-    r = C.go("--status")
+    r = C.go("--status", ORCA_TERMINAL_HANDLE="")   # read-only: no coordinator terminal needed
     assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and REPLY in r.stdout and "msg_a" not in r.stdout
     assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in ("worker-list", "inbox")] == []
