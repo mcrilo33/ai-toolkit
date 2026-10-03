@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# dispatch.sh [--run R] (<issue> | --next): one issue -> one supervised worker (06 section 4 steps 2, 3, 5, 6).
+# dispatch.sh [--run R] (<issue> | --next [--dry-run]): one issue -> one supervised worker (06 section 4 steps 2, 3, 5, 6).
 # The Run is explicit (--run or $RUN, never inferred: a coordinator's Run must not be picked up by accident).
-# Prints one JSON line {issue,dispatch,worktree,terminal}. Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready.
+# Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; n=""; next=0; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
+run="${RUN:-}"; n=""; next=0; dry=0; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;;
     --next) next=1 ;;
+    --dry-run) dry=1 ;;
     [0-9]*) n="$1" ;;
     *) usage_exit "usage: dispatch.sh [--run R] <issue> | --next" ;;
   esac; shift
@@ -24,6 +25,7 @@ base="origin/$BASE_BRANCH"
 
 # Ready = not hold/blocked, blockers closed, not in flight, Scope disjoint from every in-flight Scope
 # (a missing or `*` scope is exclusive and collides with everything); `priority` first, then number.
+# shellcheck disable=SC2016
 PICK='def scope: [(.body // "") | split("\n")[] | select(test("^\\s*[Ss]cope:"))] | .[-1]
     | if . == null then null else (sub("^\\s*[Ss]cope:"; "") | gsub(","; " ") | [splits(" +")] | map(select(. != "")))
       | if length == 0 or contains(["*"]) then null else . end end;
@@ -110,5 +112,6 @@ dispatch() {
 if [ "$next" = 1 ]; then
   n="$(pick_next)"
   [ -n "$n" ] || { echo "dispatch: nothing ready" >&2; exit 3; }
+  [ "$dry" = 0 ] || { echo "$n"; exit 0; }
 fi
 dispatch "$n"

@@ -184,15 +184,31 @@ NEXT = [
 ]
 
 
-@pytest.mark.parametrize("nodes,busy,want", [x[1:] for x in NEXT], ids=[x[0] for x in NEXT])
-def test_next_picks_the_first_ready_issue(d, nodes, busy, want):
+def stub_board(d, nodes, busy):
     d.stubs.reply("gh.api_graphql", json.dumps(nodes))
     d.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"linkedIssue": None}, *({"linkedIssue": b} for b in busy)]}}))
-    r = d.go("--next")
+
+
+@pytest.mark.parametrize("nodes,busy,want", [x[1:] for x in NEXT], ids=[x[0] for x in NEXT])
+def test_next_picks_the_first_ready_issue(d, nodes, busy, want):
+    stub_board(d, nodes, busy)
+    r = d.go("--next", "--dry-run")
     if want is None:
         assert r.returncode == 3 and "nothing ready" in r.stderr
-        assert not any(c[:2] == ["orchestration", "worker-start"] for c in d.orca())
     else:
-        assert r.returncode == 0, r.stderr
-        assert json.loads(r.stdout)["issue"] == want
-        assert ["issue", "view", str(want), "--json", "number,title,body"] in d.stubs.calls("gh")
+        assert r.returncode == 0 and r.stdout.strip() == str(want), r.stderr
+    assert [c[:2] for c in d.orca()] == [["worktree", "list"]]   # a dry run launches nothing
+
+
+def test_next_dispatches_the_pick(d):
+    stub_board(d, [issue(5, "Scope: b.py"), issue(3, "Scope: a.py")], [])
+    r = d.go("--next")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["issue"] == 3 and d.stubs.calls("gh")[-1] == ["issue", "view", "3", "--json", "number,title,body"]
+    assert any(c[:2] == ["orchestration", "worker-start"] for c in d.orca())
+
+
+def test_nothing_ready_dispatches_nothing(d):
+    stub_board(d, [], [])
+    assert d.go("--next").returncode == 3
+    assert not any(c[:2] == ["orchestration", "worker-start"] for c in d.orca())
