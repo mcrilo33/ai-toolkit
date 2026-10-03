@@ -352,7 +352,8 @@ def test_a_pending_human_gate_sets_the_worktree_comment_and_rings_the_bell_then_
     assert (tmp_path / "bell").read_text() == "\a"   # one bell per gate, on the coordinator's terminal
     C.inbox(["msg_q"]); C.spool("msg_q", "approve")
     assert C.go().returncode == 0
-    assert arg(C.calls("orca worktree set")[-1], "--comment") == "" and arg(C.calls("orca worktree set")[-1], "--worktree") == f"path:{C.wt}"
+    last = C.calls("orca worktree set")[-1]   # Orca ignores --comment "": the comment is overwritten, never cleared
+    assert arg(last, "--comment") == "gate answered by the human: approve" and arg(last, "--worktree") == f"path:{C.wt}"
 
 
 def test_an_auto_answered_gate_neither_rings_nor_comments(C, tmp_path):

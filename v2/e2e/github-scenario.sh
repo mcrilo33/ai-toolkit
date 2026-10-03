@@ -9,15 +9,13 @@ set -euo pipefail
 V2="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 # shellcheck source=../scripts/lib.sh
 . "$V2/scripts/lib.sh"
-load_env
-: "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal}"
+load_env; : "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal}"
 R=mcrilo33/ai-toolkit-e2e; G=/private/tmp/aitk-e2e-gh; E="$G.e2e"; ANS="${E2E_ANSWER:-auto}"; PH=" ${E2E_PHASES:-next happy negative} "
-repo_id=""; run=""; coord=""; step=0; A=""; B=""; mine=""; wt=""; sha=""
-rm -rf "$E"; mkdir -p "$E"
+repo_id=""; run=""; coord=""; step=0; A=""; B=""; mine=""; wt=""; sha=""; rm -rf "$E"; mkdir -p "$E"
 say() { printf '== [%ss] step %s: %s\n' "$SECONDS" "$step" "$*"; }
 fail() { printf 'FAIL step %s: %s\n  ids: repo=%s run=%s coordinator=%s issues=%s\n  coordinator log: %s\n' "$step" "$*" "$repo_id" "$run" "$coord" "$mine" "$(tail -n 5 "$E/coord.log" 2> /dev/null | tr '\n' '|')"
   cp "$E/coord.log" "$G.last-coordinator.log" 2> /dev/null && echo "  full log: $G.last-coordinator.log"; exit 1; }
-phase() { case "$PH" in *" $1 "*) ;; *) return 1 ;; esac; }
+phase() { [[ "$PH" == *" $1 "* ]]; }
 wait_for() { local t="$1" i; shift; for ((i = 0; i < t; i += 3)); do "$@" && return 0; sleep 3; done; return 1; }
 ghe() { gh -R "$R" "$@"; }
 mkissue() { ghe issue create -t "$1" -b "$2" ${3:+-l "$3"} | sed 's#.*/##'; }   # title body [label] -> number
@@ -88,9 +86,10 @@ if [ -n "$B" ]; then   # the real reviewer for A, a stub that always rejects B (
   printf '#!/bin/sh\n[ "$1" = %s ] && { echo "BLOCKER: stub reviewer rejects issue %s on purpose"; exit 3; }\nexec bash %s/.ai-toolkit/scripts/review.sh "$@"\n' "$B" "$B" "$G" > "$E/review.sh"
   chmod +x "$E/review.sh"; renv="$renv REVIEW_CMD=$E/review.sh"
 fi
-: > "$E/coord.log"
-coord="$(orca_json terminal create --worktree "path:$G" --title coordinator --command \
-  "$renv bash $G/.ai-toolkit/scripts/coordinator.sh --answer $ANS --cap 1 --drain > $E/coord.log 2>&1; echo \$? > $E/coord.rc" | jq -r '.result.terminal.handle // empty')"
+# The coordinator's own terminal shows its output (a human reads the gate question there) and tees it to the log.
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\n%s bash %s/.ai-toolkit/scripts/coordinator.sh --answer %s --cap 1 --drain 2>&1 | tee %s/coord.log\necho "${PIPESTATUS[0]}" > %s/coord.rc\n' "$renv" "$G" "$ANS" "$E" "$E" > "$E/run.sh"
+coord="$(orca_json terminal create --worktree "path:$G" --title coordinator --command "bash $E/run.sh" | jq -r '.result.terminal.handle // empty')"
 [ -n "$coord" ] || fail "terminal create"
 wait_for 90 grep -q ' coordinator: run run_' "$E/coord.log" || fail "the coordinator did not start"
 run="$(sed -n 's/.* coordinator: run \(run_[0-9a-f]*\).*/\1/p' "$E/coord.log" | head -n 1)"
@@ -112,12 +111,15 @@ if [ -n "$A" ]; then
   if [ "$ANS" = human ]; then   # only the Run's bound terminal can reply: --reply queues it from THIS terminal
     cmd=""; getcmd() { cmd="$(ghe issue view "$A" --json comments --jq '.comments[].body' | sed -n 's/.*Reply from any terminal: \(bash [^ ]* --run [^ ]* --reply [^ ]* approve\).*/\1/p' | head -n 1)"; [ -n "$cmd" ]; }
     wait_for 120 getcmd || fail "no --reply command in a comment on issue $A"
+    gc() { orca_json worktree show --worktree "issue:$A" | jq -r '.result.worktree.comment // ""'; }; answered_c() { [[ "$(gc)" == "gate answered"* ]]; }
+    wait_for 60 grep -q "^  | " "$E/coord.log" && [[ "$(gc)" == "GATE waiting: "* ]] || fail "the question text is not in the coordinator log or the worktree comment is not set"
     [ ! -e "$wt/hello.py" ] || fail "hello.py exists before the gate was answered"
-    if [ -n "${E2E_HUMAN_WAIT:-}" ]; then printf '\n>>> A HUMAN must answer the gate of issue #%s (%s/issues/%s). From any terminal:\n>>>   %s\n\n' "$A" "https://github.com/$R" "$A" "$cmd"
+    if [ -n "${E2E_HUMAN_WAIT:-}" ]; then printf '\n>>> QUESTION of issue #%s (%s/issues/%s):\n%s\n>>> A HUMAN must answer it. From any terminal:\n>>>   %s\n\n' "$A" "https://github.com/$R" "$A" "$(grep '^  | ' "$E/coord.log" | head -n 25)" "$cmd"
       wait_for 1800 replied || fail "no human reply within 30 min"
     else out="$($cmd 2>&1)" || fail "reply failed: $out"; fi
   fi
   wait_for 300 replied || fail "the question was never replied"
+  [ "$ANS" != human ] || wait_for 60 answered_c || fail "the worktree comment was not updated after the reply"
 fi
 step=6; say "worker_done, review, CI on the exact SHA, FF land; then the negative path; coordinator drained (exit 0)"
 wait_for 2400 test -s "$E/coord.rc" || fail "the coordinator did not finish within 40 min"

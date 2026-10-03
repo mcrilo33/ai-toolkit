@@ -138,7 +138,7 @@ drain_replies() {   # send the queued human replies as the bound consumer. Dropp
       if jq -e --arg i "$id" '(.answered | index($i)) != null or (.truncated | not)' <<< "$pend" > /dev/null; then warn "reply to $id dropped: no such unanswered question"
       else warn "reply to $id kept: the inbox page is truncated and does not show that question"; continue; fi
     elif orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
-      log "gate $id answered by the human: $body"; if ctx "$(pj "$q" dispatchId)"; then comment "$issue" "Gate answered by the human: $body"; orca_json worktree set --worktree "path:$wtp" --comment "" > /dev/null 2>&1 || warn "cannot clear the worktree comment"; fi
+      log "gate $id answered by the human: $body"; if ctx "$(pj "$q" dispatchId)"; then comment "$issue" "Gate answered by the human: $body"; orca_json worktree set --worktree "path:$wtp" --comment "gate answered by the human: ${body:0:60}" > /dev/null 2>&1 || warn "cannot update the worktree comment"; fi
     else warn "reply to $id failed, it stays queued"; continue; fi
     rm -f "$f"
   done
