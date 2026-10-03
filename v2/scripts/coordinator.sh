@@ -92,14 +92,13 @@ redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds 
 on_question() {
   local id q ans body warns
   id="$(jq -r .id <<< "$1")"; q="$(pj "$1" question)"; [ -n "$q" ] || q="$(jq -r '.body // ""' <<< "$1")"
-  ctx "$(pj "$1" dispatchId)" || return 1
-  if [ "$answer" = auto ] && ans="$(printf '%s' "$q" | "$ANSWER_CMD" "$wtp")"; then
-    body="$(head -n 1 <<< "$ans")"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
-    orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null || { warn "reply to $id failed"; return 1; }
-    log "#$issue gate answered: $body"
+  ctx "$(pj "$1" dispatchId)" || { notify "gate question $id comes from an unknown worker: reply by hand"; return 1; }
+  if [ "$answer" = auto ] && ans="$(printf '%s' "$q" | "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
+    && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
+    log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; notify "#$issue: $warns"; }
-  else   # human mode, or the answerer gave nothing usable: never a blind approve. The question stays in the inbox.
-    comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply: orca orchestration reply --run $run --id $id --body approve   (or --body 'revise: ...')"
+  else   # human mode, no usable answer, or the reply failed: never a blind approve. The question stays in the inbox.
+    comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply: orca orchestration reply --run $run --from $H --id $id --body approve   (or --body 'revise: ...')"
     notify "#$issue: a gate question is waiting for you"
   fi
 }
@@ -175,7 +174,8 @@ while :; do
     [ $((empties % ${COORD_SWEEP_EVERY:-10})) -ne 0 ] || sweep
     continue
   fi
-  while IFS= read -r m; do handle "$m" || warn "message $(jq -r .id <<< "$m") not fully handled"; done <<< "$msgs"
+  # fd 3, not stdin: a handler that reads stdin (claude -p, ssh) must not swallow the rest of the batch.
+  while IFS= read -r m <&3; do handle "$m" || warn "message $(jq -r .id <<< "$m") not fully handled"; done 3<<< "$msgs"
   # Always ack, after the whole batch: a replied question is replayed until acked (03 #20).
   orca_json orchestration check --run "$run" --terminal "$H" --ack "$(jq -r '.result.deliveryId // empty' <<< "$out")" > /dev/null || warn "ack failed"
 done

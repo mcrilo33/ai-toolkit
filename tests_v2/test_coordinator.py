@@ -115,7 +115,7 @@ def test_the_human_path_notifies_and_comments_the_reply_command_without_replying
     C.mail([msg("question", "msg_q", question="q")])
     C.go("--answer", mode)
     assert not C.calls("orca orchestration reply") and C.stubs.calls("notify") and C.calls("orca orchestration check ack")
-    assert "orca orchestration reply --run run_t --id msg_q --body approve" in C.calls("gh issue comment")[0][-1]
+    assert "orca orchestration reply --run run_t --from term_c --id msg_q --body approve" in C.calls("gh issue comment")[0][-1]
     assert (len(C.stubs.calls("answer.sh")) == 1) == (mode == "auto")
 
 
@@ -131,6 +131,7 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
     C.mail([msg("question", "msg_q", question="q"), msg("worker_done", "msg_d", outcome="succeeded")])
     C.go()
     assert C.stubs.calls("land.sh") == [["--review", "--dispatch", "ctx_1", "1"]] and len(C.calls("orca orchestration check ack")) == 1
+    assert "msg_q" in C.calls("gh issue comment")[0][-1] and C.stubs.calls("notify")   # the unreplied question is handed to the human
     in_order(C.kinds(), "orca orchestration reply", "land.sh", "orca orchestration check ack")
 
 
