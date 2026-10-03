@@ -43,11 +43,11 @@ ack. Ack-and-ignore a `worker_done` whose issue is already closed (`gh issue vie
 OPEN while `coordinator.sh --status` says `coordinator.sh` holds the Run means a land is in flight: wait, never land it yourself.
 
 **`question`** (a worker's PLAN gate): show the issue (`gh issue view <n>`, its `Scope:`/`Gate:` footer), the plan, and what bears on it
-(the files it touches, the acceptance criteria, conflicts with other live issues). Say what you would answer and why, then discuss. Never approve blindly: no reply before the user decided, unless they said in this conversation to approve a class of plans. Turn their
-answer, whatever its wording, into exactly ONE of two replies, then comment `Gate answered by the user: <body>` on the issue:
+(the files it touches, the acceptance criteria, conflicts with other live issues). Say what you would answer and why, then discuss. Never approve blindly: no reply before the user decided, unless they said in this conversation to approve a class of plans. Turn their answer, whatever its wording, into exactly ONE of three replies (which one: `afk-answering.md`, Choosing the reply), then comment `Gate answered by the user: <body>` on the issue:
 
 ```bash
 orca orchestration reply --run <run> --from $H --id <message-id> --body "approve"
+orca orchestration reply --run <run> --from $H --id <message-id> --body "approve with: <the change, one sentence>"
 orca orchestration reply --run <run> --from $H --id <message-id> --body "revise: <the change, one paragraph>"
 ```
 
