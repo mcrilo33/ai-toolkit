@@ -36,6 +36,7 @@ def C(stubs, repo, run, tmp_path):
 
     def mail(*batches):   # one batch per wait; a non-empty batch costs a second check call, its ack
         n = 0
+        (tmp_path / "stubs/orca.orchestration_check.count").unlink(missing_ok=True)   # numbering restarts for each coordinator run
         for i, b in enumerate(batches):
             n += 1
             stubs.reply("orca.orchestration_check", json.dumps({"result": {"messages": b, "deliveryId": f"d{i}" if b else None}}), n=n)
