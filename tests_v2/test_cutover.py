@@ -11,7 +11,7 @@ V1 = ["scripts/old.sh", "scripts/telemetry/t.py", "shared/hooks/h.sh", "shared/s
       "mcp/m.py", "dashboard/d.json", "settings/ai-toolkit.yml", "settings/cursor/c.json", "tests/old_test.py", "docs/old.md", "docs/orca-migration/x.md",
       "CLAUDE.md", "README.md", "orca.yaml", "pyproject.toml", "ruff.toml", ".test-select-exempt", ".gitignore", ".github/workflows/ci.yml", "VERSION"]
 NEW = ["v2/scripts/new.sh", "v2/settings/ai-toolkit.env", "v2/orca.yaml", "v2/README.md", "v2/bin/b", "v2/hooks/h", "v2/.shellcheckrc",
-       "v2/.github/workflows/ci.yml", "tests_v2/test_x.py", "tests_v2/pytest.ini", "docs/v2/architecture.md", "docs/v2/wp1-notes.md"]
+       "v2/.github/workflows/ci.yml", "tests_v2/test_x.py", "tests_v2/pytest.ini", "docs/v2/architecture.md", "docs/v2/frontmatter.md", "docs/v2/wp1-notes.md"]
 GONE = ["scripts/old.sh", "scripts/telemetry", "shared/hooks", "shared/skills/hub/scripts", "shared/skills/source-task", "shared/rules/metadata.yml",
         "shared/pyproject.toml", "mcp", "dashboard", "settings/ai-toolkit.yml", "settings/cursor", "tests/old_test.py", "docs/old.md", "docs/orca-migration",
         "docs/v2", "CLAUDE.md", "pyproject.toml", "ruff.toml", ".test-select-exempt", "v2", "tests_v2"]
@@ -62,7 +62,7 @@ def test_cutover_makes_one_commit_with_the_v2_layout(cut):
     for p in GONE:
         assert not (root / p).exists(), p
     for p in ("scripts/new.sh", "settings/ai-toolkit.env", "orca.yaml", "README.md", "bin/b", "hooks/h", ".shellcheckrc", ".github/workflows/ci.yml",
-              "tests/test_x.py", "docs/architecture.md", "shared/rules/a.md", "shared/skills/solo/SKILL.md", "shared/skills/hub/SKILL.md", "VERSION", ".gitignore"):
+              "tests/test_x.py", "docs/architecture.md", "docs/frontmatter.md", "shared/rules/a.md", "shared/skills/solo/SKILL.md", "shared/skills/hub/SKILL.md", "VERSION", ".gitignore"):
         assert (root / p).is_file(), p
     assert (root / "orca.yaml").read_text() == "v2/orca.yaml\n"  # replaced by the v2 file, not merged
     assert (root / "requirements-dev.txt").read_text().split() == ["pytest>=8,<9", "pytest-xdist>=3,<4", "pyyaml>=6,<7"]
@@ -121,7 +121,7 @@ def test_sync_into_itself_generates_claude_md_and_keeps_the_tracked_orca_yaml(tm
 
 def test_nothing_points_at_a_file_the_cutover_deletes():
     """docs/ keeps only architecture.md and v2/ moves to the root: no policy or script may name a deleted doc or the v2/ and tests_v2/ prefixes."""
-    stale = re.compile(r"(?<![A-Za-z0-9_./-])docs/(?!architecture\.md)[A-Za-z0-9_./-]+\.md|shared/hooks/|\bscripts/(worktree|hub|spoke|sync-to-repo)")
+    stale = re.compile(r"(?<![A-Za-z0-9_./-])docs/(?!(?:architecture|frontmatter)\.md)[A-Za-z0-9_./-]+\.md|shared/hooks/|\bscripts/(worktree|hub|spoke|sync-to-repo)")
     roots = [V2 / "scripts", V2 / "hooks", V2 / "bin", V2 / "e2e", ROOT / "shared"]
     hits = [f"{f.relative_to(ROOT)}: {m.group(0)}" for r in roots for f in r.rglob("*") if f.is_file() and f.suffix in {"", ".sh", ".md", ".py"} and not f.relative_to(ROOT).as_posix().startswith(("shared/hooks/", "shared/skills/hub/scripts/"))  # both deleted by cutover.sh
             for m in stale.finditer(f.read_text(errors="ignore")) if f.name != "cutover.sh"]

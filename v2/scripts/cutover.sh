@@ -20,16 +20,16 @@ git rev-parse --git-dir > /dev/null 2>&1 || usage_exit "$co is not a git reposit
 sha="$(git rev-parse -q --verify "$v1^{commit}")" || usage_exit "unknown ref $v1 (pass --v1 <ref>)"
 ! git rev-parse -q --verify refs/tags/v1-final > /dev/null || usage_exit "tag v1-final exists: already cut over? (rollback: git reset --hard v1-final)"
 
-# What goes: the v1 machinery (06 section 8) plus the v1 files the v2 tree replaces or makes stale. docs/ keeps only the architecture doc.
+# What goes: the v1 machinery (06 section 8) plus the v1 files the v2 tree replaces or makes stale. docs/ keeps architecture.md and frontmatter.md.
 DELETE="scripts mcp dashboard dist settings tests shared/hooks shared/skills/hub/scripts shared/pyproject.toml shared/ruff.toml CLAUDE.md README.md
   orca.yaml pyproject.toml ruff.toml .test-select-exempt .github/workflows/ci.yml"
 for s in source-task next-batch verify-agents verify-rules verify-skills bootstrap-test-suite; do DELETE="$DELETE shared/skills/$s"; done
-DELETE="$DELETE $(git ls-files 'shared/*/metadata.yml' | tr '\n' ' ') $(git ls-files docs | grep -vx 'docs/v2/architecture.md' | tr '\n' ' ')"
+DELETE="$DELETE $(git ls-files 'shared/*/metadata.yml' | tr '\n' ' ') $(git ls-files docs | grep -vxE 'docs/v2/(architecture|frontmatter)\.md' | tr '\n' ' ')"
 
 echo "tag v1-final $sha$([ "$push" = 1 ] && echo ' (pushed to origin)' || echo ' (local)')"
 for p in $DELETE; do [ -z "$(git ls-files -- "$p")" ] || echo "delete $p"; done
 for e in $(cd v2 && ls -A); do echo "move v2/$e -> $e"; done
-echo "move tests_v2 -> tests"; echo "move docs/v2/architecture.md -> docs/architecture.md"
+echo "move tests_v2 -> tests"; echo "move docs/v2/{architecture,frontmatter}.md -> docs/"
 echo "trim requirements-dev.txt to pytest, pytest-xdist, pyyaml; ignore /CLAUDE.md (sync.sh generates it)"
 [ "$dry" = 0 ] || exit 0
 
