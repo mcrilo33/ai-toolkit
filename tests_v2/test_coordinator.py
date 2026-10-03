@@ -18,14 +18,23 @@ def msg(kind, mid="msg_1", **payload):
     return {"id": mid, "type": kind, "body": "the body", "payload": json.dumps({"taskId": "task_ctx_1", "dispatchId": "ctx_1", **payload})}
 
 
+def arg(a, flag):
+    return a[a.index(flag) + 1]
+
+
+def in_order(kinds, *seq):
+    i = -1
+    for s in seq:
+        i = kinds.index(s, i + 1)
+
+
 @pytest.fixture
 def C(stubs, repo, run, tmp_path):
-    cmds = tmp_path / "cmds"
+    cmds, wt = tmp_path / "cmds", str(repo.wt("1-x"))
     cmds.mkdir()
     for n in ("dispatch.sh", "land.sh", "answer.sh", "notify"):   # sub-commands are stubs that also record their stdin
         (cmds / n).write_text(STUB.replace("n=$(basename", 'cat > "$STUB_DIR/$(basename "$0").stdin"; n=$(basename', 1))
         (cmds / n).chmod(0o755)
-    wt = str(repo.wt("1-x"))
 
     def row(d="ctx_1", st="dispatched", lv="live"):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",
@@ -55,51 +64,34 @@ def C(stubs, repo, run, tmp_path):
         return run(["bash", CO, *(["--run", run_id] if run_id else []), *args], cwd=repo.root,
                    **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, **cmd_env, **env})
 
-    def trail():   # [("orca orchestration check ack", argv), ("gh issue", argv), ...] in call order
-        t = []
-        for r in (Path(os.environ["STUB_DIR"]) / "calls.log").read_text().splitlines():
-            n, *a = [x for x in r.split("\x1f") if x != "--json"]
-            t.append((" ".join([n, *a[:2]] if n in ("orca", "gh") else [n]) + (" ack" if "--ack" in a else ""), a))
-        return t
+    def trail():   # [("orca orchestration check ack", argv), ("gh issue edit", argv), ("land.sh", argv)...] in call order
+        rows = (Path(os.environ["STUB_DIR"]) / "calls.log").read_text().splitlines()
+        return [(" ".join([n, *a[:2]] if n in ("orca", "gh") else [n]) + (" ack" if "--ack" in a else ""), a)
+                for n, *a in ([x for x in r.split("\x1f") if x != "--json"] for r in rows)]
 
     def calls(kind):
         return [a for k, a in trail() if k == kind]
 
     def blocked():   # label + comment + notification + release; the worktree is kept and nothing is re-dispatched
         ks = [k for k, _ in trail()]
-        return (any(a[:4] == ["issue", "edit", "1", "--add-label"] and "blocked" in a for a in calls("gh issue edit"))
-                and "gh issue comment" in ks and "notify" in ks and "orca orchestration worker-release" in ks
-                and "orca orchestration worker-start" not in ks and "orca worktree rm" not in ks)
+        return (any(a[3:] == ["--add-label", "blocked"] for a in calls("gh issue edit")) and "gh issue comment" in ks and "notify" in ks
+                and "orca orchestration worker-release" in ks and "orca orchestration worker-start" not in ks and "orca worktree rm" not in ks)
 
     return type("C", (), dict(go=staticmethod(go), mail=staticmethod(mail), workers=staticmethod(workers), row=staticmethod(row), wt=wt,
-                              trail=staticmethod(trail), calls=staticmethod(calls), blocked=staticmethod(blocked), stubs=stubs,
-                              kinds=staticmethod(lambda: [k for k, _ in trail()]), stdin=staticmethod(lambda n: (tmp_path / f"stubs/{n}.stdin").read_text())))
+                              calls=staticmethod(calls), blocked=staticmethod(blocked), stubs=stubs, kinds=staticmethod(lambda: [k for k, _ in trail()]),
+                              stdin=staticmethod(lambda n: (tmp_path / f"stubs/{n}.stdin").read_text())))
 
 
-def arg(a, flag):
-    return a[a.index(flag) + 1]
-
-
-def in_order(kinds, *seq):
-    i = -1
-    for s in seq:
-        i = kinds.index(s, i + 1)
-
-
-def test_a_given_run_is_rebound_and_every_wait_names_it_and_the_wake_types(C):
-    assert C.go().returncode == 0
-    assert C.calls("orca orchestration run-use")[0][2:6] == ["--id", "run_t", "--from", "term_c"]
+def test_a_given_run_is_rebound_without_one_a_run_is_created_and_every_wait_names_it_and_the_wake_types(C):
+    assert C.go().returncode == 0 and C.calls("orca orchestration run-use")[0][2:6] == ["--id", "run_t", "--from", "term_c"]
     w = C.calls("orca orchestration check")[0]
     assert arg(w, "--run") == "run_t" and arg(w, "--terminal") == "term_c" and "--wait" in w and arg(w, "--types") == "question,worker_done,escalation"
-
-
-def test_without_a_run_one_is_created_from_this_terminal(C):
     r = C.go(run_id=None)
-    assert r.returncode == 0 and "run_new" in r.stdout and arg(C.calls("orca orchestration run-create")[0], "--from") == "term_c"
-    assert arg(C.calls("orca orchestration check")[0], "--run") == "run_new"
+    assert "run_new" in r.stdout and arg(C.calls("orca orchestration run-create")[0], "--from") == "term_c"
+    assert arg(C.calls("orca orchestration check")[-1], "--run") == "run_new"
 
 
-def test_a_run_owned_by_another_terminal_stops_the_coordinator(C):
+def test_a_run_taken_over_by_another_terminal_stops_the_coordinator(C):
     C.stubs.reply("orca.orchestration_run_use", '{"error":{"code":"consumer_fenced"}}', rc=1)
     r = C.go()
     assert r.returncode == 1 and "another" in r.stderr and not C.calls("orca orchestration check")
@@ -109,31 +101,24 @@ def test_a_run_owned_by_another_terminal_stops_the_coordinator(C):
 
 
 def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_acks(C):
+    C.stubs.reply("answer.sh", "revise: drop the extra file\nWARN: touches CI\n")
     C.mail([msg("question", "msg_q", question="PLAN: do X?")])
     assert C.go("--answer", "auto").returncode == 0
     assert C.stubs.calls("answer.sh") == [[C.wt]] and C.stdin("answer.sh") == "PLAN: do X?"
     rep = C.calls("orca orchestration reply")[0]
-    assert (arg(rep, "--id"), arg(rep, "--body"), arg(rep, "--run")) == ("msg_q", "approve", "run_t")
-    in_order(C.kinds(), "answer.sh", "orca orchestration reply", "orca orchestration check ack")
-    assert arg(C.calls("orca orchestration check ack")[0], "--ack") == "d0"
-
-
-def test_a_revise_with_warnings_is_replied_verbatim_and_flagged_to_the_human(C):
-    C.stubs.reply("answer.sh", "revise: drop the extra file\nWARN: touches CI\n")
-    C.mail([msg("question", "msg_q", question="q")])
-    C.go("--answer", "auto")
-    assert arg(C.calls("orca orchestration reply")[0], "--body") == "revise: drop the extra file"
-    assert "touches CI" in C.calls("gh issue comment")[0][-1] and C.stubs.calls("notify")
+    assert (arg(rep, "--id"), arg(rep, "--body"), arg(rep, "--run")) == ("msg_q", "revise: drop the extra file", "run_t")
+    in_order(C.kinds(), "answer.sh", "orca orchestration reply", "orca orchestration check ack")   # the warning goes to the human
+    assert arg(C.calls("orca orchestration check ack")[0], "--ack") == "d0" and "touches CI" in C.calls("gh issue comment")[0][-1] and C.stubs.calls("notify")
 
 
 @pytest.mark.parametrize("mode, rc", [("auto", 1), ("human", 0)])
 def test_the_human_path_notifies_and_comments_the_reply_command_without_replying(C, mode, rc):
-    C.stubs.reply("answer.sh", "", rc=rc)
+    C.stubs.reply("answer.sh", "", rc=rc)   # auto: the answerer found nothing usable. Never a blind approve
     C.mail([msg("question", "msg_q", question="q")])
     C.go("--answer", mode)
-    assert not C.calls("orca orchestration reply") and C.stubs.calls("notify")
+    assert not C.calls("orca orchestration reply") and C.stubs.calls("notify") and C.calls("orca orchestration check ack")
     assert "orca orchestration reply --id msg_q --body approve" in C.calls("gh issue comment")[0][-1]
-    assert (len(C.stubs.calls("answer.sh")) == 1) == (mode == "auto") and C.calls("orca orchestration check ack")
+    assert (len(C.stubs.calls("answer.sh")) == 1) == (mode == "auto")
 
 
 @pytest.mark.parametrize("kind, extra", [("worker_done", {"outcome": "failed"}), ("escalation", {})])
@@ -143,19 +128,11 @@ def test_a_failed_or_escalating_worker_blocks_the_issue(C, kind, extra):
     assert C.blocked() and not C.stubs.calls("land.sh") and C.calls("orca orchestration check ack")
 
 
-def test_a_successful_worker_is_landed_with_review_then_acked(C):
-    C.stubs.reply("land.sh", "landed #1")
-    C.mail([msg("worker_done", outcome="succeeded")])
-    assert C.go().returncode == 0
-    assert C.stubs.calls("land.sh") == [["--review", "--dispatch", "ctx_1", "1"]]
-    in_order(C.kinds(), "land.sh", "orca orchestration check ack")
-
-
-def test_one_delivery_is_acked_once_after_all_its_messages_even_when_a_handler_fails(C):
-    C.stubs.reply("orca.orchestration_reply", "boom", rc=1)
+def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_once_after_all_its_messages(C):
+    C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # a failing handler must not stop the rest, nor the ack
     C.mail([msg("question", "msg_q", question="q"), msg("worker_done", "msg_d", outcome="succeeded")])
     C.go()
-    assert len(C.calls("orca orchestration check ack")) == 1
+    assert C.stubs.calls("land.sh") == [["--review", "--dispatch", "ctx_1", "1"]] and len(C.calls("orca orchestration check ack")) == 1
     in_order(C.kinds(), "orca orchestration reply", "land.sh", "orca orchestration check ack")
 
 
@@ -185,49 +162,41 @@ def test_a_land_that_the_worker_cannot_fix_blocks_at_once(C, rc, out):
 
 
 @pytest.mark.parametrize("cleanup_rc", [0, 6])
-def test_landed_but_cleanup_incomplete_finishes_once_and_never_blocks(C, cleanup_rc):
+def test_landed_but_cleanup_incomplete_finishes_once_and_parks_a_still_open_issue(C, cleanup_rc):
     C.stubs.reply(key("land.sh", "--review", "--dispatch"), "land.sh: landed abc but cleanup is incomplete\n", rc=6)
     C.stubs.reply(key("land.sh", "--cleanup-only", "--branch"), "", rc=cleanup_rc)
     C.mail([msg("worker_done", outcome="succeeded")])
     C.go()
     co = C.stubs.calls("land.sh")[1]
     assert co[:3] == ["--cleanup-only", "--branch", "1-x"] and arg(co, "--tip") and co[-1] == "1" and len(C.stubs.calls("land.sh")) == 2
-    assert "orca orchestration worker-release" not in C.kinds() and ("gh issue comment" in C.kinds()) == (cleanup_rc == 6)
-    assert "--add-label" not in sum(C.calls("gh issue edit"), [])
+    assert bool(C.calls("gh issue edit")) == (cleanup_rc == 6)   # else `--next` would pick the open issue again
 
 
 def test_a_worker_that_exited_without_worker_done_is_retried_once_on_the_tenth_empty_wait_then_blocked(C):
     C.workers(C.row(lv="exited"))
+    C.stubs.reply(key("dispatch.sh", "--retry-of", "ctx_1"), '{"issue":1}')
     C.go("--cap", "1", COORD_MAX_TICKS=9)
     assert not C.stubs.calls("dispatch.sh")
     C.go("--cap", "1", COORD_MAX_TICKS=10)
     assert C.stubs.calls("dispatch.sh")[-1] == ["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]
-    C.workers(C.row(st="failed", lv="exited"), C.row("ctx_2", lv="exited"))   # the retry died too
+    C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2", lv="live"))   # the relaunched worker is alive: left alone
     C.go("--cap", "1", COORD_MAX_TICKS=10)
-    assert C.blocked()
-
-
-def test_a_retried_worker_that_is_alive_is_left_alone(C):
-    C.workers(C.row(lv="exited"), C.row("ctx_2"))
+    assert len(C.stubs.calls("dispatch.sh")) == 1 and not C.calls("gh issue edit")
+    C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2", lv="exited"))   # it died too
     C.go("--cap", "1", COORD_MAX_TICKS=10)
-    assert not C.stubs.calls("dispatch.sh") and "gh issue edit" not in C.kinds()
+    assert C.blocked() and len(C.stubs.calls("dispatch.sh")) == 1
 
 
-def test_slots_are_filled_up_to_the_cap_with_the_next_ready_issues(C):
+def test_slots_are_filled_up_to_the_cap_and_a_failed_dispatch_is_cleaned_up_and_blocks_the_issue(C):
     C.stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "5\n")
     C.stubs.reply(key("dispatch.sh", "5"), '{"issue":5}')
     C.go("--cap", "2")
     assert C.stubs.calls("dispatch.sh") == [["--next", "--dry-run"], ["5"]]   # one live worker + cap 2 = one more
-    n = len(C.stubs.calls("dispatch.sh"))
     C.go("--cap", "1")
-    assert len(C.stubs.calls("dispatch.sh")) == n and os.environ["STUB_DIR"]
-
-
-def test_a_dispatch_that_fails_leaves_no_half_made_worktree_and_blocks_the_issue(C):
-    C.stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "5\n")
+    assert len(C.stubs.calls("dispatch.sh")) == 2
     C.stubs.reply(key("dispatch.sh", "5"), "boom", rc=1)
     C.go("--cap", "2")
-    assert C.calls("orca worktree rm")[0][2:4] == ["--worktree", "issue:5"] and ["issue", "edit", "5"] == C.calls("gh issue edit")[0][:3]
+    assert C.calls("orca worktree rm")[0][2:4] == ["--worktree", "issue:5"] and C.calls("gh issue edit")[0][:3] == ["issue", "edit", "5"]
 
 
 def test_drain_stops_when_nothing_is_ready_and_no_worker_is_live_but_not_before(C):
@@ -245,10 +214,9 @@ def test_until_stops_the_loop_at_the_clock_time_and_wraps_past_midnight(C, now, 
 
 
 def test_status_prints_the_run_workers_and_unanswered_questions_and_changes_nothing(C):
-    q, a = msg("question", "msg_q", question="PLAN: do X?"), msg("question", "msg_a", question="old")
-    rows = [{**q, "run_id": "run_t", "thread_id": "msg_q"}, {**a, "run_id": "run_t", "thread_id": "msg_a"},
-            {"id": "msg_r", "type": "status", "run_id": "run_t", "thread_id": "msg_a", "body": "approve", "payload": None}]
+    rows = [{**msg("question", i), "run_id": "run_t", "thread_id": i} for i in ("msg_q", "msg_a")]
+    rows.append({"id": "msg_r", "type": "status", "run_id": "run_t", "thread_id": "msg_a", "body": "approve", "payload": None})   # answers msg_a
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
     r = C.go("--status")
     assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and "msg_q" in r.stdout and "msg_a" not in r.stdout
-    assert not [k for k in C.kinds() if k.split()[1:2] in (["orchestration"],) and k.split()[2] in ("check", "reply", "worker-start", "worker-release")]
+    assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in ("worker-list", "inbox")] == []

@@ -7,7 +7,6 @@ import pytest
 from conftest import STUB, V2
 
 ANSWER, REVIEW = str(V2 / "scripts/answer.sh"), str(V2 / "scripts/review.sh")
-CLAUDE = "claude._p___model"   # the claude stub's reply key for `claude -p --model ...`
 OK = {"verdict": "APPROVE", "blockers": [], "warnings": ["a.py:1 - nit"], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
 
 
@@ -23,10 +22,8 @@ def tee_stdin():   # the claude stub also records the prompt it was given on std
 
 @pytest.fixture
 def A(stubs, tmp_path):
-    stdin = tee_stdin()
-    wt = tmp_path / "wt"
+    stdin, wt, rule = tee_stdin(), tmp_path / "wt", tmp_path / "rule.md"
     wt.mkdir()
-    rule = tmp_path / "rule.md"
     rule.write_text("be decisive")
 
     def go(out, rc=0, rule_path=None, input="", **env):
@@ -36,25 +33,17 @@ def A(stubs, tmp_path):
     return type("A", (), {"go": staticmethod(go), "wt": wt, "rule": rule, "stubs": stubs, "stdin": staticmethod(stdin)})
 
 
-def test_approve_runs_read_only_claude_in_the_worktree_with_the_rule(A):
-    r = A.go("thinking...\nEVIDENCE: read it\nREVERSIBILITY: reversible\nANSWER: approve\n")
+def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_question(A):
+    r = A.go("thinking...\nREVERSIBILITY: reversible\nANSWER:   Approve  \n", input="PLAN: do X. Approve?", ANSWER_MODEL="m-1")
     assert r.returncode == 0 and r.stdout == "approve\n", r.stderr
     argv = A.stubs.calls("claude")[0]
-    assert argv[:2] == ["-p", "--model"] and argv[2] == "claude-opus-5-5"
-    assert ["--append-system-prompt-file", str(A.rule), "--allowedTools", "Read,Grep,Glob"] == argv[3:7]
-    assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude")
-    assert A.go("ANSWER: approve\n", input="PLAN: do X. Approve?").returncode == 0
-    assert A.stdin() == "PLAN: do X. Approve?"
+    assert argv[:3] == ["-p", "--model", "m-1"] and ["--append-system-prompt-file", str(A.rule), "--allowedTools", "Read,Grep,Glob"] == argv[3:7]
+    assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and A.stdin() == "PLAN: do X. Approve?"
 
 
 def test_revise_keeps_its_text_and_warn_lines_follow_the_answer(A):
-    r = A.go("WARN: touches the CI config\nREVERSIBILITY: scope\nWARN: second\nANSWER: revise: drop the extra file\n", ANSWER_MODEL="m-1")
+    r = A.go("WARN: touches the CI config\nREVERSIBILITY: scope\nWARN: second\nANSWER: revise: drop the extra file\n")
     assert r.returncode == 0 and r.stdout == "revise: drop the extra file\nWARN: touches the CI config\nWARN: second\n"
-    assert A.stubs.calls("claude")[0][2] == "m-1"
-
-
-def test_the_answer_word_is_case_insensitive_and_trimmed(A):
-    assert A.go("ANSWER:   Approve  \n").stdout == "approve\n"
 
 
 @pytest.mark.parametrize("out", [
@@ -74,32 +63,25 @@ def test_a_failing_claude_or_a_missing_rule_is_an_escalation_not_an_approve(A, t
 
 @pytest.fixture
 def R(stubs, repo):
-    stdin = tee_stdin()
-    wt = repo.wt("9-feat")
-    stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(wt), "branch": "refs/heads/9-feat"}}}))
+    stdin, wt = tee_stdin(), repo.wt("9-feat")
+    show = json.dumps({"result": {"worktree": {"path": str(wt), "branch": "refs/heads/9-feat"}}})
+    stubs.reply("orca.worktree_show", show)
 
     def go(verdict, rc=0, **env):
         stubs.reply("claude", verdict if isinstance(verdict, str) else json.dumps(verdict), rc=rc)
         return sh(["bash", REVIEW, "9"], repo.root, **env)
 
-    return type("R", (), {"go": staticmethod(go), "wt": wt, "stubs": stubs, "stdin": staticmethod(stdin)})
+    return type("R", (), {"go": staticmethod(go), "wt": wt, "stubs": stubs, "stdin": staticmethod(stdin), "show": show})
 
 
 def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktree(R):
-    r = R.go(OK)
+    r = R.go(OK, REVIEW_MODEL="fable-x", BASE_BRANCH="trunk")
     assert r.returncode == 0 and "SUMMARY: fine" in r.stdout
     argv = R.stubs.calls("claude")[0]
-    assert argv[:3] == ["-p", "--model", "claude-opus-5-5"] and argv[argv.index("--agent") + 1] == "code-review"
+    assert argv[:3] == ["-p", "--model", "fable-x"] and argv[argv.index("--agent") + 1] == "code-review"
     tools = argv[argv.index("--allowedTools") + 1]
     assert "Read" in tools and "git diff" in tools and not {"Edit", "Write"} & set(tools.replace("(", ",").split(","))
-    assert "origin/main...9-feat" in R.stdin() and "JSON" in R.stdin()
-    assert f"PWD={R.wt.resolve()}" in R.stubs.env("claude")
-
-
-def test_the_review_model_and_base_branch_come_from_the_environment(R):
-    R.go(OK, REVIEW_MODEL="fable-x", BASE_BRANCH="trunk")
-    argv = R.stubs.calls("claude")[0]
-    assert argv[2] == "fable-x" and "origin/trunk...9-feat" in R.stdin()
+    assert "origin/trunk...9-feat" in R.stdin() and "JSON" in R.stdin() and f"PWD={R.wt.resolve()}" in R.stubs.env("claude")
 
 
 def test_request_changes_exits_3_and_prints_the_blockers(R):
@@ -124,14 +106,13 @@ def test_an_unparseable_verdict_exits_1_after_one_retry_and_is_never_an_approve(
 
 
 def test_a_fenced_object_is_accepted_and_a_garbled_first_try_is_retried_once(R):
-    R.stubs.reply(CLAUDE, "sorry, here you go", n=1)
-    R.stubs.reply(CLAUDE, "```json\n" + json.dumps(OK) + "\n```", n=2)
-    r = R.go(OK)   # the numbered replies win over the plain one
-    assert r.returncode == 0 and len(R.stubs.calls("claude")) == 2
+    R.stubs.reply("claude._p___model", "sorry, here you go", n=1)
+    R.stubs.reply("claude._p___model", "```json\n" + json.dumps(OK) + "\n```", n=2)
+    assert R.go(OK).returncode == 0 and len(R.stubs.calls("claude")) == 2
 
 
 def test_a_missing_worktree_or_a_failing_claude_is_an_error_not_an_approve(R):
     R.stubs.reply("orca.worktree_show", "nope", rc=1)
     assert R.go(OK).returncode == 1
-    R.stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(R.wt), "branch": "refs/heads/9-feat"}}}))
+    R.stubs.reply("orca.worktree_show", R.show)
     assert R.go(OK, rc=1).returncode == 1

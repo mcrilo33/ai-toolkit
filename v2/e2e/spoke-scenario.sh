@@ -52,7 +52,8 @@ body="Create hello.txt in the repo root containing exactly the word hello, then 
 jq -n --arg b "$(printf '%b' "$body")" '{number: 1, title: "Add hello.txt", body: $b}' > "$E/issue.json"
 jq -c '[{number, body, labels: {nodes: []}, blockedBy: {nodes: []}}]' "$E/issue.json" > "$E/nodes.json"
 # shellcheck disable=SC2016
-printf '#!/bin/sh\necho "$*" >> %s/gh.log\ncase "$1 $2" in "issue view") cat %s/issue.json ;; "api graphql") cat %s/nodes.json ;; esac\n' "$E" "$E" "$E" > "$E/gh"
+# graphql lists the open issues: empty once `issue close` was logged, like GitHub (else the coordinator would dispatch it again)
+printf '#!/bin/sh\necho "$*" >> %s/gh.log\ncase "$1 $2" in "issue view") cat %s/issue.json ;; "api graphql") if grep -q "^issue close" %s/gh.log; then echo "[]"; else cat %s/nodes.json; fi ;; esac\n' "$E" "$E" "$E" "$E" > "$E/gh"
 chmod +x "$E/gh"
 printf 'AI_TOOLKIT_GH=%s/gh\nCHECK_CMD="test -f hello.txt"\nLOCAL_GATE=1\nANSWER_MODEL=%s\n' "$E" "${E2E_ANSWER_MODEL:-claude-sonnet-5-5}" > "$S/.ai-toolkit/ai-toolkit.local.env"
 # A target's .ai-toolkit/ is untracked (the user's global gitignore lists it), so a new worktree has no

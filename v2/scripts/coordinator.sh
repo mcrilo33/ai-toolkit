@@ -120,7 +120,7 @@ on_done() {
         *) redispatch 1 "address: the land was refused ($last). Fix it on your branch (merge origin/$BASE_BRANCH and resolve conflicts, or fix the failing checks), push, then send worker_done again." "$last" ;;
       esac ;;
     6) RUN="$run" "$LAND_CMD" --cleanup-only --branch "$branch" --tip "$(git rev-parse HEAD)" --dispatch "$disp" "$issue" \
-         || { comment "$issue" "Landed, but cleanup is incomplete: finish with land.sh --cleanup-only $issue"; notify "#$issue landed, cleanup incomplete"; } ;;
+         || block "landed, but cleanup is incomplete (finish with land.sh --cleanup-only $issue); blocked so the still-open issue is not dispatched again" ;;
     *) block "land.sh exited $rc: $last" ;;
   esac
 }
