@@ -1,27 +1,55 @@
 import os
 import shutil
+import subprocess
 
 import pytest
 
-from conftest import V2, git
+from conftest import V2
 
 
 @pytest.fixture
 def tool(tmp_path, stubs):
-    """A copy of v2/ with a git hooks dir (WP3 ships the real one) so install.sh has something to wire."""
     root = tmp_path / "tool"
     shutil.copytree(V2, root)
-    (root / "hooks" / "git").mkdir(parents=True)
-    (root / "hooks" / "git" / "pre-commit").write_text("#!/bin/sh\n")
     stubs.reply("orca", "1.4.219")
     return root
 
 
-def test_install_points_core_hooks_path_at_the_synced_git_hooks(run, tool, repo):
+def synced(repo):
+    """The repo as sync.sh leaves it: native git hooks under .ai-toolkit/hooks/git."""
+    hook = repo.root / ".ai-toolkit" / "hooks" / "git" / "pre-commit"
+    hook.parent.mkdir(parents=True)
+    hook.write_text("#!/bin/sh\n")
+    return hook
+
+
+def local_hooks_path(repo):
+    return subprocess.run(["git", "-C", str(repo), "config", "--local", "--get", "core.hooksPath"],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def test_install_sets_core_hooks_path_on_the_target_repo_only(run, tool, repo, tmp_path):
+    hook = synced(repo)
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
     r = run(["bash", str(tool / "scripts" / "install.sh")], cwd=repo.root)
     assert r.returncode == 0, r.stderr
-    assert git(repo.root, "config", "core.hooksPath") == str(tool / "hooks" / "git")
-    assert os.access(tool / "hooks" / "git" / "pre-commit", os.X_OK)
+    assert local_hooks_path(repo.root) == str(repo.root / ".ai-toolkit" / "hooks" / "git")
+    assert os.access(hook, os.X_OK)
+    assert local_hooks_path(other) == ""  # no other repo is bound
+    assert "hooksPath" not in (tmp_path / "gitconfig").read_text()  # and never the global config
+
+
+def test_install_takes_the_target_repo_as_an_argument(run, tool, repo, tmp_path):
+    synced(repo)
+    r = run(["bash", str(tool / "scripts" / "install.sh"), str(repo.root)], cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert local_hooks_path(repo.root) == str(repo.root / ".ai-toolkit" / "hooks" / "git")
+
+
+def test_install_in_a_repo_that_was_not_synced_wires_nothing(run, tool, repo):
+    r = run(["bash", str(tool / "scripts" / "install.sh")], cwd=repo.root)
+    assert r.returncode == 0 and "sync.sh" in r.stderr and local_hooks_path(repo.root) == ""
 
 
 def test_install_outside_a_git_repo_warns_and_still_succeeds(run, tool, tmp_path):
