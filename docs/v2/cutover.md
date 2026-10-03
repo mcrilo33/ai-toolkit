@@ -7,7 +7,7 @@ Run it in a **fresh clone**, not in the hub checkout. Nothing here pushes to Git
 1. `git clone git@github.com:mcrilo33/ai-toolkit.git <tk> && cd <tk> && git checkout v2`
 2. `git merge origin/main` (main must be an ancestor of v2; resolve modify/delete conflicts by deleting: v2 deletes those files). Re-run step 3 of the rehearsal's tests afterwards.
 3. `bash v2/scripts/cutover.sh --dry-run`, read the list, then `bash v2/scripts/cutover.sh`. It tags `v1-final` at `origin/main` (local), deletes the v1 machinery, moves `v2/*` and its
-   dotfiles (`.github`, `.shellcheckrc`) to the root, renames `tests_v2` to `tests`, trims `requirements-dev.txt`, ignores `/CLAUDE.md`, and makes ONE commit. Refuses (exit 2, nothing touched)
+   dotfiles (`.github`, `.shellcheckrc`) to the root, renames `tests_v2` to `tests`, trims `requirements-dev.txt`, replaces v1's `.gitignore` (v2's ignores `/CLAUDE.md`), and makes ONE commit. Refuses (exit 2, nothing touched)
    on a dirty tree, an existing tag, or a missing `v2/`.
 4. `pytest -n auto tests` and `shellcheck scripts/*.sh bin/claude-spoke hooks/claude/*.sh hooks/git/* e2e/*.sh` (the `ci.yml` steps, which cannot run on GitHub before the push).
 5. `git checkout main && git merge --no-ff v2 -m "Merge v2: cutover"`. `bash scripts/sync.sh <tk> && bash scripts/install.sh <tk>`: `CLAUDE.md` appears (generated), `git status` stays clean.
