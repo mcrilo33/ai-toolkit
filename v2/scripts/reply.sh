@@ -8,6 +8,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 . "$here/lib.sh"
 run="${1:-}"; id="${2:-}"; body="${3:-}"
 [ -n "$run" ] || usage_exit "--reply needs --run <run-id>"
+valid_run "$run" || usage_exit "bad run id '$run'"
 case "$id" in '' | *[!A-Za-z0-9_-]*) usage_exit "bad message id '$id'" ;; esac
 case "$body" in
   approve) ;;

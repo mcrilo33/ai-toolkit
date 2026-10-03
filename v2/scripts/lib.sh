@@ -63,8 +63,10 @@ gh_issue() { gh issue view "$1" --json number,title,body; }
 # issue_footer <body> <Key>: value of the last `Key: value` line (Scope:, Gate:, Model:).
 issue_footer() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | tail -n 1; }
 
-# spool_dir <run-id>: the coordinator's only state, outside every worktree (AITK_STATE_DIR relocates it): replies/ queued human answers, holder.<pid> its mode.
-spool_dir() { echo "${AITK_STATE_DIR:-$HOME/.ai-toolkit/coordinator}/$1"; }
+valid_run() { [[ "$1" =~ ^run_[a-z0-9]+$ ]]; }   # an Orca Run id: it names a directory, so nothing else gets near the spool path
+# spool_dir <run-id>: the coordinator's only state, outside every worktree (AITK_STATE_DIR relocates it): replies/ queued human answers,
+# holder.<pid> = "<handle> <mode>" of a live coordinator.sh (the --stop wait signal, and --status's mode).
+spool_dir() { valid_run "$1" || die "bad run id '$1'"; echo "${AITK_STATE_DIR:-$HOME/.ai-toolkit/coordinator}/$1"; }
 
 # usage_exit <msg>: caller misuse, exit 2 (die is exit 1: a failed operation).
 usage_exit() { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 2; }

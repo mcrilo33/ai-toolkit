@@ -27,6 +27,7 @@ while [ $# -gt 0 ]; do
 done
 case "$answer" in auto | human) ;; *) usage_exit "--answer takes auto or human" ;; esac
 [ "$stop" = 0 ] || [ -n "$run" ] || usage_exit "--stop needs --run <run-id>"
+[ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
 [ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid>)
 DISPATCH_CMD="${DISPATCH_CMD:-$here/dispatch.sh}"; LAND_CMD="${LAND_CMD:-$here/land.sh}"; ANSWER_CMD="${ANSWER_CMD:-$here/answer.sh}"
@@ -65,8 +66,13 @@ pending() {   # {open: questions nobody has replied to (waiting for the human), 
        answered: [$m[] | select(.thread_id != null and .thread_id != .id) | .thread_id], truncated: ($all | length >= 200)}'
 }
 holder() { orca_json orchestration run-show --id "$run" 2> /dev/null | jq -r '.result.run.coordinator_handle // empty'; }   # the terminal that holds the Run
-live_hold() {   # $1 = a handle: if a live coordinator.sh runs bound as it, print its mode and succeed (holder.<pid> = "<handle> <mode>")
-  local f; for f in "$(spool_dir "$run")"/holder.*; do [ -f "$f" ] && kill -0 "${f##*.}" 2> /dev/null && [ "$(cut -d' ' -f1 "$f")" = "$1" ] && { cut -d' ' -f2- "$f"; return 0; }; done; return 1
+live_hold() {   # $1 eq|ne, $2 a handle: if a live coordinator.sh (holder.<pid> = "<handle> <mode>", the pid's command must still be coordinator.sh) is bound as
+  local f h  # (eq) / as anything but (ne) that handle, print its mode and succeed
+  for f in "$(spool_dir "$run")"/holder.*; do
+    [ -f "$f" ] && [[ "$(ps -o command= -p "${f##*.}" 2> /dev/null)" == *coordinator.sh* ]] || continue
+    h="$(cut -d' ' -f1 "$f")"; { [ "$1" = eq ] && [ "$h" = "$2" ]; } || { [ "$1" = ne ] && [ "$h" != "$2" ]; } || continue
+    cut -d' ' -f2- "$f"; return 0
+  done; return 1
 }
 yield() {   # exit 0 when another terminal holds the Run. $1 set = Orca already said fenced: an unreadable holder is then "another terminal"
   local h; h="$(holder)"; [ -n "$h" ] || h="${1:+another terminal}"
@@ -75,7 +81,7 @@ yield() {   # exit 0 when another terminal holds the Run. $1 set = Orca already 
 replycmd() { printf 'bash %s --run %s --reply %s approve' "$here/coordinator.sh" "$run" "$1"; }
 if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to
   [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"
-  log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
+  log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold eq "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
   echo "live workers:"
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "  \(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict)"'
   echo "pending questions:"
@@ -91,9 +97,9 @@ else
   run="$(orca_mutate orchestration run-create --objective "ai-toolkit coordinator" --from "$H" | jq -r '.result.run.id // empty')"
   [ -n "$run" ] || die "run-create failed"
 fi
-if [ "$stop" = 1 ]; then   # the caller holds the Run now: the loop's wait returned consumer_fenced and it exits 0 at the end of its current step
-  for ((i = 0; i < ${COORD_STOP_TRIES:-900}; i++)); do
-    live_hold "$prev" > /dev/null || { log "run $run bound to $H: no coordinator.sh holds it any more (stopped, or none was running)"; exit 0; }
+if [ "$stop" = 1 ]; then   # the caller holds the Run now: the loop's wait returned consumer_fenced and it exits 0 at the end of its current step.
+  for ((i = 0; i < ${COORD_STOP_TRIES:-900}; i++)); do   # Wait on the loop's own holder.<pid>, never on run-show: a second --stop already finds itself the holder
+    live_hold ne "$H" > /dev/null || { log "run $run bound to $H: no coordinator.sh holds it any more (stopped, or none was running)"; exit 0; }
     sleep "${COORD_STOP_POLL:-1}"
   done
   die "run $run is bound to $H, but coordinator.sh is still finishing its step (a land?): it exits when done, see --status"
@@ -156,6 +162,7 @@ on_question() {
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; notify "#$issue: $warns"; }
   else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
+    yield   # ...unless the reply failed because the Run was taken back meanwhile
     comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: revise: <change>)"
     show_q "$q"; notify "#$issue: gate question waiting: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
   fi
@@ -164,6 +171,7 @@ on_done() {
   local out rc=0 branch bl last
   ctx "$(pj "$1" dispatchId)" || return 1
   [ "$(pj "$1" outcome)" = succeeded ] || { block "worker_done failed: $(jq -r '.body // ""' <<< "$1")"; return 0; }
+  [ "$(gh issue view "$issue" --json state --jq .state 2> /dev/null)" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; return 0; }
   branch="$(git -C "$wtp" branch --show-current)"
   # No --dispatch: land finds and releases EVERY dispatch of the worktree, earlier address rounds included.
   out="$(RUN="$run" "$LAND_CMD" --review "$issue" 2>&1)" || rc=$?
