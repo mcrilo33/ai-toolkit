@@ -43,7 +43,7 @@ pick_next() {
   local nodes busy
   # shellcheck disable=SC2016
   nodes="$(gh api graphql -F owner='{owner}' -F name='{repo}' -F limit=100 --jq '.data.repository.issues.nodes' -f query='
-    query($owner:String!, $name:String!, $limit:Int!) { repository(owner:$owner, name:$name) { issues(states: OPEN, first: $limit) {
+    query($owner:String!, $name:String!, $limit:Int!) { repository(owner:$owner, name:$name) { issues(states: OPEN, first: $limit, orderBy: {field: CREATED_AT, direction: ASC}) {
       nodes { number body labels(first: 20) { nodes { name } } blockedBy(first: 50) { nodes { number state } } } } } }')" || die "gh api graphql failed"
   busy="$(orca_json worktree list | jq -c '[.result.worktrees[].linkedIssue | select(. != null)]')" || die "worktree list failed"
   printf '%s' "$nodes" | jq -r --argjson busy "$busy" "$PICK"

@@ -143,6 +143,7 @@ def test_failed_worker_start_exits_non_zero_without_linking_the_issue(d):
 def test_a_run_is_required_and_never_inferred(d):
     r = d.go("7", RUN="")
     assert r.returncode == 2 and "Run" in r.stderr and d.orca() == []
+    assert d.go().returncode == 2 and d.go("--bogus").returncode == 2
     assert d.go("--run", "run_flag", "7", RUN="").returncode == 0
     assert worker_start(d)[2:4] == ["--run", "run_flag"]
     assert not any(c[:2] == ["orchestration", "run-current"] for c in d.orca())

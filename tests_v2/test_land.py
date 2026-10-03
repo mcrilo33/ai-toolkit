@@ -185,9 +185,13 @@ def test_cleanup_failures_are_reported_after_landing_and_do_not_stop_the_rest(L)
     assert ("git", "delete", BRANCH) in L.trail() and ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks") in L.trail()
 
 
+def test_usage_errors_exit_2(L):
+    assert L.go().returncode == 2 and L.go("--bogus", "9").returncode == 2 and L.trail() == []
+
+
 def test_refuses_to_run_inside_a_worktree(L):
     r = L.go("9", cwd=L.wt)
-    assert r.returncode == 2 and "main checkout" in r.stderr and L.trail() == []
+    assert r.returncode == 2 and "not a worktree" in r.stderr and L.trail() == []
 
 
 def test_refuses_off_the_base_branch_or_with_a_dirty_main(L):

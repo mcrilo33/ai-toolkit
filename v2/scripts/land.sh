@@ -55,7 +55,7 @@ gate() {   # $1 = the exact sha under test
     [ "$ci_state" = green ] || bail 4 "CI is red for $1"
   fi
 }
-moved() { git fetch -q origin && ! git merge-base --is-ancestor "origin/$BASE_BRANCH" "$tip"; }
+moved() { git fetch -q origin || die "git fetch origin failed"; ! git merge-base --is-ancestor "origin/$BASE_BRANCH" "$tip"; }
 
 for round in 1 2 3; do
   if moved; then
