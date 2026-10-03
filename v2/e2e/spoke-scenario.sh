@@ -20,12 +20,16 @@ say() { printf '== step %s: %s\n' "$step" "$*"; }
 fail() { printf 'FAIL step %s: %s\n  ids: repo=%s worktree=%s run=%s dispatch=%s\n' "$step" "$*" "$repo_id" "$wt" "$run" "$disp"; exit 1; }
 wait_for() { local t="$1" i; shift; for ((i = 0; i < t; i += 3)); do "$@" && return 0; sleep 3; done; return 1; }
 cleanup() {
-  local d ws=""
+  local d w ws=""
   for d in $([ -z "$run" ] || orca_json orchestration worker-list --run "$run" 2> /dev/null | jq -r '.result.workers[]?.dispatchId' 2> /dev/null); do
     orca orchestration worker-stop --dispatch "$d" --json > /dev/null 2>&1 || true   # only this script's own Run
     orca orchestration worker-release --dispatch "$d" --json > /dev/null 2>&1 || true
   done
-  [ -z "$wt" ] || orca worktree rm --worktree "path:$wt" --force --run-hooks --json > /dev/null 2>&1 || true
+  # Every non-main worktree of the scratch repo, found by listing: dispatch.sh may have died after worktree create.
+  for w in $([ -z "$repo_id" ] || orca_json worktree list --repo "path:$S" 2> /dev/null | jq -r '.result.worktrees[]? | select(.isMainWorktree | not) | .path' 2> /dev/null); do
+    ws="$(dirname "$w")"
+    orca worktree rm --worktree "path:$w" --force --run-hooks --json > /dev/null 2>&1 || true
+  done
   [ -z "$repo_id" ] || orca project setup-delete --setup "$repo_id" --json > /dev/null 2>&1 || true
   [ -z "$wt" ] || ws="$(dirname "$wt")"
   case "$ws" in */"$(basename "$S")") rm -rf "$ws" ;; esac   # Orca's per-repo workspace dir

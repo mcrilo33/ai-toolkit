@@ -14,9 +14,10 @@ tests (dispatch 215 + land 237)/600, e2e 122/150. 47 new tests (45 in the two fi
   `orca worktree list`, Scope disjoint from every in-flight issue's Scope (missing or `*` = exclusive, both sides), `priority` first,
   then number. Nothing ready: exit 3. Exits: dispatch 0/1/2/3; land 0 landed, 1 error, 2 refused, 3 review no, 4 gate red/timeout,
   5 merge conflict, 6 landed but cleanup incomplete (main is pushed, do not re-land).
-- `land.sh`: refuses (2) outside the main checkout / off `BASE_BRANCH` / dirty tracked tree / spoke dirty or unpushed. Gate runs on the
+- `land.sh`: refuses (2) with local main ahead/diverged (behind is fast-forwarded), a spoke on the base branch, outside the main checkout / off `BASE_BRANCH` / dirty tracked tree / spoke dirty or unpushed. Gate runs on the
   exact tip; if main moved (before or during the gate) it merges main on the spoke, pushes, re-gates (3 rounds). A rejected main push
-  resets local main to where it was. `--review` calls `${REVIEW_CMD:-review.sh} <n>` (WP2 hook; default is skip).
+  resets local main to where it was. Branch delete is lease-guarded (a later worker push survives, exit 6); `worktree rm` is re-checked with `show`;
+  `--cleanup-only <n>` finishes close/delete/release/rm after exit 6. dispatch links the issue at `worktree create --issue` (override mode cannot: small race). `--review` calls `${REVIEW_CMD:-review.sh} <n>` (WP2 hook; default is skip).
   `worker-release` takes `--dispatch D`, else matches `worker-list` rows by `resource.worktreeId` ending `::<worktree path>`.
 
 ## Deviations
