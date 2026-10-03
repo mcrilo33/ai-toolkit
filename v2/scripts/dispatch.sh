@@ -70,7 +70,7 @@ start_worker() {   # worker-start with the common flags; $@ = placement flags. S
     || die "worker-start failed: $(printf '%s' "$out" | jq -c '{state: .result.state, stage: .result.failedStage}' 2> /dev/null)"
   disp="$(printf '%s' "$out" | jq -r '.result.dispatchId // empty')"
 }
-# --- launch path (06 Q1, docs/v2/wp0-notes.md): DISPATCH_LAUNCH=twostep. After Orca's agentCmdOverrides.claude
+# --- launch path (06 Q1): DISPATCH_LAUNCH=twostep. After Orca's agentCmdOverrides.claude
 # points at bin/claude-spoke, flip the default below to `override` (a single worker-start, no terminal step).
 launch_twostep() {
   local o

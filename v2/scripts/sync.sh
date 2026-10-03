@@ -5,7 +5,7 @@
 #   rules/*.md (minus guidelines)  -> .claude/rules/    (no paths: = always on; paths: = conditional)
 #   rules/guidelines.md            -> CLAUDE.md         rules/on-demand/*.md -> .ai-toolkit/rules/ (never auto-loaded)
 #   skills/ agents/ prompts/       -> .claude/{skills,agents,commands}
-#   v2/{scripts,bin}, hooks/git, ai-toolkit.env -> .ai-toolkit/   hooks/claude -> .claude/hooks   settings/claude/settings.json -> .claude/settings.json
+#   {scripts,bin} (under v2/ until the cutover), hooks/git, ai-toolkit.env -> .ai-toolkit/   hooks/claude -> .claude/hooks   settings/claude/settings.json -> .claude/settings.json
 #   orca.yaml generated (setup/archive run from $ORCA_ROOT_PATH, where a new worktree has no .ai-toolkit)
 set -euo pipefail
 # shellcheck source=lib.sh

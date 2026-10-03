@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # secrets-scan: PreToolUse(Write|Edit|MultiEdit|NotebookEdit). Blocks writing a hardcoded secret (same pattern set as
-# v1 shared/hooks/lib/utils.sh). Exit 2 + stderr = deny; a crash (bad JSON, no jq) is exit 2 too (fail-closed).
+# the v1 hook library). Exit 2 + stderr = deny; a crash (bad JSON, no jq) is exit 2 too (fail-closed).
 set -Eeuo pipefail
 deny() { echo "secrets-scan: blocked: $*" >&2; exit 2; }
 trap 'deny "cannot parse the tool payload (fail-closed)"' ERR

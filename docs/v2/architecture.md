@@ -37,7 +37,7 @@ orca.yaml                  Orca hooks of THIS repo (setup/archive); a synced tar
 2. **Pick.** `dispatch.sh --next`: open, not `hold`/`blocked`, all blockers closed, not already linked to a worktree of this repo, `Scope`
    disjoint from the in-flight ones (a missing or `*` scope is exclusive); `priority` first, then the lowest number. Exit 3 = nothing ready.
 3. **Dispatch.** `dispatch.sh <n>`: `worktree create` (Orca runs `scripts/setup.sh` first: `.claude/` copied from the main checkout, `spoke-run-id`,
-   `task.md` from the issue), a `claude-spoke` terminal, then `worker-start --terminal` with the seed prompt, then `worktree set --issue n
+   `task.md` from the issue), a `claude-spoke` terminal (the two-step launch: Orca's own agent launch cannot carry the per-spoke OTel env), then `worker-start --terminal` with the seed prompt, then `worktree set --issue n
    --workspace-status in-progress`. Branch = Orca's `<n>-<slug>`.
 4. **Gate.** `Gate: plan`: the worker explores, then blocks in its preamble's `orchestration ask` with the plan (options approve, revise).
    The coordinator answers it (`answer.sh`, auto) or hands it to the human (below). No edit happens before `approve`.

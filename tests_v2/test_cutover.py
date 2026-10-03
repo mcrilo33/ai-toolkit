@@ -1,9 +1,10 @@
 """cutover.sh (06 section 8): the single v1 -> v2 restructuring commit, on a synthetic repo."""
+import re
 import shutil
 import subprocess
 
 import pytest
-from conftest import V2, git
+from conftest import ROOT, V2, git
 
 V1 = ["scripts/old.sh", "scripts/telemetry/t.py", "shared/hooks/h.sh", "shared/skills/hub/scripts/x.sh", "shared/skills/hub/SKILL.md",
       "shared/skills/source-task/SKILL.md", "shared/skills/solo/SKILL.md", "shared/rules/metadata.yml", "shared/rules/a.md", "shared/pyproject.toml",
@@ -116,3 +117,12 @@ def test_sync_into_itself_generates_claude_md_and_keeps_the_tracked_orca_yaml(tm
     assert (root / "CLAUDE.md").read_text() == "# Guidelines\n"
     assert (root / "orca.yaml").read_text() == "setup: ./scripts/setup.sh\n" and not (root / "orca.yaml.bak").exists()
     assert (root / ".ai-toolkit" / "scripts" / "setup.sh").is_file()
+
+
+def test_nothing_points_at_a_file_the_cutover_deletes():
+    """docs/ keeps only architecture.md and v2/ moves to the root: no policy or script may name a deleted doc or the v2/ and tests_v2/ prefixes."""
+    stale = re.compile(r"(?<![A-Za-z0-9_./-])docs/(?!architecture\.md)[A-Za-z0-9_./-]+\.md|shared/hooks/|\bscripts/(worktree|hub|spoke|sync-to-repo)")
+    roots = [V2 / "scripts", V2 / "hooks", V2 / "bin", V2 / "e2e", ROOT / "shared"]
+    hits = [f"{f.relative_to(ROOT)}: {m.group(0)}" for r in roots for f in r.rglob("*") if f.is_file() and f.suffix in {"", ".sh", ".md", ".py"} and not f.relative_to(ROOT).as_posix().startswith(("shared/hooks/", "shared/skills/hub/scripts/"))  # both deleted by cutover.sh
+            for m in stale.finditer(f.read_text(errors="ignore")) if f.name != "cutover.sh"]
+    assert not hits, hits

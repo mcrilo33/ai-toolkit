@@ -36,7 +36,7 @@ fix will touch, derived from reading the code — never a prose guess.
    paths, NOT a `## Scope` markdown header (a scripted planner cannot read prose):
 
    ```
-   Scope: shared/hooks/foo.sh tests/unit/test_foo.sh
+   Scope: scripts/foo.sh tests/test_foo.py
    ```
 
    Keep it tight and honest: list the files you actually expect to edit. If the

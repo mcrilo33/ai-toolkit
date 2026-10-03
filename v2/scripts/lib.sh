@@ -73,7 +73,7 @@ wait_until() {
   return 1
 }
 
-# spawn_claude <worktree> <title> <model> <effort>: the two-step launch (docs/v2/wp0-notes.md): a terminal running bin/claude-spoke
+# spawn_claude <worktree> <title> <model> <effort>: the two-step launch (docs/architecture.md): a terminal running bin/claude-spoke
 # (OTel env), waited on until claude is up; prints its handle. The first run in a repo root meets Claude's trust dialog
 # (default "No, exit"): Down+Enter. dispatch.sh uses it for a new worker and for a retry, so a retried worker keeps the shim's env.
 _agent_up() {

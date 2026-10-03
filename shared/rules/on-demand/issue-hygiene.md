@@ -23,7 +23,7 @@ Every dispatchable issue carries a **`Scope:`** line in its body — a space- or
 comma-separated list of the files and globs the task is expected to touch:
 
 ```
-Scope: shared/hooks/foo.sh tests/unit/test_foo.py
+Scope: scripts/foo.sh tests/test_foo.py
 ```
 
 The dispatcher reads `Scope:` to compute the file-overlap matrix against the in-flight issues; it
