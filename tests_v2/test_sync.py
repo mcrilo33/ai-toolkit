@@ -22,7 +22,7 @@ def src(tmp_path):
     write(root / "v2" / "settings" / "claude" / "settings.json", '{"hooks": {}}\n')
     write(root / "v2" / "hooks" / "claude" / "guard.sh", "#!/bin/sh\n")
     sh = root / "shared"
-    write(sh / "rules" / "guidelines.md", "# Guidelines\n")
+    write(sh / "rules" / "guidelines.md", '---\ndescription: "g"\n---\n# Guidelines\n')
     write(sh / "rules" / "security.md", "# Security\n")
     write(sh / "rules" / "python-style.md", "---\npaths:\n  - '**/*.py'\n---\n# Py\n")
     write(sh / "rules" / "on-demand" / "workflow.md", "# Workflow\n")
@@ -65,7 +65,7 @@ def exclude(t):
 def test_layout_in_target(sync, target):
     r = sync()
     assert r.returncode == 0, r.stderr
-    assert (target / "CLAUDE.md").read_text() == "# Guidelines\n"
+    assert (target / "CLAUDE.md").read_text() == "# Guidelines\n"  # frontmatter stripped
     # always-on (no paths:) and conditional rules both load from .claude/rules; guidelines is CLAUDE.md
     assert sorted(p.name for p in (target / ".claude" / "rules").iterdir()) == ["python-style.md", "security.md"]
     assert (target / ".ai-toolkit" / "rules" / "workflow.md").is_file()  # on-demand: never auto-loaded

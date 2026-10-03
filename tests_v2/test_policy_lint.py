@@ -19,7 +19,8 @@ AGENT_KEYS = {"name", "description", "model", "effort", "tools", "disallowedTool
 COMMAND_KEYS = {"description", "argument-hint", "allowed-tools", "model"}
 # deleted mechanisms (06 section 2): nothing under shared/ may point at them
 DELETED = re.compile(r"spoke-ready|review-stamp|approve_review|tmux|\bgate/|\.review/|hub-afk|worktree-(new|land|done)"
-                     r"|test-select|metadata\.yml|source-task|next-batch|spoke-push|batch-plan|gate-broker")
+                     r"|test-select|metadata\.yml|source-task|next-batch|spoke-push|batch-plan|gate-broker"
+                     r"|red-proof|reviewer-sep|commit-gauntlet|commit-quality|Tested-RED|todo-ledger|hub-guard|\bready/|/source\b")
 LINE_CAPS = {"skills/solo-cycle/SKILL.md": 120, "skills/hub/SKILL.md": 60, "skills/afk/SKILL.md": 40,
              "skills/land/SKILL.md": 30, "skills/start-task/SKILL.md": 60, "skills/quick/SKILL.md": 30,
              "rules/on-demand/workflow.md": 100, "rules/on-demand/planning-hub.md": 50,
@@ -105,11 +106,12 @@ def test_agent_frontmatter(path):
     assert fm.get("model") in MODELS, f"{path.stem}: model must be a Claude 5 id, got {fm.get('model')!r}"
     assert "[1m]" not in path.read_text().split("\n---\n")[0]
     assert fm.get("effort") in EFFORTS
-    assert set(fm.get("disallowedTools", [])) <= CLAUDE_TOOLS  # not the Copilot names v1 carried
+    denied = {t.strip() for t in fm.get("disallowedTools", "").split(",") if t.strip()}
+    assert denied <= CLAUDE_TOOLS  # real Claude Code tool names, not the Copilot ones v1 carried
     for s in fm.get("skills", []):
         assert (SHARED / "skills" / s / "SKILL.md").is_file(), f"{path.stem}: unknown skill {s}"
     if path.stem in READ_ONLY_AGENTS:
-        assert EDIT_TOOLS <= set(fm.get("disallowedTools", []))
+        assert EDIT_TOOLS <= denied
 
 
 @pytest.mark.parametrize("path", COMMANDS)

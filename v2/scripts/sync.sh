@@ -51,7 +51,8 @@ put_tree() { # put_tree <src-dir> <dst-rel-dir>: everything below it, minus cach
 
 put_md "$SHARED/rules" .claude/rules guidelines.md
 put_md "$SHARED/rules/on-demand" .ai-toolkit/rules
-put "$SHARED/rules/guidelines.md" CLAUDE.md bak
+awk 'NR == 1 && /^---$/ { fm = 1; next } fm && /^---$/ { fm = 0; next } !fm' "$SHARED/rules/guidelines.md" > "$TMP"
+put "$TMP" CLAUDE.md bak   # the frontmatter is for the lint, not for CLAUDE.md
 put_tree "$SHARED/skills" .claude/skills
 put_md "$SHARED/agents" .claude/agents
 put_md "$SHARED/prompts" .claude/commands
