@@ -153,7 +153,7 @@ async def test_fetch_returns_data(http_client):
 ## Markers
 
 - No `slow` marker: see Test economy, principle 6
-- `@pytest.mark.integration` — tests requiring external services
+- `@pytest.mark.integration` — tests crossing a real local boundary (filesystem, subprocess, database); they run in the default suite and never use the network
 - Register custom markers in `pyproject.toml` to avoid warnings
 
 ```toml
