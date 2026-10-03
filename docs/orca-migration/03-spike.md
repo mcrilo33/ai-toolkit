@@ -151,3 +151,13 @@ so nothing below mutated Orca state.
 | `terminal send` receipt | `result.send.{accepted, prompt.{requestId, stages[]}}`; `--wait-submit` and `--retry-request` are **only valid with `--text` + `--enter`** (a bare Escape goes without them). Stages: `input_accepted`, `turn_started`. `accepted: false` exits 1. | `terminal-send.js`. |
 | `worktree ps` agent fields | `agents[].{state, toolName, toolInput, stateStartedAt, updatedAt, paneKey, prompt, lastAssistantMessage}`; for a Bash call `toolInput` is the **command string**. Whether Orca clips a long `toolInput` is unverified, so an ellipsis tail is read as an unreadable command (declined, never classified). | live `worktree ps --json`. |
 | Inbox: does an answered `question` leave `check --peek`? | **Unverified.** The slot_state gate read assumes a replied question stops showing as unread. If it does not, a gate would re-park forever: confirm with one real `reply` on a disposable run, and if needed ack with `check --ack`. | — |
+
+## Round 6 — coordinator verification of Round 5's open items (2026-10-02 ~20:30)
+
+Resolves the D3 and inbox rows marked unverified above.
+
+| # | Question | Result |
+|---|---|---|
+| 19 | D3: does `worker-start --retry-of` re-seed the task spec? | **Yes.** After `worker-stop --dispatch d`, `worker-start --task t --retry-of d --terminal <new claude terminal> --worktree path:<same>` **without `--spec`** is accepted, creates a new dispatch, and the new agent's first prompt contains the original spec (marker found) behind the worker preamble; the agent resumed the work. |
+| 20 | Does a replied question leave the inbox? | **Only after ack.** After `orchestration reply`, the question is still listed by `check --peek` and replayed by a consuming `check` until `check --ack <delivery_id>`; after the ack it is gone. A coordinator must ack after replying or the gate re-parks. |
+| 21 | Permission dialog answer | (from #9) sending `1` **without** Enter confirms the dialog; an extra Enter risks confirming the next dialog or submitting an empty prompt. Prove delivery by the agent-state transition `waiting` → `working`. |

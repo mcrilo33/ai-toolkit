@@ -20,9 +20,18 @@ skill sharing as a distribution channel (only for ad-hoc one-off sharing), compu
 Each step is independently shippable, test-first (pytest, AAA), and keeps the full suite green.
 **S1–S3 are needed whatever happens next. S4–S6 are the Orca-first core.**
 
-**Unattended-safety rule (S4–S6):** these steps modify scripts the `/afk` drain itself runs (dispatch, land, coordinator).
-Every Orca execution path is therefore behind a config switch (`settings/ai-toolkit.yml`, e.g. `execution.host: tmux|orca`), **default
-`tmux`** until a human flips it after the drain. A self-update mid-drain then never changes the live execution path.
+**Revised 2026-10-02: Orca-only, replace-and-delete.** The migration goal now includes **minimising ai-toolkit's code** so it
+iterates faster. Decisions (user):
+- **Orca everywhere.** No `execution.host` dual path. Orca becomes a prerequisite of ai-toolkit, including for downstream synced
+  repos. Each step **replaces** the tmux mechanism **and deletes** it; S11 is folded into S4–S6.
+- **Travel mode deleted now** (`afk-travel.sh`, `travel-local.sh`, their tests and the skill), without waiting for the S10 mobile spike.
+- The former unattended-safety switch is dropped: the work is now interactive (drain off), so the self-update hazard no longer applies.
+- Every issue gets a **net-negative line-count** acceptance criterion and an explicit deletion list.
+- Baseline (main `35062573`): ~47.7k lines of shell/Python code, ~92.4k lines of tests. Execution-layer candidates ≈ 9.3k lines;
+  target 5–7k lines deleted plus their tests.
+- The `/afk` drain is run interactively with Orca orchestration (the migration session as coordinator) until S6 lands.
+
+~~Unattended-safety rule (S4–S6): Orca paths behind `execution.host: tmux|orca`, default tmux.~~ (superseded above)
 
 ### S0 — Model routing refresh (priority, independent)
 - Same policy shape as #347 (memory: model-routing-preference), moved to the newest models: spoke driver `claude-sonnet-5-5` / high
