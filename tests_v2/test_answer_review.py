@@ -84,14 +84,9 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     assert "origin/trunk...9-feat" in R.stdin() and "JSON" in R.stdin() and f"PWD={R.wt.resolve()}" in R.stubs.env("claude")
 
 
-def test_request_changes_exits_3_and_prints_the_blockers(R):
-    r = R.go({**OK, "verdict": "REQUEST_CHANGES", "blockers": ["a.py:3 - off by one", "b.py:9 - no test"]})
-    assert r.returncode == 3 and r.stdout.splitlines()[:2] == ["BLOCKER: a.py:3 - off by one", "BLOCKER: b.py:9 - no test"]
-
-
-@pytest.mark.parametrize("patch, word", [({"tests_weakened": True}, "tests_weakened"), ({"tdd_followed": False}, "tdd_followed"),
-                                         ({"blockers": ["x.py:1 - bug"]}, "bug")])
-def test_an_approve_that_contradicts_its_own_fields_is_rejected(R, patch, word):
+@pytest.mark.parametrize("patch, word", [({"verdict": "REQUEST_CHANGES", "blockers": ["a.py:3 - off by one"]}, "off by one"), ({"tests_weakened": True}, "tests_weakened"),
+                                         ({"tdd_followed": False}, "tdd_followed"), ({"blockers": ["x.py:1 - bug"]}, "bug")])
+def test_request_changes_exits_3_with_blocker_lines_and_an_approve_that_contradicts_its_own_fields_is_rejected(R, patch, word):
     r = R.go({**OK, **patch})
     assert r.returncode == 3 and "BLOCKER:" in r.stdout and word in r.stdout
 

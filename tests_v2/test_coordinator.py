@@ -23,9 +23,7 @@ def arg(a, flag):
 
 
 def in_order(kinds, *seq):
-    i = -1
-    for s in seq:
-        i = kinds.index(s, i + 1)
+    assert [kinds.index(s) for s in seq] == sorted(kinds.index(s) for s in seq)
 
 
 @pytest.fixture
@@ -203,8 +201,7 @@ def test_drain_stops_when_nothing_is_ready_and_no_worker_is_live_but_not_before(
     C.workers(C.row(st="completed"))
     assert C.go("--drain", COORD_MAX_TICKS=5).returncode == 0 and not C.calls("orca orchestration check")
     C.workers(C.row())
-    C.go("--drain", COORD_MAX_TICKS=2)
-    assert len(C.calls("orca orchestration check")) == 2
+    assert C.go("--drain", COORD_MAX_TICKS=2).returncode == 0 and len(C.calls("orca orchestration check")) == 2
 
 
 @pytest.mark.parametrize("now, until, runs", [("10:00", "10:00", False), ("10:30", "10:00", True), ("09:59", "10:00", True), ("23:30", "00:30", True)])

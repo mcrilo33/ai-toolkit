@@ -103,7 +103,8 @@ step=5; say "PLAN gate: the worker asks before coding; ${E2E_ANSWER:-auto} answe
 inbox() { orca_json orchestration inbox --limit 200 --full | jq -c --arg r "$run" '[.result.messages[] | select(.run_id == $r)]'; }
 question() { inbox | jq -r '[.[] | select(.type == "question")][0].id // empty'; }
 replied() { inbox | jq -e '[.[] | select(.type == "status" and (.subject | startswith("Re:")))] | length > 0' > /dev/null; }
-wait_for 600 test -n "$(question)" || fail "no question within 10 min"
+asked() { [ -n "$(question)" ]; }
+wait_for 600 asked || fail "no question within 10 min"
 if [ "${E2E_ANSWER:-auto}" = human ]; then   # the human: reply AFTER the coordinator acked the question without replying
   wait_for 60 grep -q 'waiting for you' "$E/coord.log" || fail "the coordinator did not hand the question to the human"
   sleep 5; orca_mutate orchestration reply --id "$(question)" --body approve > /dev/null || fail "human reply"
