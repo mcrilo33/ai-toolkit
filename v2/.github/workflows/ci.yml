@@ -1,0 +1,33 @@
+# ai-toolkit v2 CI (repo-root layout, after cutover). On EVERY branch push: land.sh gates a spoke on the run for its exact tip
+# (`gh run list --commit <sha>`), so a branch without a run can never land.
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - name: shellcheck (scripts, hooks, shim, e2e)
+        run: |
+          command -v shellcheck > /dev/null || brew install shellcheck
+          command -v jq > /dev/null || brew install jq
+          shellcheck scripts/*.sh bin/claude-spoke hooks/claude/*.sh hooks/git/* e2e/*.sh
+      - name: tests
+        run: pytest -n auto tests
+      - name: sync idempotency (sync twice into a temp repo, no drift)
+        run: |
+          t="$(mktemp -d)"; git -C "$t" init -q
+          snap() { (cd "$t" && find . -path ./.git -prune -o -type f -exec cksum {} + | LC_ALL=C sort); }
+          bash scripts/sync.sh "$t" > /dev/null; snap > first.txt
+          bash scripts/sync.sh "$t" > /dev/null; snap > second.txt
+          diff first.txt second.txt

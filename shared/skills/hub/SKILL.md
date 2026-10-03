@@ -43,7 +43,7 @@ unconfirmed; those change shared state and are hard to undo.
 
 - **Dispatch**: `.ai-toolkit/scripts/dispatch.sh <n>` or `--next` (picks the next ready issue).
 - **Answer a gate** (attended): read the plan in the question, then
-  `orca orchestration reply --id <message-id> --body "approve"` or `"revise: <what to change>"`.
+  `.ai-toolkit/scripts/coordinator.sh --run <run> --reply <message-id> approve` (or `'revise: <change>'`); a bare `orca orchestration reply` is refused outside the Run's bound terminal.
 - **Land**: `.ai-toolkit/scripts/land.sh <n>`.
 - **Unattended**: start `coordinator.sh` (`afk` skill) instead of hand-driving each step.
 - **Teardown** (abandoned or finished by hand): `orca worktree rm --worktree issue:<n> --run-hooks`.

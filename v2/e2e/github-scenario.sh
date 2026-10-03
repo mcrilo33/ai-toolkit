@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Real end-to-end (06 section 7 steps 1-10) on the throwaway PUBLIC repo mcrilo33/ai-toolkit-e2e: real gh issues, real GitHub CI on the exact
 # SHA, real Orca, real claude. The only GitHub repo this script writes to: it refuses any other origin. A stable clone ($G) is registered in
-# Orca ONCE (never unregistered), reset per run to the `e2e-base` tag (a force-push of the e2e main) and synced from this checkout (--local-only).
+# Orca ONCE (never unregistered), reset per run to the `e2e-base-2` tag (a force-push of the e2e main) and synced from this checkout (--local-only).
 # Phases (E2E_PHASES, default "next happy negative"): next = `dispatch.sh --next` order on 5 real issues; happy = issue A (Gate: plan) through
 # gate, review, CI, FF land; negative = issue B, a REVIEW_CMD wrapper rejects it every time -> 2 rounds -> `blocked`. E2E_ANSWER=human: the gate
 # is answered with `coordinator.sh --reply` (scripted, or E2E_HUMAN_WAIT=1: it prints the line and waits for a REAL human). Run from an Orca terminal.
@@ -39,7 +39,7 @@ cleanup() {   # also on failure: every terminal this script made is closed, the 
   [ -z "$run" ] || rm -rf "${AITK_STATE_DIR:-$HOME/.ai-toolkit/coordinator}/$run"; rm -rf "$E"
 }
 trap cleanup EXIT
-step=1; say "preflight: orca ready, clone of $R registered once and reset to e2e-base, synced, hooks installed"
+step=1; say "preflight: orca ready, clone of $R registered once and reset to e2e-base-2, synced, hooks installed"
 [ "$(orca_json status | jq -r '.result.runtime.state')" = ready ] || fail "orca status is not ready"
 [ -d "$G/.git" ] || git clone -q "git@github.com:$R.git" "$G"
 [ "$(git -C "$G" remote get-url origin | sed -E 's#.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')" = "$R" ] || fail "origin of $G is not $R: refusing to touch it"
@@ -47,15 +47,15 @@ repo_id="$(orca_json repo list | jq -r --arg p "$G" '[.result.repos[] | select(.
 [ -n "$repo_id" ] || repo_id="$(orca_json repo add --path "$G" | jq -r '.result.repo.id')"
 drop_worktrees; orca terminal close --worktree "path:$G" --all --json > /dev/null 2>&1 || true
 git -C "$G" fetch -q --prune --tags origin
-if ! git -C "$G" rev-parse -q --verify refs/tags/e2e-base > /dev/null; then   # once: the base = README + orca.yaml + .gitignore + one pytest job + one test
-  git -C "$G" checkout -q -f main; git -C "$G" reset -q --hard origin/main; mkdir -p "$G/tests" "$G/.github/workflows"
+if ! git -C "$G" rev-parse -q --verify refs/tags/e2e-base-2 > /dev/null; then   # once: the base = README + orca.yaml + .gitignore + pytest.ini + one pytest job + one test
+  git -C "$G" checkout -q -f main; git -C "$G" reset -q --hard "$(git -C "$G" rev-list --max-parents=0 origin/main | tail -n 1)"; mkdir -p "$G/tests" "$G/.github/workflows"
   # shellcheck disable=SC2016
   printf 'setupAgentStartupPolicy: wait-for-setup\nscripts:\n  setup: bash "$ORCA_ROOT_PATH/.ai-toolkit/scripts/setup.sh"\n  archive: bash "$ORCA_ROOT_PATH/.ai-toolkit/scripts/archive.sh"\n' > "$G/orca.yaml"
-  printf '.claude/\n.ai-toolkit/\n/CLAUDE.md\n__pycache__/\n.pytest_cache/\n' > "$G/.gitignore"; printf 'def test_smoke():\n    assert True\n' > "$G/tests/test_smoke.py"
+  printf '.claude/\n.ai-toolkit/\n/CLAUDE.md\n__pycache__/\n.pytest_cache/\n' > "$G/.gitignore"; printf '[pytest]\npythonpath = .\n' > "$G/pytest.ini"; printf 'def test_smoke():\n    assert True\n' > "$G/tests/test_smoke.py"
   printf 'name: ci\non: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: pip install pytest && pytest -q\n' > "$G/.github/workflows/ci.yml"
-  git -C "$G" add -A; git -C "$G" -c core.hooksPath=/dev/null commit -q -m "chore: e2e base"; git -C "$G" tag e2e-base; git -C "$G" push -q -f origin main refs/tags/e2e-base
+  git -C "$G" add -A; git -C "$G" -c core.hooksPath=/dev/null commit -q -m "chore: e2e base"; git -C "$G" tag e2e-base-2; git -C "$G" push -q -f origin main refs/tags/e2e-base-2
 fi
-git -C "$G" checkout -q -f main && git -C "$G" reset -q --hard e2e-base && git -C "$G" clean -fdq
+git -C "$G" checkout -q -f main && git -C "$G" reset -q --hard e2e-base-2 && git -C "$G" clean -fdq
 for b in $(git -C "$G" for-each-ref --format='%(refname:short)' refs/heads | grep -vx main); do git -C "$G" branch -q -D "$b"; done
 for b in $(git -C "$G" ls-remote --heads origin | sed 's#.*refs/heads/##' | grep -vx main); do git -C "$G" push -q origin --delete "$b"; done
 git -C "$G" push -q -f origin main

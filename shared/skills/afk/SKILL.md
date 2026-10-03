@@ -20,7 +20,7 @@ orca terminal create --worktree path:$PWD --title coordinator \
 
 | Flag | Meaning |
 |------|---------|
-| `--answer auto` | `answer.sh` services PLAN gates by the `afk-answering` rule; `--answer human` notifies and waits for `orca orchestration reply` |
+| `--answer auto` | `answer.sh` services PLAN gates by the `afk-answering` rule; `--answer human` notifies (the loop never pauses); reply from ANY terminal with `coordinator.sh --run <run> --reply <message-id> approve\|'revise: ...'` |
 | `--until HH:MM` / `+40m` | stop dispatching at that time and finish what is live |
 | `--drain` | stop when the backlog is empty and no worker is live |
 | `--cap N` | max concurrent spokes (`CONCURRENCY_CAP`, default 3; the shared usage window saturates past ~4) |
