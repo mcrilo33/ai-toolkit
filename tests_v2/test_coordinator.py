@@ -343,12 +343,12 @@ def test_a_failing_desktop_notification_is_warned_about_not_swallowed(C, stubs):
     assert r.returncode == 0 and "osascript" in r.stderr and "warning" in r.stderr and C.stubs.calls("osascript")
 
 
-def test_a_pending_human_gate_sets_the_worktree_comment_and_rings_the_bell_then_the_reply_clears_the_comment(C, tmp_path):
+def test_a_pending_human_gate_sets_the_worktree_comment_and_rings_the_bell_then_the_reply_overwrites_the_comment(C, tmp_path):
     C.mail([msg("question", "msg_q", question="PLAN: add hello.py\nthen a test")])
     assert C.go("--answer", "human").returncode == 0
     cm = [a for a in C.calls("orca worktree set")]
     assert len(cm) == 1 and arg(cm[0], "--worktree") == f"path:{C.wt}"
-    assert arg(cm[0], "--comment") == f"GATE waiting: PLAN: add hello.py then a test | reply: coordinator.sh --reply msg_q approve"
+    assert arg(cm[0], "--comment") == f"GATE waiting: PLAN: add hello.py then a test | reply: {REPLY}"   # the full line: it needs --run
     assert (tmp_path / "bell").read_text() == "\a"   # one bell per gate, on the coordinator's terminal
     C.inbox(["msg_q"]); C.spool("msg_q", "approve")
     assert C.go().returncode == 0

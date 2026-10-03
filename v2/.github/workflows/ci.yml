@@ -1,6 +1,8 @@
 # ai-toolkit v2 CI (repo-root layout, after cutover). On EVERY branch push: land.sh gates a spoke on the run for its exact tip
 # (`gh run list --commit <sha>`), so a branch without a run can never land.
 name: ci
+permissions:
+  contents: read
 on:
   push:
   pull_request:

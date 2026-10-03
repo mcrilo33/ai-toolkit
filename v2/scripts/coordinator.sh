@@ -64,7 +64,7 @@ pj() { jq -r --arg k "$2" '(.payload // "{}" | if type == "string" then fromjson
 question_of() { local q; q="$(pj "$1" question)"; [ -n "$q" ] || q="$(jq -r '.body // ""' <<< "$1")"; printf '%s' "$q"; }
 show_q() { printf '%s\n' "$1" | fold -s -w 100 | head -n 25 | sed 's/^/  | /' || true; }   # the question as the human must read it: wrapped, at most 25 lines
 gate_flag() {   # $1 worktree path, $2 message id, $3 question: the stable Orca surfaces of a pending human gate: the worktree comment and a bell on this terminal
-  orca_json worktree set --worktree "path:$1" --comment "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: coordinator.sh --reply $2 approve" > /dev/null 2>&1 || warn "cannot set the worktree comment"
+  orca_json worktree set --worktree "path:$1" --comment "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2")" > /dev/null 2>&1 || warn "cannot set the worktree comment"
   printf '\a' > "${COORD_BELL_TTY:-/dev/tty}" 2> /dev/null || true
 }
 mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }

@@ -1,5 +1,5 @@
 # v2 WP6 notes: real end-to-end + cutover tooling
-Branch `v2-wp6`. Budgets (`wc -l`): coordinator.sh 236/240 (+7 for the human-gate UX) · github-scenario.sh 150/150 · cutover.sh 46/80 · cutover-rehearsal.sh 93 (not budgeted) · ci.yml 33/60 · architecture.md 103/300 ·
+Branch `v2-wp6`. Budgets (`wc -l`): coordinator.sh 236/240 (+7 for the human-gate UX) · github-scenario.sh 150/150 · cutover.sh 48/80 · cutover-rehearsal.sh 94 (not budgeted) · ci.yml 35/60 · architecture.md 104/300 ·
 frontmatter.md 33 + cutover.md 22 + README 12 (extras) · test_cutover.py 139 (not budgeted). `pytest -n auto tests_v2`: 555 pass, ~36 s wall here (the 10 s cap needs a quiet machine, see WP1/WP2).
 
 ## Results (all real: GitHub repo `mcrilo33/ai-toolkit-e2e`, CI on the exact SHA, Orca, Claude)
