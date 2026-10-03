@@ -53,6 +53,10 @@ orca_mutate() {
   return "$rc"
 }
 
+# gh: AI_TOOLKIT_GH (caller env or the local env file) swaps the binary. The e2e stubs GitHub this way, because
+# Orca's setup terminal does not inherit the caller's PATH.
+gh() { command "${AI_TOOLKIT_GH:-gh}" "$@"; }
+
 # gh_issue <n>: {number,title,body} of one issue.
 gh_issue() { gh issue view "$1" --json number,title,body; }
 
