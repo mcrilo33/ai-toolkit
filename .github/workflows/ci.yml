@@ -5,7 +5,9 @@ name: CI
 # the dev machine. PRs and main stay covered.
 on:
   push:
-    branches: ['**']
+    # v2 rewrite (docs/orca-migration/06-target-architecture.md §0 D7): no CI on the v2 build
+    # branches until cutover, when v2 ships its own ci.yml.
+    branches: ['**', '!v2', '!v2-*']
   pull_request:
 
 permissions:
