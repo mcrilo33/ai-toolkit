@@ -8,10 +8,10 @@ can schedule it (see the `issue-hygiene` rule):
 - **`Scope:`** — a whitespace- or comma-separated list of the file paths/globs it will
   touch, so the planner can batch it against disjoint work. A **missing** line or
   `Scope: *` marks the issue **exclusive**: it runs alone, never batched — the slow path.
-  A missing line is the *accidental* exclusive (`batch-plan.sh` names each ready
-  scope-less issue in its plan log); `*` is the *deliberate* one. Write a concrete file
+  A missing line is the *accidental* exclusive (`dispatch.sh --next` names each ready
+  scope-less issue in its output); `*` is the *deliberate* one. Write a concrete file
   list whenever you can.
-- **`Gate:`** — `none` or `plan`. `none` runs the spoke autonomously straight to `ready/`;
+- **`Gate:`** — `none` or `plan`. `none` runs the spoke autonomously straight to `worker_done`;
   `plan` (the default for non-trivial work) pauses the spoke for a human plan review
   before it writes code. Omitting it defaults to `plan`.
 

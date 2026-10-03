@@ -1,3 +1,8 @@
+---
+description: "Diagram type selection, flowcharts, sequence, class, ER, and state diagrams"
+paths:
+  - '**/*.md'
+---
 # Mermaid Conventions
 
 ## Diagram Type Selection

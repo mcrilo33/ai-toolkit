@@ -1,3 +1,6 @@
+---
+description: "When to spawn specialist agents, parallel execution, multi-perspective review, and delegation protocol"
+---
 # Agent Orchestration
 
 Delegate to specialist agents when a task matches their expertise. Over-delegating
@@ -47,27 +50,22 @@ scope growth is the most common miss.
 
 ## What's enforced vs. how you do it
 
-The commit/push hooks enforce *outcomes*, not which agent produced them: a
-failing-then-passing test (`red-proof-verify`), clean lint/types on changed lines
-(`commit-gauntlet`), and a `code-review` APPROVE artifact from a *separate* reviewer
-before push (`reviewer-sep-warn`). So the one load-bearing delegation — the only one a
-hook hard-blocks on — is an independent `code-review` before you ship.
+The machinery enforces *outcomes*, not which agent produced them: CI green on the branch, and an independent
+`code-review` (run by the coordinator with a different model) whose verdict reports `tdd_followed` and
+`tests_weakened`. Within the spoke, TDD and the PLAN gate are policy. So the one load-bearing delegation is an
+independent `code-review` before you ship.
 
 That splits the agents by what separation actually buys:
 
-- `code-review` / `security-reviewer` — high value: an independent reader catches what
-  the implementer is blind to. It is the review a solo dev otherwise lacks. **Always
-  separate, before ship.**
+- `code-review` / `security-reviewer` — high value: an independent reader catches what the implementer is blind
+  to. **Always separate, before ship.**
 - `planner` / `architect` — real value on hard or uncertain work. Spawn by the rubric above.
-- `tdd-red` / `tdd-green` / `tdd-refactor` — low value as a separate agent: the test is
-  written first, so there is nothing to leak, and `red-proof-verify` enforces the RED
-  discipline from the trailer, not the agent boundary. **Inline is fine.**
+- `tdd-red` / `tdd-green` / `tdd-refactor` — low value as a separate agent: the test is written first, so there is
+  nothing to leak. **Inline is fine.**
 
-**Solo / PR-less work (`solo-cycle`):** write the RED test, GREEN implementation, and any
-refactor inline — the hooks still prove the test failed first and the lint/type gates
-pass. The one non-negotiable separate agent is `code-review` before each push. Reach for
-the `tdd-*` agents only when you want a clean context boundary (larger or collaborative
-work).
+**Solo / PR-less work (`solo-cycle`):** write the RED test, GREEN implementation, and any refactor inline. The one
+non-negotiable separate agent is `code-review` before each push. Reach for the `tdd-*` agents only when you want a
+clean context boundary (larger or collaborative work).
 
 ## Parallel vs sequential
 

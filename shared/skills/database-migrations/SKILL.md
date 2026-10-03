@@ -1,3 +1,8 @@
+---
+name: database-migrations
+description: "Safe database migration patterns — zero-downtime strategies, expand-contract, ORM workflows (Prisma, Django, Alembic, golang-migrate), and anti-patterns. Use when adding, modifying, or reviewing migrations."
+argument-hint: "[migration type: add-column|rename|remove|index|data-migration]"
+---
 # Database Migrations
 
 Safe migration patterns for schema changes — zero-downtime strategies, ORM-specific

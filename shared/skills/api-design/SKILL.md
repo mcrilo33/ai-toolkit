@@ -1,3 +1,8 @@
+---
+name: api-design
+description: "REST API design patterns — resource naming, HTTP methods, status codes, response format, pagination, filtering, sorting, rate limiting, and versioning. Use when designing or reviewing API endpoints."
+argument-hint: "[topic: resources|status-codes|pagination|filtering|versioning]"
+---
 # API Design
 
 REST API design patterns — resource naming, HTTP methods, status codes, pagination,
@@ -139,7 +144,7 @@ GET /api/v1/users?page=2&per_page=20
 **Pros:** Simple, supports "jump to page N".
 **Cons:** Inconsistent on inserts/deletes, slow on large offsets.
 
-### Cursor-Based (recommended for large datasets)
+### Keyset / Opaque Token (recommended for large datasets)
 
 ```
 GET /api/v1/users?cursor=eyJpZCI6MTAwfQ&limit=20

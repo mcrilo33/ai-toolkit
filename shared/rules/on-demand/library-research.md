@@ -1,3 +1,6 @@
+---
+description: "Library documentation research using Context7 — resolve, fetch, and answer from current docs for any language"
+---
 # Library Documentation Research
 
 Fetch current, version-specific documentation for any library or framework using Context7 before answering or writing code.

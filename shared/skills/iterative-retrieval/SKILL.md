@@ -1,3 +1,8 @@
+---
+name: iterative-retrieval
+description: "Progressively refine context retrieval in a bounded 3-cycle loop (dispatch, evaluate, refine) when the files or terminology a task needs are unknown up front. Use when gathering context for a subagent, when a search misses because the codebase uses unfamiliar terms, or when a task fails with missing/too-much context. Triggers on 'find where X is handled' and subagent context gathering."
+argument-hint: "[task or behavior to gather context for]"
+---
 # Iterative Retrieval
 
 Progressively refine context retrieval before and during subagent work, instead of

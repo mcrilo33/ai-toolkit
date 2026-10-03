@@ -1,3 +1,9 @@
+---
+name: documentation
+description: "Write or update project documentation as an isolated task — read code, produce docs, never modify source."
+model: claude-sonnet-5-5
+effort: high
+---
 # Documentation — Isolated Scope
 
 Write or update project documentation as a standalone task. Read code, produce docs. Do not change code.

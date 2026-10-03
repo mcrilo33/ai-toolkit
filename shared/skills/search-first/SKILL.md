@@ -1,3 +1,8 @@
+---
+name: search-first
+description: "Research existing solutions before writing new code — search codebase, GitHub, library docs, package registries, MCP servers, and web. Use when implementing a non-trivial feature, adding a dependency, or exploring prior art. Triggers on 'find a library for', 'is there an MCP for', 'how do others do X', or 'search first'."
+argument-hint: "[topic or feature to research]"
+---
 # Search First
 
 Research existing solutions before writing new code. Follow a structured search ladder
@@ -10,7 +15,7 @@ for the job.
 - Before adding a new dependency or library
 - Before building a utility, helper, or pattern that likely exists already
 - When the user says "find a library for", "is there an MCP for", or "how do others do X"
-- When scoping work for `context-map` or `source-task` and the approach is unclear
+- When scoping work for `context-map` or `start-task` and the approach is unclear
 
 **Do NOT use when:**
 

@@ -1,3 +1,8 @@
+---
+name: frontend-patterns
+description: "React / Next.js patterns — component composition, custom hooks, state management, data fetching, forms, performance, error boundaries, and accessibility. Use when building or reviewing frontend code."
+argument-hint: "[pattern: components|hooks|state|forms|performance|a11y]"
+---
 # Frontend Patterns
 
 Production-ready patterns for React / Next.js applications — component design,
