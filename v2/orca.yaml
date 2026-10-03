@@ -1,5 +1,0 @@
-# At cutover this file moves to the repo root; paths are repo-root relative.
-setupAgentStartupPolicy: wait-for-setup
-scripts:
-  setup: ./scripts/setup.sh
-  archive: ./scripts/archive.sh

@@ -63,7 +63,7 @@ def test_afk_and_hub_point_at_coordinate_instead_of_duplicating_it():
 
 
 def test_the_architecture_doc_describes_both_modes_the_switch_and_the_attended_flow():
-    doc = Path(ROOT / "docs/v2/architecture.md").read_text()
+    doc = next(p for p in (ROOT / "docs/architecture.md", ROOT / "docs/v2/architecture.md") if p.exists()).read_text()  # before/after cutover
     assert all(w in doc for w in ("/coordinate", "attended", "--stop", "taken back", "```mermaid"))
 
 

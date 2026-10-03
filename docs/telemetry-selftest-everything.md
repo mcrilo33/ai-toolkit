@@ -1,1 +1,0 @@
-- trigger-everything self-test 2026-06-20

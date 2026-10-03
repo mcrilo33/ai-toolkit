@@ -1,4 +1,5 @@
+# At cutover this file moves to the repo root; paths are repo-root relative.
 setupAgentStartupPolicy: wait-for-setup
 scripts:
-  setup: ./scripts/provision-worktree.sh
-  archive: ./scripts/archive-worktree.sh
+  setup: ./scripts/setup.sh
+  archive: ./scripts/archive.sh
