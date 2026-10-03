@@ -1,3 +1,6 @@
+---
+description: "Secrets management, credentials handling, macOS Keychain storage, input validation, and dependency security"
+---
 # Security (Non-Negotiable)
 
 ## Secrets & Credentials (CRITICAL)

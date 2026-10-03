@@ -1,3 +1,8 @@
+---
+description: "Type annotations, docstrings, naming, imports, modern Python, Pydantic, and async patterns"
+paths:
+  - '**/*.py'
+---
 # Python Code Style
 
 ## Type Annotations

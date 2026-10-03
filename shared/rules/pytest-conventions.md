@@ -1,3 +1,10 @@
+---
+description: "Test file layout, naming, AAA structure, fixtures, parametrize, mocking, and assertions"
+paths:
+  - '**/test_*.py'
+  - '**/tests/**/*.py'
+  - '**/conftest.py'
+---
 # Pytest Conventions
 
 ## Principles

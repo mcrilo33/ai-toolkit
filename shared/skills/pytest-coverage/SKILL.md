@@ -1,3 +1,8 @@
+---
+name: pytest-coverage
+description: "Run pytest with coverage, find uncovered lines, and add tests to reach 100%. Use when user asks to increase coverage, check coverage, or get to 100%."
+argument-hint: "[module or file to cover]"
+---
 # Pytest Coverage
 
 Increase test coverage to 100% by iteratively finding and covering untested lines.

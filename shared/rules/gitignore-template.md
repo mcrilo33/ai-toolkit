@@ -1,3 +1,8 @@
+---
+description: "Standard .gitignore patterns for environment, IDE, dependencies, build artifacts, and secrets"
+paths:
+  - '**/.gitignore'
+---
 # .gitignore
 
 The host project owns its own `.gitignore`. The toolkit does **not** ship or reconcile a
@@ -6,17 +11,14 @@ responsibility and most projects already ignore them.
 
 ## What the toolkit ignores
 
-The only paths the toolkit owns are its own generated, per-clone state — never committed by
-anyone. `sync-to-repo.sh` writes these to the target's `.git/info/exclude` (per-clone,
-unversioned, idempotent marked block), so they never dirty the tracked `.gitignore`:
+The only paths the toolkit owns are its own generated, per-clone state, never committed by anyone. `sync.sh`
+writes them to the target's `.git/info/exclude` (per-clone, unversioned, one marked block), so they never dirty
+the tracked `.gitignore`:
 
-- `/.ai-toolkit/`, `.ai-toolkit-manifest.json`
-- `/.review/`
-- `.testmondata`, `.testmondata-shm`, `.testmondata-wal`
-- `pyrightconfig.json`
+- `/.ai-toolkit/` (scripts, hooks, env files, `sync-manifest`, and the per-machine `ai-toolkit.local.env`)
 
-With `--local-only`, the same block additionally excludes the synced deployment dirs
-(`.claude/`, `.cursor/`, the `.github/` ai-toolkit subdirs) for a personal deployment.
+With `--local-only`, the same block additionally excludes the synced deployment files (`.claude/`, `CLAUDE.md`,
+`orca.yaml`) for a personal deployment.
 
 ## Secrets are not a name-based ignore concern
 

@@ -1,3 +1,8 @@
+---
+name: backend-patterns
+description: "Production-ready backend patterns — service layer, repository, error handling, DB access, caching, auth, rate limiting, background jobs, and structured logging. Use when building or reviewing API services."
+argument-hint: "[pattern: service-layer|caching|auth|rate-limiting|logging]"
+---
 # Backend Patterns
 
 Production-ready patterns for API services, database access, caching, auth, and background

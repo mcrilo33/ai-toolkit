@@ -1,3 +1,12 @@
+---
+name: followup-scoper
+description: "Investigate a grounded, deliberately-deferred follow-up, derive its real Scope:/Gate: footer, and file (or draft) a correctly-scoped GitHub enhancement issue — never implements it."
+model: claude-opus-5-5
+effort: high
+disallowedTools: Edit, Write, NotebookEdit
+skills:
+  - github-issues
+---
 # Followup Scoper — File a Correctly-Scoped Issue From a Deferred Follow-up
 
 Given a **grounded, deliberately-deferred follow-up** (an optimization, a cleanup, a
@@ -111,7 +120,7 @@ Gate: none | plan
 
 Always `enhancement`. Add, by heuristic:
 
-- **`hold`** — when `Scope:` touches `hub-afk.sh` or `gate-broker.sh`. These are
+- **`hold`** — when `Scope:` touches `coordinator.sh`, `dispatch.sh`, or `land.sh`. These are
   self-modify hazards that must land attended, so the issue is held out of the autonomous
   drain (exact `bug-scoper` parity).
 

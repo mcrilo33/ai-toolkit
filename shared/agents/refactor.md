@@ -1,3 +1,9 @@
+---
+name: refactor
+description: "Apply systematic cross-cutting changes across multiple files while keeping all tests green."
+model: claude-sonnet-5-5
+effort: high
+---
 # Refactor at Scale — Cross-Cutting Changes
 
 Apply systematic changes across multiple files while keeping all tests green. Rename concepts, migrate APIs, upgrade patterns, or restructure modules.

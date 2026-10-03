@@ -1,3 +1,12 @@
+---
+name: bug-scoper
+description: "Investigate a defect, derive its real Scope:/Gate: footer, and file (or draft) a correctly-scoped GitHub bug issue — never fixes the bug."
+model: claude-opus-5-5
+effort: high
+disallowedTools: Edit, Write, NotebookEdit
+skills:
+  - github-issues
+---
 # Bug Scoper — File a Correctly-Scoped Issue From a Defect
 
 Given a defect (a symptom, a stack trace, or a "this is wrong" observation, plus
@@ -74,9 +83,9 @@ Gate: none | plan
 Always `bug`. Add, by heuristic:
 
 - **`priority`** — when the defect is a correctness bug, risks data loss, or is a
-  fail-open (a gate/guard that silently passes when it should block). These jump
+  fail-open (a gate or guard that silently passes when it should block). These jump
   the queue.
-- **`hold`** — when `Scope:` touches `hub-afk.sh` or `gate-broker.sh`. These are
+- **`hold`** — when `Scope:` touches `coordinator.sh`, `dispatch.sh`, or `land.sh`. These are
   self-modify hazards that must land attended, so the issue is held out of the
   autonomous drain.
 

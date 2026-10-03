@@ -1,3 +1,7 @@
+---
+name: generate-tests
+description: "Generate or update pytest tests — unit, integration, TDD mode. Use ONLY when explicitly asked."
+---
 # Generate & Update Tests
 
 Generate or update pytest tests following project quality standards. This skill activates only on explicit request.

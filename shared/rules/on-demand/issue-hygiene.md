@@ -1,3 +1,6 @@
+---
+description: "What a dispatchable issue must contain so the /afk scheduler can batch and order it — a mandatory Scope: line of touched files/globs (missing or '*' means exclusive) plus a Gate: none|plan line, with genuine ordering expressed as native GitHub blocked-by dependencies rather than file overlap. Programmatic filers emit the footer too. Surfaced on demand when authoring issues, not auto-applied to every session."
+---
 # Issue Hygiene
 
 Defines what a **dispatchable issue** must contain so it can be scheduled automatically.
@@ -48,7 +51,7 @@ for human review:
 Gate: plan
 ```
 
-`Gate: none` runs the spoke autonomously straight to the `ready/` marker; `Gate: plan`
+`Gate: none` runs the spoke autonomously straight to `worker_done`; `Gate: plan`
 (the default for all but very-clear work, and what an **omitted** line means) parks the
 spoke at a PLAN gate for a human to approve the approach before any code is written. The
 line records *which* gate, not *who* services it — the harness derives that from attended
@@ -62,9 +65,9 @@ The convention binds **any** path that files issues, not just a human typing the
 must emit the `Scope:` + `Gate:` footer on every issue they open. The two silent
 serializations this rule exists to prevent both came from bulk-filed issues that shipped
 without a machine-readable `Scope:` line — a missing line fails closed to exclusive, which
-is safe but forfeits all parallelism until a human notices. `batch-plan.sh` now logs each
-ready scope-less issue by number so the next such gap is diagnosable from the plan output
-(the no-silent-caps rule) rather than surfacing only as a mysteriously serial drain.
+is safe but forfeits all parallelism until a human notices. `dispatch.sh --next` logs each
+ready scope-less issue by number so the next such gap is diagnosable from its output
+rather than surfacing only as a mysteriously serial drain.
 
 ## Ordering is a dependency, not overlap
 
@@ -120,7 +123,7 @@ mandatory; only the *answer* varies — and, per the caveat above, you declare t
   open; a blocker *closing* is what releases the dependent into the next batch.
 - **Concurrency** — independent issues with disjoint `Scope:` still batch and run at the
   same time. A declared edge serializes *only* the pair it names.
-- **Lint** — `batch-plan.sh` prints a stderr-only `possible undeclared dependency`
+- **Lint** — `dispatch.sh --next` prints a stderr-only `possible undeclared dependency`
   warning when two open issues share a not-yet-created scope path with no edge between
   them, so a likely-missing edge surfaces at plan time. Detection-only: it never changes
   the batch, the exit code, or which issues dispatch.
