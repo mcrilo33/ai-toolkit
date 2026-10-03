@@ -41,6 +41,7 @@ target() { # one `rm -r` target: inside the worktree, or strictly below a temp r
   case "$p" in *\$* | \~[!/]*) deny "rm -r target $1 has an unexpanded variable: use a literal path";; esac
   p="$(canon "$p")"
   case "$p" in "$root"/?*) return 0;; "$root" | "$home" | "$home"/*) deny "rm -r of $1 (worktree root or home)";; esac
+  if [ -e "$p/.git" ]; then deny "rm -r of another git checkout or worktree: $1"; fi
   case "$p" in /tmp/?* | /private/tmp/?* | "$(phys "${TMPDIR:-/nonexistent}")"/?*) return 0;; esac
   deny "rm -r outside the worktree: $1"
 }
