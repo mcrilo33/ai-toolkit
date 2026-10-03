@@ -72,7 +72,7 @@ def test_seed_for_a_plan_gate_asks_before_coding_and_never_touches_the_base(d):
     ws = worker_start(d)
     seed = ws[ws.index("--spec") + 1]
     for part in (".ai-toolkit/task.md", "approve,revise", "do not edit code before approve", "RED", "git push -u origin HEAD",
-                 "worker_done --outcome succeeded", "Never merge or push the base branch"):
+                 "worker_done --outcome succeeded", "Never merge or push the base branch", "in-spoke code-review"):
         assert part in seed, part
 
 
@@ -82,7 +82,9 @@ def test_gate_none_and_model_footer_override_the_defaults(d):
     term = next(c for c in d.orca() if c[:2] == ["terminal", "create"])
     assert term[7].endswith("--model claude-opus-5-5 --effort medium --dangerously-skip-permissions")
     ws = worker_start(d)
-    assert "approve,revise" not in ws[ws.index("--spec") + 1]
+    seed = ws[ws.index("--spec") + 1]
+    assert "approve,revise" not in seed and "code-review" not in seed  # light lane: no PLAN gate, no in-worker review
+    assert "RED" in seed and "git push -u origin HEAD" in seed and "worker_done" in seed
 
 
 def test_missing_gate_footer_falls_back_to_the_env_default(d):

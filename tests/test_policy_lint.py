@@ -24,7 +24,7 @@ DELETED = re.compile(r"spoke-ready|review-stamp|approve_review|tmux|\bgate/|\.re
                      r"|ai-toolkit\.yml|issue_routing|hub-(status|notify|inject|agent)|transition-log|verify-(skills|rules|agents)"
                      r"|bootstrap-test-suite|sync-to-repo|Cursor|Copilot")
 LINE_CAPS = {"skills/solo-cycle/SKILL.md": 120, "skills/coordinate/SKILL.md": 120, "skills/hub/SKILL.md": 60, "skills/afk/SKILL.md": 40,
-             "skills/land/SKILL.md": 30, "skills/start-task/SKILL.md": 60, "skills/quick/SKILL.md": 30,
+             "skills/land/SKILL.md": 30, "skills/start-task/SKILL.md": 60,
              "rules/on-demand/workflow.md": 100, "rules/on-demand/planning-hub.md": 50,
              "rules/on-demand/afk-answering.md": 120, "agents/code-review.md": 110}
 VERDICT_KEYS = ("verdict", "blockers", "warnings", "tdd_followed", "tests_weakened", "summary")

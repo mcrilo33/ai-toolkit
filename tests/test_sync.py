@@ -33,7 +33,7 @@ def src(tmp_path):
     write(sh / "skills" / "land" / "references" / "r.md")
     write(sh / "skills" / "land" / "scripts" / "__pycache__" / "x.pyc")
     write(sh / "skills" / "land" / ".DS_Store")
-    write(sh / "skills" / "quick" / "SKILL.md", "---\nname: quick\ndescription: d\n---\n")
+    write(sh / "skills" / "hub" / "SKILL.md", "---\nname: hub\ndescription: d\n---\n")
     write(sh / "agents" / "debug.md", "---\nname: debug\n---\n")
     write(sh / "prompts" / "commit-msg.md", "---\ndescription: d\n---\n")
     return root
@@ -118,7 +118,7 @@ def test_edit_in_source_reaches_target(sync, src, target):
 
 def test_gc_removes_what_a_previous_sync_wrote_and_nothing_else(sync, src, target):
     sync()
-    mine = write(target / ".claude" / "skills" / "quick" / "mine.md", "user file")
+    mine = write(target / ".claude" / "skills" / "hub" / "mine.md", "user file")
     other = write(target / ".claude" / "rules" / "mine.md", "user rule")
     shutil.rmtree(src / "shared" / "skills" / "land")
     (src / "shared" / "rules" / "security.md").unlink()
@@ -126,7 +126,7 @@ def test_gc_removes_what_a_previous_sync_wrote_and_nothing_else(sync, src, targe
     assert not (target / ".claude" / "skills" / "land").exists()  # file gone, empty dirs pruned
     assert not (target / ".claude" / "rules" / "security.md").exists()
     assert mine.read_text() == "user file" and other.read_text() == "user rule"
-    assert (target / ".claude" / "skills" / "quick" / "SKILL.md").is_file()
+    assert (target / ".claude" / "skills" / "hub" / "SKILL.md").is_file()
 
 
 def test_gc_ignores_manifest_entries_that_escape_the_target(sync, target, tmp_path):

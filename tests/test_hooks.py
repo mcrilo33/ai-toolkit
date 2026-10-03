@@ -305,15 +305,6 @@ def test_commit_msg_rejects(hooked, msg, why):
     assert r.returncode != 0 and "commit-msg" in r.stderr and why in r.stderr
 
 
-def test_commit_msg_exempts_the_issue_less_quick_lane(hooked):
-    git(hooked["root"], "worktree", "add", "-q", "-b", "quick-fix", str(hooked["root"].parent / "quick-fix"))
-    q = hooked["root"].parent / "quick-fix"
-    assert commit(q, "fix: no anchor needed").returncode == 0
-    r = commit(q, "wip")
-    assert r.returncode != 0 and "<type>" in r.stderr
-    assert commit(hooked["wt"], "fix: no anchor").returncode != 0
-
-
 def test_pre_commit_blocks_the_base_branch_only_in_the_main_checkout(hooked):
     root, wt, msg = hooked["root"], hooked["wt"], "chore: x #1"
     r = commit(root, msg)
