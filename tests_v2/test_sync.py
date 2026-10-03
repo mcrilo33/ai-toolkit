@@ -212,3 +212,14 @@ def test_migrate_v1_removes_what_the_v1_manifest_listed_and_nothing_else(sync, t
     assert (target / ".claude" / "hooks" / "guard.sh").is_file()  # the v2 hook outlives the GC of v1 hooks
     assert (target / ".cursor" / "mine.json").read_text() == "user" and victim.read_text() == "keep"
     assert (target / ".claude" / "settings.json").is_file()  # the v2 output survives the GC
+
+
+def test_otel_sh_stays_in_the_toolkit_checkout(sync, src, target):
+    assert (src / "v2" / "scripts" / "otel.sh").is_file()  # the fixture copies the real scripts
+    sync()
+    assert not (target / ".ai-toolkit" / "scripts" / "otel.sh").exists() and "otel.sh" not in "".join(manifest(target))
+    stale = write(target / ".ai-toolkit" / "scripts" / "otel.sh")  # shipped by an earlier sync
+    with (target / ".ai-toolkit" / "sync-manifest").open("a") as f:
+        f.write(".ai-toolkit/scripts/otel.sh\n")
+    sync()
+    assert not stale.exists()

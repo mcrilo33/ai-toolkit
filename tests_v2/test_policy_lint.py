@@ -20,7 +20,9 @@ COMMAND_KEYS = {"description", "argument-hint", "allowed-tools", "model"}
 # deleted mechanisms (06 section 2): nothing under shared/ may point at them
 DELETED = re.compile(r"spoke-ready|review-stamp|approve_review|tmux|\bgate/|\.review/|hub-afk|worktree-(new|land|done)"
                      r"|test-select|metadata\.yml|source-task|next-batch|spoke-push|batch-plan|gate-broker"
-                     r"|red-proof|reviewer-sep|commit-gauntlet|commit-quality|Tested-RED|todo-ledger|hub-guard|\bready/|/source\b")
+                     r"|red-proof|reviewer-sep|commit-gauntlet|commit-quality|Tested-RED|todo-ledger|hub-guard|\bready/|/source\b"
+                     r"|ai-toolkit\.yml|issue_routing|hub-(status|notify|inject|agent)|transition-log|verify-(skills|rules|agents)"
+                     r"|bootstrap-test-suite|sync-to-repo|Cursor|Copilot")
 LINE_CAPS = {"skills/solo-cycle/SKILL.md": 120, "skills/hub/SKILL.md": 60, "skills/afk/SKILL.md": 40,
              "skills/land/SKILL.md": 30, "skills/start-task/SKILL.md": 60, "skills/quick/SKILL.md": 30,
              "rules/on-demand/workflow.md": 100, "rules/on-demand/planning-hub.md": 50,

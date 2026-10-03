@@ -43,10 +43,10 @@ put_md() { # put_md <src-dir> <dst-rel-dir> [skip-name]: the *.md files of one d
     [ "${f##*/}" = "${3:-}" ] || put "$f" "$2/${f##*/}"
   done
 }
-put_tree() { # put_tree <src-dir> <dst-rel-dir>: everything below it, minus caches
+put_tree() { # put_tree <src-dir> <dst-rel-dir> [skip-name]: everything below it, minus caches
   local f
   [ -d "$1" ] || return 0
-  while IFS= read -r f; do put "$1/$f" "$2/$f"; done < <(cd "$1" && find . -type f ! -name .DS_Store ! -name '*.pyc' ! -path '*/__pycache__/*' | sed 's|^\./||' | LC_ALL=C sort)
+  while IFS= read -r f; do put "$1/$f" "$2/$f"; done < <(cd "$1" && find . -type f ! -name .DS_Store ! -name "${3:-.DS_Store}" ! -name '*.pyc' ! -path '*/__pycache__/*' | sed 's|^\./||' | LC_ALL=C sort)
 }
 
 put_md "$SHARED/rules" .claude/rules guidelines.md
@@ -56,7 +56,7 @@ put "$TMP" CLAUDE.md bak   # the frontmatter is for the lint, not for CLAUDE.md
 put_tree "$SHARED/skills" .claude/skills
 put_md "$SHARED/agents" .claude/agents
 put_md "$SHARED/prompts" .claude/commands
-put_tree "$V2/scripts" .ai-toolkit/scripts
+put_tree "$V2/scripts" .ai-toolkit/scripts otel.sh   # the collector is per-machine: it runs from the toolkit checkout
 put_tree "$V2/bin" .ai-toolkit/bin
 put_tree "$V2/hooks/claude" .claude/hooks   # setup.sh copies only .claude/ into a new worktree
 put_tree "$V2/hooks/git" .ai-toolkit/hooks/git
