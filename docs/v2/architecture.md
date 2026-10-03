@@ -64,8 +64,9 @@ One foreground process in an Orca terminal on the main checkout, the single cons
 everything else is re-derived from `worker-list`, `worktree list` and labels). Flags: `--answer auto|human`, `--cap N` (default `CONCURRENCY_CAP`),
 `--until HH:MM`, `--drain` (stop when nothing is ready and no worker is live), `--status` (read-only: Run, live workers, unanswered questions with their reply line).
 
-- **Human answers (`--answer human`, or when `answer.sh` has no usable answer).** The loop never pauses. It comments on the issue and notifies with the
-  exact line; run it from ANY terminal (a bare `orca orchestration reply` is refused outside the Run's bound terminal):
+- **Human answers (`--answer human`, or when `answer.sh` has no usable answer).** The loop never pauses. It prints the question (wrapped, at most 25 lines) above the exact
+  reply line in the coordinator terminal (and in `--status`), comments on the issue, sets the spoke worktree's Orca comment to `GATE waiting: ... | reply: ...`, rings the bell
+  of its terminal (Orca's `terminalBell` notification) and sends a best-effort desktop notification (osascript, warned when it fails; macOS may drop it silently). Run the reply line from ANY terminal (a bare `orca orchestration reply` is refused outside the Run's bound terminal):
   `bash .ai-toolkit/scripts/coordinator.sh --run <run-id> --reply <message-id> approve` or `... 'revise: <what to change>'`.
   It queues one file in `~/.ai-toolkit/coordinator/<run-id>/replies/` (`AITK_STATE_DIR` relocates it); the loop sends it at its next wake (30 s while a question waits).
 - **`blocked` issue.** Read the comment, then fix by hand in the kept worktree (`orca worktree show --worktree issue:<n>`), push, and `land.sh <n>`; or remove the label

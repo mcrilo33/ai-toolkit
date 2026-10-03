@@ -91,7 +91,7 @@ fi
 printf '#!/usr/bin/env bash\n%s bash %s/.ai-toolkit/scripts/coordinator.sh --answer %s --cap 1 --drain 2>&1 | tee %s/coord.log\necho "${PIPESTATUS[0]}" > %s/coord.rc\n' "$renv" "$G" "$ANS" "$E" "$E" > "$E/run.sh"
 coord="$(orca_json terminal create --worktree "path:$G" --title coordinator --command "bash $E/run.sh" | jq -r '.result.terminal.handle // empty')"
 [ -n "$coord" ] || fail "terminal create"
-wait_for 90 grep -q ' coordinator: run run_' "$E/coord.log" || fail "the coordinator did not start"
+wait_for 90 grep -q ' coordinator: run run_' "$E/coord.log" 2> /dev/null || fail "the coordinator did not start"
 run="$(sed -n 's/.* coordinator: run \(run_[0-9a-f]*\).*/\1/p' "$E/coord.log" | head -n 1)"
 if [ -n "$A" ]; then
   step=4; say "issue #$A: worktree linked in-progress, setup ran (.claude/hooks, spoke-run-id, task.md), agent working"
