@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
 # dispatch.sh [--run R] (<issue> | --next [--dry-run]): one issue -> one supervised worker (06 section 4 steps 2, 3, 5, 6).
 # The Run is explicit (--run or $RUN, never inferred: a coordinator's Run must not be picked up by accident).
+# --retry-of D --task T <issue>: relaunch the issue's worker (a new claude-spoke terminal in its worktree) on the same task; Orca re-seeds the spec.
 # Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; n=""; next=0; dry=0; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
+run="${RUN:-}"; n=""; next=0; dry=0; retry_of=""; task=""; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;;
     --next) next=1 ;;
     --dry-run) dry=1 ;;
+    --retry-of) retry_of="${2:-}"; shift ;;
+    --task) task="${2:-}"; shift ;;
     [0-9]*) n="$1" ;;
     *) usage_exit "usage: dispatch.sh [--run R] <issue> | --next" ;;
   esac; shift
 done
 [ -n "$run" ] || usage_exit "no Run: pass --run or set RUN"
-[ "$next" = 1 ] || [ -n "$n" ] || usage_exit "usage: dispatch.sh [--run R] <issue> | --next"
+[ "$next" = 1 ] || [ -n "$n" ] || usage_exit "usage: dispatch.sh [--run R] <issue> | --next | --retry-of D --task T <issue>"
+[ -z "$retry_of" ] || [ -n "$task" ] || usage_exit "--retry-of needs --task"
 : "${ORCA_TERMINAL_HANDLE:?run me from the coordinator Orca terminal}"
 main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 base="origin/$BASE_BRANCH"
@@ -55,33 +59,27 @@ seed() {   # $1 = gate
   printf '%s' "$s Cycle per subtask: RED -> GREEN -> REFACTOR -> in-spoke code-review -> git push -u origin HEAD. When the acceptance criteria hold: push, then send worker_done --outcome succeeded with a 3-sentence summary. Never merge or push the base branch."
 }
 
-agent_up() {   # claude is up; the first run in a repo root meets Claude's trust dialog (default "No, exit"): Down+Enter
-  [ "$(orca_json terminal show --terminal "$term" | jq -r '.result.terminal.agentIdentity // empty')" = claude ] && return 0
-  if orca_json terminal read --terminal "$term" | jq -e '.result.terminal.tail | join(" ") | test("No, exit")' > /dev/null; then
-    orca terminal send --terminal "$term" --text $'\e[B' --json > /dev/null; sleep "$poll"
-    orca terminal send --terminal "$term" --enter --json > /dev/null
-  fi
-  return 1
-}
 start_worker() {   # worker-start with the common flags; $@ = placement flags. Sets $disp.
-  local out
-  out="$(orca_mutate orchestration worker-start --run "$run" --from "$ORCA_TERMINAL_HANDLE" "$@" \
-    --task-title "#$n $title" --spec "$(seed "$gate")" --timeout-ms 120000)" \
+  local out what=(--task-title "#$n $title" --spec "$(seed "$gate")")
+  [ -z "$retry_of" ] || what=(--task "$task" --retry-of "$retry_of")
+  out="$(orca_mutate orchestration worker-start --run "$run" --from "$ORCA_TERMINAL_HANDLE" "$@" "${what[@]}" --timeout-ms 120000)" \
     || die "worker-start failed: $(printf '%s' "$out" | jq -c '{state: .result.state, stage: .result.failedStage}' 2> /dev/null)"
   disp="$(printf '%s' "$out" | jq -r '.result.dispatchId // empty')"
 }
 # --- launch path (06 Q1, docs/v2/wp0-notes.md): DISPATCH_LAUNCH=twostep. After Orca's agentCmdOverrides.claude
 # points at bin/claude-spoke, flip the default below to `override` (a single worker-start, no terminal step).
 launch_twostep() {
-  local o bin
+  local o
   o="$(orca_json worktree create --repo "path:$main" --name "$name" --base-branch "$base" --issue "$n" --setup run)" || die "worktree create failed: $o"
   wt="$(printf '%s' "$o" | jq -r '.result.worktree.path // empty')"; [ -n "$wt" ] || die "worktree create returned no path: $o"
   wait_until "$tries" "$poll" test -f "$wt/.ai-toolkit/setup-done" || die "setup did not finish in $wt (see its Orca setup terminal)"
-  bin="$(cd "$here/../bin" && pwd -P)/claude-spoke"
-  term="$(orca_json terminal create --worktree "path:$wt" --title "$name-agent" \
-    --command "$(printf %q "$bin") --model $model --effort $effort --dangerously-skip-permissions" | jq -r '.result.terminal.handle // empty')"
-  [ -n "$term" ] || die "terminal create returned no handle"
-  wait_until "$tries" "$poll" agent_up || die "claude did not start in terminal $term"
+  term="$(spawn_claude "$wt" "$name-agent" "$model" "$effort")"
+  start_worker --worktree "path:$wt" --terminal "$term"; sel="path:$wt"
+}
+launch_retry() {
+  wt="$(orca_json worktree show --worktree "issue:$n")" || die "retry: no worktree for issue $n"
+  wt="$(printf '%s' "$wt" | jq -r '.result.worktree.path // empty')"; [ -n "$wt" ] || die "retry: no worktree path for issue $n"
+  term="$(spawn_claude "$wt" "$name-agent" "$model" "$effort")"
   start_worker --worktree "path:$wt" --terminal "$term"; sel="path:$wt"
 }
 launch_override() {
@@ -103,7 +101,7 @@ dispatch() {
   case "$model$effort" in *[!A-Za-z0-9._-]*) die "issue $n: bad Model footer '$model $effort'" ;; esac
   slug="$(printf '%s' "$title" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
   name="$n-${slug:-issue}"
-  "launch_${DISPATCH_LAUNCH:-twostep}"
+  if [ -n "$retry_of" ]; then launch_retry; else "launch_${DISPATCH_LAUNCH:-twostep}"; fi
   orca_json worktree set --worktree "$sel" --issue "$n" --workspace-status in-progress > /dev/null || die "worktree set failed for $sel"
   jq -nc --argjson issue "$n" --arg dispatch "$disp" --arg worktree "$wt" --arg terminal "$term" \
     '{issue: $issue, dispatch: $dispatch, worktree: $worktree, terminal: $terminal}'

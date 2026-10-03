@@ -72,3 +72,24 @@ wait_until() {
   for ((i = 0; i < t; i++)); do "$@" && return 0; sleep "$s"; done
   return 1
 }
+
+# spawn_claude <worktree> <title> <model> <effort>: the two-step launch (docs/v2/wp0-notes.md): a terminal running bin/claude-spoke
+# (OTel env), waited on until claude is up; prints its handle. The first run in a repo root meets Claude's trust dialog
+# (default "No, exit"): Down+Enter. dispatch.sh uses it for a new worker and for a retry, so a retried worker keeps the shim's env.
+_agent_up() {
+  [ "$(orca_json terminal show --terminal "$1" | jq -r '.result.terminal.agentIdentity // empty')" = claude ] && return 0
+  if orca_json terminal read --terminal "$1" | jq -e '.result.terminal.tail | join(" ") | test("No, exit")' > /dev/null; then
+    orca terminal send --terminal "$1" --text $'\e[B' --json > /dev/null; sleep "${AI_TOOLKIT_POLL:-3}"
+    orca terminal send --terminal "$1" --enter --json > /dev/null
+  fi
+  return 1
+}
+spawn_claude() {
+  local h bin
+  bin="$(cd "$AI_TOOLKIT_LIB_DIR/../bin" && pwd -P)/claude-spoke"
+  h="$(orca_json terminal create --worktree "path:$1" --title "$2" \
+    --command "$(printf %q "$bin") --model $3 --effort $4 --dangerously-skip-permissions" | jq -r '.result.terminal.handle // empty')"
+  [ -n "$h" ] || die "terminal create returned no handle"
+  wait_until "${DISPATCH_TRIES:-60}" "${AI_TOOLKIT_POLL:-3}" _agent_up "$h" || die "claude did not start in terminal $h"
+  printf '%s' "$h"
+}

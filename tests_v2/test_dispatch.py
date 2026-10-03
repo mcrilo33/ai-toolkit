@@ -214,3 +214,23 @@ def test_nothing_ready_dispatches_nothing(d):
     stub_board(d, [], [])
     assert d.go("--next").returncode == 3
     assert not any(c[:2] == ["orchestration", "worker-start"] for c in d.orca())
+
+
+def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d):
+    d.stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(d.wt), "branch": f"refs/heads/{NAME}"}}}))
+    r = d.go("--retry-of", "ctx_old", "--task", "task_7", "7", AI_TOOLKIT_POLL=0)
+    assert r.returncode == 0, r.stderr
+    calls = d.orca()
+    assert [c[:2] for c in calls] == [["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
+    assert calls[1][2:6] == ["--worktree", f"path:{d.wt}", "--title", f"{NAME}-agent"] and calls[1][7].endswith(
+        "/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")   # keeps the shim's OTel env
+    assert calls[3] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}",
+                        "--terminal", "term_agent", "--task", "task_7", "--retry-of", "ctx_old", "--timeout-ms", "120000"]
+    assert json.loads(r.stdout)["terminal"] == "term_agent"
+
+
+def test_retry_needs_a_task_and_an_existing_worktree(d):
+    assert d.go("--retry-of", "ctx_old", "7").returncode == 2
+    d.stubs.reply("orca.worktree_show", "no such worktree", rc=1)
+    r = d.go("--retry-of", "ctx_old", "--task", "task_7", "7")
+    assert r.returncode == 1 and not any(c[:2] == ["terminal", "create"] for c in d.orca())
