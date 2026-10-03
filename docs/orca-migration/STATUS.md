@@ -257,3 +257,38 @@ a short codebase"; "stop using ai-toolkit for the migration".
   config 140, tests 2,341 (was 84.9k), docs 149, policy 11.2k (target 8k: still to prune).** Findings: Orca runs the
   TRACKED orca.yaml of a new worktree; issue:N selectors are global across repos (use path:); rehearsal caught
   cutover.sh dropping settings/* (fixed). Fable review of WP6 running. Attended human run still pending (user).
+- **WP6 merged into v2** (b7d2b5fe): checklist fixes from the Fable review (orca-migration docs precondition, CI on a scratch branch on ubuntu+macos BEFORE pushing main, hub sync with --migrate-v1, rollback restores the local hooksPath, branch-protection check). 560 tests. Coordinator committed docs/orca-migration on its branch (39e0c647) to land on main before cutover.
+- **User decision: hybrid coordinator with an explicit switch.** Attended = a Claude Code session holds the Run (Orca pushes messages into it; discuss, then reply); '/coordinate auto' hands the Run to coordinator.sh --answer auto; '/coordinate attended' takes it back (+ summary of what happened). Never inferred from presence. --reply stays as fallback. **WP7 dispatched** (ctx_3392d16e464f) before cutover; the attended e2e run will test this mode.
+- **WP7 merged into v2** (19c58cc6): /coordinate skill (attended Claude session = coordinator), explicit
+  `/coordinate auto|attended` switch via run-use fencing, `coordinator.sh --stop` waits on any live foreign holder,
+  reply.sh extracted. Fable round 1 found a double-land BLOCKER (second --stop returned 0 mid-land), fixed and
+  re-verified. 620 tests; switch e2e PASS live (stand-in session).
+- **Post-cutover v2 follow-ups (from reviews):** --stop `prev=$(holder)` under set -e fails silently on a run-show
+  error; wait on ANY live holder (incl. own handle); on_question yield without fenced on run-show hiccup; land.sh
+  launch_override links the issue late; first:100 GraphQL window; policy 11.2k → 8k prune; tests_v2 10 s cap on a
+  quiet machine; ci.yml first real run.
+- Attended test prepared: clone /private/tmp/aitk-e2e-gh reset + synced from v2 19c58cc6 (export /private/tmp/aitk-v2-src), issue #111 (slugify, Gate: plan).
+- **Attended run with the user: PASS.** A real Claude session in Orca ran `/coordinate attended`, dispatched issue #111
+  (slugify, Gate: plan); Orca pushed the gate question into the session, the user discussed and approved through it,
+  the worker coded test-first (2 commits), review + CI green on 37ceb79e, FF land, issue closed "landed in 37ceb79e".
+  v2 is validated end to end, attended and unattended. Next: cutover (needs the user's explicit go).
+
+## RESUME POINT (2026-10-03, before the user restarts Orca)
+- **v2 is complete and validated**: origin/v2 = 19c58cc6 (WP0-WP7 merged, each Fable-reviewed), 620 tests, real-GitHub
+  e2e green (auto, human --reply, switch), **attended run with the user PASS** (issue #111 on mcrilo33/ai-toolkit-e2e).
+- **Next = the cutover**, user said GO after restarting/cleaning Orca (keep only the ai-toolkit project). Follow
+  `docs/v2/cutover.md` on origin/v2 exactly:
+  0. Commit STATUS/LESSONS on mcrilo33/orca-migration, then merge this branch into main (push) so v1-final keeps
+     docs/orca-migration; check no v1 spoke / afk drain; branch protection check (gh api …/branches/main/protection).
+  1-5. Fresh clone (NOT the hub), merge origin/main into v2, cutover.sh --dry-run then real, tests + shellcheck,
+     merge --no-ff into main, sync + install into the clone.
+  6. Push to scratch branch v2-cutover-ci; wait for CI green on ubuntu AND macos; delete the scratch branch.
+  7. Push v1-final + main; CI green on main.
+  8. Hub ~/Repos/ai-toolkit: pull --ff-only, `sync.sh . --migrate-v1`, `install.sh .`, verify skills/hooks;
+     `docker rm -f lf-collector` then `otel.sh up`. Untracked pr6* files must survive.
+  10. Update memory notes naming deleted mechanisms.
+- Rollback: docs/v2/cutover.md "Rollback" (v1-final tag).
+- After cutover: remove the aitk-e2e-gh registration and /private/tmp clones, the scratch export /private/tmp/aitk-v2-src;
+  post-cutover follow-ups are listed above in this file.
+- The coordinator Run of this session was run_54f40aea9fdf; after an Orca restart the terminal handle changes:
+  re-bind with `orca orchestration run-use --id run_54f40aea9fdf --from $ORCA_TERMINAL_HANDLE` if needed (or a new Run).
