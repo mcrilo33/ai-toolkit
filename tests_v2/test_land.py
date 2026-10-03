@@ -291,3 +291,46 @@ def test_cleanup_only_refuses_a_branch_that_has_not_landed(L):
     r = L.go("--cleanup-only", "9")
     assert r.returncode == 2 and "not landed" in r.stderr
     no_side_effects(L, before)
+
+
+@pytest.fixture
+def gone(L):
+    """Exit 6 where only `gh issue close` failed and the worktree is already gone (the common case)."""
+    L.stubs.reply("gh.issue_close", "boom", rc=1)
+    assert L.go("9").returncode == 6
+    L.stubs.reply("gh.issue_close", "")
+    L.stubs.reply("orca.worktree_show", "no such worktree", rc=1)
+    return len(L.trail())
+
+
+def test_cleanup_only_works_when_the_worktree_is_gone_given_the_branch_and_tip(L, gone):
+    r = L.go("--cleanup-only", "--branch", BRANCH, "--tip", L.tip, "9")
+    assert r.returncode == 0, r.stderr
+    t = L.trail()[gone:]
+    assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close")] and t[-1][3:] == ("9", "-c", f"landed in {L.tip}")
+    assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "show")]   # no worker-list, release or rm
+
+
+def test_cleanup_only_derives_the_tip_from_a_surviving_remote_branch_and_deletes_it(L, gone):
+    git(L.root, "push", "-q", "origin", f"{L.tip}:refs/heads/{BRANCH}")
+    git(L.root, "fetch", "-q")
+    r = L.go("--cleanup-only", "--branch", BRANCH, "9")
+    assert r.returncode == 0, r.stderr
+    assert ("git", "delete", BRANCH) in L.trail()[gone:]
+
+
+def test_cleanup_only_with_a_gone_worktree_still_refuses_an_unlanded_tip(L, gone):
+    git(L.root, "push", "-q", "origin", f"{L.tip}:refs/heads/{BRANCH}")
+    unlanded = commit(L.wt, "later.txt", push=BRANCH)
+    r = L.go("--cleanup-only", "--branch", BRANCH, "--tip", unlanded, "9")
+    assert r.returncode == 2 and "not landed" in r.stderr
+    assert not [t for t in L.trail()[gone:] if t[:3] == ("gh", "issue", "close")]
+
+
+@pytest.mark.parametrize("args, why", [(["--cleanup-only", "9"], "no Orca worktree"), (["--branch", BRANCH, "9"], "no Orca worktree"),
+                                        (["--cleanup-only", "--branch", BRANCH, "9"], "--tip"),
+                                        (["--cleanup-only", "--branch", "main", "--tip", "HEAD", "9"], "base branch")])
+def test_a_missing_worktree_is_refused_unless_cleanup_only_can_name_the_branch_and_tip(L, gone, args, why):
+    r = L.go(*args)   # the last case: origin/<branch> is gone too, so there is nothing to derive the tip from
+    assert r.returncode == 2 and why in r.stderr
+    assert not [t for t in L.trail()[gone:] if t[:3] == ("gh", "issue", "close")]
