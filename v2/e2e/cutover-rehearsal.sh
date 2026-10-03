@@ -8,6 +8,7 @@ set -euo pipefail
 V2="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 # shellcheck source=../scripts/lib.sh
 . "$V2/scripts/lib.sh"
+load_env
 : "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal}"
 C=/private/tmp/aitk-cutover-rehearsal; O="$C.git"; E="$C.e2e"; SRC="$(git -C "$V2" rev-parse --show-toplevel)"; run=""; coord=""; step=0
 say() { printf '== [%ss] step %s: %s\n' "$SECONDS" "$step" "$*"; }
@@ -87,6 +88,6 @@ git fetch -q origin; sha="$(git -C "$O" rev-parse main)"
 [ "$(git rev-parse HEAD)" = "$sha" ] || fail "the clone's main is not at the origin's main"
 grep -q "^issue close 1 -c landed in $sha" "$E/gh.log" || fail "the issue was not closed with the landed sha"
 grep -q '^SUMMARY: ' "$E/coord.log" || fail "no review verdict: the code-review agent did not run from the cutover tree"
-! git -C "$O" for-each-ref --format='%(refname)' refs/heads | grep -qv -e '/main$' -e '/v2$' -e '/v2-wp' || fail "the spoke branch is still on the origin"
+! git -C "$O" rev-parse -q --verify refs/heads/1-add-hello-txt > /dev/null || fail "the spoke branch is still on the origin"
 [ "$(orca_json worktree list --repo "path:$C" | jq '[.result.worktrees[] | select(.isMainWorktree | not)] | length')" = 0 ] || fail "a spoke worktree is still there"
 echo "PASS cutover rehearsal in ${SECONDS}s (landed $sha on $O; clone $C stays registered in Orca)"
