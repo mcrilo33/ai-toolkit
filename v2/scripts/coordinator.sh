@@ -84,10 +84,11 @@ block() {   # $1 = why. Label, comment, notify, free the slot; the worktree stay
   comment "$issue" "blocked: $1"; notify "#$issue blocked: $1"; release "$disp"
 }
 redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds are spent. A new Task on the worker's own terminal:
-  local r; r="$(rounds)"   # worker-start refuses --task together with --spec
-  [ "$r" -lt "$1" ] || { block "$3"; return 0; }
-  orca_mutate orchestration worker-start --run "$run" --from "$H" --worktree "path:$wtp" --terminal "$term" \
-    --task-title "#$issue address (round $((r + 1)))" --spec "$2" --timeout-ms 120000 > /dev/null || { block "re-dispatch failed"; return 0; }
+  local r out; r="$(rounds)"   # worker-start refuses --task together with --spec
+  [ "$r" -lt "$1" ] || { block "$3"; return 0; }   # Orca refuses an idle terminal it does not currently see as an agent: look first, as dispatch.sh does
+  wait_until "${COORD_AGENT_TRIES:-10}" "${AI_TOOLKIT_POLL:-3}" _agent_up "$term" || { block "the worker terminal $term is no longer running claude"; return 0; }
+  out="$(orca_mutate orchestration worker-start --run "$run" --from "$H" --worktree "path:$wtp" --terminal "$term" \
+    --task-title "#$issue address (round $((r + 1)))" --spec "$2" --timeout-ms 120000 2>&1)" || { warn "worker-start: $out"; block "re-dispatch failed"; return 0; }
   comment "$issue" "round $((r + 1)): $2"
 }
 
@@ -169,8 +170,7 @@ sweep() {   # a worker whose process exited without worker_done (and was not rel
       | .resource.worktreeId as $p | select([$w[] | select(.resource.worktreeId == $p and .dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited")] | length == 0) | .dispatchId'); do
     ctx "$d" || continue
     if [ "$(rounds)" -lt 1 ]; then
-      log "#$issue: worker $d exited without worker_done, relaunching"
-      RUN="$run" "$DISPATCH_CMD" --retry-of "$d" --task "$task" "$issue" > /dev/null || block "relaunch failed"
+      log "#$issue: worker $d exited without worker_done, relaunching"; RUN="$run" "$DISPATCH_CMD" --retry-of "$d" --task "$task" "$issue" > /dev/null || block "relaunch failed"
     else block "worker exited again without worker_done"; fi
   done
 }

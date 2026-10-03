@@ -18,7 +18,8 @@ S=/private/tmp/aitk-e2e-scratch; E="$S.e2e"; rm -rf "$E"; mkdir -p "$S" "$E"
 repo_id=""; wt=""; run=""; coord=""; br=1-add-hello-txt; step=0
 
 say() { printf '== step %s: %s\n' "$step" "$*"; }
-fail() { printf 'FAIL step %s: %s\n  ids: repo=%s worktree=%s run=%s coordinator=%s\n  coordinator log: %s\n' "$step" "$*" "$repo_id" "$wt" "$run" "$coord" "$(tail -n 5 "$E/coord.log" 2> /dev/null | tr '\n' '|')"; exit 1; }
+fail() { printf 'FAIL step %s: %s\n  ids: repo=%s worktree=%s run=%s coordinator=%s\n  coordinator log: %s\n' "$step" "$*" "$repo_id" "$wt" "$run" "$coord" "$(tail -n 5 "$E/coord.log" 2> /dev/null | tr '\n' '|')"
+  cp "$E/coord.log" "$S.last-coordinator.log" 2> /dev/null && echo "  full coordinator log: $S.last-coordinator.log"; exit 1; }
 wait_for() { local t="$1" i; shift; for ((i = 0; i < t; i += 3)); do "$@" && return 0; sleep 3; done; return 1; }
 drop_worktrees() {   # every non-main worktree of the scratch repo, terminals first; found by listing: dispatch.sh may have died after worktree create
   local w
@@ -129,7 +130,7 @@ wait_for 2400 test -s "$E/coord.rc" || fail "the coordinator did not finish with
 [ "$(cat "$E/coord.rc")" = 0 ] || fail "coordinator exited $(cat "$E/coord.rc")"
 inbox | jq -e '[.[] | select(.type == "worker_done" and (.payload | fromjson | .outcome == "succeeded"))] | length > 0' > /dev/null || fail "no worker_done succeeded in the Run"
 grep -q '^SUMMARY: ' "$E/coord.log" || fail "no review verdict in the coordinator log"
-[ -z "${E2E_NEGATIVE:-}" ] || { grep -q 'round 1' "$E/coord.log" && [ -e "$E/rejected" ] || fail "the rejected review was not re-dispatched"; }
+[ -z "${E2E_NEGATIVE:-}" ] || { grep -q 'round 1' "$E/gh.log" && [ -e "$E/rejected" ] || fail "the rejected review was not re-dispatched"; }
 
 step=7; say "landed: main ff + pushed, issue closed, branch/worktree gone, worker released"
 [ "$(git -C "$S.git" show main:hello.txt | head -n 1)" = hello ] || fail "origin/main has no hello.txt"

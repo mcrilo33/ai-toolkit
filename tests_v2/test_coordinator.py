@@ -52,6 +52,7 @@ def C(stubs, repo, run, tmp_path):
 
     stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": wt, "linkedIssue": 1}]}}))
     stubs.reply("orca.orchestration_run_create", '{"result":{"run":{"id":"run_new"}}}')
+    stubs.reply("orca.terminal_show", '{"result":{"terminal":{"agentIdentity":"claude"}}}')
     stubs.reply("dispatch.sh", "", rc=3)   # nothing ready
     stubs.reply("answer.sh", "approve\n")
     workers(row())
@@ -168,6 +169,14 @@ def test_a_rejected_land_re_dispatches_the_reason_to_the_same_worker_a_bounded_n
             assert arg(ws, "--spec").startswith("address:") and (rc != 3 or "(1) a.py:3 - bug (2) b.py:1" in arg(ws, "--spec"))
             assert not C.calls("gh issue edit")
     assert len(C.calls("orca orchestration worker-start")) == limit and C.calls("gh issue edit")[0][3:] == ["--add-label", "blocked"]   # then blocked
+
+
+def test_a_worker_terminal_that_is_no_longer_claude_blocks_instead_of_re_dispatching(C):
+    C.stubs.reply("land.sh", "BLOCKER: x\n", rc=3)
+    C.stubs.reply("orca.terminal_show", '{"result":{"terminal":{"agentIdentity":null}}}')
+    C.mail([msg("worker_done", outcome="succeeded")])
+    C.go(COORD_AGENT_TRIES=2)
+    assert C.blocked() and len(C.calls("orca terminal show")) == 2
 
 
 @pytest.mark.parametrize("rc, out", [(3, "no verdict\n"), (4, "land.sh: CI for abc timed out\n"), (4, "land.sh: main keeps moving; land again\n"),
