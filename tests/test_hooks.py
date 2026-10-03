@@ -219,11 +219,11 @@ esac
 ROW = {"agentTerminalHandle": "term_w", "dispatchStatus": "dispatched", "runId": "run_1"}
 
 
-def shim_env(*, workers=(ROW,), holder="term_h", identity="claude", title="bash", rc=0, raw=None, handle="term_w"):
+def shim_env(*, workers=(ROW,), holder="term_h", identity="claude", title="✳ fix the thing", rc=0, raw=None, handle="term_w"):
     """The orca answers a spoke's guard reads: its worker row -> the Run -> the holder terminal -> its agentIdentity and title."""
     out = {"SHIM_RC": str(rc), "SHIM_WORKERS": json.dumps({"result": {"workers": list(workers)}}),
            "SHIM_RUN": json.dumps({"result": {"run": {"coordinator_handle": holder} if holder else {}}}),
-           "SHIM_TERM": json.dumps({"result": {"terminal": {"agentIdentity": identity, "title": title} if identity else {"title": title}}})}
+           "SHIM_TERM": json.dumps({"result": {"terminal": {k: v for k, v in (("agentIdentity", identity or None), ("title", title)) if v is not None}}})}
     if raw is not None:
         out.update(SHIM_WORKERS=raw, SHIM_RUN=raw, SHIM_TERM=raw)
     return {**out, "ORCA_TERMINAL_HANDLE": handle} if handle else out
@@ -241,11 +241,15 @@ def shim_bin(tmp_path_factory):
 WF_SCENARIOS = {
     "no-run-main-checkout": ("root", None, True), "no-run-plain-worktree": ("wt", None, True),
     "session-holds-the-run": ("spoke", shim_env(), True),
-    # Orca reports `claude` for the loop terminal too (it runs headless `claude -p` children; seen live: identity claude, title bash before the
-    # loop titled itself), so the loop's own title, set by coordinator.sh, is what tells it from a session
-    "auto-loop-holds-the-run": ("spoke", shim_env(title="coordinator.sh auto"), False),
-    "human-loop-holds-the-run": ("spoke", shim_env(title="coordinator.sh human until 23:59 drain"), False),
-    "session-with-own-title-holds-the-run": ("spoke", shim_env(title="my coordinator session"), True),
+    # Measured live: the coordinator.sh loop terminal reports agentIdentity `claude` (sticky once a headless `claude -p` child ran) and the title `bash`
+    # (Orca titles a terminal by its foreground process and overwrites a custom title); a Claude session's title is a topic or a path, never a bare shell
+    "auto-loop-holds-the-run": ("spoke", shim_env(title="bash"), False),
+    "loop-run-by-zsh": ("spoke", shim_env(title="zsh"), False), "loop-run-by-a-login-shell": ("spoke", shim_env(title="-bash"), False),
+    "holder-without-a-title": ("spoke", shim_env(title=None), False), "holder-with-a-non-string-title": ("spoke", shim_env(title=7), False),
+    "session-with-a-topic-title-holds-the-run": ("spoke", shim_env(title="✳ danger-guard.sh attended test accuracy"), True),
+    "session-with-a-working-glyph-title": ("spoke", shim_env(title="◐ fix the loop"), True),
+    "session-with-a-path-title": ("spoke", shim_env(title="..-for-workflow"), True),
+    "session-whose-topic-says-bash": ("spoke", shim_env(title="✳ bash completion"), True),
     "holder-is-no-agent": ("spoke", shim_env(identity=""), False),
     "other-agent-holds-the-run": ("spoke", shim_env(identity="codex"), False),
     "orca-fails": ("spoke", shim_env(rc=1), False), "orca-prints-garbage": ("spoke", shim_env(raw="not json"), False),
