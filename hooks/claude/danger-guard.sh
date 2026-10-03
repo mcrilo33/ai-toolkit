@@ -18,8 +18,8 @@ in="$(cat)"
 j() { jq -r "$1 // empty" <<<"$in"; }
 phys() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
 orc() { # `orca ...` stdout (empty on any failure), killed after 5s: a hung CLI must deny, not time the hook out into an allow
-  local o p w; o="$(mktemp)"; orca "$@" > "$o" 2> /dev/null & p=$!; { sleep 5; kill $p; } > /dev/null 2>&1 & w=$!
-  if wait $p; then cat "$o"; fi; kill $w 2> /dev/null; wait $w 2> /dev/null; rm -f "$o"; return 0
+  local o p w; o="$(mktemp)"; orca "$@" > "$o" 2> /dev/null & p=$!; { sleep 5; kill -9 $p; } > /dev/null 2>&1 & w=$!
+  if wait $p 2> /dev/null; then cat "$o"; fi; kill $w 2> /dev/null; wait $w 2> /dev/null; rm -f "$o"; return 0
 }
 attended() { # 0 = a human attends (outside a spoke, or a Claude session holds the spoke's Run); every unreadable answer is empty
   [ -n "$spoke" ] || return 0
