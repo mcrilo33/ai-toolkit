@@ -95,19 +95,37 @@ def test_newer_push_cancels_the_older_run_of_the_same_branch(
     assert concurrency["cancel-in-progress"] is True
 
 
-def test_pytest_suite_runs_serially_until_the_suite_is_xdist_safe(
+def test_pytest_suite_runs_two_phase_under_xdist(workflow: dict[str, Any]) -> None:
+    # The suite is parallel-safe (#385): the bulk runs under `-n auto -m "not serial"`, then the
+    # isolation-escaping `serial` tail runs single-process (#328). Both phases always run, and
+    # exit 5 (no tests collected) is green, so one red phase cannot hide the other's failures.
+    runs = [s.get("run", "") for s in workflow["jobs"]["test"]["steps"]]
+    (script,) = [r for r in runs if "pytest" in r]
+    lines = [ln.strip() for ln in script.splitlines()]
+    parallel = [ln for ln in lines if "-n auto" in ln]
+    serial = [ln for ln in lines if "-m serial" in ln]
+    assert len(parallel) == 1 and '-m "not serial"' in parallel[0]
+    assert "--durations=25" in parallel[0]
+    assert len(serial) == 1 and "-n " not in serial[0]
+    assert "par_rc" in script and "ser_rc" in script
+    assert script.count("-eq 5") == 2
+
+
+def test_workflow_can_be_rerun_on_a_branch_without_a_noise_commit(
     workflow: dict[str, Any],
 ) -> None:
-    # `-n auto` surfaced a new timing flake on every CI attempt (#378, epic #377), so the Linux
-    # suite stays single-process; CI is the gate and must be reproducible. Re-enable xdist
-    # (and the `serial` tail, #328) only once #377 lands, updating this test with it.
-    runs = [s.get("run", "") for s in workflow["jobs"]["test"]["steps"]]
-    pytest_runs = [r for r in runs if "pytest" in r]
-    assert pytest_runs == ["python -m pytest tests/ -q"]
-    assert not any("-n " in r or "xdist" in r for r in runs)
-    # Serial takes ~9-10 min: a 10-minute limit times out (reported `cancelled`, which the
-    # ready/land gate reads as a failure) on ~40% of runs, so the timeout must leave headroom.
-    assert workflow["jobs"]["test"]["timeout-minutes"] >= 15
+    # `gh workflow run CI --ref <branch>` needs workflow_dispatch (#385 proof runs). PyYAML
+    # parses the bare `on` key as boolean True.
+    keyed: dict[Any, Any] = workflow
+    assert "workflow_dispatch" in keyed[True]
+
+
+def test_test_job_timeout_leaves_headroom_over_the_parallel_run(
+    workflow: dict[str, Any],
+) -> None:
+    # A timeout is reported `cancelled`, which the ready/land gate reads as a failure. The
+    # xdist run targets < 5 min; the limit only bounds a hang and must never be tight.
+    assert 10 <= workflow["jobs"]["test"]["timeout-minutes"] <= 20
 
 
 def test_report_red_files_issues_only_for_main_and_prs(

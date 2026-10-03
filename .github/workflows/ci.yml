@@ -7,6 +7,8 @@ on:
   push:
     branches: ['**']
   pull_request:
+  # Rerun CI on a branch without a noise commit: `gh workflow run CI --ref <branch>` (#385).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -20,8 +22,8 @@ jobs:
   test:
     name: Pytest suite
     runs-on: ubuntu-latest
-    # The serial suite takes ~9-10 min (2 of the last 5 main runs hit the old 10-minute limit,
-    # which GitHub reports as `cancelled` and ready/land read as a failure): leave headroom.
+    # A timeout is reported as `cancelled`, which ready/land read as a failure: leave headroom
+    # over the target (<5 min under `-n auto`, #385) until the proof runs bound the real max.
     timeout-minutes: 20
     steps:
       - name: Check out repository
@@ -39,13 +41,19 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
 
-      # SERIAL on purpose (#378 -> epic #377): the first CI runs under `-n auto` surfaced a
-      # different timing-sensitive failure on every attempt (gate-broker retry windows, #299 retry
-      # journaling order, hook-chaining EPIPE), flakes that serial CI had always masked. CI is the gate, so it must be
-      # reproducible: one process, ~9 min on a runner. Re-enable `-n auto -m "not serial"` +
-      # a `-m serial` tail once #377 makes the suite xdist-safe.
+      # Two phases, the same split the push gate and the macOS job run (#328, #385): the
+      # parallel-safe bulk under `-n auto -m "not serial"`, then the ref-mutating `serial`
+      # tail single-process (exit 5, "no tests collected", is green). Both phases always run
+      # so one red phase cannot hide the other's failures; the step fails if either did.
+      # -rfE lists failures in the summary, --durations=25 shows the slowest tests.
       - name: Run tests
-        run: python -m pytest tests/ -q
+        run: |
+          par_rc=0
+          ser_rc=0
+          python -m pytest tests/ -q -n auto -m "not serial" -rfE --durations=25 || par_rc=$?
+          python -m pytest tests/ -q -m serial -rfE || ser_rc=$?
+          [ "$par_rc" -eq 0 ] || [ "$par_rc" -eq 5 ] || exit "$par_rc"
+          [ "$ser_rc" -eq 0 ] || [ "$ser_rc" -eq 5 ] || exit "$ser_rc"
 
   shellcheck:
     name: ShellCheck
