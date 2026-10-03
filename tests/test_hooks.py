@@ -245,6 +245,8 @@ WF_SCENARIOS = {
     # (Orca titles a terminal by its foreground process and overwrites a custom title); a Claude session's title is a topic or a path, never a bare shell
     "auto-loop-holds-the-run": ("spoke", shim_env(title="bash"), False),
     "loop-run-by-zsh": ("spoke", shim_env(title="zsh"), False), "loop-run-by-a-login-shell": ("spoke", shim_env(title="-bash"), False),
+    "loop-run-by-tcsh": ("spoke", shim_env(title="tcsh"), False), "holder-with-an-empty-title": ("spoke", shim_env(title=""), False),
+    "loop-terminal-still-on-its-launch-title": ("spoke", shim_env(title="coordinator"), False),
     "holder-without-a-title": ("spoke", shim_env(title=None), False), "holder-with-a-non-string-title": ("spoke", shim_env(title=7), False),
     "session-with-a-topic-title-holds-the-run": ("spoke", shim_env(title="✳ danger-guard.sh attended test accuracy"), True),
     "session-with-a-working-glyph-title": ("spoke", shim_env(title="◐ fix the loop"), True),

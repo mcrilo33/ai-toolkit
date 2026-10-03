@@ -7,9 +7,9 @@
 # Writes to .github/workflows/ ASK instead (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode)
 # when a human attends, and are denied like the rest when nobody does. Attended = outside a spoke (no Run), or in a spoke when the
 # terminal holding its Run is a Claude session. Read from Orca: worker-list (this terminal's dispatched row -> Run), run-show
-# (-> holder terminal), terminal show (-> agentIdentity claude AND a string title that is no bare shell name). The loop terminal reports
-# claude too (sticky once a headless `claude -p` child ran) but Orca titles it by its foreground process, `bash`; a session's title is a topic
-# or a path. Anything else (a missing handle or title, orca failing or timing out, an unreadable answer) is unattended: deny. The ask is
+# (-> holder terminal), terminal show (-> agentIdentity claude AND a string title that is no bare shell name, empty, or the skill's `coordinator`). The loop
+# terminal reports claude too (sticky once a headless `claude -p` child ran) but Orca titles it by its foreground process, `bash`; a session's
+# title is a topic or a path. Anything else (a missing handle or title, orca failing or timing out, an unreadable answer) is unattended: deny. The ask is
 # emitted last, so a deny in a compound still wins.
 set -Eeuo pipefail
 deny() { echo "danger-guard: blocked: $*" >&2; exit 2; }
@@ -30,7 +30,7 @@ attended() { # 0 = a human attends (outside a spoke, or a Claude session holds t
   [ -n "$run" ] || return 1
   holder="$(orc orchestration run-show --id "$run" --json | jq -r '.result.run.coordinator_handle // empty' 2> /dev/null || :)"
   [ -n "$holder" ] || return 1
-  [ "$(orc terminal show --terminal "$holder" --json | jq -r '.result.terminal | select(.agentIdentity == "claude" and (.title | type) == "string" and (.title | test("^-?(ba|z|da|k|fi)?sh$") | not)) | "session"' 2> /dev/null || :)" = session ]
+  [ "$(orc terminal show --terminal "$holder" --json | jq -r '.result.terminal | select(.agentIdentity == "claude" and (.title | type) == "string" and (.title | test("^(-?(ba|z|da|k|fi|t?c)?sh|coordinator)?$") | not)) | "session"' 2> /dev/null || :)" = session ]
 }
 wf=""; wfd="write to a protected path (.github/workflows, orca.yaml, claude settings/hooks)" # a .github/workflows/ write (what, deny text), settled by finish()
 finish() {
