@@ -33,7 +33,7 @@ if [ "$reply" = 1 ]; then
   case "$reply_id" in '' | *[!A-Za-z0-9_-]*) usage_exit "bad message id '$reply_id'" ;; esac
   case "$reply_body" in
     approve) ;;
-    revise:*[![:space:]]*) reply_body="revise: $(sed 's/^[[:space:]]*//' <<< "${reply_body#revise:}")" ;;
+    revise:*[![:space:]]*) reply_body="${reply_body#revise:}"; reply_body="revise: ${reply_body#"${reply_body%%[![:space:]]*}"}" ;;
     *) usage_exit "the reply is 'approve' or 'revise: <change>'" ;;
   esac
   d="$(rdir)"; (umask 077; mkdir -p "$d"); chmod 700 "$d"
