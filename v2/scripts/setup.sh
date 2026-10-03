@@ -5,6 +5,7 @@
 set -euo pipefail
 # shellcheck source=lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+load_env   # the main checkout's local env (AI_TOOLKIT_GH)
 
 root="${ORCA_ROOT_PATH:?ORCA_ROOT_PATH unset: run me as the Orca setup hook}"
 wt="${ORCA_WORKTREE_PATH:-$PWD}"

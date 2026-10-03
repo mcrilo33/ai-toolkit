@@ -1,3 +1,8 @@
+---
+name: security-review
+description: "Interactive security audit — 10-point checklist covering secrets, input validation, SQL injection, auth, XSS, CSRF, rate limiting, data exposure, dependencies, and infrastructure. Use when auditing code before shipping."
+argument-hint: "[scope: file path, module, or 'full']"
+---
 # Security Review
 
 Interactive security audit — walk through a structured checklist to find vulnerabilities

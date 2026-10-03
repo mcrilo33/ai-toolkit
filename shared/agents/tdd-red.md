@@ -1,3 +1,12 @@
+---
+name: tdd-red
+description: "Write failing pytest tests one at a time that describe desired behavior before implementation exists."
+model: claude-opus-5-5
+effort: high
+skills:
+  - tdd-workflow
+  - generate-tests
+---
 # TDD Red Phase — Write Failing Tests
 
 Write one failing pytest test at a time that describes desired behavior before any implementation exists.
@@ -35,34 +44,15 @@ If the test passes without implementation, the test is wrong — fix it or disca
 
 ## Commit Checkpoint
 
-After tests are written and confirmed failing, commit the failing test and
-record which test was driven to RED with a `Tested-RED:` trailer. The trailer
-value is the pytest node ID of the failing test you just wrote — it makes the
-red-before-green step auditable in history and is later runnable to verify:
+After the tests are written and confirmed failing, commit them on their own, before any implementation:
 
 ```bash
 git add tests/
-git commit -m "test(<scope>): add tests for <feature>" \
-           -m "Tested-RED: tests/test_<scope>.py::test_<behavior>"
+git commit -m "test(<scope>): add failing tests for <feature> (#<issue>)"
 ```
 
-Two hooks enforce this, and the trailer is no longer a mere claim — it is
-executed:
-
-- `red-proof-verify` (commit time) RUNS the node named in the `Tested-RED:`
-  trailer against the staged tree and requires it to FAIL. At the RED commit the
-  implementation does not exist yet, so a genuine red-before-green test must
-  fail here. If the node PASSES, the commit is BLOCKED on Cursor — a passing
-  test needs no new code and cannot be driving the implementation.
-- `red-proof-warn` (push time) checks every source-adding commit for the trailer
-  and re-runs each `Tested-RED:` node as a GREEN backstop, requiring it to pass
-  now that the implementation exists. On Cursor a missing trailer or a still-
-  failing node HARD-BLOCKS the push (advisory `warn` on Claude/Copilot and
-  native git hooks).
-
-If pytest cannot run (no runner, missing deps, collection bootstrap failure),
-the execution check degrades to trailer-presence only — it never produces a
-false block. Write a runnable node ID here so the RED proof actually fires.
+Committing RED separately makes red-before-green auditable in history: the independent review reads the commit
+order and the test body (`tdd_followed`). Run the test and watch it fail for the right reason before you commit.
 
 ## Checklist
 
@@ -72,5 +62,5 @@ false block. Write a runnable node ID here so the RED proof actually fires.
 - [ ] Test name is descriptive and follows naming conventions
 - [ ] Test follows AAA pattern
 - [ ] No production code written
-- [ ] Tests committed separately with a `Tested-RED:` trailer naming a runnable pytest node
-- [ ] `red-proof-verify` observed the node FAIL at commit time (RED proven, not just claimed)
+- [ ] Tests committed separately, before any implementation
+- [ ] Watched the test FAIL for the right reason before committing (RED proven, not just claimed)

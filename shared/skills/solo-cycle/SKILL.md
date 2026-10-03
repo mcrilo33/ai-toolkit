@@ -1,380 +1,95 @@
+---
+name: solo-cycle
+description: "Per-subtask cycle for a dispatched spoke, PR-less: anchor to the issue, PLAN gate, RED test, GREEN implementation, REFACTOR, one in-spoke code-review per subtask, push, then worker_done. Use when working a task from .ai-toolkit/task.md, when the user says /cycle, or wants commit+push per subtask."
+argument-hint: "[subtask description or issue number]"
+---
 # Solo Cycle
 
-Per-subtask cycle for solo, PR-less work. One subtask = one anchored, tested,
-reviewed, pushed unit of work. There is no PR — the push IS the ship gate; all
-enforcement fires on `git commit` and `git push`. The cycle repeats per subtask
-within a session.
+The cycle of a **spoke**: one Orca worktree, one branch `<n>-<slug>`, one issue. There is no PR: the push is
+the ship gate for a subtask, and `worker_done` ends the task. The coordinator (`coordinator.sh`, see `afk`)
+then runs the independent review, waits for CI, and lands it (`land`). A spoke never merges, never lands,
+and never pushes the base branch.
 
-Ending the task is not the spoke's job: once the final subtask is pushed **and the
-ready-to-land marker is emitted**, the **hub** lands it with `/land <id>` (the `land`
-skill) — merge, suite, ship, teardown. The marker is what tells the hub the whole
-issue is done, not just one subtask (see [The final-push marker](#the-final-push-marker)).
+## What you start with
 
-## The gate spectrum
+- `.ai-toolkit/task.md` — the issue (title, body, `Scope:` / `Gate:` / `Model:` footer). Read it first; it is
+  the contract. Stay inside `Scope:`; flag anything that needs more.
+- Your preamble from Orca carries the exact `ask` and `worker_done` commands for this dispatch (handle,
+  task id, dispatch id). Run them verbatim. There is no other channel to the coordinator: a question or
+  a result left in your terminal never reaches it.
 
-The single human checkpoint used to be `/land` on the hub — *after* a spoke had
-fully run and pushed, so a wrong direction was only caught post-hoc and cost a
-whole cycle plus a post-fix. Gating moves that checkpoint to its cheapest,
-highest-leverage point, but gating *everything* would erase the fire-and-forget
-parallelism that makes the hub/spoke model valuable. So the **gate level is
-declared per task** by risk/novelty (in the issue and the kickoff — see
-`start-task`), not applied uniformly:
+## The PLAN gate (`Gate: plan`, the default)
 
-| Task type | Gates |
-|-----------|-------|
-| Very-clear / trivial / mechanical | **none** — fully autonomous to `ready/` |
-| **Standard (DEFAULT)** | **PLAN gate** |
-| Novel / risky / ambiguous | PLAN + RED gate |
-| GUI / behavioral | PLAN + human-acceptance RED + draft-review |
+Before any code: explore, then run your preamble's `ask` with the **complete plan as the question** (files,
+approach, test strategy, open questions) and `--options approve,revise`. It blocks until the coordinator
+(`answer.sh` or the human) replies.
 
-**PLAN is the default for all but very-clear work.** Approving a plan you agree
-with costs seconds (even a rubber-stamp); a wrong autonomous dev costs the whole
-cycle plus a post-fix — so defaulting non-trivial work to a PLAN gate wins on
-expected value even when most plans pass. The no-gate skip-lane is widened
-**empirically** over time from the dashboard's observed redirect-vs-rubber-stamp
-rate — not guessed up front.
+| Reply | You |
+|-------|-----|
+| `approve` | start the cycle |
+| `revise: …` | amend the plan, `ask` again (max 2 rounds, then `worker_done --outcome failed` naming the blocker) |
+| the call times out | re-run the same `ask`; never start coding unanswered |
 
-Gates do **not** serialize the queue: a spoke runs **in parallel to its gate**
-and **parks** there, so the user reviews the queue in any order (PLAN-gate #A
-while #B sits at its own gate) — never one-at-a-time.
-
-### The PLAN gate (default, before RED)
-
-After ANCHOR and before writing any code, a PLAN-gated spoke:
-
-1. **Explores the code** and **writes the complete plan as a normal visible
-   message** — files, approach, test strategy, and **open questions**. The plan
-   is the message itself, never an empty or abbreviated stub deferred to an
-   approval card.
-2. **Parks** by emitting the `gate/<issue>` marker (below) — which then **blocks in
-   `orca orchestration ask`** with an explicit ask to reply to approve, or tell me what to
-   change, until the coordinator replies — all **before writing code**. The hub planned the *what/why* (the issue); the PLAN gate is the *how*
-   (it needs the codebase in front of it), so scope is not re-litigated twice.
-3. On approval, proceeds into the RED → GREEN → REVIEW → PUSH cycle below.
-
-The git-native `gate/<issue>` park is the **sole** PLAN-gate mechanism — the plan
-is a visible message and the tag is the only park, surfaced to the hub exactly
-the way `ready/<issue>` surfaces completion. There is no separate approval card,
-and no auto-approve shortcut that would disable review at the very moment human
-review of the *how* is wanted.
-
-A **very-clear / trivial / mechanical** task declares no gate and runs
-**autonomous** straight through to `ready/`, exactly as before.
-
-The other spectrum levels — the **RED gate** (user validates the failing test as
-the executable spec), **human-acceptance RED** (a manual checklist for
-GUI/behavioral work with no clean automated red), and **draft-review** (park
-with a diff + run command after GREEN, before the gauntlet) — are declared in
-the same way but their machinery is **pending follow-up issues**; only the PLAN
-gate is live in this version.
-
-### The gate marker
-
-A parked gate is surfaced to the hub the same git-native way completion is: the
-spoke emits an annotated **`gate/<issue>`** tag whose message names the current
-park state (`plan` now; `red` / `draft` reserved for the follow-ups), force-moved
-as the spoke advances and dropped once it moves past the gate. This is distinct
-from the final-completion marker: **`ready/<issue>`** still means *the whole
-issue is done* and is what `/land` consumes — `gate/<issue>` only means *parked,
-awaiting review*. Emit it **only** through the one allowlistable marker process:
-
-```bash
-bash .ai-toolkit/scripts/spoke-ready.sh --gate <issue>
-```
-
-Never hand-roll the tag push in any form — not a `git tag … && git push …` chain,
-not a bare `git push -f origin refs/tags/gate/<issue>`, and **never** piped into a
-filter like `… | grep -v telemetry` to hide noise. Two reasons: the compound form
-re-prompts the push gate (issues #37/#45), and piping a push into `grep`/any filter
-**masks its exit code** — a force-push that dies with SIGPIPE/exit 141 then reads as
-success and the marker silently never lands (see the long-gate SSH-stale footgun).
-If telemetry noise is the problem, fix the leak; do not filter the push output.
-
-The script force-moves the annotated `gate/<issue>` tag and pushes it as a tag-only
-push, which the pre-push gate short-circuits (a marker carries no code), so emitting
-it never runs the suite. To re-emit or move the gate, just **re-run the script** — it
-is idempotent — never a manual re-push of the refspec.
-
-**Under Orca the gate then waits for the answer** (#365). `--gate` posts the plan as an
-`orchestration ask` (options `approve,revise`) and blocks. Read its exit code:
-
-| Exit | Meaning | What you do |
-|------|---------|-------------|
-| 0 | approved — the script consumed `gate/<issue>` and the plan artifact | proceed to RED |
-| 3 | the reply asks for changes (printed) | amend the plan, then re-run `--gate` |
-| 6 | no reply yet: the question is still **pending** (id kept in `.ai-toolkit/gate-<issue>.ask`) | **re-run the exact same command** to keep waiting; never start coding and never ask again |
-| 1 | the ask failed | read the error; a stale/missing capability needs the token below |
-
-Orca hands a dispatched worker a **dispatch capability** only in its preamble
-(`--dispatch-capability <token>`); pass it once as
-`spoke-ready.sh --gate <issue> --dispatch-capability <token>` — it is remembered in
-`.ai-toolkit/dispatch-capability`, so the later `ready` / `--blocked` (which send
-`worker_done` `succeeded` / `failed`, best-effort) find it. A restarted worker has a new
-token: pass it again.
-
-### Gate action — who services a parked gate (attended vs unattended)
-
-The gate spectrum above says *which* gates a task has; the **gate action** is the
-orthogonal second dimension — *who* services a gate when the spoke reaches it. It
-is one of `{ human-pause | agent-review | none }` and is derived from the **mode**
-the spoke runs in, **not** declared per task (the `Gate:` line is mode-agnostic):
-
-- **Attended mode** — every declared gate resolves as **human-pause**: the spoke
-  parks (`gate/<issue>`) and waits for a person. This is the default behavior
-  described above and is unchanged.
-- **Unattended mode** (the `/afk` supervisor, `hub-afk.sh`) — the *judgment* gates
-  resolve as **agent-review**, and the inherently-human ones resolve as `none` →
-  **always park**. Uncertainty routes to **park**, never to "ask" (which hangs the
-  slot) or "guess".
-- **none** — a very-clear / trivial task has no gate, in either mode.
-
-In unattended mode each judgment gate is serviced by an **independent adversarial**
-reviewer — a fresh `code-review` subagent (pinned to Opus), never the implementer
-grading itself, **prompted to refute** the work and to approve only on strong
-evidence. The revise loop is bounded: at most **two rounds** of revision, then the
-spoke **parks** rather than looping forever (the doom-loop guard).
-
-| Declared gate | Unattended action | On exhaustion |
-|---------------|--------------|---------------|
-| PLAN | agent-review: is the plan correct, complete, in-scope? | park → `blocked/<issue>` |
-| RED | agent-review: do the tests encode the criteria and fail for the right reason? | park → `blocked/<issue>` |
-| REVIEW (code) | agent-review: does the impl satisfy the tests **without gutting them**? | park → `blocked/<issue>` |
-| DRAFT / human-acceptance | `none` — inherently human (UX/behavioral); the agent cannot stand in | **always park** → `accept/<issue>` |
-
-The code-review reviewer must specifically check the implementation did **not gut**
-the tests to go green: no inserted `sys.exit(0)`, no deleted or weakened
-assertions, no test marked `skip`/`xfail`.
-
-**Honest enforceability.** For the PLAN and RED gates there is no diff to bind a
-signed artifact to, so "an independent adversarial review happened" is
-**policy** (behavioral), not a daemon-enforced gate — an unattended spoke *can*
-narrate a review it never ran. The mechanical backstops that do not depend on the
-model's honesty are the **anti-gutting** pre-push tripwire (it flags test-gutting
-signatures in the pushed diff — advisory) and **test-select** (the suite must still
-pass). The dashboard's rubber-stamp/redirect rate is the empirical check over
-time. The docs do not overclaim the agent review as enforced.
-
-Unattended mode ends a spoke with one of **three terminal markers**, each of which
-**frees a supervisor slot**:
-
-- `ready/<issue>` — all gates auto-passed and the work is machine-verifiable
-  (tests green) → the hub rubber-stamps `/land`.
-- `accept/<issue>` — built, pushed and agent-reviewed, but the final sign-off is
-  inherently human → surfaced on the dashboard for a human glance.
-- `blocked/<issue>` — stuck (ambiguity the spoke can't resolve, a reviewer that
-  refused after two rounds, a suspected test-gutting, or a budget/time ceiling) →
-  surfaced on the dashboard: answer and re-queue.
-
-Emit them through the one allowlistable marker process — `accept`/`blocked` mirror
-the `gate`/`ready` flags:
-
-```bash
-bash .ai-toolkit/scripts/spoke-ready.sh --accept <issue> -m "<what to eyeball>"
-bash .ai-toolkit/scripts/spoke-ready.sh --blocked <issue> -m "<the blocker>"
-```
+`Gate: none` (trivial, mechanical) skips it. Never edit code, tests, or config before `approve`.
 
 ## The cycle (per subtask)
 
-| # | Step | Outcome | Enforced by |
-|---|------|---------|-------------|
-| 1 | ANCHOR | Issue exists; commits reference it | `commit-quality` (blocks unanchored commits) |
-| 2 | RED | Failing test committed with `Tested-RED:` trailer | `red-proof-verify` (runs the node; blocks the commit if it passes) |
-| 3 | GREEN | Implementation commit; tests pass | `commit-gauntlet` (lint/typecheck on changed lines), `secrets-scan` |
-| 4 | REVIEW | APPROVE artifact `.review/<diff-hash>.json` exists | Written by the `code-review` agent on APPROVE |
-| 5 | PUSH | `git push` succeeds — work is shipped | `push-scope-guard`, `red-proof-warn`, `reviewer-sep-warn`, `todo-ledger-warn`, `git-push-review` |
+| # | Step | Outcome |
+|---|------|---------|
+| 1 | ANCHOR | commits reference the issue (`#<n>` in the message; `commit-msg` checks the format) |
+| 2 | RED | a failing test, committed alone; you saw it fail for the right reason |
+| 3 | GREEN | the minimal implementation; the new test and the existing suite pass |
+| 4 | REFACTOR | tidy with tests green; no behavior change |
+| 5 | REVIEW | the `code-review` subagent on the subtask's diff; fix every blocker, then re-review |
+| 6 | PUSH | `git push -u origin <branch>`, plain, one per subtask |
 
-Then: next subtask → back to step 1 (or step 2 if it is the same issue).
+Then the next subtask, from step 2.
 
-### Per-cycle-step model routing
+### RED and GREEN
 
-The spoke driver is an expensive model, but a cycle step need not run on it. Each
-step is **realized by delegating to a routed subagent**, and that subagent runs on
-its own configured model — so RED (`tdd-red`), GREEN (`tdd-green`, `tdd-refactor`),
-and REVIEW (`code-review`) each execute on the model the config assigns, with their
-own per-span model attribution in Langfuse.
+Write the failing test first and run it. Delegating to `tdd-red` / `tdd-green` / `tdd-refactor` is optional
+(clean context for larger work; each runs on the model in its own frontmatter). Commit RED and GREEN
+separately. Never weaken a test to get green: no deleted or loosened assertions, no `skip`/`xfail`, no
+`sys.exit(0)`. The independent reviewer reports `tdd_followed` and `tests_weakened`, and either one blocks
+the land.
 
-The routing is **config-driven, not hardcoded here**:
-`settings/ai-toolkit.yml` `model.cycle_steps.<step>` declares the model, the sync
-pipeline stamps it onto the delegate agent's frontmatter, and
-`ai_toolkit_config.py::cycle_step_effective_model` resolves what a step actually
-runs on. Change the config and re-sync — nothing in this skill hardcodes a model.
-GREEN is routed to the cheaper tier, which is where the token saving lands.
+Non-TDD subtasks (docs, config, chores) skip RED; anchor, review, and push still apply.
 
-ANCHOR and PUSH have **no delegate** — they are mechanical (git plumbing, marker
-emission), so they run on the spoke driver and the routing **fails open** to
-today's behavior. A step with no configured model does the same.
+### REVIEW
 
-### 1. ANCHOR
+Spawn `code-review` once per subtask on `git diff origin/<base>...HEAD`. It is advisory in the spoke (no
+artifact, no gate): its job is to cut the rounds of the real review, which the coordinator runs on your
+pushed branch with a different model. REQUEST_CHANGES: fix and re-run it. Any commit after a review means
+the next push needs a fresh one.
 
-Ensure an issue exists — `gh issue create` for ad-hoc work, or pick an existing
-one. Then either:
+### PUSH
 
-- Create a branch `feature/<id>-<slug>` (preferred), or
-- Stay on `main` and add `-m "Refs #<id>"` to every commit.
+`git push -u origin <branch>` as its own command (no pipes, no `&&` chains, so the exit code is the push's).
+Push without asking: it is your own ephemeral branch and nothing merges from it until the land. `push-guard`
+denies the base branch, `--force*`, and `--no-verify`; a denial is by design, so change the approach.
+CI runs on your branch; format and lint before committing so it stays green.
 
-`commit-quality` blocks unanchored commits, so anchor before the first commit.
+## Finishing
 
-### 2. RED
+When every acceptance criterion in `task.md` holds and the last subtask is pushed, run your preamble's
+`worker_done --outcome succeeded` with a 3-sentence body: what you did, what you found, what is left.
+Then stop; do not poll and do not start new work.
 
-Write the failing test by delegating to the `tdd-red` agent — it carries the
-model the config routes the RED step to (see [Per-cycle-step model
-routing](#per-cycle-step-model-routing) below), so the step runs on that model
-with its own per-span attribution. Inline authoring is fine for a trivial
-one-liner, but it runs on the spoke driver model instead. Commit the test with a
-`Tested-RED: <pytest-node-id>` trailer. At commit time `red-proof-verify` runs
-that node and blocks the commit if it PASSES — a passing test is not driving any
-new code. The gate is the proof, not the author.
+If you are stuck (ambiguity you cannot resolve, a failing dependency you do not own, a scope breach), send
+`--outcome failed` with the blocker. The coordinator labels the issue `blocked` and tells the human.
 
-### 3. GREEN
-
-Write the implementation by delegating to the `tdd-green` agent (then
-`tdd-refactor`) rather than inline — these carry the model the config routes the
-GREEN step to, the **cheaper tier**, so the bulk of the mechanical implementation
-work runs off the expensive spoke driver (the highest-leverage token saving in
-the cycle). Then commit. `commit-gauntlet` lints and typechecks the changed
-lines; `secrets-scan` blocks hardcoded credentials.
-
-### 4. REVIEW
-
-Spawn the `code-review` agent on the full diff to be pushed — `git diff
-<upstream>..HEAD`, or the full diff if no upstream exists. On APPROVE it writes
-`.review/<diff-hash>.json`.
-
-One review per subtask — commit freely within the subtask, review once before
-pushing. If REQUEST_CHANGES: fix, re-stage, fresh review. The hash binds to
-the exact diff — any new commit invalidates the artifact.
-
-### 5. PUSH
-
-The push is the ship gate. Run it through the one allowlistable process:
-
-```bash
-bash .ai-toolkit/scripts/spoke-push.sh            # normal per-subtask push
-bash .ai-toolkit/scripts/spoke-push.sh --ready N  # final subtask: push + ready/N marker
-```
-
-The script refuses on the default branch, prints diagnostics, then runs the
-real `git push -u origin <branch>` — so `red-proof-warn`, `reviewer-sep-warn`,
-`git-push-review` and `push-scope-guard` all fire exactly as for a hand-typed
-push; on Cursor they hard-block. It does **not** use `--no-verify`. The push
-only succeeds when all evidence is in place.
-
-**Never chain the push.** Claude Code's Bash matcher decomposes a compound
-command and requires every segment to be separately allowed, so a decorated push
-(`git push … | tail`, `git status && … && git push`, `git tag X && git push
-origin X`) re-prompts on every ship. Run any diagnostics as their own commands
-and let the script own the push + marker — that is the whole reason the seeded
-allowlist is `Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)` and not a bare
-`git push` rule.
-
-The script pushes only the task's own branch. `push-scope-guard` denies a spoke
-push whose refspec touches the default branch or another task's ref: the spoke's
-origin branch is ephemeral staging, and `main` is published exclusively from the
-hub.
-
-Push **without prompting** the user. An own-branch push is low-stakes and
-force-push-recoverable, it targets the spoke's own ephemeral branch (never
-`main`), and every hard gate — red-proof, commit-gauntlet, the review artifact —
-has already passed before you reach PUSH. There is no human judgment left at
-push time; the one human checkpoint is `/land <id>` on the hub. Still ask before
-genuinely dangerous or irreversible ops — force-push / `--force-with-lease`,
-history rewrites, a push touching the default branch, or deletions outside the
-worktree — but never for the routine own-branch push (or the marker below).
-
-## The final-push marker
-
-A per-subtask push looks identical to task completion — clean tree, branch pushed.
-The hub can't tell "subtask 1 of 3 shipped" from "issue done" by branch state alone,
-so completion must be **signalled explicitly**. On the **FINAL** subtask — and
-only then — pass `--ready <issue>` to the push script so the branch push and the
-`ready/<issue>` marker emit from the same single allowlistable process (never a
-separate `git tag … && git push …` chain, which would re-prompt):
-
-```bash
-bash .ai-toolkit/scripts/spoke-push.sh --ready <issue>
-```
-
-This pushes the branch, then delegates the marker to
-`bash .ai-toolkit/scripts/spoke-ready.sh <issue>` — the same canonical emitter the
-`gate/<issue>` park uses. The marker is an annotated, force-moved tag pushed as a
-tag-only push (the pre-push gate skips it — a tag carries no code) and re-running
-is idempotent.
-
-**Completion is agent-determined, not a human call.** You decide a subtask is the
-final one by checking the issue's **acceptance criteria** against your task ledger:
-every criterion met (every box tickable) means the whole issue is done. On that final
-push, emit the marker **automatically, with no human prompt**; a mid-cycle push emits
-no marker. The push-only-vs-push-plus-ready choice is deterministic — "is this the
-final subtask?" — so there is nothing for the human to adjudicate. The marker merges
-nothing and is trivially reversible (delete/re-tag); the real, gated decision is
-`/land <id>` on the hub, which runs the suite on the merged result.
-
-This is the whole-issue ship gate, distinct from the per-subtask push gate. The hub's
-`hub-status.sh` flips the branch from `pushed (in progress)` to `pushed → mergeable`
-only once the marker points at the tip, and `worktree-land.sh` refuses to land until
-then. So:
-
-- Emit the marker **once**, after the last subtask — never after an intermediate one.
-- If you push more work after tagging, the marker goes stale (sha ≠ tip); re-emit it at
-  the new tip with `bash .ai-toolkit/scripts/spoke-ready.sh <issue>` (idempotent).
-- Ad-hoc/express (lane-2, non-numbered) branches carry no marker — their single push IS
-  completion, and the hub lands them with `--force-land`.
-
-The hub consumes the marker on landing (deletes the local + remote tag), so it can't
-re-flag a future branch that reuses the issue number.
-
-## The session ledger (Tasks or TodoWrite)
-
-GitHub issues hold the durable contract; your head holds the momentary edit. The
-middle layer — *which subtask and which cycle step is live right now* — is what a
-dead worktree session forgets, leaving you to reconstruct mid-cycle state by
-archaeology. Track it in a task ledger — `TaskCreate`/`TaskUpdate`, or `TodoWrite` on older runtimes — so the cycle is visible and resumable.
-
-**Seed it** before the first commit: one todo per subtask × the cycle steps that
-apply — `Subtask 1 · ANCHOR`, `Subtask 1 · RED`, `Subtask 1 · GREEN`,
-`Subtask 1 · REVIEW`, `Subtask 1 · PUSH`, then the same for subtask 2 (ANCHOR only
-once when subtasks share the issue). Keep exactly one todo `in_progress` — the step
-you are on — and flip it to `completed` the moment its gate passes, moving the next
-step to `in_progress`.
-
-**Maintain it** as the cycle turns:
-
-- On REQUEST_CHANGES, insert a `Subtask N · Fix review findings` todo before that
-  subtask's REVIEW todo, work it, then re-review.
-- At PUSH, sync only the *outcome* to the GitHub issue — check the subtask's box,
-  leave a one-line note. Never mirror the live todo list into the issue.
-
-The ledger is ephemeral session scratch; the GitHub issue is the durable contract.
+If the coordinator re-engages you with `address: …`, that is the independent review (or a CI/merge
+conflict): fix exactly those items, run steps 5-6, and send `worker_done` again.
 
 ## Rules of thumb
 
-- Push once per subtask; the review artifact covers the whole `upstream..HEAD` diff
-- Commit granularity within a subtask is free (RED commit + GREEN commit minimum for TDD)
-- Any commit after APPROVE invalidates the artifact (hash mismatch) — re-review before pushing
-- Non-TDD subtasks (docs, config, chores) need no `Tested-RED` trailer —
-  `red-proof-warn` only gates source-adding commits — but anchor and review still apply
-- The task ledger is ephemeral session scratch; the GitHub issue is the durable
-  contract — sync only outcomes at PUSH, and skip the ledger entirely for single-step
-  work (one tiny subtask, a docs/config one-liner), where it is pure overhead
-- `todo-ledger-warn` enforces the ledger at PUSH by scanning the session transcript for
-  a ledger call — `TodoWrite`, `TaskCreate`, or `TaskUpdate` (warn on Claude, hard-deny on Cursor). For genuinely single-step
-  work, add a `No-Ledger: <reason>` trailer to a commit in the pushed range to bypass it
+- Push once per subtask; commit granularity inside it is free (RED + GREEN minimum for TDD).
+- Strong criteria ("tests X, Y pass") beat weak ones ("make it work"); state them in the plan.
+- A session todo list is fine scratch for the live subtask; nothing reads it. The issue is the contract.
+- Never touch `.github/workflows/`, `orca.yaml`, or `~/.claude`; `danger-guard` denies it.
+- Format and lint locally; the suite is CI's job, run the tests of the code you touched.
 
-## Edge cases
+## Related
 
-| Situation | Action |
-|-----------|--------|
-| Push blocked by `reviewer-sep-warn` | Run the `code-review` agent, get APPROVE |
-| Push blocked by `red-proof-warn` | A source-adding commit is missing its trailer — amend/reword it, or add the failing-test commit |
-| Push blocked by `todo-ledger-warn` | Seed a task ledger (`TaskCreate` or `TodoWrite`) this session, or add a `No-Ledger: <reason>` trailer for single-step work |
-| Working on `main` with no issue branch | Add `Refs #<id>` to every commit message |
-| Review says REQUEST_CHANGES | Fix and re-review — never bypass |
-| Tempted to use `--no-verify` | Blocked by `block-no-verify`, by design |
-
-## Related skills
-
-- `source-task` — anchor: fetch the issue and confirm the branch
-- `tdd-workflow` — RED/GREEN/REFACTOR guidance
-- `land` — hub-side `/land <id>` that ends the task once the last subtask is pushed
-- `verification-loop` — deeper VERIFY pass before the review
-- `git-commit` — commit message format
+`tdd-workflow` (RED/GREEN/REFACTOR guidance), `verification-loop` (pre-review pass), `git-commit` (message
+format), `land` (what happens after `worker_done`).

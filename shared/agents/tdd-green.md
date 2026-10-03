@@ -1,3 +1,11 @@
+---
+name: tdd-green
+description: "Write minimal Python code to make failing tests pass without over-engineering."
+model: claude-sonnet-5-5
+effort: high
+skills:
+  - tdd-workflow
+---
 # TDD Green Phase — Make Tests Pass
 
 Write the minimal Python code to make the failing tests pass. Nothing more.

@@ -1,3 +1,9 @@
+---
+name: debug
+description: "Systematically identify, analyze, and resolve bugs using a structured triage-reproduce-investigate-fix cycle."
+model: claude-opus-5-5
+effort: max
+---
 # Debug Mode — Find and Fix Bugs
 
 Systematically identify, analyze, and resolve bugs. Reproduce first, understand second, fix last.

@@ -1,3 +1,6 @@
+---
+description: "No data leakage from eval/ground truth into prompts, and mechanism-first reasoning over metric chasing"
+---
 # Scientific Integrity (Non-Negotiable)
 
 ## No Data Leakage

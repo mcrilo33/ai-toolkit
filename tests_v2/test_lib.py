@@ -30,3 +30,12 @@ def test_orca_mutate_does_not_replay_a_definite_failure(run, stubs):
 def test_issue_footer_reads_the_last_matching_line(run):
     r = lib(run, 'b=$(printf "t\\nScope: a.py\\nScope: hello.py tests/\\n"); issue_footer "$b" Scope; issue_footer "$b" Model; echo end')
     assert r.stdout.splitlines() == ["hello.py tests/", "end"]
+
+
+def test_gh_binary_can_be_swapped_by_env_for_stubbed_runs(run, stubs, tmp_path):
+    alt = tmp_path / "alt-gh"
+    alt.write_text('#!/bin/sh\necho "alt $*"\n')
+    alt.chmod(0o755)
+    assert lib(run, "gh issue view 4", AI_TOOLKIT_GH=alt).stdout.strip() == "alt issue view 4"
+    lib(run, "gh issue view 4")
+    assert stubs.calls("gh") == [["issue", "view", "4"]]

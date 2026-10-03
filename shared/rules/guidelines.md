@@ -1,3 +1,6 @@
+---
+description: "Agent behavior, clarification, autonomy, prohibitions, and response style"
+---
 # Guidelines
 
 ## Agent Behavior

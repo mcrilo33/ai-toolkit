@@ -1,116 +1,23 @@
+---
+name: land
+description: "Land a finished task from the hub: independent review, green CI on the exact tip, merge into the base branch, close the issue, release the worker, and remove the worktree. Use on the hub when the user says /land <id>, 'land it', or a spoke sent worker_done succeeded."
+argument-hint: "[issue number]"
+---
 # Land
 
-Land a finished task from the hub: `/land <id>`. The hub starts and ends tasks; spokes
-only execute. A spoke's push is its ship gate — landing (merge, push, teardown, issue
-close) happens **here**, on the main checkout, never inside the worktree. Landing runs
-no tests itself: CI is the gate — the land requires a green CI run on the exact SHA it ships
-(`docs/test-gate.md`).
+`.ai-toolkit/scripts/land.sh <n>` runs the whole landing, in order; each step must pass before the next:
 
-The deterministic sequence lives in `.ai-toolkit/scripts/worktree-land.sh`; this skill orchestrates
-it: pick the target, confirm, run, then report and refresh the hub picture.
+1. `review.sh <n>`: independent review on `origin/<base>...<branch>`; REQUEST_CHANGES stops here.
+2. CI green for the exact tip (`gh run list --commit <sha>`); `--local-gate` runs `$CHECK_CMD` instead
+   (no CI yet).
+3. Base moved? merge it into the spoke branch and push, then wait for CI again.
+4. `git merge --ff-only`, `git push origin <base>`, `gh issue close -c "landed in <sha>"`, delete the remote branch.
+5. `orca orchestration worker-release`, then `orca worktree rm --worktree issue:<n> --run-hooks`.
 
-## Preconditions
+Run it on the main worktree only (it refuses elsewhere). The coordinator calls it itself on
+`worker_done succeeded`; run it by hand for an attended land.
 
-- Run from the **hub** (main checkout) on the default branch, with a clean tree —
-  the script aborts otherwise, with the precise reason.
-- The spoke has finished and signalled it: `hub-status.sh` shows the branch
-  `pushed → mergeable`, which requires a `ready/<issue>` completion marker at the tip.
-  A branch reading `pushed (in progress)` has pushed a subtask but isn't done — landing
-  it refuses (use `--force-land` only for a branch that legitimately never carries a
-  marker, e.g. an ad-hoc/express branch).
-- `gh` authenticated for the issue close (degrades to a warning without it).
-
-## Workflow
-
-### 1. Identify the landing target
-
-Resolve `<id>` (issue number, slug, branch, or worktree path) against the live
-worktrees — `bash .ai-toolkit/scripts/hub-status.sh` if the state is not already
-known. If the branch is `dirty` or `unpushed`, stop: the spoke is still working; landing
-verifies pushes, it never rescues them.
-
-### Pre-land review (pane-visible, logged, costed)
-
-Any agent you run before landing — a `/code-review`, a bug-scoper, a delta re-review —
-should go through the hub-agent helper so it runs on a trackable surface instead of
-invisibly inside your session (issue #245): a tmux window `hub:<label>` you can watch
-live, output teed to a log, a `hub-status` row while it runs, and its token cost attributed
-in Langfuse.
-
-```bash
-.ai-toolkit/scripts/hub-agent.sh review-<id> --purpose "pre-land review #<id>" \
-  -- claude -p "/code-review <id>"
-```
-
-The window closes on completion; the log survives at
-`.ai-toolkit/hub-agents/<label>.log`, and `hub-status.sh` lists the run under **Hub
-agents** while it is live. Read the review, then land.
-
-### 2. Confirm, then run the landing script
-
-Restate what is about to happen (branch, merge target, teardown) and get a quick yes —
-a land is a merge plus an irreversible teardown. Then:
-
-```bash
-.ai-toolkit/scripts/worktree-land.sh <id>
-```
-
-| Flag | Effect |
-|------|--------|
-| `--skip-tests` | Skip the pre-push hook's fast tier on the main push (threads `TEST_SELECT_SKIP=1`); CI is still required |
-| `--local-gate` | Offline escape hatch: run the former local full suite once instead of waiting for CI; recorded in the land log |
-| `--test-cmd <cmd>` | Run `<cmd>` as the gate instead of consulting CI (threads `TEST_SELECT_CMD`) |
-| `--local` | Micro-spoke landing: skips upstream guards; accepts a bare local branch with no upstream; refuses any branch that has an upstream and refuses the default branch itself |
-| `--force-land` | Land a numbered branch that carries no `ready/<issue>` marker (an express/ad-hoc branch that never emits one); the marker guard is otherwise mandatory |
-
-The script runs, in order, aborting safely at the first failure:
-
-1. **Guards** — hub on a clean default branch; worktree resolved, clean, fully pushed
-   (neither ahead of nor behind its upstream); for a numbered branch, a `ready/<issue>`
-   marker points at the tip (unless `--force-land`).
-2. **Gate + merge** — the branch tip must be CI-green (`CI pending/failed/no run` refuse). When
-   the default branch moved, it is merged **into the spoke, on the spoke**, pushed, and CI is
-   awaited on the new tip; the hub then only fast-forwards to a CI-green SHA.
-3. **Ship** — `git push origin <default>` (no local tests: CI already proved that SHA).
-   A rejected push (a remote refusal, or the local gate of `--local-gate`) rolls back with
-   `git reset --keep` and nothing is pushed. Then the telemetry ingest → release the
-   spoke's Orca worker (`worker-release`, which closes its terminal) → `worktree-done.sh`
-   (`orca worktree rm`, without the archive hook: the ingest already ran; the merged
-   branch is pruned local + origin) → consume the `ready/<issue>` marker (delete the
-   local + remote tag, so it can't re-flag a future branch) → `gh issue close <id>`.
-   A removal Orca refuses exits 3 (shipped, cleanup incomplete), never 1.
-
-### 3. Handle a refused landing
-
-The script's abort message names the failed guard. Typical moves:
-
-| Abort reason | Action |
-|--------------|--------|
-| Hub dirty / off default branch | Commit or stash, `git checkout <default>`, re-run |
-| Worktree has uncommitted changes | Spoke finishes its cycle first — switch to its window |
-| Branch never pushed / ahead of upstream | Spoke pushes (`/cycle` PUSH step), re-run |
-| Branch behind upstream | Reconcile on the spoke (`git pull`), re-run |
-| No `ready/<issue>` marker / stale marker | Spoke isn't done, or pushed after tagging — finish on the spoke and emit/refresh the marker after the final push, or `--force-land` if it legitimately never carries one |
-| Merge conflict | Rebase the spoke on the default branch, push, re-run |
-| Pre-push gate failed (rolled back) | Fix on the spoke, push, re-run — main was restored |
-
-### 4. Report
-
-Relay the script's summary: merged SHA, suite result, what was pruned, issue closed.
-Then re-run `hub-status.sh` so the next move starts from a fresh picture.
-
-## Edge cases
-
-| Situation | Action |
-|-----------|--------|
-| Micro-spoke (lane 1) branch | Review the diff first — lane 1 is non-executable paths only (docs, comments, wording; never `scripts/`, `shared/hooks/`, `tests/`, skill scripts). Then `.ai-toolkit/scripts/worktree-land.sh <branch> --local`: skips upstream guards; no issue to close; the branch is deleted after merge; temp worktree is torn down if still registered |
-| Ad-hoc branch (no issue number) | Lands normally; the issue-close step is skipped |
-| `gh` missing or close fails | Warns; close by hand: `gh issue close <id>` |
-| Push succeeded but teardown failed | Work is shipped; re-run `worktree-done.sh <id>` alone and close the issue by hand |
-
-## Related skills
-
-- `hub` — survey what is in flight; proposes `/land <id>` for mergeable branches
-- `start-task` — the hub-side counterpart that begins a task
-- `solo-cycle` — the spoke's per-subtask cycle whose PUSH step makes a branch landable
-- `verification-loop` — deeper VERIFY pass before the spoke pushes; the pre-push test gate is the last line
+- Exit codes: review blocked, CI red or timed out, merge conflict. On a conflict or REQUEST_CHANGES the fix
+  goes back to the spoke (`worker-start --task <T> --terminal <h> --spec "address: …"`), max 2 rounds, then
+  label the issue `blocked`.
+- Never force a land past a red review or red CI; fix the cause.

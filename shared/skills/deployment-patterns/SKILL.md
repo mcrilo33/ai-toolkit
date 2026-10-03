@@ -1,3 +1,8 @@
+---
+name: deployment-patterns
+description: "Deployment strategies (rolling, blue-green, canary), health checks, environment config, rollback procedures, and production readiness checklists. Use when designing or reviewing deployment pipelines."
+argument-hint: "[pattern: rolling|blue-green|canary|health-checks|rollback]"
+---
 # Deployment Patterns
 
 Production deployment strategies, CI/CD pipeline design, health checks, environment

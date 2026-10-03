@@ -1,3 +1,7 @@
+---
+name: create-readme
+description: "Create a README.md file for a project. Use ONLY when explicitly asked to create a new README."
+---
 # Create README
 
 Create a comprehensive, well-structured README.md for a project.
