@@ -11,7 +11,7 @@ V1 = ["scripts/old.sh", "scripts/telemetry/t.py", "shared/hooks/h.sh", "shared/s
       "mcp/m.py", "dashboard/d.json", "settings/ai-toolkit.yml", "settings/cursor/c.json", "tests/old_test.py", "docs/old.md", "docs/orca-migration/x.md",
       "CLAUDE.md", "README.md", "orca.yaml", "pyproject.toml", "ruff.toml", ".test-select-exempt", ".gitignore", ".github/workflows/ci.yml", "VERSION"]
 NEW = ["v2/scripts/new.sh", "v2/settings/ai-toolkit.env", "v2/orca.yaml", "v2/README.md", "v2/bin/b", "v2/hooks/h", "v2/.shellcheckrc",
-       "v2/.github/workflows/ci.yml", "tests_v2/test_x.py", "tests_v2/pytest.ini", "docs/v2/architecture.md", "docs/v2/frontmatter.md", "docs/v2/wp1-notes.md"]
+       "v2/.github/workflows/ci.yml", "v2/.gitignore", "tests_v2/test_x.py", "tests_v2/pytest.ini", "docs/v2/architecture.md", "docs/v2/frontmatter.md", "docs/v2/wp1-notes.md"]
 GONE = ["scripts/old.sh", "scripts/telemetry", "shared/hooks", "shared/skills/hub/scripts", "shared/skills/source-task", "shared/rules/metadata.yml",
         "shared/pyproject.toml", "mcp", "dashboard", "settings/ai-toolkit.yml", "settings/cursor", "tests/old_test.py", "docs/old.md", "docs/orca-migration",
         "docs/v2", "CLAUDE.md", "pyproject.toml", "ruff.toml", ".test-select-exempt", "v2", "tests_v2"]
@@ -80,7 +80,8 @@ def test_cutover_makes_one_commit_with_the_v2_layout(cut):
     assert {"settings/ai-toolkit.env", "scripts/new.sh", "tests/test_x.py", "docs/architecture.md", ".github/workflows/ci.yml"} <= tracked
     assert (root / "orca.yaml").read_text() == "v2/orca.yaml\n"  # replaced by the v2 file, not merged
     assert (root / "requirements-dev.txt").read_text().split() == ["pytest>=8,<9", "pytest-xdist>=3,<4", "pyyaml>=6,<7"]
-    assert "/CLAUDE.md" in (root / ".gitignore").read_text().splitlines()  # sync.sh generates it
+    ignored = (root / ".gitignore").read_text().splitlines()
+    assert "/CLAUDE.md" in ignored and "settings/*" not in ignored  # sync.sh generates CLAUDE.md; v1's ignore rules are replaced by v2's file
 
 
 def test_rollback_is_a_reset_to_the_v1_final_tag(cut):
