@@ -1,208 +1,56 @@
+---
+name: hub
+description: "Orient a fresh coordinator session and dispatch from it: survey in-flight Orca worktrees, pending questions, open issues, and branches awaiting land, then propose the next move and act only on confirmation. Use on the main checkout when the user says /hub, 'what's in flight', or 'hub status'."
+argument-hint: "[optional: issue number to focus on]"
+---
 # Hub
 
-Orient a fresh **planning hub** session and dispatch from it. This is the entry point for
-a main-checkout session in the parallel-worktrees workflow: it shows what is in flight,
-then proposes the next move. Read the `planning-hub` rule for the role and
-`docs/parallel-worktrees.md` for the full model.
-
-Use it when you sit down at the hub — the user says `/hub`, "what's in flight", "hub
-status", or starts a fresh main-checkout session and wants to get oriented.
+The hub is the session on the **main checkout**, on the base branch, inside an Orca terminal. It decides,
+dispatches, answers, and lands; it never writes task code (see `.ai-toolkit/rules/planning-hub.md`).
 
 ## Preconditions
 
-- Run from the **main checkout** (the hub), which stays on the base branch
-  (`main` by default; `git config ai-toolkit.base-branch` overrides, issue #117).
-- `gh` authenticated (issue survey degrades gracefully without it).
-- The worktree scripts are installed at `.ai-toolkit/scripts/` (`worktree-new.sh`,
-  `worktree-done.sh`) — `sync-to-repo.sh` puts them there in any synced repo.
+- `git branch --show-current` is the base branch and you are not in a linked worktree. Otherwise you are a
+  spoke: follow `solo-cycle` instead.
+- `$ORCA_TERMINAL_HANDLE` is set (Orca terminal) and `orca status` reports ready. `gh auth status` is green.
+- The lifecycle scripts are in `.ai-toolkit/scripts/` (`sync.sh` put them there).
 
-## Workflow
-
-### 1. Confirm you are on the hub
-
-You are the hub only on the main checkout, on the base branch. If `git branch --show-current`
-is a task branch or you are inside a worktree, you are a **spoke** — stop and follow
-`source-task` / `solo-cycle` instead. The hub never writes task code (see `planning-hub`).
-
-### 2. Survey what is in flight
-
-Run the dashboard:
+## 1. Survey (read-only)
 
 ```bash
-bash .ai-toolkit/scripts/hub-status.sh
+orca worktree ps --json                                   # every worktree: linked issue, agent state working|waiting|done
+orca orchestration worker-list --terminal-state active --json   # live workers (liveness live|unverifiable|exited)
+orca orchestration inbox --json                           # pending question / worker_done / escalation messages
+gh issue list --state open --json number,title,labels     # backlog: priority, hold, blocked labels
+.ai-toolkit/scripts/coordinator.sh --status               # is a coordinator loop running?
 ```
 
-It reports, read-only:
+Summarize as one table, one row per issue: `#n title · state · next step`.
 
-- **Worktrees** — each task branch with ahead/behind vs the default branch, its state
-  (`dirty`, `unpushed`, `pushed (in progress)`, or `pushed → mergeable`), its issue
-  (`#N OPEN`, `#N ?` when `gh` is unreachable), and its live tmux pane
-  (`tmux <session>:<window>`, matched across
-  **all** sessions by pane path, or `no pane`). Rows with a pane include a copy-paste
-  `↳ jump:` command (`select-window` / `switch-client` / `attach`, picked for where you
-  are). A `↳ todos:` sub-line shows the spoke's task ledger (Tasks system, or TodoWrite
-  on older runtimes) from its latest Claude session: `<done>/<total> · step: <X> ·
-  <activity>`, where `step:` is the in_progress item's cycle keyword
-  (ANCHOR/RED/GREEN/REVIEW/PUSH) or its truncated text, activity is `active Ns ago` /
-  `idle Nm`, and `⚠ WAITING ON INPUT` is appended when the spoke is blocked on an
-  unanswered question; `todos: none` means the spoke never seeded a ledger of either
-  kind — that absence is signal, since kickoffs mandate one.
-- **Hub agents** — live hub-side agent runs (pre-land reviews, bug-scopers, delta
-  re-reviews) dispatched through `hub-agent.sh`, listed as `hub:<label> · <purpose> ·
-  <age> · <log>`. A run drops off the moment it finishes; `(none running)` when idle.
-- **Open issues** — flagged `worktree active` or `no worktree` so you can see what is
-  unstarted.
+| State | Meaning | Next step |
+|-------|---------|-----------|
+| unstarted | open, not `hold`, blocked-by closed, no worktree | dispatch (`start-task`) |
+| working | agent `working` | nothing; do not interrupt |
+| parked | a `question` in the inbox (PLAN gate) | answer it (below) |
+| done | `worker_done` received, not landed | review + land (`land`) |
+| blocked | label `blocked`, worker released | read the escalation, decide |
+| abandoned | worktree gone, issue open | re-dispatch or close |
 
-A fully-pushed branch reads `pushed → mergeable` only when a `ready/<issue>` completion
-marker (a git tag the spoke pushes after its FINAL subtask) points at the branch tip;
-otherwise it reads `pushed (in progress)` — the spoke is between subtasks and a
-per-subtask push must not be mistaken for a finished issue. Ad-hoc/express branches
-(non-numbered slug) need no marker — their single push IS completion.
+## 2. Propose, then act on confirmation
 
-### Run hub-side agents on a trackable surface
+State the single best next move and why, then wait. Never dispatch, answer, land, or remove a worktree
+unconfirmed; those change shared state and are hard to undo.
 
-Every unit of agent work should run somewhere the operator can watch it. Spokes already
-do (tmux window + hub-status row + Langfuse session); hub-side agents — pre-land
-reviews, bug-scopers, delta re-reviews — otherwise run invisibly inside your session.
-Dispatch them through the helper instead (issue #245):
-
-```bash
-.ai-toolkit/scripts/hub-agent.sh <label> --purpose "<one-line purpose>" -- <command>
-```
-
-It opens a tmux window `hub:<label>` (watchable live, closes on completion), tees output
-to `.ai-toolkit/hub-agents/<label>.log`, adds a **Hub agents** row to `hub-status.sh`
-while it runs, and launches the agent with the native-OTel prefix so its token cost lands
-in Langfuse. Without tmux it degrades to an inline foreground run. Use it for
-`claude -p "/code-review <id>"` before a manual land and for bug-scoper dispatches.
-
-### Proactive ready-to-land watch (optional)
-
-`hub-status.sh` is **pull** — you only see `pushed → mergeable` when you run it. To be
-told the moment a spoke finishes, run the **push** companion on a loop:
-
-```bash
-bash .ai-toolkit/scripts/hub-ready-watch.sh
-```
-
-Each run best-effort fetches tags, diffs the `ready/<issue>` markers against a last-seen
-set (kept under the git common dir), and prints `#N → run /land N <branch> ↑ahead ↓behind`
-for each **newly**-ready spoke — nothing when there is no change, so it is quiet enough to
-loop (`/loop 2m bash .ai-toolkit/scripts/hub-ready-watch.sh`). It is detection only:
-
-- Only a `ready/*` tag **at its branch tip** fires — a mid-task push (no tag) or a stale
-  marker (tag behind the tip) is ignored, so it never false-fires between subtasks.
-- It **never merges.** The surfaced `/land N` stays a human-invoked one-confirm step
-  (section 3) — the watcher proposes, you land.
-- Offline-safe: a finished spoke's tag is locally visible (shared ref store), so a failed
-  fetch is non-fatal and local markers still surface.
-
-The same loop is also the hub's **single OS-notifier** (issue #146). Spokes silence
-their own per-turn idle notifications (the synced config sets
-`preferredNotifChannel: notifications_disabled`), and each `hub-ready-watch.sh` run
-invokes the co-located `hub-notify.sh`, which fires exactly one desktop notification
-(`osascript`) per NEW lifecycle transition — `gate/<N>` "parked — reply to approve",
-`ready/<N>` "done → /land N", `blocked/<N>` "BLOCKED — needs a human" — deduped on its
-own last-seen set. It is **mode-aware**: under an `/afk` drain it suppresses the
-`gate`/`ready` pings (the answerer services parks; the drain auto-lands ready spokes)
-and notifies only on `blocked/<N>` escalation. So the one loop you already run both
-prints the land proposals and pings you the moment a spoke needs you.
-
-### Telemetry watchdog (when spokes export OTel)
-
-`worktree-new.sh` ensures the OTel collector + Langfuse bridge once at spawn, but nothing
-restarts them if they die mid-run — a crash silently drops every span until the next
-spawn (issue #115). The watchdog companion closes that gap: while at least one spoke
-pane is live it re-ensures both (recycling a dead or stale one), and it is quiet when
-there is nothing to do, so loop it alongside the ready watch:
-
-```bash
-/loop 2m bash .ai-toolkit/scripts/hub-otel-watch.sh
-```
-
-### Unattended drain and parallel batching
-
-Two skills move a backlog without hands-on dispatching, with the observability
-dashboard as the single source of truth for what happened during a run:
-
-- **`/next-batch`** — compute and dispatch the largest disjoint-scope set of ready
-  issues that can run concurrently right now. `batch-plan.sh` reads the open backlog
-  in one `gh api graphql` round-trip, ranks ready issues by critical-path depth,
-  greedily packs a batch whose file-scopes don't collide (honoring in-flight spoke
-  scopes), then spawns each via `worktree-new.sh`. Run it whenever you want to fill
-  idle capacity; it is independent of `/afk`.
-- **`/afk`** — drain the backlog unattended for a bounded window or until it is empty.
-  The hub keeps plan → dispatch → auto-answer → auto-land → reap running with zero
-  human input (`hub-afk.sh`); a parked spoke is answered on the human's behalf by a
-  reasoning answerer or escalated to `blocked`. Use it when stepping away:
-  `/afk <duration>`, `/afk until HH:MM`, `/afk drain`, plus `/afk off` and
-  `/afk status`.
-
-### 3. Propose the next move — act only on confirmation
-
-From the dashboard, surface concrete next steps and wait for the user's OK before doing
-anything that changes state:
-
-| Dashboard signal | Proposed action | How |
-|------------------|-----------------|-----|
-| Open issue, `no worktree` | Start it | `start-task` skill (creates issue if needed + spawns spoke) |
-| New idea, no issue yet | Define then dispatch | discuss scope → `start-task` |
-| Branch `pushed → mergeable` | Land and tear down | `/land <id>` (`land` skill → `.ai-toolkit/scripts/worktree-land.sh`) |
-| Branch `pushed (in progress)` | Leave it — spoke pushed a subtask but isn't done | paste the row's `↳ jump:` command; land only once it flips to `mergeable` (or `--force-land` for a branch that never carries a marker) |
-| Branch `unpushed` / `dirty` | Leave it — spoke still working | paste the row's `↳ jump:` command to reach its pane |
-| Trivial non-executable change (docs/wording) | Lane 1 micro-spoke | spawn subagent with `isolation: worktree`, review diff, land with `.ai-toolkit/scripts/worktree-land.sh <branch> --local` |
-| Small obvious one-subtask change (code) | Lane 2 express spoke | `.ai-toolkit/scripts/worktree-new.sh <slug>` (no issue), single cycle, all push gates |
-
-Never auto-merge or auto-teardown. Restate the branch/issue and the exact command, get a
-quick yes, then run it. Merges and teardowns happen **on the hub**; task edits never do.
-
-### 4. Report
-
-Give the user a short read: how many spokes are running, which issues are unstarted, which
-branches are ready to merge, and your single recommended next action.
-
-`hub-status.sh` does not surface cost. For per-spoke token/cost attribution across runs,
-point the user at Langfuse (the observability surface since #90) — cost is computed by
-Langfuse from token usage (`ccusage` was retired in #91); see
-`docs/telemetry-pull-layer.md` for the on-machine backfill source.
-
-### Micro-spoke dispatch (lane 1)
-
-Use a micro-spoke for any change that touches only non-executable paths: docs, comments,
-and wording. Path restriction is absolute — lane 1 must never touch `scripts/`,
-`shared/hooks/`, `tests/`, or any skill script (`.sh`, `.py`).
-
-For the triage heuristic and lane definitions see `shared/rules/workflow.md`.
-
-**Full lane-1 flow:**
-
-1. **Spawn** a subagent with `isolation: worktree` and a tight prompt. The prompt must
-   specify:
-   - The exact files to touch and the exact change to make.
-   - That the commit must be `docs:` or `chore:` type.
-   - That staging and committing must use plain `git add <files>` followed by a
-     standalone `git commit -m "<message>"` — no `-a`, no pathspec on the commit command,
-     no chaining or prefixes (the gate only exempts a standalone plain commit).
-   - That the subagent must return its branch name and a diff summary when done.
-2. **Review** the returned diff on the hub before doing anything else.
-3. **Land** with:
-
-   ```bash
-   .ai-toolkit/scripts/worktree-land.sh <branch> --local
-   ```
-
-   `--local` skips upstream guards (micro-spokes never push). It accepts a bare local
-   branch whose temp worktree may already be gone, refuses any branch that has an
-   upstream (that is not a micro-spoke), and refuses the default branch itself. No issue
-   to close.
-
-4. **Verify cleanup.** A landed micro-spoke leaves nothing behind: no branch, no
-   worktree (none were created beyond the temp worktree).
+- **Dispatch**: `.ai-toolkit/scripts/dispatch.sh <n>` or `--next` (picks the next ready issue).
+- **Answer a gate, handle a finished worker**: `/coordinate` (`coordinate` skill): this session holds the Run, discusses the plan with the user, replies.
+- **Land**: `.ai-toolkit/scripts/land.sh --review <n>` (the independent review, then CI on the exact tip, then FF).
+- **Unattended**: `/coordinate auto` (alias `/afk`) hands the Run to the coordinator loop instead of hand-driving each step.
+- **Teardown** (abandoned or finished by hand): `orca worktree rm --worktree issue:<n> --run-hooks`.
 
 ## Rules of thumb
 
-- One survey per sit-down — re-run after a merge or a dispatch to refresh the picture.
-- Keep the hub on the base branch (`main` unless `ai-toolkit.base-branch` is set).
-  If a survey shows the hub checkout dirty or off the base, flag it.
-- The issue is the contract — dispatch with a kickoff that lets the spoke run on its own
-  (`/source` then `/cycle`).
+- One recommendation, not a menu. One holder per Run (`coordinator.sh --status` says who): never start a second consumer, switch with `/coordinate`.
+- A small fix you want to drive interactively: `/quick`. A tiny non-executable change: a subagent with
+  `isolation: worktree`, reviewed and merged by you.
+- Ambiguous scope stays here: use `brainstorming`, write the issue, then dispatch.
+- Surface what the human must decide (blocked issues, `revise` loops) before what is running fine.

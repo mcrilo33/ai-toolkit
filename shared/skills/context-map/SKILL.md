@@ -1,3 +1,8 @@
+---
+name: context-map
+description: "Analyze the blast radius of a task — map files, dependencies, tests, and risks before implementation. Use when scope is unclear, multiple files are involved, or user says /map or 'analyze impact'."
+argument-hint: "[task description or issue reference]"
+---
 # Context Map
 
 Analyze the blast radius of a task before making changes. This implements the DEFINE step
@@ -9,7 +14,7 @@ proceed autonomously or pause for confirmation.
 - Before any task that touches 2+ files
 - When scope or impact is unclear
 - When the user says "map this", "what files are involved", "analyze impact"
-- Automatically before EXECUTE when `source-task` hands off a non-trivial task
+- Automatically before EXECUTE when a dispatched spoke starts a non-trivial task from `.ai-toolkit/task.md`
 
 **Do NOT use when:**
 - Single-file, clear-scope change (proceed directly)
@@ -156,5 +161,5 @@ Apply the autonomy threshold:
 |-------|-------|------|
 | `acquire-codebase-knowledge` | Whole repo | Onboarding, discovery |
 | **`context-map`** | **Single task** | **Before implementation** |
-| `source-task` | Task setup | Before context-map |
+| `start-task` | Task dispatch | Before context-map |
 | `generate-tests` | Test creation | After implementation |

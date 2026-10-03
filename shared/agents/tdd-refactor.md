@@ -1,3 +1,11 @@
+---
+name: tdd-refactor
+description: "Improve code quality, readability, and design while keeping all tests green."
+model: claude-sonnet-5-5
+effort: high
+skills:
+  - tdd-workflow
+---
 # TDD Refactor Phase — Improve Quality
 
 Improve code quality, readability, and design while keeping all tests green.

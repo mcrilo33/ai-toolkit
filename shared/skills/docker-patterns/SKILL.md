@@ -1,3 +1,8 @@
+---
+name: docker-patterns
+description: "Docker and Docker Compose patterns — multi-stage builds, local dev setup, volumes, networking, container security, and .dockerignore. Use when dockerizing applications or reviewing Dockerfiles."
+argument-hint: "[pattern: dockerfile|compose|volumes|networking|security]"
+---
 # Docker Patterns
 
 Production-ready Docker and Docker Compose patterns for local development, multi-stage

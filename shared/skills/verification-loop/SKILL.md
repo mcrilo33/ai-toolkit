@@ -1,3 +1,8 @@
+---
+name: verification-loop
+description: "Run a structured quality-gate pipeline (Build → Type Check → Lint → Tests → Security Scan → Diff Review) and produce a pass/fail report. Use before committing, creating a PR, or when user says 'verify', 'check everything', 'run quality gates', or 'pre-flight'."
+argument-hint: "[optional: specific gate to run, e.g. 'tests only']"
+---
 # Verification Loop
 
 Run a structured quality-gate pipeline and produce a pass/fail report before closing a task.
@@ -7,7 +12,7 @@ Run a structured quality-gate pipeline and produce a pass/fail report before clo
 - Before committing or pushing
 - After finishing implementation (EXECUTE → VERIFY transition)
 - When the user says "verify", "check everything", "run quality gates", or "pre-flight"
-- The `land` gate is its hub-side last line — landing's push fires the pre-push test gate on the merged hub (`docs/test-gate.md`)
+- The `land` gate is its hub-side last line — landing pushes the merged tip, which CI has already gated (CI is the gate)
 
 ## Gates
 
@@ -78,12 +83,8 @@ git diff --cached --name-only | grep -E '\.env($|\.)'
 
 If a project-specific scanner exists (e.g., `bandit`, `npm audit`, `cargo audit`), run it too.
 
-> On Cursor, the `secrets-scan` / `config-protection` hooks enforce at **commit
-> time** (`git add`/`git commit` staged scan), not pre-write. The `afterFileEdit`
-> hooks (auto-format, secret-revert) are best-effort, non-blocking, produce no
-> agent-visible output, and may not fire on subagent edits — never rely on them
-> as a gate. This staged scan is the real verification step; run it yourself
-> here even though the commit hook will also catch a leak.
+> The `secrets-scan` hook blocks a write carrying a secret, but it is not a gate you can rely on for staged
+> content: run the scan yourself here even though CI will also catch a leak.
 
 ### 6. Diff Review
 

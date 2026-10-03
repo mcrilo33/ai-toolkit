@@ -1,0 +1,48 @@
+# Claude Code native OTel -> Langfuse (v2, D1: raw export only; scores/dashboards come later).
+# Traces go to Langfuse after a transform; logs + metrics are kept raw as rotated JSONL in /raw
+# (host dir AITK_OTEL_RAW_DIR, outside any worktree) for later analysis. Langfuse reads usage only
+# from gen_ai.usage.*, so tokens are remapped (else cost reads $0). Every spoke trace carries the
+# spoke_run_id resource attribute (bin/claude-spoke) and becomes one Langfuse session.
+receivers:
+  otlp:  # claude-spoke: OTEL_EXPORTER_OTLP_ENDPOINT (gRPC)
+    protocols: {grpc: {endpoint: "0.0.0.0:4317"}, http: {endpoint: "0.0.0.0:4318"}}
+  otlp/beta:  # claude-spoke: BETA_TRACING_ENDPOINT; MUST differ from the normal host:port. With beta
+    # tracing on, Claude sends its logs and metrics here too (verified live), so all pipelines read it.
+    protocols: {http: {endpoint: "0.0.0.0:4418"}}
+processors:
+  batch: {}
+  transform/langfuse:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil
+          - set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_read_input_tokens"], attributes["cache_read_tokens"]) where attributes["cache_read_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_creation_input_tokens"], attributes["cache_creation_tokens"]) where attributes["cache_creation_tokens"] != nil
+          # span names encode the dimension, so Langfuse "group by name" = per tool / hook / sub-agent
+          - set(name, Concat(["tool:", attributes["tool_name"]], "")) where name == "claude_code.tool" and attributes["tool_name"] != nil
+          - set(name, Concat(["hook:", attributes["hook_name"]], "")) where name == "claude_code.hook" and attributes["hook_name"] != nil
+          - set(name, "sub-agent:llm") where name == "claude_code.llm_request" and attributes["agent_id"] != nil
+          - set(name, Concat(["sub-agent:", attributes["subagent_type"]], "")) where attributes["tool_name"] == "Agent" and attributes["subagent_type"] != nil
+          # one spoke (across resumes) = one session; langfuse.session.id beats Claude's own session.id
+          - set(attributes["langfuse.session.id"], resource.attributes["spoke_run_id"]) where resource.attributes["spoke_run_id"] != nil
+          - set(attributes["langfuse.observation.metadata.repo"], resource.attributes["repo"]) where resource.attributes["repo"] != nil
+          # content (needs the OTEL_LOG_* opt-ins that claude-spoke sets)
+          - set(attributes["langfuse.observation.input"], attributes["user_prompt"]) where attributes["user_prompt"] != nil
+          - set(attributes["langfuse.observation.input"], attributes["full_command"]) where attributes["full_command"] != nil
+          - set(attributes["langfuse.observation.output"], attributes["response.model_output"]) where attributes["response.model_output"] != nil
+      - context: spanevent
+        statements:
+          - set(span.attributes["langfuse.observation.output"], attributes["output"]) where attributes["output"] != nil
+exporters:
+  otlp_http/langfuse:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers: {Authorization: "${env:LANGFUSE_BASIC_AUTH}"}
+  file/logs: {path: /raw/logs.jsonl, rotation: {max_megabytes: 25, max_backups: 5}}
+  file/metrics: {path: /raw/metrics.jsonl, rotation: {max_megabytes: 25, max_backups: 5}}
+service:
+  pipelines:
+    traces: {receivers: [otlp, otlp/beta], processors: [transform/langfuse, batch], exporters: [otlp_http/langfuse]}
+    logs: {receivers: [otlp, otlp/beta], processors: [batch], exporters: [file/logs]}
+    metrics: {receivers: [otlp, otlp/beta], processors: [batch], exporters: [file/metrics]}

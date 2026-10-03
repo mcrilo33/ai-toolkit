@@ -1,3 +1,8 @@
+---
+name: brainstorming
+description: "Refine a rough idea into an agreed spec before any code is written — Socratic clarification, alternatives, and sign-off. Use at the start of DEFINE when a request is ambiguous or open-ended, or when the user says 'brainstorm', 'help me design', or 'I'm thinking about'."
+argument-hint: "[rough idea or feature to refine]"
+---
 # Brainstorming
 
 Refine a rough idea into an agreed spec **before** any code is written. This implements the

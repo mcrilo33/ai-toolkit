@@ -1,3 +1,7 @@
+---
+name: generate-docs
+description: "Generate or update documentation — docstrings, README, API docs, inline comments. Use ONLY when explicitly asked."
+---
 # Generate & Update Docs
 
 Generate or update documentation following project quality standards. This skill activates only on explicit request.

@@ -1,81 +1,35 @@
 #!/usr/bin/env bash
-# install.sh — Install ai-toolkit settings and symlinks
+# One-time machine setup: checks the prerequisites and prints what Orca needs to launch the OTel
+# shim. It installs no PATH shim and never writes Orca's settings (that needs the user's OK).
 set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=lib.sh
+. "$here/scripts/lib.sh"
+load_env
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(dirname "$SCRIPT_DIR")"
+miss=""
+for t in orca gh git jq python3; do command -v "$t" > /dev/null || miss="$miss $t"; done
+case "$miss" in *" jq"*) warn "jq is required: the Claude hooks fail closed (deny every tool call) without it" ;; esac
+[ -z "$miss" ] || die "missing prerequisite(s):$miss"
 
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-info()  { echo -e "${GREEN}✓${NC} $1"; }
-warn()  { echo -e "${YELLOW}⚠${NC} $1"; }
-error() { echo -e "${RED}✗${NC} $1"; }
-
-link_file() {
-    local src="$1"
-    local dst="$2"
-
-    if [ -L "$dst" ]; then
-        local current
-        current="$(readlink "$dst")"
-        if [ "$current" = "$src" ]; then
-            info "Already linked: $dst"
-            return
-        fi
-        warn "Replacing symlink: $dst (was → $current)"
-        rm "$dst"
-    elif [ -e "$dst" ]; then
-        warn "Backing up existing: $dst → ${dst}.bak"
-        mv "$dst" "${dst}.bak"
-    fi
-
-    mkdir -p "$(dirname "$dst")"
-    ln -s "$src" "$dst"
-    info "Linked: $dst → $src"
-}
-
-echo ""
-echo "╔══════════════════════════════════════════╗"
-echo "║   ai-toolkit — Install Settings           ║"
-echo "╚══════════════════════════════════════════╝"
-echo ""
-
-# --- Cursor MCP ---
-echo "── Cursor MCP ──"
-if [ -f "$REPO_DIR/settings/cursor/mcp.json" ]; then
-    link_file "$REPO_DIR/settings/cursor/mcp.json" "$HOME/.cursor/mcp.json"
+cur="$(orca --version | grep -Eo '[0-9]+(\.[0-9]+)+' | head -1)"
+[ "$(printf '%s\n%s\n' "$ORCA_MIN_VERSION" "$cur" | sort -V | head -1)" = "$ORCA_MIN_VERSION" ] \
+  || die "orca $cur is older than $ORCA_MIN_VERSION"
+grep -qE 'TERM_PROGRAM.*Orca|ORCA_PANE_KEY' "$HOME/.zshrc" 2> /dev/null \
+  || warn "$HOME/.zshrc does not skip tmux autostart in Orca terminals; Orca cannot see agents inside tmux"
+chmod +x "$here/bin/claude-spoke" "$here"/scripts/*.sh
+# Native git hooks (commit-msg, pre-commit): wired on ONE repo, the target (argument, default: the repo this runs in),
+# never globally. Linked worktrees share the repo config. The hooks come from the target's own synced copy.
+if root="$(git -C "${1:-.}" rev-parse --show-toplevel 2> /dev/null)"; then
+  if [ -d "$root/.ai-toolkit/hooks/git" ]; then
+    chmod +x "$root"/.ai-toolkit/hooks/git/*
+    git -C "$root" config --local core.hooksPath "$root/.ai-toolkit/hooks/git"
+    echo "native git hooks: $root core.hooksPath=$root/.ai-toolkit/hooks/git"
+  else
+    warn "$root has no .ai-toolkit/hooks/git: run sync.sh into it first, then re-run install.sh"
+  fi
+else
+  warn "not in a git repository: run install.sh <repo> to wire its native git hooks"
 fi
-
-# --- Claude Settings ---
-echo ""
-echo "── Claude Code ──"
-if [ -f "$REPO_DIR/claude/settings.json" ]; then
-    mkdir -p "$HOME/.claude"
-    link_file "$REPO_DIR/claude/settings.json" "$HOME/.claude/settings.json"
-fi
-
-# --- VS Code ---
-echo ""
-echo "── VS Code / Copilot ──"
-warn "VS Code settings cannot be symlinked (partial settings.json)."
-echo "  Copy relevant keys from:"
-echo "    $REPO_DIR/settings/vscode/copilot-settings.jsonc"
-echo "  MCP config:"
-echo "    $REPO_DIR/settings/vscode/mcp.json"
-echo "  Custom language models:"
-echo "    $REPO_DIR/settings/vscode/chat-language-models.json"
-
-echo ""
-echo "── Per-Repo Tool Configs ──"
-echo "  To sync Copilot, Cursor, and Claude configs into a project:"
-echo ""
-echo "    ./scripts/sync-to-repo.sh <repo-path>          # All tools"
-echo "    ./scripts/sync-to-repo.sh <repo-path> copilot   # Copilot only"
-echo "    ./scripts/sync-to-repo.sh <repo-path> cursor    # Cursor only"
-echo "    ./scripts/sync-to-repo.sh <repo-path> claude    # Claude only"
-
-echo ""
-info "Installation complete!"
+echo "ok. Dispatch launches spokes through $here/bin/claude-spoke (terminal create --command)."
+echo "Optional, to verify in WP1: Orca > Settings > Agents > Claude command = $here/bin/claude-spoke"

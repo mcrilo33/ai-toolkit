@@ -1,215 +1,56 @@
+---
+name: start-task
+description: "Dispatch a planned task from the hub into a running Orca worker: draft and file the GitHub issue with its Scope:/Gate:/Model: footer and blocked-by edges, then run dispatch.sh. Use in the hub session when the user says 'start this work', 'spin it up', or 'let's build X' after scope is clear."
+argument-hint: "[issue number, or the task to file]"
+---
 # Start Task
 
-Dispatch a planned task from the **planning hub** into a running **execution spoke**
-in one step: create the GitHub issue, spawn its worktree, and seed the spoke's first
-prompt. This is the hub → spoke handoff in the parallel-worktrees workflow.
+Hub to spoke: the **issue is the contract**. The worker starts with a fresh context holding just that issue
+(`.ai-toolkit/task.md`), so planning noise does not leak in. Run from the main checkout (see `hub`).
 
-Use it in the long-lived planning session (on the main checkout) once scope is clear
-and the user says "start this work", "spin it up", or "let's build X". For the model
-and lifecycle see `docs/parallel-worktrees.md`.
+## 1. Scope
 
-## Preconditions
+Restate the task as a draft issue: **title**, **body** (problem, proposal, acceptance criteria drawn from the
+conversation). Get a quick OK before filing; do not invent scope.
 
-- Run from the **main checkout** (the hub), which stays on the base branch
-  (`main` by default; `git config ai-toolkit.base-branch` overrides, issue #117).
-- `gh` is authenticated and `.ai-toolkit/scripts/worktree-new.sh` is installed
-  (every synced repo has it; `sync-to-repo.sh` puts it there).
-- You are in an **Orca terminal** with a bound Run (`orca orchestration run-create
-  --objective "<what this session coordinates>"`), Orca >= 1.4.218 has this repo
-  registered, and the Orca workspaces dir is trusted by Claude once
-  (`docs/parallel-worktrees.md`, *Orca prerequisites*). `worktree-new.sh` fails loud
-  otherwise.
-- The scope has been discussed enough to write a clear issue.
-
-## Workflow
-
-### 0. Triage the lane
-
-Before creating an issue or spawning a worktree, classify the task (~10 seconds):
-
-- Does the change touch executable behavior? **No** → **Lane 1 (micro-spoke).** Do not
-  create an issue and do not call `worktree-new.sh`. Dispatch a micro-spoke from the hub
-  instead: spawn a subagent with `isolation: worktree`, review its diff, and land with
-  `.ai-toolkit/scripts/worktree-land.sh <branch> --local`. Lane 1 is restricted to non-executable
-  paths only (docs, comments, wording) — never `scripts/`, `shared/hooks/`, `tests/`, or
-  skill scripts. See the hub skill's "Micro-spoke dispatch (lane 1)" section for the full
-  flow.
-- One subtask, obvious approach, small diff? → **Lane 2 (express spoke).** Skip issue
-  creation (steps 1–3 below). Dispatch directly:
-
-  ```bash
-  .ai-toolkit/scripts/worktree-new.sh <slug> --prompt "<kickoff>"
-  ```
-
-  The spoke runs a single cycle under all push gates. No issue, no task ledger.
-- Otherwise, when in doubt, or when the "why" should be findable later → **Lane 3
-  (full).** Continue with step 1 below.
-
-### 1. Confirm the scope
-
-Restate the decided task back to the user as a draft issue — **title** plus a short
-**body** (problem, proposal, acceptance criteria drawn from the planning conversation).
-Get a quick OK before creating anything. Don't invent scope the user didn't agree to.
-
-### 2. Pick the branch type and the gate level
-
-Choose a branch type: `feature` (new capability), `fix` (bug), or `chore`
-(maintenance).
-
-Then choose the **gate level** — where the spoke pauses for human review, declared
-per task by **risk / novelty** (see the gate spectrum in `solo-cycle`):
-
-| Task type | Gate level |
-|-----------|------------|
-| Very-clear / trivial / mechanical | **none** — autonomous to `ready/` |
-| **Standard (DEFAULT)** | **PLAN gate** |
-| Novel / risky / ambiguous | PLAN + RED gate |
-| GUI / behavioral | PLAN + human-acceptance RED + draft-review |
-
-**PLAN is the default for all but very-clear work** — a rubber-stamped plan costs
-seconds, a wrong autonomous dev costs the whole cycle. Only declare `none` when the
-task is genuinely very-clear. (Only the PLAN gate is live today; the RED, human-
-acceptance, and draft levels are declared the same way but their machinery is pending
-follow-up issues — see `solo-cycle`.)
-
-The `Gate:` line records *which* gate, not *who* services it. **Who** is the
-**gate action** — `{ human-pause | agent-review | none }` — and it is derived from
-the **mode** the spoke runs in, not declared per task: dispatched while you are
-attending, a gate is **human-pause** (parks for you); dispatched into the unattended
-`/afk` queue, the judgment gates become **agent-review** and escalate to park. So the
-same issue body is mode-agnostic; only the harness decides attended-vs-unattended (see
-`solo-cycle`'s "Gate action").
-
-### 3. Create the issue
-
-Every dispatchable issue carries two body lines that make it schedulable (see the
-`issue-hygiene` rule):
-
-- A **`Gate:`** line — the chosen gate level — so the contract is durable (the spoke reads
-  it when it anchors).
-- A **`Scope:`** line — **mandatory** — a space- or comma-separated list of the files and
-  globs the task is expected to touch (e.g.
-  `Scope: shared/hooks/foo.sh tests/unit/test_foo.py`). The planner reads it to compute
-  the file-overlap matrix that drives its PARALLEL / SERIAL batching plan. A missing line
-  or `Scope: *` marks the issue **exclusive**: the planner runs it alone, never batched —
-  the slow path. Always write a concrete file list when you can; reserve `*` for genuinely
-  repo-wide work. Keep it tight and honest — an over-broad scope needlessly serializes
-  work that could have run in parallel.
+## 2. File the issue
 
 ```bash
-gh issue create --title "<title>" --body "<plan>
+gh issue create --title "<title>" --body "<body>
 
-Gate: plan   # plan (default) or none; the richer levels are pending follow-ups
-Scope: <files/globs the task touches>   # mandatory; '*' or omitted ⇒ exclusive (runs alone)"
+Scope: <files/globs the task touches>
+Gate: plan
+Model: <optional model id>"
 ```
 
-Capture the issue number `N` from the returned URL.
+The footer is the dispatch contract (see `.ai-toolkit/rules/issue-hygiene.md`):
 
-### 3b. Declare blocked-by dependencies (required step)
+| Line | Rule |
+|------|------|
+| `Scope:` | mandatory, concrete files/globs; missing or `*` runs the issue alone. Overlap with an in-flight issue serializes it |
+| `Gate:` | `plan` (default: the worker `ask`s for approval of its plan) or `none` (very-clear, mechanical work) |
+| `Model:` | optional override of `SPOKE_MODEL`; reasoning-heavy work gets an Opus id |
 
-**Answer this for every issue, the same status as the mandatory `Scope:` line:
-"Does this depend on open work that must land first?"** Declaring is not optional — only
-the *answer* is. If **yes**, record the native GitHub **blocked-by** dependency now, at
-creation, using the REST/GraphQL calls in `github-issues/references/dependencies.md`; the
-planner holds a blocked issue until its blockers close. If **no**, the answer is simply
-"no open dependency" and you file with no edge. Skipping the question is the failure mode
-this step exists to prevent — a genuinely dependent issue that ships with no edge lets a
-spoke start against an unfinished prerequisite.
+Labels: `priority` (dispatched first), `hold` (never dispatched). **Blocked-by**: answer "does this depend on
+open work?" for every issue and declare a real native edge if yes (`github-issues/references/dependencies.md`);
+never use one to encode file overlap. A chain with colliding `Scope:` is one issue with subtasks.
 
-Express ordering *only* when it is real. Do **not** use a dependency to encode "these
-touch the same file" — file overlap is a scheduling concern the planner already derives
-from `Scope:`, not an ordering constraint. A spurious blocked-by edge stalls work that
-could have proceeded.
-
-**Chain + colliding scopes ⇒ file one issue with subtasks.** Before creating a
-blocked-by chain, compare the `Scope:` lines of the issues about to be filed. When
-consecutive issues in the chain collide on scope, the planner can never parallelize
-them — the split buys zero throughput and costs N cold starts (worktree spawn, testmon
-rebuild, context re-read), N lands, and N merge-main churns. File such a chain as
-**one issue with subtasks**, unless an intermediate has standalone shelf-life:
-independent value if the rest stalls, its own rollback line, or a non-overlapping
-scope that could parallelize with other work. When you split deliberately, record the
-reasoning with a `Split: intentional — <why>` body line in any issue of the chain — it
-silences `batch-plan.sh`'s `merge candidates` lint for that chain only and keeps the
-rationale where the spoke will read it.
-
-### 4. Dispatch the worktree + seed the spoke
+## 3. Dispatch
 
 ```bash
-.ai-toolkit/scripts/worktree-new.sh N --type <type> --prompt "<kickoff>"
+.ai-toolkit/scripts/dispatch.sh <n>      # or --next for the next ready issue
 ```
 
-This creates an Orca worktree on `feature/N-<slug>` (or `<type>/N-<slug>`), provisions it
-(`.claude/`, gates, task contract), launches `claude` in an Orca terminal, and delivers
-the kickoff with `orca orchestration worker-start`. A good kickoff hands the spoke everything it needs to
-run on its own:
-
-```
-You're in a dedicated worktree for issue #N (Gate: <level>). Run /source to anchor to
-issue #N and read it. Before touching code, break the issue body into a task ledger
-(TaskCreate, or TodoWrite on older runtimes) — one todo per subtask × the solo-cycle
-steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH), exactly one in_progress.
-
-This task's gate is <level>. If it is `plan` (the default for non-trivial work): the
-PLAN gate comes first — explore the code, then **print the full implementation plan
-(files, approach, test strategy, open questions) as a normal visible message** before
-any approval ask, and WAIT for my approval before writing code (before GREEN). Do not
-defer the plan into an approval card — the message itself is the plan. Park there
-rather than blocking: emit the `gate/N` marker (`bash .ai-toolkit/scripts/spoke-ready.sh
---gate N`) so the hub sees you parked, then stop with an explicit "reply to approve, or
-tell me what to change" and proceed into the cycle once I approve. If
-the gate is `none` (very-clear work), skip the PLAN gate and run autonomous straight
-through.
-
-Then implement it following the solo-cycle (/cycle: RED → GREEN → REVIEW → PUSH). The
-task ledger is ephemeral session scratch; issue #N stays the durable contract — skip the
-ledger only if the task is genuinely single-step. Push your own branch on every subtask
-without asking; when your ledger shows the issue's acceptance criteria are all met, that
-is the final subtask — push and emit the `ready/N` marker, also without asking. The
-routine own-branch push plus ready emission needs no approval. Still ask me before
-genuinely dangerous or irreversible ops: force-push / `--force-with-lease`, history
-rewrites, anything touching the default branch (`main`), or deletions outside the
-worktree. Do NOT self-land — the hub lands #N.
-```
-
-> [!NOTE]
-> On Claude the marker tag pushes (`gate/N`, `ready/N`) are advisory and proceed.
-> On Cursor `push-scope-guard` denies a spoke's tag pushes by default (it allows
-> only the spoke's own branch), so approve the marker-push prompt when it appears —
-> the same applies to the existing `ready/N` push.
-
-### 5. Report the handoff
-
-Tell the user: the issue URL, the branch, the worktree path, and the Orca terminal
-handle `worktree-new.sh` printed (open that worktree in Orca to watch it). The spoke is
-now running on its own.
-
-## Rules of thumb
-
-- The **hub stays on the base branch and read-only** (`main` by default) — it decides
-  *what*; the spoke does the *how*. The `source-task` guard nudges you here if you
-  start coding on the hub.
-- The **issue is the contract** between hub and spoke. The spoke begins with a fresh,
-  focused context containing just that issue — planning noise doesn't leak in. The
-  spoke's task ledger is ephemeral session scratch; the issue stays the durable
-  contract.
-- For several **independent** tasks, repeat per task (each its own issue + Orca
-  worktree). Sequence dependent tasks instead of fanning out.
-- If the user already has an issue number, skip steps 1–3 and dispatch directly.
+It starts one worker (`orca orchestration worker-start`, worktree `<n>-<slug>`, seed prompt from
+`Gate:`), links the issue, and sets the workspace status. Report the issue URL, the branch, and the worktree to
+the user; open the worktree in Orca to watch. A `Gate: plan` worker blocks in `ask` until someone replies: the
+coordinator (`afk`) or you via `hub`.
 
 ## Edge cases
 
 | Situation | Action |
 |-----------|--------|
-| Not on the main checkout | `cd` to the hub first; worktrees are created relative to the main root |
-| `gh` not authenticated | Ask the user to `gh auth login`, or proceed ad-hoc with a slug instead of an issue |
-| Scope still fuzzy | Stay in the hub; use the `brainstorming` skill before dispatching |
-| Task is tiny / docs-only | Lane 1 micro-spoke: no issue, no worktree-new — dispatch a subagent with `isolation: worktree` from the hub and land with `--local` |
-| Task is small but touches code | Lane 2 express spoke: skip steps 1–3, dispatch `worktree-new.sh <slug>` ad-hoc |
-
-## Related skills
-
-- `source-task` — the spoke runs this first to anchor to the issue and confirm the branch
-- `solo-cycle` — the per-subtask RED / GREEN / REVIEW / PUSH cycle the spoke follows
-- `brainstorming` — refine a fuzzy idea in the hub before dispatching
-- `land` — the hub-side `/land <id>` that ends the task once the spoke has pushed
+| Scope still fuzzy | stay in the hub; use `brainstorming` first |
+| Issue already exists | skip to step 3 |
+| Tiny or interactive fix | `quick` instead of an issue |
+| `dispatch.sh` fails | it retries once; the failing stage is printed; do not re-run blindly |

@@ -1,3 +1,7 @@
+---
+name: git-commit
+description: "Stage changes, generate conventional commit messages, and execute git commits. Use when user asks to commit, says /commit, or wants to create a git commit."
+---
 # Git Commit
 
 Analyze staged changes, stage files intelligently, generate a conventional commit message, and execute the commit.
@@ -32,10 +36,8 @@ git add -p
 ```
 
 **Never stage secrets** (`.env`, credentials, private keys, tokens). If detected, warn and exclude.
-On Cursor the `secrets-scan` and `config-protection` hooks enforce at commit
-time: a `git add`/`git commit` that stages a hardcoded secret or a protected
-config file (lockfiles, `pyproject.toml`, CI config, etc.) is DENIED. Remove the
-secret / unstage the config before committing rather than relying on the hook.
+The `secrets-scan` hook denies a write that carries a hardcoded secret; remove the secret
+before committing rather than relying on the hook.
 
 ### 3. Analyze Diff
 
@@ -51,15 +53,12 @@ Determine:
 
 ### 4. Get Issue Reference (required)
 
-Every commit must be anchored to an issue — the `commit-quality` hook blocks
-commits that have neither an issue ID in the branch name nor an anchor in the
-message.
+Every commit must be anchored to an issue — the `commit-msg` hook checks the
+conventional type and an issue anchor (`#<id>`) in the message.
 
 1. Extract from branch name: `git branch --show-current`
-   - `feature/123-desc` → branch already carries the anchor, nothing to add
-   - `fix/HEX-456-desc` → branch already carries the anchor
-2. If no issue in the branch, check if `/source` was used earlier and recover
-   the ID from it.
+   - `123-desc` → the branch carries the issue number; still put `#123` in the message
+2. If the branch has no number, read `.ai-toolkit/task.md` (a dispatched spoke) for the ID.
 3. If neither is available, ask the user for the issue reference and add it to
    the message as a second `-m "Closes #<id>"` (also accepted: `Fixes`,
    `Resolves`, `Refs`). Do not commit without an anchor.
@@ -184,8 +183,6 @@ to improve testability and reduce controller complexity.
 
 - NEVER update git config
 - NEVER run destructive commands (`--force`, `hard reset`) without explicit request
-- NEVER skip hooks (`--no-verify`) unless user asks — on Cursor the
-  `block-no-verify` hook DENIES any command carrying `--no-verify` regardless
-- NEVER force push to main/master — on Cursor a force push without
-  `--force-with-lease` is DENIED by the `git-push-review` hook
+- NEVER skip hooks (`--no-verify`); `push-guard` denies it regardless
+- NEVER force push to main/master; `push-guard` denies force pushes
 - If commit fails due to hooks, fix the issue and create a NEW commit (don't amend)

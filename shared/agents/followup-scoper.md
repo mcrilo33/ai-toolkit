@@ -1,3 +1,12 @@
+---
+name: followup-scoper
+description: "Investigate a grounded, deliberately-deferred follow-up, derive its real Scope:/Gate: footer, and file (or draft) a correctly-scoped GitHub enhancement issue — never implements it."
+model: claude-opus-5-5
+effort: high
+disallowedTools: Edit, Write, NotebookEdit
+skills:
+  - github-issues
+---
 # Followup Scoper — File a Correctly-Scoped Issue From a Deferred Follow-up
 
 Given a **grounded, deliberately-deferred follow-up** (an optimization, a cleanup, a
@@ -65,7 +74,7 @@ reading the code — never a prose guess.
    NOT a `## Scope` markdown header (a scripted planner cannot read prose):
 
    ```
-   Scope: shared/hooks/foo.sh tests/unit/test_foo.sh
+   Scope: scripts/foo.sh tests/test_foo.py
    ```
 
    Keep it tight and honest: list the files you actually expect to edit. If the follow-up
@@ -111,7 +120,7 @@ Gate: none | plan
 
 Always `enhancement`. Add, by heuristic:
 
-- **`hold`** — when `Scope:` touches `hub-afk.sh` or `gate-broker.sh`. These are
+- **`hold`** — when `Scope:` touches `coordinator.sh`, `dispatch.sh`, or `land.sh`. These are
   self-modify hazards that must land attended, so the issue is held out of the autonomous
   drain (exact `bug-scoper` parity).
 
@@ -124,15 +133,13 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
   `labels` — you have no shell, so filing is MCP-only). Report the URL.
 - **Attended (a human is present to approve):** return the full drafted issue — title,
   body, footer, labels — for a one-look approval instead of filing blind.
-- **Target repo — set `owner`/`repo` EXPLICITLY, never rely on the ambient default.** A
-  follow-up on the **ai-toolkit tooling** (a synced rule/skill/hook/script/agent, or the
-  `scripts/telemetry/` code — anything originating from ai-toolkit) is filed to the
-  **ai-toolkit upstream repo**: `owner: mcrilo33, repo: ai-toolkit`. This matters because
-  ai-toolkit is synced *into* other projects: without an explicit target the MCP call
-  defaults to the current project's git remote and misfiles the toolkit's own follow-up
-  into the host project's tracker. A follow-up on the **host project's own code** is filed
-  to that project's repo. (Canonical upstream is `mcrilo33/ai-toolkit`; a fork changes it
-  here.)
+- **Target repo — set `owner`/`repo` EXPLICITLY, never rely on the ambient default.** A follow-up on the
+  **ai-toolkit tooling** (a synced rule, skill, agent, hook, script, `CLAUDE.md`, or `orca.yaml`: anything
+  under `.claude/` or `.ai-toolkit/`, or `shared/` in the toolkit repo itself) is filed to `UPSTREAM_REPO`
+  (`owner/repo`, from the main checkout's `.ai-toolkit/ai-toolkit.local.env` (`$ORCA_ROOT_PATH`), else
+  `.ai-toolkit/ai-toolkit.env`); empty or unset means the project's own repo. Without an explicit target
+  the call defaults to the current git remote and misfiles the toolkit's follow-up in the host tracker.
+  A follow-up on the **host project's own code** is filed to that project's repo.
 
 State which path you took, and which repo you filed to and why.
 

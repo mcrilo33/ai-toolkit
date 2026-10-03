@@ -1,3 +1,8 @@
+---
+name: ci-cd-review
+description: "Review, audit, or design GitHub Actions CI/CD workflows — security, optimization, testing, and deployment. Use when user asks to review a workflow, audit CI/CD, or design a pipeline."
+argument-hint: "[workflow file or aspect: security|optimization|testing|deployment]"
+---
 # CI/CD workflow review
 
 Review, audit, or design GitHub Actions workflows against project standards.

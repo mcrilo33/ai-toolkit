@@ -1,3 +1,8 @@
+---
+name: langfuse
+description: "Interact with Langfuse and access its documentation: query or modify traces, prompts, datasets, scores, and sessions via the langfuse-cli, look up concepts/integration/SDK guides, instrument apps, migrate prompts, and debug traces. Use when working with Langfuse observability, the OTel collector pipeline, or per-spoke cost/latency analysis."
+argument-hint: "[topic: instrumentation|cli|error-analysis|prompt-migration|judge-calibration]"
+---
 # Langfuse
 
 This skill helps you use Langfuse effectively across all common workflows: instrumenting applications, migrating prompts, debugging traces, and accessing data programmatically.

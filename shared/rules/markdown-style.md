@@ -1,3 +1,8 @@
+---
+description: "Markdown structure, formatting, code blocks, lists, links, tables, and README conventions"
+paths:
+  - '**/*.md'
+---
 # Markdown Style
 
 ## Document Structure

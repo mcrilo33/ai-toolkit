@@ -1,266 +1,35 @@
-name: CI
-
-# CI is the gate (#378): every branch push runs the full suite, so the ready and land
-# scripts can wait for a green run on the exact SHA instead of re-running the suite on
-# the dev machine. PRs and main stay covered.
-on:
-  push:
-    branches: ['**']
-  pull_request:
-
+# ai-toolkit v2 CI (repo-root layout, after cutover). On EVERY branch push: land.sh gates a spoke on the run for its exact tip
+# (`gh run list --commit <sha>`), so a branch without a run can never land.
+name: ci
 permissions:
   contents: read
-
-# A newer push to the same ref cancels that ref's in-flight run.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
+on:
+  push:
+  pull_request:
 jobs:
-  test:
-    name: Pytest suite
-    runs-on: ubuntu-latest
-    # The serial suite takes ~9-10 min (2 of the last 5 main runs hit the old 10-minute limit,
-    # which GitHub reports as `cancelled` and ready/land read as a failure): leave headroom.
-    timeout-minutes: 20
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 1
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements-dev.txt
-
-      - name: Install test dependencies
-        run: python -m pip install -r requirements-dev.txt
-
-      # SERIAL on purpose (#378 -> epic #377): the first CI runs under `-n auto` surfaced a
-      # different timing-sensitive failure on every attempt (gate-broker retry windows, #299 retry
-      # journaling order, hook-chaining EPIPE), flakes that serial CI had always masked. CI is the gate, so it must be
-      # reproducible: one process, ~9 min on a runner. Re-enable `-n auto -m "not serial"` +
-      # a `-m serial` tail once #377 makes the suite xdist-safe.
-      - name: Run tests
-        run: python -m pytest tests/ -q
-
-  shellcheck:
-    name: ShellCheck
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 1
-
-      # shellcheck is preinstalled on ubuntu-latest runners.
-      # Threshold: --severity=error. The codebase currently has 0 errors but
-      # 7 warning-level (SC2034, SC2155) and 16 info/style-level pre-existing
-      # findings; gating at error keeps CI green on the current code while
-      # still catching real breakage. Tighten to warning once those are fixed.
-      - name: Lint shell scripts
-        run: shellcheck --severity=error shared/hooks/*.sh shared/hooks/lib/*.sh scripts/*.sh
-
-  sync-idempotency:
-    name: Sync idempotency
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 1
-
-      - name: Run sync twice and assert no drift
+      - run: pip install -r requirements-dev.txt
+      - name: shellcheck (scripts, hooks, shim, e2e)
         run: |
-          set -euo pipefail
-          TMP="$(mktemp -d)"
-          # git init so sync-to-repo.sh skips its interactive non-git-repo prompt
-          git init -q "$TMP"
-          git -C "$TMP" config user.name "ci"
-          git -C "$TMP" config user.email "ci@example.com"
-
-          ./scripts/sync-to-repo.sh "$TMP" all
-          git -C "$TMP" add -A
-          git -C "$TMP" commit -m baseline -q
-
-          ./scripts/sync-to-repo.sh "$TMP" all
-
-          # The hooks reconciler backs up pre-existing hooks.json/settings.json
-          # as *.bak on every run, so the second sync legitimately creates two
-          # .bak files. Everything else must be byte-identical.
-          DRIFT="$(git -C "$TMP" status --porcelain | grep -v '\.bak$' || true)"
-          if [ -n "$DRIFT" ]; then
-            echo "Sync is not idempotent — drift detected after second run:"
-            echo "$DRIFT"
-            exit 1
-          fi
-          echo "Sync is idempotent (no drift beyond reconciler .bak backups)."
-
-  # macOS + non-C locale reproduction of the production control-plane
-  # environment (#194). Linux CI is structurally blind to the BSD/GNU +
-  # locale divergence bug class: pgrep -f illegal-byte-sequence false
-  # negatives, French-formatted `ps -o lstart` breaking staleness detection,
-  # grep ERE portability (anti-gutting-scan.sh carries BSD-portability
-  # comments), and the #129/#132 tmp-path / global-gitignore cluster — all
-  # pass on ubuntu where the code does not run. This job runs only the
-  # shell-control-plane test subset (suites that drive a *.sh hook or
-  # scripts/*.sh via subprocess), not the full suite, to keep macOS minutes
-  # bounded. continue-on-error until the pre-existing macOS-only failures
-  # tracked in #384 are fixed; drop it then, so the job gates (#379).
-  # Related: #189.
-  shell-control-plane-macos:
-    name: Shell control-plane (macOS, fr_FR.UTF-8)
-    # Pinned to macos-15, not macos-latest: the macos-26 image dropped the
-    # fr_FR.UTF-8 locale (#287), and the #194 canary tests hardcode
-    # LC_ALL=fr_FR.UTF-8 for their subprocesses (test_process_probes.py,
-    # test_worktree_lib.py), so the job MUST supply that exact locale — a
-    # different UTF-8 locale would let those canaries fall back to C and pass
-    # vacuously. macos-15 still ships fr_FR.UTF-8; the guard below fails the
-    # job loud if a future image drops it too. Making the canaries
-    # locale-agnostic is a separate change, out of this ci.yml-only scope.
-    runs-on: macos-15
-    # The subset did not finish in 15 min serially (#379); under xdist it takes
-    # ~9 min on the 3-vCPU runner, the margin only bounds a hang.
-    timeout-minutes: 20
-    continue-on-error: true
-    env:
-      LANG: fr_FR.UTF-8
-      LC_ALL: fr_FR.UTF-8
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 1
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements-dev.txt
-
-      - name: Install test dependencies
-        run: python -m pip install -r requirements-dev.txt
-
-      - name: Confirm the non-C locale resolved on the runner
-        shell: bash
+          command -v shellcheck > /dev/null || brew install shellcheck
+          command -v jq > /dev/null || brew install jq
+          shellcheck scripts/*.sh bin/claude-spoke hooks/claude/*.sh hooks/git/* e2e/*.sh
+      - name: tests
+        run: pytest -n auto tests
+      - name: sync idempotency (sync twice into a temp repo, no drift)
         run: |
-          set -euo pipefail
-          # Fail loud if fr_FR.UTF-8 is unavailable — a silent fallback to C
-          # would make this job green for the wrong reason. The #194 canaries
-          # (test_process_probes.py, test_worktree_lib.py) hardcode
-          # LC_ALL=fr_FR.UTF-8, so this exact locale must resolve or they pass
-          # vacuously under a C fallback.
-          # Capture first, then grep: `locale -a | grep -q` exits grep on the
-          # first match, locale then dies on a closed pipe ("failed to flush
-          # stdout") and pipefail turns that into a red job (#379).
-          locales=$(locale -a)
-          grep -qiE '^fr_FR\.(UTF-8|utf8)$' <<<"$locales" || {
-            echo "fr_FR.UTF-8 is not available on this runner image." >&2
-            exit 1
-          }
-          locale
-
-      - name: Select and run the shell-control-plane test subset
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Subset = every test file that drives a *.sh control-plane script
-          # (hook or scripts/*.sh) via subprocess, detected by a *.sh token
-          # reference. Selected dynamically so the subset self-maintains as
-          # suites are added; ci.yml is the only file in scope for #194, so the
-          # selection lives here rather than behind a pytest marker. The token
-          # boundary ([^a-zA-Z0-9]|$) is portable ERE (BSD + GNU grep) and
-          # drops false matches like `github.sha`.
-          # `|| true`: grep exits 1 on no-match, which under `set -eo
-          # pipefail` would abort at this assignment before the guard
-          # below runs — swallow it so the guard prints its diagnostic.
-          subset=$(grep -rlE '\.sh([^a-zA-Z0-9]|$)' tests --include='test_*.py' | sort || true)
-          if [ -z "$subset" ]; then
-            echo "No shell-control-plane tests matched — selection is broken." >&2
-            exit 1
-          fi
-          echo "Selected shell-control-plane test files:"
-          echo "$subset" | sed 's/^/  /'
-          # Intentional word-split on the newline-separated file list; paths
-          # carry no spaces. Default macOS /bin/bash is 3.2 (no mapfile).
-          # Two phases, the same split the push gate and sweep run (#328): the
-          # parallel-safe bulk under `-n auto -m "not serial"`, then the
-          # ref-mutating serial tail single-process (exit 5, "no tests
-          # collected", is green). Serially the subset did not finish in 15 min
-          # on the 3-vCPU runner (#379), hence xdist. -rfE lists failures in
-          # the summary and --durations shows the slow suites.
-          # Both phases always run so one red phase cannot hide the other's
-          # failures; the step fails if either phase did.
-          par_rc=0
-          ser_rc=0
-          # shellcheck disable=SC2086
-          python -m pytest $subset -q -n auto -m "not serial" -rfE --durations=15 || par_rc=$?
-          # shellcheck disable=SC2086
-          python -m pytest $subset -q -m serial -rfE || ser_rc=$?
-          [ "$par_rc" -eq 0 ] || [ "$par_rc" -eq 5 ] || exit "$par_rc"
-          [ "$ser_rc" -eq 0 ] || [ "$ser_rc" -eq 5 ] || exit "$ser_rc"
-
-  # A permanently red check is noise that hides the day it fails for a real
-  # reason (#129): on any red gate job, land the failure in the backlog as a
-  # GitHub issue instead of an unread checks tab. Dedup contract: one open
-  # issue per failing job, keyed on the stable "CI red: <job>" title marker —
-  # consecutive red runs add a comment referencing the new run + commit
-  # rather than filing duplicates.
-  report-red:
-    name: File issue on red
-    runs-on: ubuntu-latest
-    needs: [test, shellcheck, sync-idempotency]
-    if: failure()
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      # Branch pushes are now gated too (#378); a red WIP branch is reported to its own
-      # spoke by the ready/land scripts, so only main and PRs file backlog issues.
-      - name: File or update a "CI red" issue per failed job
-        if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          # On pull_request, GITHUB_SHA is the throwaway merge commit; prefer
-          # the PR head SHA the developer actually pushed (empty on push runs).
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          RESULT_TEST: ${{ needs.test.result }}
-          RESULT_SHELLCHECK: ${{ needs.shellcheck.result }}
-          RESULT_SYNC: ${{ needs['sync-idempotency'].result }}
-        run: |
-          set -euo pipefail
-          # Default runner env only ($GITHUB_*): no user-controlled values are
-          # interpolated into this script's text.
-          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
-          sha="${PR_HEAD_SHA:-$GITHUB_SHA}"
-          short_sha="${sha:0:7}"
-          report() {
-            local job="$1" marker existing body
-            marker="CI red: $1"
-            body="$(printf 'CI is red for job **%s** on `%s`.\n\n- Run: %s\n- Commit: %s (%s)\n' \
-              "$job" "$branch" "$run_url" "$sha" "$short_sha")"
-            # List API + client-side title match, not --search: the Search
-            # index is eventually consistent and can miss a just-filed issue,
-            # double-filing on near-simultaneous red runs.
-            existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 \
-              --json number,title \
-              | jq -r --arg m "$marker" 'map(select(.title | startswith($m)))[0].number // empty')"
-            if [ -n "$existing" ]; then
-              gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
-            else
-              gh issue create --repo "$GITHUB_REPOSITORY" \
-                --title "$marker @ $short_sha" --body "$body"
-            fi
-          }
-          [ "$RESULT_TEST" = "failure" ] && report "Pytest suite"
-          [ "$RESULT_SHELLCHECK" = "failure" ] && report "ShellCheck"
-          [ "$RESULT_SYNC" = "failure" ] && report "Sync idempotency"
-          exit 0
+          t="$(mktemp -d)"; git -C "$t" init -q
+          snap() { (cd "$t" && find . -path ./.git -prune -o -type f -exec cksum {} + | LC_ALL=C sort); }
+          bash scripts/sync.sh "$t" > /dev/null; snap > first.txt
+          bash scripts/sync.sh "$t" > /dev/null; snap > second.txt
+          diff first.txt second.txt

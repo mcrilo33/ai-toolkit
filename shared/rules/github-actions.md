@@ -1,3 +1,9 @@
+---
+description: "Workflow structure, SHA pinning, permissions, secrets, caching, and job conventions for GitHub Actions"
+paths:
+  - '.github/workflows/*.yml'
+  - '.github/workflows/*.yaml'
+---
 # GitHub Actions conventions
 
 ## Workflow file
