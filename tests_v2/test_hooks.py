@@ -80,7 +80,8 @@ PUSH_DENY = [
         "echo ok; git push -f", "FOO=1 git push -f", "env git push -f", "/usr/bin/git push -f", "echo $(git push -f)",
         "git push origin main>/dev/null", "time git push origin main", "git --no-pager push -f",
         "git checkout main", "git switch main", "git checkout -B main", "git -C . checkout main",
-        "git push --repo=origin main", "git push origin 'refs/heads/*:refs/heads/*'", "GIT push -f", "/usr/bin/GIT push origin main",
+        "git -C", "git -C {root} push", "git --git-dir /nonexistent push -f", "git --work-tree /x push origin main",
+        "git --namespace foo push -f", "git push --repo=origin main", "git push origin 'refs/heads/*:refs/heads/*'", "GIT push -f", "/usr/bin/GIT push origin main",
     ]
 ] + [("root", c) for c in ["git push", "git push origin", "git push origin HEAD", "git push -u origin main"]]
 PUSH_ALLOW = [
@@ -117,16 +118,20 @@ RM_DENY = [
     "rm -rf /", "rm -rf /etc/x", "rm -rf ~", "rm -rf ~/x", "rm -rf $HOME/x", 'rm -rf "${HOME}/x"', "rm -fr /usr/local",
     "rm -r --force /usr", "rm --recursive /usr", "rm /usr/x -rf", "rm -rf ../../../../../../../..", "rm -rf .",
     "rm -rf {wt}", "rm -rf {home}/x", "rm -rf build /etc/x", "rm -rf $FOO/x", 'bash -c "rm -rf /usr"',
-    "echo hi && rm -rf /usr", "rm -rf /tmp", "rm -rf /private/tmp", "rm -rf $UNSET_TMP/x", "rm -rf ~root/x", "RM -rf /usr",
+    "echo hi && rm -rf /usr", "rm -rf /tmp", "rm -rf /private/tmp", "rm -rf /etc/absent/", "git clean -fdx", "git clean -xdf", "git clean -fdX",
+    "git clean -f -x", "git -C . clean -fdx", "bash -c 'git clean -fdx'", "rm -rf $UNSET_TMP/x", "rm -rf ~root/x", "RM -rf /usr",
 ]
 RM_ALLOW = [
-    "rm -rf build", "rm -rf ./dist node_modules", "rm file.txt", "rm -rf /tmp/xyz", "rm -rf $TMPDIR/xyz",
+    "rm -rf build", "rm -rf build/ dist/ .venv/ node_modules/", "rm -rf ./build/", "rm -rf /tmp/absent-x/",
+    "rm -rf $TMPDIR/absent-x/", "rm -rf ./dist node_modules", "rm file.txt", "rm -rf /tmp/xyz", "rm -rf $TMPDIR/xyz",
     "rm -rf {spoke}/sub", "rm -rf src/*.pyc", "rm -rf build 2>/dev/null", "ls /etc",
 ]
 WRITE_DENY = [
     "echo x > .github/workflows/ci.yml", "echo x >> {spoke}/.github/workflows/ci.yml", "tee orca.yaml",
     "sed -i s/a/b/ orca.yaml", "sed -i '' s/a/b/ orca.yaml", "cp x ~/.claude/settings.json",
-    'cat y > "$HOME/.claude/settings.json"', "mv a {home}/.claude/settings.json", "touch sub/orca.yaml",
+    'cat y > "$HOME/.claude/settings.json"', "mv a {home}/.claude/settings.json", "echo x > ./orca.yaml", "echo x >orca.yaml", "rm -rf .claude", "rm -rf .claude/", "mv .claude {home}/x",
+    "rm -rf .ai-toolkit", "rm -r .ai-toolkit/", "rm .ai-toolkit/spoke-run-id", "rm -rf .claude/hooks", "rm -rf .claude/hooks/",
+    "mv .claude/hooks h", "rm -rf .claude; ls",
     "python3 -c \"open('orca.yaml','w')\"", "rm .github/workflows/ci.yml", 'bash -c "echo > orca.yaml"',
     "echo x > .claude/settings.json", "tee .claude/settings.local.json", "rm .claude/hooks/push-guard.sh",
     "chmod -x .claude/hooks/push-guard.sh", "echo > {spoke}/.claude/hooks/x.sh", "cd x && echo y > orca.yaml",
@@ -134,6 +139,9 @@ WRITE_DENY = [
     "echo x > ORCA.YAML",
 ]
 WRITE_ALLOW = [
+    "touch sub/orca.yaml", "echo x > v2/orca.yaml", "cp a docs/.github/workflows/x.yml", "rm -rf .claude/cache", "ls .claude",
+    "cat .ai-toolkit/task.md", "git clean -fd", "git clean -n", "git clean -fd -e keep", "grep -n x 2>/dev/null orca.yaml",
+    "ls 2>&1 .github/workflows", "cat orca.yaml >/dev/null 2>&1", "echo x &>/dev/null; cat orca.yaml",
     "cat orca.yaml", "git add orca.yaml .github/workflows/ci.yml", "ls .github/workflows", "cat .claude/settings.json",
     "grep -n hooks .claude/settings.json", "echo hi > out.txt", "cat orca.yaml > /dev/null", "cat orca.yaml > out.txt",
     "cat .github/workflows/ci.yml 2>&1 | head", "git diff -- orca.yaml", "sed -n 1,5p orca.yaml",
@@ -172,13 +180,14 @@ def test_danger_guard_reset_hard_only_in_the_main_checkout(shared, where, cmd, w
     ("Edit", "file_path", "{spoke}/orca.yaml"), ("Write", "file_path", "{home}/.claude/settings.json"),
     ("Write", "file_path", "~/.claude/settings.json"), ("NotebookEdit", "notebook_path", ".github/workflows/n.ipynb"),
     ("Write", "file_path", ".claude/settings.json"), ("Edit", "file_path", ".claude/settings.local.json"),
-    ("Write", "file_path", ".claude/hooks/push-guard.sh"),
+    ("Write", "file_path", ".claude/hooks/push-guard.sh"), ("Write", "file_path", ".claude/hooks"),
+    ("Write", "file_path", ".ai-toolkit/spoke-run-id"), ("Write", "file_path", "./orca.yaml"),
 ])
 def test_danger_guard_denies_protected_file_writes(shared, tool, key, path):
     check("danger-guard.sh", shared, "spoke", 2, tool=tool, **{key: path})
 
 
-@pytest.mark.parametrize("path", ["src/app.py", ".claude/rules/x.md", "docs/orca.yaml.md", ".github/CODEOWNERS", "README.md"])
+@pytest.mark.parametrize("path", ["src/app.py", "{spoke}/v2/orca.yaml", "{spoke}/docs/.github/workflows/x.yml", "/tmp/fixture/orca.yaml", ".ai-toolkit/task.md", ".claude/rules/x.md", "docs/orca.yaml.md", ".github/CODEOWNERS", "README.md"])
 def test_danger_guard_allows_ordinary_file_writes(shared, path):
     check("danger-guard.sh", shared, "spoke", 0, tool="Write", file_path=path)
 
@@ -189,6 +198,7 @@ def test_spoke_only_protections_do_not_bind_the_human_session(shared):
     for p in (".claude/settings.json", ".claude/hooks/x.sh", ".claude/settings.local.json"):
         dg("root", 0, file_path=p)
     dg("root", 0, "Bash", command="echo > .claude/settings.json")
+    dg("root", 0, "Bash", command="rm -rf .claude")
     dg("root", 2, file_path=".github/workflows/ci.yml")
     dg("root", 2, file_path="{home}/.claude/settings.json")
     dg("root", 0, "AskUserQuestion", questions="[]")
@@ -196,8 +206,17 @@ def test_spoke_only_protections_do_not_bind_the_human_session(shared):
     dg("spoke", 2, "AskUserQuestion", questions="[]")
 
 
+def test_danger_guard_uses_the_project_dir_for_the_marker_and_the_worktree_root(shared):
+    sp, plain = str(shared["spoke"]), str(shared["wt"])
+    check("danger-guard.sh", shared, "wt", 2, "AskUserQuestion", env={"CLAUDE_PROJECT_DIR": sp}, questions="[]")
+    check("danger-guard.sh", shared, "spoke", 0, "AskUserQuestion", env={"CLAUDE_PROJECT_DIR": plain}, questions="[]")
+    for cwd, cmd, want in (("/", "rm -rf usr", 2), ("/", f"rm -rf {sp}/build", 0), (sp, f"echo x > {sp}/orca.yaml", 2)):
+        r = call("danger-guard.sh", cwd, command=cmd, env={"CLAUDE_PROJECT_DIR": sp, **shared["env"]})
+        assert r.returncode == want, (cwd, cmd, r.stderr)
+
+
 # --- secrets-scan -------------------------------------------------------------------------------
-SECRETS = [AWS, GHP, "sk-" + "a" * 24, "sk-lf-" + "a" * 24, "xoxb-1234567890-" + "a" * 24, "k=sk_live_" + "a" * 24,
+SECRETS = [AWS, GHP, "sk-ant-api03-" + "a" * 10 + "_-" + "b" * 10, "sk-" + "a" * 24, "sk-lf-" + "a" * 24, "xoxb-1234567890-" + "a" * 24, "k=sk_live_" + "a" * 24,
            "github_pat_" + "a" * 30, "eyJ" + "a" * 12 + ".eyJ" + "b" * 12 + "." + "c" * 12,
            "LANGFUSE_BASIC_AUTH='Basic " + "QUJD" * 6 + "'", "x\n" * 50 + f"token {AWS} end"]
 CLEAN = ["KEY = os.environ['API_KEY']\n", "sk-short AKIA123 ghp_tooShort key-abc", ""]
@@ -248,7 +267,7 @@ def test_settings_register_the_hooks_at_the_synced_path(shared, tmp_path):
         seen[script] = e["matcher"].split("|")
         tool, ti = ("Bash", {"command": "git push --force"}) if script == "push-guard.sh" else ("Write", {"file_path": "orca.yaml", "content": AWS})
         r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, env={**os.environ, "CLAUDE_PROJECT_DIR": str(tmp_path / "proj")},
-                           input=json.dumps({"tool_name": tool, "cwd": str(shared["wt"]), "tool_input": ti}))
+                           input=json.dumps({"tool_name": tool, "cwd": str(tmp_path / "proj"), "tool_input": ti}))
         assert r.returncode == 2 and script.removesuffix(".sh") in r.stderr, (cmd, r.stderr)
     assert seen["push-guard.sh"] == ["Bash"] and "AskUserQuestion" in seen["danger-guard.sh"] and "Bash" not in seen["secrets-scan.sh"]
 
@@ -281,6 +300,15 @@ def test_commit_msg_accepts(hooked, msg):
 def test_commit_msg_rejects(hooked, msg, why):
     r = commit(hooked["wt"], msg)
     assert r.returncode != 0 and "commit-msg" in r.stderr and why in r.stderr
+
+
+def test_commit_msg_exempts_the_issue_less_quick_lane(hooked):
+    git(hooked["root"], "worktree", "add", "-q", "-b", "quick-fix", str(hooked["root"].parent / "quick-fix"))
+    q = hooked["root"].parent / "quick-fix"
+    assert commit(q, "fix: no anchor needed").returncode == 0
+    r = commit(q, "wip")
+    assert r.returncode != 0 and "<type>" in r.stderr
+    assert commit(hooked["wt"], "fix: no anchor").returncode != 0
 
 
 def test_pre_commit_blocks_the_base_branch_only_in_the_main_checkout(hooked):
