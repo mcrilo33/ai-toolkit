@@ -1278,6 +1278,21 @@ def test_ready_refused_when_ci_failed_and_names_the_failing_jobs(
     assert not _remote_has_ref(remote, "refs/tags/ready/45")
 
 
+def test_ready_refused_when_only_the_macos_job_is_red(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    # The macOS job gates the run (#387): its failure turns the run-level conclusion red, ready
+    # refuses, and the refusal names the job so the spoke knows which BSD/locale leg broke.
+    macos = "Shell control-plane (macOS, fr_FR.UTF-8)"
+    env, _ = _ci_env(tmp_path, _FAILED, GH_JOBS=macos)
+
+    result = _run(spoke, "45", env=env)
+
+    assert result.returncode != 0
+    assert f"failing jobs: {macos})" in result.stderr
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
 def test_ready_refused_when_no_ci_run_exists_for_the_sha(
     spoke: Path, remote: Path, tmp_path: Path
 ) -> None:

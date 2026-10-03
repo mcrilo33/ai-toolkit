@@ -12,6 +12,8 @@ is exercised on a scratch-branch PR per the issue's acceptance criteria.
 
 from __future__ import annotations
 
+import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
-GATE_JOBS = {"test", "shellcheck", "sync-idempotency"}
+MACOS_JOB = "shell-control-plane-macos"
+GATE_JOBS = {"test", "shellcheck", "sync-idempotency", "pyright", MACOS_JOB}
 
 
 @pytest.fixture(scope="module")
@@ -117,3 +120,48 @@ def test_report_red_files_issues_only_for_main_and_prs(
     condition = report_red["steps"][0]["if"]
     assert "refs/heads/main" in condition
     assert "pull_request" in condition
+
+
+def test_no_job_is_allowed_to_fail_the_run_silently(workflow: dict[str, Any]) -> None:
+    # The ready/land gate reads the RUN-level conclusion, which a `continue-on-error` job cannot
+    # turn red. Every job is therefore part of "CI green" only while none of them carries it (#387).
+    soft = [name for name, job in workflow["jobs"].items() if "continue-on-error" in job]
+    assert soft == []
+
+
+def test_the_macos_job_is_a_blocking_job_of_the_one_workflow(workflow: dict[str, Any]) -> None:
+    # One workflow means one run-level conclusion for ready/land to read: the macOS job must live
+    # here (not in a second workflow the `--workflow CI` query never sees) and gate the run.
+    job = workflow["jobs"][MACOS_JOB]
+    assert job["runs-on"] == "macos-15"
+    assert job["name"] == "Shell control-plane (macOS, fr_FR.UTF-8)"
+
+
+def test_report_red_names_the_pyright_and_macos_jobs(report_red: dict[str, Any]) -> None:
+    env = report_red["steps"][0]["env"]
+    assert env["RESULT_PYRIGHT"] == "${{ needs.pyright.result }}"
+    assert env["RESULT_MACOS"] == "${{ needs['shell-control-plane-macos'].result }}"
+    script = report_red["steps"][0]["run"]
+    assert '"$RESULT_PYRIGHT" = "failure" ] && report "Pyright"' in script
+    assert '"$RESULT_MACOS" = "failure" ] && report "Shell control-plane (macOS)"' in script
+
+
+def test_pyright_job_checks_the_whole_repo_with_a_pinned_version(
+    workflow: dict[str, Any],
+) -> None:
+    # Whole repo, not changed files: the commit gauntlet only checks the files a commit touches,
+    # so errors in untouched files surfaced weeks later (#387). Config comes from pyproject.toml.
+    job = workflow["jobs"]["pyright"]
+    runs = [s.get("run", "") for s in job["steps"]]
+    assert any("pip install -r requirements-dev.txt" in r for r in runs)
+    assert any(re.search(r"pip install .*pyright==\d+\.\d+\.\d+", r) for r in runs)
+    assert [r for r in runs if r.strip().startswith("pyright")] == ["pyright"]
+
+
+def test_pyright_resolves_the_shared_test_helpers_through_extra_paths() -> None:
+    # `_orca_stub` lives in tests/unit and is imported by tests/integration after a runtime
+    # sys.path tweak; extraPaths mirrors that, so no per-import ignore is needed (#387).
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["tool"]["pyright"]
+    drain = (REPO_ROOT / "tests" / "integration" / "test_drain_simulation.py").read_text()
+    assert "tests/unit" in config["extraPaths"]
+    assert "pyright: ignore" not in drain
