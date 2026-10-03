@@ -16,9 +16,6 @@ cur="$(orca --version | grep -Eo '[0-9]+(\.[0-9]+)+' | head -1)"
   || die "orca $cur is older than $ORCA_MIN_VERSION"
 grep -qE 'TERM_PROGRAM.*Orca|ORCA_PANE_KEY' "$HOME/.zshrc" 2> /dev/null \
   || warn "$HOME/.zshrc does not skip tmux autostart in Orca terminals; Orca cannot see agents inside tmux"
-jq -e --arg p "$HOME/orca/workspaces" '.projects[$p].hasTrustDialogAccepted' "$HOME/.claude.json" > /dev/null 2>&1 \
-  || warn "Claude does not trust $HOME/orca/workspaces: new worktrees will show the trust dialog"
-
 chmod +x "$here/bin/claude-spoke" "$here"/scripts/*.sh
-echo "ok. For native OTel per spoke, set Orca > Settings > Agents > Claude command to:"
-echo "  $here/bin/claude-spoke"
+echo "ok. Dispatch launches spokes through $here/bin/claude-spoke (terminal create --command)."
+echo "Optional, to verify in WP1: Orca > Settings > Agents > Claude command = $here/bin/claude-spoke"

@@ -1,4 +1,3 @@
-"""Fixtures: PATH stubs for orca/gh/claude, a temp repo with a bare origin, env isolation."""
 import os
 import subprocess
 from pathlib import Path

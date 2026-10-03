@@ -16,6 +16,7 @@ def test_provisions_claude_dir_run_id_and_excludes_and_is_idempotent(run, repo, 
     rid = (wt / ".ai-toolkit/spoke-run-id").read_text()
     assert r.returncode == 0, r.stderr
     assert rid.strip() and (wt / ".claude/hooks/guard.sh").exists() and git(wt, "status", "--porcelain") == ""
+    assert (wt / ".ai-toolkit/setup-done").exists()
     assert setup(run, repo, wt=wt)[1].returncode == 0 and (wt / ".ai-toolkit/spoke-run-id").read_text() == rid
     assert (repo.root / ".git/info/exclude").read_text().count(".ai-toolkit/") == 1
 
@@ -25,7 +26,7 @@ def test_fails_loud_when_gh_fails_or_the_root_has_no_claude_dir(run, repo, stubs
     assert "issue 12" in setup(run, repo, "12-x")[1].stderr
     shutil.rmtree(repo.root / ".claude")
     wt, r = setup(run, repo)
-    assert r.returncode != 0 and ".claude" in r.stderr and not (wt / ".ai-toolkit/spoke-run-id").exists()
+    assert r.returncode != 0 and ".claude" in r.stderr and not (wt / ".ai-toolkit/setup-done").exists()
 
 
 @pytest.mark.parametrize("branch,linked,issue", [("12-add-hello", None, "12"), ("12-add-hello", 7, "7"), ("wp0", None, None)])

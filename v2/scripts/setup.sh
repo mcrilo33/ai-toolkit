@@ -12,6 +12,7 @@ cd "$wt"
 [ -d "$root/.claude" ] || die "$root/.claude is missing: sync ai-toolkit into the main checkout first"
 
 mkdir -p .claude .ai-toolkit
+rm -f .ai-toolkit/setup-done
 cp -R "$root/.claude/." .claude/
 
 # Keep the provisioning out of `git status` (info/exclude is shared by all worktrees).
@@ -37,3 +38,6 @@ fi
 
 # Host-specific extras (venv, caches...): untracked, lives in the main checkout, cwd = the worktree.
 if [ -f "$root/.ai-toolkit/setup.local.sh" ]; then bash "$root/.ai-toolkit/setup.local.sh"; fi
+
+# Readiness marker for launchers that start the agent themselves (two-step launch, 03-notes Q1).
+touch .ai-toolkit/setup-done
