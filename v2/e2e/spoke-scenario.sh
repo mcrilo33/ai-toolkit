@@ -12,35 +12,55 @@ V2="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 . "$V2/scripts/lib.sh"
 load_env
 : "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal}"
-# Fixed path: Claude's workspace-trust entry is keyed on the git root, so one path means one entry, ever.
-S=/private/tmp/aitk-e2e-scratch; E="$S.e2e"; rm -rf "$S" "$S.git" "$E"; mkdir -p "$S" "$E"
+# Fixed path: Claude's workspace-trust entry is keyed on the git root, so one path means one entry, ever. The repo is registered
+# in Orca ONCE and reused: each run resets it to its root commit and never unregisters (a removed repo leaves a stale card in the UI).
+S=/private/tmp/aitk-e2e-scratch; E="$S.e2e"; rm -rf "$E"; mkdir -p "$S" "$E"
 repo_id=""; wt=""; run=""; coord=""; br=1-add-hello-txt; step=0
 
 say() { printf '== step %s: %s\n' "$step" "$*"; }
 fail() { printf 'FAIL step %s: %s\n  ids: repo=%s worktree=%s run=%s coordinator=%s\n  coordinator log: %s\n' "$step" "$*" "$repo_id" "$wt" "$run" "$coord" "$(tail -n 5 "$E/coord.log" 2> /dev/null | tr '\n' '|')"; exit 1; }
 wait_for() { local t="$1" i; shift; for ((i = 0; i < t; i += 3)); do "$@" && return 0; sleep 3; done; return 1; }
-cleanup() {
-  local d w ws=""
-  [ -z "$coord" ] || orca terminal close --terminal "$coord" --json > /dev/null 2>&1 || true
+drop_worktrees() {   # every non-main worktree of the scratch repo, terminals first; found by listing: dispatch.sh may have died after worktree create
+  local w
+  for w in $([ -z "$repo_id" ] || orca_json worktree list --repo "path:$S" 2> /dev/null | jq -r '.result.worktrees[]? | select(.isMainWorktree | not) | .path' 2> /dev/null); do
+    orca terminal close --worktree "path:$w" --all --json > /dev/null 2>&1 || true
+    orca worktree rm --worktree "path:$w" --force --run-hooks --json > /dev/null 2>&1 || true
+  done
+}
+cleanup() {   # also on failure: every terminal this script made (the coordinator's, the workers') is closed; the repo stays registered
+  local d
   for d in $([ -z "$run" ] || orca_json orchestration worker-list --run "$run" 2> /dev/null | jq -r '.result.workers[]?.dispatchId' 2> /dev/null); do
     orca orchestration worker-stop --dispatch "$d" --json > /dev/null 2>&1 || true   # only this script's own Run
     orca orchestration worker-release --dispatch "$d" --json > /dev/null 2>&1 || true
   done
-  # Every non-main worktree of the scratch repo, found by listing: dispatch.sh may have died after worktree create.
-  for w in $([ -z "$repo_id" ] || orca_json worktree list --repo "path:$S" 2> /dev/null | jq -r '.result.worktrees[]? | select(.isMainWorktree | not) | .path' 2> /dev/null); do
-    ws="$(dirname "$w")"
-    orca worktree rm --worktree "path:$w" --force --run-hooks --json > /dev/null 2>&1 || true
-  done
-  [ -z "$repo_id" ] || orca project setup-delete --setup "$repo_id" --json > /dev/null 2>&1 || true
-  [ -z "$wt" ] || ws="$(dirname "$wt")"
-  case "$ws" in */"$(basename "$S")") rm -rf "$ws" ;; esac   # Orca's per-repo workspace dir
-  rm -rf "$S" "$S.git" "$E"
+  [ -z "$coord" ] || orca terminal close --terminal "$coord" --json > /dev/null 2>&1 || true
+  drop_worktrees
+  [ -z "$repo_id" ] || orca terminal close --worktree "path:$S" --all --json > /dev/null 2>&1 || true
+  rm -rf "$E"
 }
 trap cleanup EXIT
-step=1; say "preflight: orca ready, install.sh, scratch repo registered"
+step=1; say "preflight: orca ready, install.sh, scratch repo registered once and reset to its root commit"
 [ "$(orca_json status | jq -r '.result.runtime.state')" = ready ] || fail "orca status is not ready"
 bash "$V2/scripts/install.sh" > /dev/null 2>&1 || fail "install.sh failed"
-git init -q -b main "$S" && git init -q --bare "$S.git" && git -C "$S" remote add origin "$S.git"
+repo_id="$(orca_json repo list | jq -r --arg p "$S" '[.result.repos[] | select(.path == $p)][0].id // empty')"
+if [ -n "$repo_id" ] && [ -d "$S.git" ] && git -C "$S" rev-parse -q --verify main > /dev/null; then   # reuse: back to the root commit, no branches
+  drop_worktrees; orca terminal close --worktree "path:$S" --all --json > /dev/null 2>&1 || true
+  git -C "$S" checkout -q -f main && git -C "$S" reset -q --hard "$(git -C "$S" rev-list --max-parents=0 main)" && git -C "$S" clean -fdxq
+  git -C "$S" push -q -f origin main
+  for b in $(git -C "$S" for-each-ref --format='%(refname:short)' refs/heads | grep -vx main); do git -C "$S" branch -q -D "$b"; done
+  for b in $(git -C "$S.git" for-each-ref --format='%(refname:short)' refs/heads | grep -vx main); do git -C "$S.git" update-ref -d "refs/heads/$b"; done
+else
+  rm -rf "$S" "$S.git"; mkdir -p "$S"
+  git init -q -b main "$S" && git init -q --bare "$S.git" && git -C "$S" remote add origin "$S.git"
+  # A target's .ai-toolkit/ is untracked (the user's global gitignore lists it), so a new worktree has no copy: the hooks run
+  # from the main checkout. Orca's runner is a bash script, so $ORCA_ROOT_PATH expands.
+  # shellcheck disable=SC2016
+  printf 'setupAgentStartupPolicy: wait-for-setup\nscripts:\n  setup: $ORCA_ROOT_PATH/.ai-toolkit/scripts/setup.sh\n  archive: $ORCA_ROOT_PATH/.ai-toolkit/scripts/archive.sh\n' > "$S/orca.yaml"
+  printf '.claude/\n.ai-toolkit/\n' > "$S/.gitignore"   # explicit: never rely on a global gitignore
+  git -C "$S" add -A && git -C "$S" commit -q -m "chore: scratch repo" && git -C "$S" push -q -u origin main
+  [ -n "$repo_id" ] || repo_id="$(orca_json repo add --path "$S" | jq -r '.result.repo.id')"
+fi
+[ -n "$repo_id" ] && [ "$repo_id" != null ] || fail "orca repo add"
 mkdir -p "$S/.ai-toolkit/bin" "$S/.ai-toolkit/scripts" "$S/.claude/hooks"   # the layout sync.sh will produce (06 section 6)
 cp "$V2"/scripts/*.sh "$S/.ai-toolkit/scripts/"; cp "$V2/bin/claude-spoke" "$S/.ai-toolkit/bin/"
 cp "$V2/settings/ai-toolkit.env" "$S/.ai-toolkit/ai-toolkit.env"
@@ -56,14 +76,6 @@ jq -c '[{number, body, labels: {nodes: []}, blockedBy: {nodes: []}}]' "$E/issue.
 printf '#!/bin/sh\necho "$*" >> %s/gh.log\ncase "$1 $2" in "issue view") cat %s/issue.json ;; "api graphql") if grep -q "^issue close" %s/gh.log; then echo "[]"; else cat %s/nodes.json; fi ;; esac\n' "$E" "$E" "$E" "$E" > "$E/gh"
 chmod +x "$E/gh"
 printf 'AI_TOOLKIT_GH=%s/gh\nCHECK_CMD="test -f hello.txt"\nLOCAL_GATE=1\nANSWER_MODEL=%s\n' "$E" "${E2E_ANSWER_MODEL:-claude-sonnet-5-5}" > "$S/.ai-toolkit/ai-toolkit.local.env"
-# A target's .ai-toolkit/ is untracked (the user's global gitignore lists it), so a new worktree has no
-# copy: the hooks run from the main checkout. Orca's runner is a bash script, so $ORCA_ROOT_PATH expands.
-# shellcheck disable=SC2016
-printf 'setupAgentStartupPolicy: wait-for-setup\nscripts:\n  setup: $ORCA_ROOT_PATH/.ai-toolkit/scripts/setup.sh\n  archive: $ORCA_ROOT_PATH/.ai-toolkit/scripts/archive.sh\n' > "$S/orca.yaml"
-printf '.claude/\n.ai-toolkit/\n' > "$S/.gitignore"   # explicit: never rely on a global gitignore
-git -C "$S" add -A && git -C "$S" commit -q -m "chore: scratch repo" && git -C "$S" push -q -u origin main
-repo_id="$(orca_json repo add --path "$S" | jq -r '.result.repo.id')"
-[ -n "$repo_id" ] && [ "$repo_id" != null ] || fail "orca repo add"
 
 step=2; say "provisioned (sync.sh arrives in WP4; the issue is a stubbed gh, a real GitHub repo is not needed)"
 step=3; say "coordinator.sh --answer ${E2E_ANSWER:-auto} --cap 1 --drain, started in an Orca terminal on the scratch main"
@@ -105,12 +117,10 @@ question() { inbox | jq -r '[.[] | select(.type == "question")][0].id // empty';
 replied() { inbox | jq -e '[.[] | select(.type == "status" and (.subject | startswith("Re:")))] | length > 0' > /dev/null; }
 asked() { [ -n "$(question)" ]; }
 wait_for 600 asked || fail "no question within 10 min"
-if [ "${E2E_ANSWER:-auto}" = human ]; then   # the human: reply AFTER the coordinator acked the question without replying
-  wait_for 60 grep -q 'waiting for you' "$E/coord.log" || fail "the coordinator did not hand the question to the human"
-  sleep 5   # run the very command the coordinator put in the issue comment (gh.log): the human's reply after the ack
-  cmd="$(sed -n 's/.*Reply: \(orca orchestration reply --run [^ ]* --from [^ ]* --id [^ ]* --body approve\).*/\1/p' "$E/gh.log" | head -n 1)"
-  [ -n "$cmd" ] || fail "no reply command in the issue comment"
-  out="$($cmd 2>&1)" || fail "human reply failed: $out"
+if [ "${E2E_ANSWER:-auto}" = human ]; then   # the coordinator asks on its own terminal (only the Run's bound terminal can reply): type there
+  wait_for 90 grep -q 'waiting for you' "$E/coord.log" || fail "the coordinator did not hand the question to the human"
+  grep -q 'terminal send --terminal' "$E/gh.log" || fail "the issue comment does not tell the human how to answer"
+  sleep 3; orca terminal send --terminal "$coord" --text approve --enter --json > /dev/null || fail "terminal send to the coordinator"
 fi
 wait_for 300 replied || fail "the question was never replied"
 
