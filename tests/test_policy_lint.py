@@ -3,8 +3,11 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
-SHARED = Path(__file__).resolve().parent.parent / "shared"
+ROOT = Path(__file__).resolve().parent.parent
+SHARED = ROOT / "shared"
+CHECKS_TIMEOUT_CAP = 5  # minutes: a deliberate ceiling on suite duration; raising it is a reviewed decision
 ALWAYS_ON = {"security", "agent-orchestration", "scientific-integrity"}  # top-level rules without paths:
 GUIDELINES = "guidelines"  # becomes CLAUDE.md, always on
 MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5-20251001"}
@@ -151,3 +154,10 @@ def test_no_policy_file_references_a_deleted_mechanism():
 @pytest.mark.parametrize("rel,cap", sorted(LINE_CAPS.items()))
 def test_rewritten_policy_stays_within_its_line_cap(rel, cap):
     assert len((SHARED / rel).read_text().splitlines()) <= cap
+
+
+def test_ci_checks_job_is_capped_to_keep_suite_duration_visible():
+    job = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())["jobs"]["checks"]
+    timeout = job.get("timeout-minutes")
+    assert isinstance(timeout, int) and not isinstance(timeout, bool), "checks needs a job-level timeout-minutes"
+    assert 0 < timeout <= CHECKS_TIMEOUT_CAP
