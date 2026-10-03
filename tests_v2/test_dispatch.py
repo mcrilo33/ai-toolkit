@@ -199,7 +199,8 @@ def test_next_picks_the_first_ready_issue(d, nodes, busy, want):
         assert r.returncode == 3 and "nothing ready" in r.stderr
     else:
         assert r.returncode == 0 and r.stdout.strip() == str(want), r.stderr
-    assert [c[:2] for c in d.orca()] == [["worktree", "list"]]   # a dry run launches nothing
+    # a dry run launches nothing; only THIS repo's worktrees are in flight (issue numbers of other registered repos must not collide)
+    assert d.orca() == [["worktree", "list", "--repo", f"path:{d.root}"]]
 
 
 def test_next_dispatches_the_pick(d):
