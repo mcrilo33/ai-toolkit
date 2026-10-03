@@ -85,7 +85,7 @@ First settle the session's business: handle and ack the current batch, and tell 
 ```bash
 date -u +%FT%TZ        # the switch time: say it in your reply, it anchors the summary of what happened while away
 orca terminal create --worktree path:$PWD --title coordinator \
-  --command ".ai-toolkit/scripts/coordinator.sh --run <run> --answer auto [--until HH:MM] [--drain] [--cap N]"
+  --command "bash .ai-toolkit/scripts/coordinator.sh --run <run> --answer auto [--until HH:MM] [--drain] [--cap N]"
 ```
 
 The new terminal takes the Run over (`run-use`; without `--run` it creates one) and this session is fenced: stop consuming. Check with `coordinator.sh --status --run <run>`

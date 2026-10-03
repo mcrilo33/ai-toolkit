@@ -25,7 +25,7 @@ hooks/git/                 commit-msg (conventional type + #N anchor), pre-commi
 langfuse/                  otelcol.yaml compose.yaml (collector only; dashboards and scores are a later batch)
 settings/                  ai-toolkit.env (defaults) claude/settings.json (hook registrations)
 shared/                    rules/ (always-on + on-demand/), skills/, agents/, prompts/: frontmatter lives in each file
-e2e/                       spoke-scenario.sh (local scratch repo, stubbed gh), github-scenario.sh (real GitHub), cutover-rehearsal.sh
+e2e/                       spoke-scenario.sh (local scratch repo, stubbed gh), github-scenario.sh + switch-scenario.sh (real GitHub, shared github-lib.sh), cutover-rehearsal.sh
 tests/                     pytest -n auto tests: PATH stubs for orca/gh/claude, tmp git repos, no real network
 orca.yaml                  Orca hooks of THIS repo (setup/archive); a synced target gets a generated one
 ```
@@ -137,7 +137,7 @@ or re-bind after a restart: everything else is re-derived from `worker-list`, `w
 ## Testing
 
 `pytest -n auto tests` (stubs for `orca`/`gh`/`claude`, a tmp repo + bare origin per test, env stripped, no wall-clock asserts). `shellcheck` over scripts, hooks, shim and e2e.
-Real checks: `e2e/github-scenario.sh` (real GitHub repo, real CI, real Claude; `E2E_PHASES`, `E2E_ANSWER=human`, `E2E_HUMAN_WAIT=1`) and `e2e/spoke-scenario.sh` (local, stubbed gh).
+Real checks: `e2e/github-scenario.sh` (real GitHub repo, real CI, real Claude; `E2E_PHASES`, `E2E_ANSWER=human`, `E2E_HUMAN_WAIT=1`), `e2e/switch-scenario.sh` (a stand-in session holds the Run, replies to a gate, hands over to `--answer auto`, takes the Run back with `--stop`) and `e2e/spoke-scenario.sh` (local, stubbed gh).
 CI (`.github/workflows/ci.yml`): tests, shellcheck, sync-twice-no-drift, macOS + Linux.
 
 ## Known limits (D8, D9)
