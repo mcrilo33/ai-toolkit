@@ -13,12 +13,12 @@ notifications and the UI. GitHub owns the backlog (issues, labels) and the test 
 | Config | flat `KEY=value` defaults, overridden per machine | `settings/ai-toolkit.env` |
 
 There is no state directory of marker files, no supervisor self-copy, no tmux. State lives in Orca (orchestration DB, worktree metadata),
-git, and GitHub labels. The one file ai-toolkit keeps is the human-reply spool of a running coordinator (below).
+git, and GitHub labels. The only files ai-toolkit keeps are the human-reply spool and the `holder.<pid>` display file of a running coordinator (below).
 
 ## Layout (repo root)
 
 ```text
-scripts/   lib.sh dispatch.sh land.sh review.sh answer.sh coordinator.sh setup.sh archive.sh sync.sh install.sh otel.sh cutover.sh
+scripts/   lib.sh dispatch.sh land.sh review.sh answer.sh coordinator.sh reply.sh setup.sh archive.sh sync.sh install.sh otel.sh cutover.sh
 bin/claude-spoke           launch shim: OTel env + spoke_run_id resource attribute, then exec claude (pass-through outside a spoke)
 hooks/claude/              push-guard.sh danger-guard.sh secrets-scan.sh (registered by settings/claude/settings.json)
 hooks/git/                 commit-msg (conventional type + #N anchor), pre-commit (no commit on the base branch in the main checkout)
@@ -53,6 +53,50 @@ orca.yaml                  Orca hooks of THIS repo (setup/archive); a synced tar
    `address:`. Still failing, a timeout, a `failed` completion or an escalation: label `blocked` + comment + desktop notification, the worker is released,
    the **worktree is kept** for the human.
 
+## Two modes, one switch
+
+A Run has one consumer at a time. **Attended**: a Claude Code session on the main checkout (the `coordinate` skill) holds the Run; Orca pushes
+`You have N orchestration messages` into it, the user discusses a worker's plan with the session, decides, and the session replies to the waiting
+worker (`approve` or `revise: ...`), lands finished work with `land.sh --review`, and dispatches on request. **Auto**: `coordinator.sh --answer auto`
+holds the Run (the loop below). The switch is explicit, never inferred from presence: `/coordinate auto [--until HH:MM] [--drain]` (alias `/afk`) starts the loop
+in an Orca terminal bound to the SAME Run; `/coordinate attended` runs `coordinator.sh --stop --run <run>` and summarizes what happened while away from Orca,
+git and GitHub. Mechanics stay in the scripts; the session only converses, decides and calls them.
+
+```mermaid
+sequenceDiagram
+    participant W as Worker (spoke)
+    participant O as Orca (Run inbox)
+    participant S as Session (attended)
+    participant U as User
+    participant L as coordinator.sh (auto)
+    W->>O: ask (PLAN gate)
+    O-->>S: You have 1 orchestration message
+    S->>U: issue, plan, recommendation
+    U->>S: decision
+    S->>O: reply approve | revise: ...
+    W->>O: worker_done succeeded
+    O-->>S: push
+    S->>S: land.sh --review n
+    U->>S: /coordinate auto
+    S->>L: terminal create: coordinator.sh --run R --answer auto
+    L->>O: run-use (fences the session)
+    W->>O: ask (next gate)
+    O-->>L: check --wait
+    L->>O: answer.sh, then reply
+    U->>S: /coordinate attended
+    S->>O: coordinator.sh --stop: run-use (fences the loop)
+    O-->>L: consumer_fenced
+    L->>L: "Run taken back by session", exit 0
+    S->>U: summary (Orca, git, GitHub)
+```
+
+`run-use` from another terminal always succeeds: it takes the Run over (the consumer generation grows) and fences the previous holder, whose pending `check --wait`
+returns `consumer_fenced` at once. So re-binding IS the stop mechanism: no signal, no stop file. The loop, on a fence (or when `run-show` names another holder at
+the top of a tick, before each message, before the ack, before it would label an issue `blocked`), logs `Run <id> taken back by <handle>` and exits 0: it never
+retries and never acks, the unfinished batch replays to the new holder (the session ignores a replay for an issue already closed). `--stop` also waits (bounded) until
+the loop has really exited, because a land may be in flight; exit 1 means it is still finishing a step. `--status` prints `held by: coordinator.sh (<mode>)`,
+`held by: a session (<handle>)` or `held by: nobody`: the mode comes from `holder.<pid>` in the spool dir (display only, a dead pid or another handle is ignored).
+
 ## Coordinator runbook
 
 ```bash
@@ -60,9 +104,10 @@ orca terminal create --worktree path:<main-checkout> --title coordinator \
   --command "bash .ai-toolkit/scripts/coordinator.sh --answer auto --cap 1 --drain"      # in a synced target
 ```
 
-One foreground process in an Orca terminal on the main checkout, the single consumer of one Run (`run-create`, or `--run R` to re-bind after a restart:
-everything else is re-derived from `worker-list`, `worktree list` and labels). Flags: `--answer auto|human`, `--cap N` (default `CONCURRENCY_CAP`),
-`--until HH:MM`, `--drain` (stop when nothing is ready and no worker is live), `--status` (read-only: Run, live workers, unanswered questions with their reply line).
+One foreground process in an Orca terminal on the main checkout, the single consumer of one Run (`run-create`, or `--run R` to take it over from a session
+or re-bind after a restart: everything else is re-derived from `worker-list`, `worktree list` and labels). Flags: `--answer auto|human`, `--cap N` (default `CONCURRENCY_CAP`),
+`--until HH:MM`, `--drain` (stop when nothing is ready and no worker is live), `--status` (read-only: Run, who holds it, live workers, unanswered questions with their reply line),
+`--run R --stop` (take the Run from this terminal and wait for the loop to exit).
 
 - **Human answers (`--answer human`, or when `answer.sh` has no usable answer).** The loop never pauses. It prints the question (wrapped, at most 25 lines) above the exact
   reply line in the coordinator terminal (and in `--status`), comments on the issue, sets the spoke worktree's Orca comment to `GATE waiting: ... | reply: ...`, rings the bell
@@ -73,7 +118,7 @@ everything else is re-derived from `worker-list`, `worktree list` and labels). F
   after fixing the cause and `dispatch.sh <n>` again; or `orca worktree rm --worktree issue:<n> --force --run-hooks`.
 - **`land.sh` exit codes.** 0 landed, 2 refused (precondition), 3 review no, 4 gate red/timeout, 5 merge conflict, 6 landed but cleanup incomplete (main is pushed:
   finish with `land.sh --cleanup-only <n>`, never land again).
-- **Restart.** Stop with Ctrl-C in its terminal, start again with `--run <run-id>`; a dead holder of the Run reports `consumer_fenced`.
+- **Restart / stop.** `coordinator.sh --stop --run <run-id>` from any Orca terminal (or `/coordinate attended`), or Ctrl-C in its terminal; start again with `--run <run-id>` (it takes the Run over).
 - **Dispatch failure.** `dispatch.sh` can leave a half-made worktree: the coordinator removes it and labels the issue `blocked`.
 
 ## Setup on a new machine

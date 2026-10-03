@@ -42,16 +42,14 @@ State the single best next move and why, then wait. Never dispatch, answer, land
 unconfirmed; those change shared state and are hard to undo.
 
 - **Dispatch**: `.ai-toolkit/scripts/dispatch.sh <n>` or `--next` (picks the next ready issue).
-- **Answer a gate** (attended): read the plan in the question, then
-  `.ai-toolkit/scripts/coordinator.sh --run <run> --reply <message-id> approve` (or `'revise: <change>'`); a bare `orca orchestration reply` is refused outside the Run's bound terminal.
+- **Answer a gate, handle a finished worker**: `/coordinate` (`coordinate` skill): this session holds the Run, discusses the plan with the user, replies.
 - **Land**: `.ai-toolkit/scripts/land.sh <n>`.
-- **Unattended**: start `coordinator.sh` (`afk` skill) instead of hand-driving each step.
+- **Unattended**: `/coordinate auto` (alias `/afk`) hands the Run to the coordinator loop instead of hand-driving each step.
 - **Teardown** (abandoned or finished by hand): `orca worktree rm --worktree issue:<n> --run-hooks`.
 
 ## Rules of thumb
 
-- One recommendation, not a menu. The coordinator loop and this session are never both consumers of the Run:
-  if `coordinator.sh --status` shows a loop, observe and answer through it; do not start a second one.
+- One recommendation, not a menu. One holder per Run (`coordinator.sh --status` says who): never start a second consumer, switch with `/coordinate`.
 - A small fix you want to drive interactively: `/quick`. A tiny non-executable change: a subagent with
   `isolation: worktree`, reviewed and merged by you.
 - Ambiguous scope stays here: use `brainstorming`, write the issue, then dispatch.
