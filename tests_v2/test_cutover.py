@@ -23,12 +23,14 @@ def put(root, rel, text=None):
     f.write_text(text if text is not None else f"{rel}\n")
 
 
-@pytest.fixture
-def cut(tmp_path, run):
-    """A v1 main (pushed to a bare origin) and a v2 branch on top of it; returns (checkout, run-cutover)."""
-    origin, root = tmp_path / "origin.git", tmp_path / "clone"
+@pytest.fixture(scope="module")
+def template(tmp_path_factory):
+    """A v1 main (pushed to a bare origin) and a v2 branch on top of it, built once per module and copied per test."""
+    base = tmp_path_factory.mktemp("tpl")
+    origin, root = base / "origin.git", base / "clone"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
     subprocess.run(["git", "clone", "-q", str(origin), str(root)], check=True, capture_output=True)
+    git(root, "config", "user.name", "t"); git(root, "config", "user.email", "t@t")
     for rel in V1:
         put(root, rel)
     put(root, "requirements-dev.txt", "pytest>=8,<9\npytest-testmon>=2,<3\npytest-xdist>=3,<4\npyyaml>=6,<7\nduckdb>=1,<2\n")
@@ -37,6 +39,15 @@ def cut(tmp_path, run):
     for rel in NEW:
         put(root, rel)
     git(root, "add", "-A"); git(root, "commit", "-qm", "v2 work")
+    return base
+
+
+@pytest.fixture
+def cut(template, tmp_path, run):
+    """(checkout, run-cutover): a private copy of the template, origin re-pointed at the copy of the bare repo."""
+    shutil.copytree(template, tmp_path / "w", symlinks=True)
+    root = tmp_path / "w" / "clone"
+    git(root, "remote", "set-url", "origin", str(tmp_path / "w" / "origin.git"))
     return root, lambda *a: run(["bash", str(V2 / "scripts" / "cutover.sh"), *a], cwd=root)
 
 

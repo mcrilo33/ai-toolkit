@@ -27,19 +27,15 @@ for s in source-task next-batch verify-agents verify-rules verify-skills bootstr
 DELETE="$DELETE $(git ls-files 'shared/*/metadata.yml' | tr '\n' ' ') $(git ls-files docs | grep -vxE 'docs/v2/(architecture|frontmatter)\.md' | tr '\n' ' ')"
 
 echo "tag v1-final $sha$([ "$push" = 1 ] && echo ' (pushed to origin)' || echo ' (local)')"
-for p in $DELETE; do [ -z "$(git ls-files -- "$p")" ] || echo "delete $p"; done
+for p in $DELETE; do [ ! -e "$p" ] || echo "delete $p"; done
 for e in $(cd v2 && ls -A); do echo "move v2/$e -> $e"; done
 echo "move tests_v2 -> tests"; echo "move docs/v2/{architecture,frontmatter}.md -> docs/"
 echo "trim requirements-dev.txt to pytest, pytest-xdist, pyyaml; ignore /CLAUDE.md (sync.sh generates it)"
 [ "$dry" = 0 ] || exit 0
 
 git tag v1-final "$sha"
-for p in $DELETE; do [ -z "$(git ls-files -- "$p")" ] || { git rm -rq -- "$p"; rm -rf -- "$p"; }; done
-mvtree() {   # file by file: a destination directory that already exists is merged into, never nested
-  local f
-  while IFS= read -r f; do mkdir -p "$(dirname "$2/${f#"$1"/}")"; git mv -f "$f" "$2/${f#"$1"/}"; done < <(git ls-files "$1")
-  rm -rf "$1"
-}
+for p in $DELETE; do rm -rf -- "$p"; done; find docs -type d -empty -delete   # plain file moves: `git add -A` below records them (and the renames)
+mvtree() { mkdir -p "$2"; cp -R "$1"/. "$2"/; rm -rf "$1"; }   # merges into an existing directory, dotfiles included; the tree is clean, so only ignored files ride along
 mvtree v2 .; mvtree tests_v2 tests; mvtree docs/v2 docs
 grep -E '^(pytest|pytest-xdist|pyyaml)([<>=~!]|$)' requirements-dev.txt > requirements-dev.new; mv requirements-dev.new requirements-dev.txt
 grep -qxF /CLAUDE.md .gitignore 2> /dev/null || echo /CLAUDE.md >> .gitignore
