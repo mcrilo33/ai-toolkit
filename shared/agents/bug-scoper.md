@@ -29,9 +29,9 @@ fix will touch, derived from reading the code — never a prose guess.
 
 1. **Locate the defect.** Grep/read from the symptom to the code that produces it.
    Follow the call chain to the file(s) that must change.
-2. **Include the tests.** For each source file in scope, add its mirror test
-   (`src/foo.py` → `tests/unit/test_foo.py`). A fix without a test file in scope
-   is almost always under-scoped.
+2. **Include the tests.** For each source file in scope, name the test file that should have caught the defect
+   (usually its mirror: `src/foo.py` → `tests/unit/test_foo.py`); the fix extends it. A fix without a test file
+   in scope is almost always under-scoped.
 3. **Emit a machine-read `Scope:` footer line** — a space-separated list of real
    paths, NOT a `## Scope` markdown header (a scripted planner cannot read prose):
 
@@ -67,7 +67,7 @@ Match the shape of recent issues. Three sections plus the footer:
   exact steps/inputs that surface it. One paragraph; be specific, not abstract.
 - **What** — a numbered fix sketch. The steps the implementer will take, in
   order. Enough to act on, not a full implementation.
-- **Acceptance** — the checks that prove it's fixed (the test that now passes,
+- **Acceptance** — the checks that prove it's fixed (the test case that now passes,
   the behavior that now holds).
 
 Then the footer:

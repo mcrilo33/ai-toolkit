@@ -21,8 +21,8 @@ If the test passes without implementation, the test is wrong — fix it or disca
 
 1. **Understand the requirement** — clarify behavior, inputs, outputs, edge cases. If unclear, ask.
 2. **Break down into testable behaviors** — list the individual behaviors to verify.
-3. **Confirm plan with user** — present the list. NEVER start without confirmation.
-4. **Write ONE failing test** — start with the simplest happy path case.
+3. **Confirm plan with user** — present the list, marking each behavior as an extension of an existing test or a new test, with the net test count (`pytest-conventions`, Test economy). NEVER start without confirmation.
+4. **Write ONE failing test**, or one failing case on the existing test that covers the area — start with the simplest happy path case.
 5. **Run the test** — verify it fails for the right reason (`NameError`, `ImportError`, `AssertionError`).
 6. **Hand off to GREEN phase** — do not proceed to implementation.
 
@@ -31,7 +31,7 @@ If the test passes without implementation, the test is wrong — fix it or disca
 - **One test at a time** — never batch multiple tests before verifying each fails.
 - **AAA pattern** — clear Arrange, Act, Assert sections.
 - **Behavior-focused names** — `test_<function>_<scenario>` describing expected behavior.
-- **Single assertion focus** — each test verifies one specific outcome.
+- **One behavior per test** — each test verifies one specific outcome and names the defect it catches.
 - **Edge cases** — consider boundary conditions after happy path is green.
 
 ## Conventions
@@ -61,6 +61,7 @@ order and the test body (`tdd_followed`). Run the test and watch it fail for the
 - [ ] Test fails for the right reason (missing implementation)
 - [ ] Test name is descriptive and follows naming conventions
 - [ ] Test follows AAA pattern
+- [ ] Checked for an existing test covering this area; extended it where one exists
 - [ ] No production code written
 - [ ] Tests committed separately, before any implementation
 - [ ] Watched the test FAIL for the right reason before committing (RED proven, not just claimed)

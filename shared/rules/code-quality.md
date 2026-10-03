@@ -154,13 +154,13 @@ Minimize everything *except* the following — never trade these away for brevit
 
 ## Tests Are Not Optional
 
-**When you write or modify functional code, you must write or update tests.** Do not wait for the user to ask.
+**When you change behavior, a test covers it.** Do not wait for the user to ask. Extend an existing test before adding one (`pytest-conventions`, Test economy).
 
-- New function/class/module → write tests covering happy path + key edge cases
-- Modified behavior → update existing tests or add new ones to cover the change
-- Bug fix → add a regression test that would have caught the bug
+- New behavior → a test for the happy path and the key edge cases
+- Modified behavior → update the test that covers it; add one only for what no test covers
+- Bug fix → extend the test that should have caught it; add a new test only if none covers the area
+- Removed behavior → remove its tests in the same change
 - The only exceptions: config files, documentation-only changes, simple renames with no behavior change
-- If unsure whether tests are needed, they are
 
 ## Documentation Follows Code
 
@@ -187,4 +187,4 @@ Before marking work as done, verify every changed/added file against:
 - [ ] No hardcoded values (URLs, ports, credentials, magic numbers) — use constants or config
 - [ ] No unnecessary mutation — prefer immutable data and pure functions
 - [ ] No dead code introduced (unused imports, variables, functions)
-- [ ] Tests written/updated for all functional changes (not deferred, not optional)
+- [ ] Behavior changes are covered by a test (extended where one exists; not deferred)
