@@ -115,6 +115,20 @@ def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_ac
 REPLY = "bash {}/scripts/coordinator.sh --run run_t --reply msg_q approve".format(V2)
 
 
+@pytest.mark.parametrize("args,mode", [([], "auto"), (["--answer", "human"], "human"), (["--until", "23:59", "--drain"], "auto until 23:59 drain")])
+def test_the_loop_titles_its_own_terminal_with_its_mode_before_the_first_wait_so_a_hook_can_tell_it_from_a_session(C, args, mode):
+    assert C.go(*args).returncode == 0
+    r = C.calls("orca terminal rename")
+    assert [(arg(a, "--terminal"), arg(a, "--title")) for a in r] == [("term_c", f"coordinator.sh {mode}")]
+    assert C.kinds().index("orca terminal rename") < C.kinds().index("orca orchestration check")
+
+
+def test_a_loop_that_cannot_title_its_terminal_does_not_start_since_the_guard_would_mistake_it_for_a_session(C):
+    C.stubs.reply("orca.terminal_rename", "", rc=1)
+    r = C.go()
+    assert r.returncode != 0 and not C.calls("orca orchestration check")
+
+
 @pytest.mark.parametrize("mode, rc", [("human", 0), ("auto", 1)])   # auto: the answerer found nothing usable. Never a blind approve
 def test_a_question_for_the_human_is_notified_with_the_exact_reply_command_and_acked_without_waiting(C, mode, rc):
     C.stubs.reply("answer.sh", "", rc=rc)

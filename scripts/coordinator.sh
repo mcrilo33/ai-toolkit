@@ -106,6 +106,9 @@ if [ "$stop" = 1 ]; then   # the caller holds the Run now: the loop's wait retur
 fi
 mode="$answer${until:+ until $until}"; [ "$drain" = 0 ] || mode="$mode drain"
 sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'rm -f "$errf" "$hf"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
+# The loop's own terminal reports agentIdentity claude (its headless `claude -p` children), so name it: danger-guard denies, never asks, for a Run held by a "coordinator.sh ..." title.
+# Left in place on exit: workers still live after --until are as unattended as before. Fatal: without it a worker's workflow write would ask a prompt nobody answers.
+orca terminal rename --terminal "$H" --title "coordinator.sh $mode" > /dev/null 2>&1 || die "cannot title this terminal (orca terminal rename): danger-guard could not tell this loop from a session"
 log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
 
 # ctx <dispatch>: sets disp task term wtp issue from the worker's Orca row and the issue linked to its worktree.

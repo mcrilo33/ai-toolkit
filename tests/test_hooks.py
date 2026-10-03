@@ -2,7 +2,6 @@ import json
 import os
 import shutil
 import subprocess
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -220,41 +219,14 @@ esac
 ROW = {"agentTerminalHandle": "term_w", "dispatchStatus": "dispatched", "runId": "run_1"}
 
 
-def shim_env(*, workers=(ROW,), holder="term_h", identity="claude", rc=0, raw=None, handle="term_w"):
-    """The orca answers a spoke's guard reads: its worker row -> the Run -> the holder terminal -> its agentIdentity."""
+def shim_env(*, workers=(ROW,), holder="term_h", identity="claude", title="bash", rc=0, raw=None, handle="term_w"):
+    """The orca answers a spoke's guard reads: its worker row -> the Run -> the holder terminal -> its agentIdentity and title."""
     out = {"SHIM_RC": str(rc), "SHIM_WORKERS": json.dumps({"result": {"workers": list(workers)}}),
            "SHIM_RUN": json.dumps({"result": {"run": {"coordinator_handle": holder} if holder else {}}}),
-           "SHIM_TERM": json.dumps({"result": {"terminal": {"agentIdentity": identity} if identity else {}}})}
+           "SHIM_TERM": json.dumps({"result": {"terminal": {"agentIdentity": identity, "title": title} if identity else {"title": title}}})}
     if raw is not None:
         out.update(SHIM_WORKERS=raw, SHIM_RUN=raw, SHIM_TERM=raw)
     return {**out, "ORCA_TERMINAL_HANDLE": handle} if handle else out
-
-
-@pytest.fixture(scope="module")
-def live_loop(tmp_path_factory):
-    """A live process whose command is coordinator.sh: what a running Run loop looks like to `ps`."""
-    d = tmp_path_factory.mktemp("loop")
-    (d / "coordinator.sh").write_text("#!/bin/bash\nsleep 60\n")
-    (d / "coordinator.sh").chmod(0o755)
-    (d / "other.sh").write_text("#!/bin/bash\nsleep 60\n")
-    (d / "other.sh").chmod(0o755)
-    procs = {n: subprocess.Popen([str(d / f"{n}.sh")]) for n in ("coordinator", "other")}
-    time.sleep(0.3)  # let the shell exec so that `ps` shows the script
-    yield {n: p.pid for n, p in procs.items()}
-    for p in procs.values():
-        p.kill()
-        p.wait()
-
-
-def loop_state(tmp_path, live_loop, kind):
-    """AITK_STATE_DIR with the holder.<pid> marker coordinator.sh writes (spool_dir/<run>/holder.<pid> = '<handle> <mode>')."""
-    pid, line = {"auto": (live_loop["coordinator"], "term_h auto"), "human": (live_loop["coordinator"], "term_h human"),
-                 "other-handle": (live_loop["coordinator"], "term_other auto"), "dead": (2**22 + 7, "term_h auto"),
-                 "reused-pid": (live_loop["other"], "term_h auto")}[kind]
-    d = tmp_path / "state" / "run_1"
-    d.mkdir(parents=True)
-    (d / f"holder.{pid}").write_text(line + "\n")
-    return str(tmp_path / "state")
 
 
 @pytest.fixture(scope="module")
@@ -269,13 +241,12 @@ def shim_bin(tmp_path_factory):
 WF_SCENARIOS = {
     "no-run-main-checkout": ("root", None, True), "no-run-plain-worktree": ("wt", None, True),
     "session-holds-the-run": ("spoke", shim_env(), True),
-    # Orca reports `claude` for the loop terminal too (its headless `claude -p` children), so the identity alone cannot tell a session from the loop
-    "auto-loop-holds-the-run": ("spoke", {**shim_env(), "LOOP": "auto"}, False),
-    "human-loop-holds-the-run": ("spoke", {**shim_env(), "LOOP": "human"}, False),
+    # Orca reports `claude` for the loop terminal too (it runs headless `claude -p` children; seen live: identity claude, title bash before the
+    # loop titled itself), so the loop's own title, set by coordinator.sh, is what tells it from a session
+    "auto-loop-holds-the-run": ("spoke", shim_env(title="coordinator.sh auto"), False),
+    "human-loop-holds-the-run": ("spoke", shim_env(title="coordinator.sh human until 23:59 drain"), False),
+    "session-with-own-title-holds-the-run": ("spoke", shim_env(title="my coordinator session"), True),
     "holder-is-no-agent": ("spoke", shim_env(identity=""), False),
-    "loop-bound-to-another-terminal": ("spoke", {**shim_env(), "LOOP": "other-handle"}, True),
-    "stale-loop-marker": ("spoke", {**shim_env(), "LOOP": "dead"}, True),
-    "loop-marker-pid-reused": ("spoke", {**shim_env(), "LOOP": "reused-pid"}, True),
     "other-agent-holds-the-run": ("spoke", shim_env(identity="codex"), False),
     "orca-fails": ("spoke", shim_env(rc=1), False), "orca-prints-garbage": ("spoke", shim_env(raw="not json"), False),
     "no-worker-row": ("spoke", shim_env(workers=()), False), "row-not-dispatched": ("spoke", shim_env(workers=({**ROW, "dispatchStatus": "completed"},)), False),
@@ -302,16 +273,13 @@ WF_LANES = [
 
 @pytest.mark.parametrize("scenario", WF_SCENARIOS)
 @pytest.mark.parametrize("tool,ti,named", WF_LANES)
-def test_danger_guard_workflow_writes_ask_only_when_a_session_attends(shared, shim_bin, live_loop, tmp_path, scenario, tool, ti, named):
+def test_danger_guard_workflow_writes_ask_only_when_a_session_attends(shared, shim_bin, scenario, tool, ti, named):
     where, answers, asks = WF_SCENARIOS[scenario]
     if where != "spoke" and named == "spoke-only":
         pytest.skip("spoke-only protections")
     named = "" if named == "spoke-only" else named
     ti = {k: v.replace("{spoke}", str(shared[where])).replace("{home}", str(shared["home"])) for k, v in ti.items()}
-    answers = dict(answers or {})
-    if kind := answers.pop("LOOP", None):
-        answers["AITK_STATE_DIR"] = loop_state(tmp_path, live_loop, kind)
-    env = {**shared["env"], "PATH": f"{shim_bin}:{os.environ['PATH']}", **answers}
+    env = {**shared["env"], "PATH": f"{shim_bin}:{os.environ['PATH']}", **(answers or {})}
     r = call("danger-guard.sh", shared[where], tool, env=env, **ti)
     if asks and named:
         out = json.loads(r.stdout)["hookSpecificOutput"]
