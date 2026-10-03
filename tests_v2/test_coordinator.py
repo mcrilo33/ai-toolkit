@@ -60,7 +60,7 @@ def C(stubs, repo, run, tmp_path):
     def go(*args, run_id="run_t", **env):
         cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh", "notify")}
         return run(["bash", CO, *(["--run", run_id] if run_id else []), *args], cwd=repo.root,
-                   **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, **cmd_env, **env})
+                   **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "COORD_HUMAN_IN": "", **cmd_env, **env})
 
     def trail():   # [("orca orchestration check ack", argv), ("gh issue edit", argv), ("land.sh", argv)...] in call order
         rows = (Path(os.environ["STUB_DIR"]) / "calls.log").read_text().splitlines()
@@ -109,14 +109,33 @@ def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_ac
     assert arg(C.calls("orca orchestration check ack")[0], "--ack") == "d0" and "touches CI" in C.calls("gh issue comment")[0][-1] and C.stubs.calls("notify")
 
 
-@pytest.mark.parametrize("mode, rc", [("auto", 1), ("human", 0)])
-def test_the_human_path_notifies_and_comments_the_reply_command_without_replying(C, mode, rc):
-    C.stubs.reply("answer.sh", "", rc=rc)   # auto: the answerer found nothing usable. Never a blind approve
+@pytest.mark.parametrize("mode, rc", [("human", 0), ("auto", 1)])   # auto: the answerer found nothing usable. Never a blind approve
+def test_the_human_is_prompted_on_the_coordinator_terminal_and_what_is_typed_is_replied(C, tmp_path, mode, rc):
+    C.stubs.reply("answer.sh", "", rc=rc)
+    (tmp_path / "typed").write_text("maybe\nrevise:\nrevise:  use a tmp dir\n")   # two invalid lines are re-prompted
+    C.mail([msg("question", "msg_q", question="PLAN?")])
+    r = C.go("--answer", mode, COORD_HUMAN_IN=tmp_path / "typed")
+    rep = C.calls("orca orchestration reply")[0]
+    assert (arg(rep, "--id"), arg(rep, "--body")) == ("msg_q", "revise: use a tmp dir") and "PLAN?" in r.stdout and C.stubs.calls("notify")
+    assert (len(C.stubs.calls("answer.sh")) == 1) == (mode == "auto") and "terminal send --terminal term_c" in C.calls("gh issue comment")[0][-1]
+    in_order(C.kinds(), "notify", "orca orchestration reply", "orca orchestration check ack")
+
+
+@pytest.mark.parametrize("mode, rc, typed", [("human", 0, ""), ("auto", 1, None)])
+def test_a_question_nobody_answers_is_acked_and_left_parked_with_the_takeover_hint(C, tmp_path, mode, rc, typed):
+    C.stubs.reply("answer.sh", "", rc=rc)
+    env = {}
+    if typed is not None:   # a terminal that gives no input (EOF), or none at all
+        (tmp_path / "typed").write_text(typed)
+        env = {"COORD_HUMAN_IN": tmp_path / "typed"}
     C.mail([msg("question", "msg_q", question="q")])
-    C.go("--answer", mode)
-    assert not C.calls("orca orchestration reply") and C.stubs.calls("notify") and C.calls("orca orchestration check ack")
-    assert "orca orchestration reply --run run_t --from term_c --id msg_q --body approve" in C.calls("gh issue comment")[0][-1]
-    assert (len(C.stubs.calls("answer.sh")) == 1) == (mode == "auto")
+    C.go("--answer", mode, **env)
+    assert not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack") and C.stubs.calls("notify")
+    assert "run-use --id run_t" in C.calls("gh issue comment")[0][-1]
+
+
+def test_human_mode_without_a_terminal_to_ask_on_is_refused(C):
+    assert C.go("--answer", "human").returncode == 2
 
 
 @pytest.mark.parametrize("kind, extra", [("worker_done", {"outcome": "failed"}), ("escalation", {})])
