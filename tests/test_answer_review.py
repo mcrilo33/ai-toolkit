@@ -41,14 +41,20 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and A.stdin() == "PLAN: do X. Approve?"
 
 
-def test_revise_keeps_its_text_and_warn_lines_follow_the_answer(A):
-    r = A.go("WARN: touches the CI config\nREVERSIBILITY: scope\nWARN: second\nANSWER: revise: drop the extra file\n")
-    assert r.returncode == 0 and r.stdout == "revise: drop the extra file\nWARN: touches the CI config\nWARN: second\n"
+@pytest.mark.parametrize("line, body", [
+    ("revise: drop the extra file", "revise: drop the extra file"),
+    ("approve with: drop the extra file", "approve with: drop the extra file"),
+    ("Approve  With:   drop the extra file  ", "approve with: drop the extra file"),
+])
+def test_revise_and_approve_with_keep_their_text_and_warn_lines_follow_the_answer(A, line, body):
+    r = A.go(f"WARN: touches the CI config\nREVERSIBILITY: scope\nWARN: second\nANSWER: {line}\n")
+    assert r.returncode == 0 and r.stdout == f"{body}\nWARN: touches the CI config\nWARN: second\n"
 
 
 @pytest.mark.parametrize("out", [
     "", "I think it is fine\n", "ANSWER: maybe\n", "ANSWER:\n", "ANSWER: revise:\n", "ANSWER: revise\n", "ANSWER: approve it\n",
     "ANSWER: approve\nand then more text\n", "**ANSWER: approve**\n", "answer: approve please\n",
+    "ANSWER: approve with:\n", "ANSWER: approve with\n", "ANSWER: approve with:   \n", "ANSWER: approve withdraw\n",
 ])
 def test_anything_but_a_clean_final_answer_line_is_never_an_approve(A, out):
     r = A.go(out)
