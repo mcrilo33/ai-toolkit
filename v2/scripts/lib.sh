@@ -58,3 +58,13 @@ gh_issue() { gh issue view "$1" --json number,title,body; }
 
 # issue_footer <body> <Key>: value of the last `Key: value` line (Scope:, Gate:, Model:).
 issue_footer() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | tail -n 1; }
+
+# usage_exit <msg>: caller misuse, exit 2 (die is exit 1: a failed operation).
+usage_exit() { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 2; }
+
+# wait_until <tries> <sleep-seconds> <cmd...>: poll until cmd succeeds; false when the tries run out.
+wait_until() {
+  local t="$1" s="$2" i; shift 2
+  for ((i = 0; i < t; i++)); do "$@" && return 0; sleep "$s"; done
+  return 1
+}
