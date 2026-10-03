@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2086  # `check $seg` splits a segment into words on purpose (globbing is off: set -f)
-# danger-guard: PreToolUse(Bash|Write|Edit|MultiEdit|NotebookEdit|AskUserQuestion). Yolo mode (D8) has no prompts, so this
-# deny-list is the brake: rm -r outside the worktree, git reset --hard in the main checkout, writes to orca.yaml,
+# danger-guard: PreToolUse(Bash|Write|Edit|MultiEdit|NotebookEdit|AskUserQuestion). Yolo mode (D8) has no prompts of its own, so
+# this deny-list is the brake: rm -r outside the worktree, git reset --hard in the main checkout, writes to orca.yaml,
 # ~/.claude/settings.json and, in a spoke, the project .claude/{settings*.json,hooks/}; AskUserQuestion in a spoke.
 # Exit 2 + stderr = deny; a crash (bad JSON, no jq) is exit 2 too (fail-closed). A pattern list, not a sandbox.
 # Writes to .github/workflows/ ASK instead (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode)
@@ -17,19 +17,19 @@ set -f; shopt -s nocasematch # macOS is case-insensitive: RM, ORCA.YAML and .Git
 in="$(cat)"
 j() { jq -r "$1 // empty" <<<"$in"; }
 phys() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
-orc() { # `orca ...` stdout, killed after 5s: a hung CLI must deny, not time the hook out into an allow
+orc() { # `orca ...` stdout (empty on any failure), killed after 5s: a hung CLI must deny, not time the hook out into an allow
   local o p w; o="$(mktemp)"; orca "$@" > "$o" 2> /dev/null & p=$!; { sleep 5; kill $p; } > /dev/null 2>&1 & w=$!
-  wait $p || { kill $w 2> /dev/null; rm -f "$o"; return 1; }; kill $w 2> /dev/null; cat "$o"; rm -f "$o"
+  if wait $p; then cat "$o"; fi; kill $w 2> /dev/null; wait $w 2> /dev/null; rm -f "$o"; return 0
 }
-attended() { # 0 = a human attends (outside a spoke, or a Claude session holds the spoke's Run)
+attended() { # 0 = a human attends (outside a spoke, or a Claude session holds the spoke's Run); every unreadable answer is empty
   [ -n "$spoke" ] || return 0
   local h="${ORCA_TERMINAL_HANDLE:-}" run holder
   [ -n "$h" ] || return 1
-  run="$(orc orchestration worker-list --json --limit 100 | jq -r --arg h "$h" '[.result.workers[] | select(.agentTerminalHandle == $h and .dispatchStatus == "dispatched")][0].runId // empty')" || return 1
+  run="$(orc orchestration worker-list --json --limit 100 | jq -r --arg h "$h" '[.result.workers[] | select(.agentTerminalHandle == $h and .dispatchStatus == "dispatched")][0].runId // empty' 2> /dev/null || :)"
   [ -n "$run" ] || return 1
-  holder="$(orc orchestration run-show --id "$run" --json | jq -r '.result.run.coordinator_handle // empty')" || return 1
+  holder="$(orc orchestration run-show --id "$run" --json | jq -r '.result.run.coordinator_handle // empty' 2> /dev/null || :)"
   [ -n "$holder" ] || return 1
-  [ "$(orc terminal show --terminal "$holder" --json | jq -r '.result.terminal.agentIdentity // empty')" = claude ]
+  [ "$(orc terminal show --terminal "$holder" --json | jq -r '.result.terminal.agentIdentity // empty' 2> /dev/null || :)" = claude ]
 }
 wf=""; wfd="write to a protected path (.github/workflows, orca.yaml, claude settings/hooks)" # a .github/workflows/ write (what, deny text), settled by finish()
 finish() {

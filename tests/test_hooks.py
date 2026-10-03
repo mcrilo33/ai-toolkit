@@ -248,20 +248,21 @@ WF_SCENARIOS = {
     "other-terminals-row": ("spoke", shim_env(workers=({**ROW, "agentTerminalHandle": "term_x"},)), False),
     "no-terminal-handle": ("spoke", shim_env(handle=""), False), "no-holder": ("spoke", shim_env(holder=""), False),
 }
-# tool, tool_input, the path the ask must name ("" = a protected path that never asks)
+# tool, tool_input, the text the ask must carry ("" = a protected path that never asks; "spoke-only" = same, protected in a spoke only)
 WF_LANES = [
     ("Write", {"file_path": ".github/workflows/ci.yml"}, ".github/workflows/ci.yml"),
+    ("Edit", {"file_path": "{spoke}/.github/workflows/new.yml"}, "new.yml"),
     ("MultiEdit", {"file_path": "sub/../.github/workflows/ci.yml"}, ".github/workflows/ci.yml"),
     ("NotebookEdit", {"notebook_path": ".github/workflows/n.ipynb"}, ".github/workflows/n.ipynb"),
-    ("Bash", {"command": "echo x > .github/workflows/ci.yml"}, ".github/workflows"),
-    ("Bash", {"command": "sed -i s/a/b/ .github/workflows/ci.yml"}, ".github/workflows"),
-    ("Bash", {"command": "cd .github/workflows && echo x > ci.yml"}, ".github/workflows"),
+    ("Bash", {"command": "echo x > .github/workflows/ci.yml"}, "echo x > .github/workflows/ci.yml"),
+    ("Bash", {"command": "sed -i s/a/b/ .github/workflows/ci.yml"}, "sed -i s/a/b/ .github/workflows/ci.yml"),
+    ("Bash", {"command": "cd .github/workflows && echo x > ci.yml"}, "cd .github/workflows && echo x > ci.yml"),
     ("Bash", {"command": "echo x > .github/workflows/ci.yml; rm -rf /usr"}, ""),
     ("Bash", {"command": "echo x > .github/workflows/ci.yml && echo y > orca.yaml"}, ""),
     ("Write", {"file_path": "orca.yaml"}, ""), ("Write", {"file_path": "{home}/.claude/settings.json"}, ""),
     ("Bash", {"command": "echo x > orca.yaml"}, ""), ("Bash", {"command": "cp x ~/.claude/settings.json"}, ""),
-    ("Write", {"file_path": ".claude/settings.json"}, ""), ("Write", {"file_path": ".claude/hooks/push-guard.sh"}, ""),
-    ("Write", {"file_path": ".ai-toolkit/spoke-run-id"}, ""), ("Bash", {"command": "rm .claude/settings.local.json"}, ""),
+    ("Write", {"file_path": ".claude/settings.json"}, "spoke-only"), ("Write", {"file_path": ".claude/hooks/push-guard.sh"}, "spoke-only"),
+    ("Write", {"file_path": ".ai-toolkit/spoke-run-id"}, "spoke-only"), ("Bash", {"command": "rm .claude/settings.local.json"}, "spoke-only"),
 ]
 
 
@@ -269,17 +270,19 @@ WF_LANES = [
 @pytest.mark.parametrize("tool,ti,named", WF_LANES)
 def test_danger_guard_workflow_writes_ask_only_when_a_session_attends(shared, shim_bin, scenario, tool, ti, named):
     where, answers, asks = WF_SCENARIOS[scenario]
-    if where != "spoke" and (".claude/" in str(ti) or "spoke-run-id" in str(ti)):
+    if where != "spoke" and named == "spoke-only":
         pytest.skip("spoke-only protections")
-    ti = {k: v.replace("{spoke}", str(shared["spoke"])).replace("{home}", str(shared["home"])) for k, v in ti.items()}
+    named = "" if named == "spoke-only" else named
+    ti = {k: v.replace("{spoke}", str(shared[where])).replace("{home}", str(shared["home"])) for k, v in ti.items()}
     env = {**shared["env"], "PATH": f"{shim_bin}:{os.environ['PATH']}", **(answers or {})}
     r = call("danger-guard.sh", shared[where], tool, env=env, **ti)
     if asks and named:
         out = json.loads(r.stdout)["hookSpecificOutput"]
-        assert (r.returncode, out["hookEventName"], out["permissionDecision"]) == (0, "PreToolUse", "ask"), r.stderr
+        assert (r.returncode, out["hookEventName"], out["permissionDecision"], r.stderr) == (0, "PreToolUse", "ask", "")
         assert named in out["permissionDecisionReason"] and "danger-guard" in out["permissionDecisionReason"]
     else:
         assert r.returncode == 2 and r.stdout == "" and "danger-guard: blocked" in r.stderr, (r.returncode, r.stdout, r.stderr)
+        assert r.stderr.count("\n") == 1 and "cannot parse" not in r.stderr, r.stderr  # one clear reason, no trap noise
 
 
 def test_danger_guard_uses_the_project_dir_for_the_marker_and_the_worktree_root(shared):
