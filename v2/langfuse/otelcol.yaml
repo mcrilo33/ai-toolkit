@@ -6,7 +6,8 @@
 receivers:
   otlp:  # claude-spoke: OTEL_EXPORTER_OTLP_ENDPOINT (gRPC)
     protocols: {grpc: {endpoint: "0.0.0.0:4317"}, http: {endpoint: "0.0.0.0:4318"}}
-  otlp/beta:  # claude-spoke: BETA_TRACING_ENDPOINT; MUST be a different host:port than the normal one
+  otlp/beta:  # claude-spoke: BETA_TRACING_ENDPOINT; MUST differ from the normal host:port. With beta
+    # tracing on, Claude sends its logs and metrics here too (verified live), so all pipelines read it.
     protocols: {http: {endpoint: "0.0.0.0:4418"}}
 processors:
   batch: {}
@@ -35,13 +36,13 @@ processors:
         statements:
           - set(span.attributes["langfuse.observation.output"], attributes["output"]) where attributes["output"] != nil
 exporters:
-  otlphttp/langfuse:
+  otlp_http/langfuse:
     endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
     headers: {Authorization: "${env:LANGFUSE_BASIC_AUTH}"}
   file/logs: {path: /raw/logs.jsonl, rotation: {max_megabytes: 25, max_backups: 5}}
   file/metrics: {path: /raw/metrics.jsonl, rotation: {max_megabytes: 25, max_backups: 5}}
 service:
   pipelines:
-    traces: {receivers: [otlp, otlp/beta], processors: [transform/langfuse, batch], exporters: [otlphttp/langfuse]}
-    logs: {receivers: [otlp], processors: [batch], exporters: [file/logs]}
-    metrics: {receivers: [otlp], processors: [batch], exporters: [file/metrics]}
+    traces: {receivers: [otlp, otlp/beta], processors: [transform/langfuse, batch], exporters: [otlp_http/langfuse]}
+    logs: {receivers: [otlp, otlp/beta], processors: [batch], exporters: [file/logs]}
+    metrics: {receivers: [otlp, otlp/beta], processors: [batch], exporters: [file/metrics]}

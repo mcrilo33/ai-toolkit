@@ -65,8 +65,8 @@ def test_collector_wires_receivers_through_the_transform_to_langfuse():
         assert set(p["receivers"]) <= set(COLLECTOR["receivers"]), name
         assert set(p.get("processors", [])) <= set(COLLECTOR["processors"]), name
         assert set(p["exporters"]) <= set(COLLECTOR["exporters"]), name
-    assert svc["traces"] == {"receivers": ["otlp", "otlp/beta"], "processors": ["transform/langfuse", "batch"], "exporters": ["otlphttp/langfuse"]}
-    lf = COLLECTOR["exporters"]["otlphttp/langfuse"]
+    assert svc["traces"] == {"receivers": ["otlp", "otlp/beta"], "processors": ["transform/langfuse", "batch"], "exporters": ["otlp_http/langfuse"]}
+    lf = COLLECTOR["exporters"]["otlp_http/langfuse"]
     assert lf["endpoint"] == "${env:LANGFUSE_OTLP_ENDPOINT}" and lf["headers"]["Authorization"] == "${env:LANGFUSE_BASIC_AUTH}"
 
 
@@ -82,7 +82,9 @@ def test_transform_keeps_session_and_token_mapping_and_drops_the_bridge_machiner
 
 def test_logs_and_metrics_land_as_rotated_jsonl_in_the_mounted_raw_dir():
     for sig in ("logs", "metrics"):
-        (exp,) = COLLECTOR["service"]["pipelines"][sig]["exporters"]
+        pipe = COLLECTOR["service"]["pipelines"][sig]
+        assert pipe["receivers"] == ["otlp", "otlp/beta"], "with beta tracing on, Claude sends logs and metrics to the beta endpoint"
+        (exp,) = pipe["exporters"]
         cfg = COLLECTOR["exporters"][exp]
         assert exp.startswith("file/") and cfg["path"].startswith("/raw/") and cfg["rotation"]["max_megabytes"] and cfg["rotation"]["max_backups"]
     assert "${AITK_OTEL_RAW_DIR:?}:/raw" in COMPOSE["services"]["collector"]["volumes"]
