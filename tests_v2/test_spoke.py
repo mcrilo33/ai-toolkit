@@ -10,12 +10,14 @@ def in_spoke(repo, run_id="abc-123"):
     return wt
 
 
-def test_spoke_exports_native_otel_env_and_passes_args_through(run, stubs, repo):
-    r = run([SPOKE, "--model", "m"], cwd=in_spoke(repo), OTEL_ENDPOINT="http://collector:4317")
+def test_spoke_exports_native_otel_env_and_passes_args_through(run, stubs, repo, tmp_path):
+    (tmp_path / "l.env").write_text("SECRET_PROBE=s3cret\n")
+    r = run([SPOKE, "--model", "m"], cwd=in_spoke(repo), OTEL_ENDPOINT="http://collector:4317", AI_TOOLKIT_LOCAL_ENV=tmp_path / "l.env")
     env = stubs.env("claude")
     assert r.returncode == 0 and stubs.calls("claude") == [["--model", "m"]], r.stderr
     assert "CLAUDE_CODE_ENABLE_TELEMETRY=1" in env and "OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317" in env
     assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=abc-123,repo=origin" in env and "OTLP_HEADERS" not in env
+    assert "SECRET_PROBE" not in env and "s3cret" not in env
 
 
 def test_spoke_is_a_plain_claude_without_a_run_id_or_when_opted_out(run, stubs, repo):

@@ -41,7 +41,7 @@ echo '#!/bin/sh' > "$S/.claude/hooks/guard.sh"
 # copy: the hooks run from the main checkout. Orca's runner is a bash script, so $ORCA_ROOT_PATH expands.
 # shellcheck disable=SC2016
 printf 'setupAgentStartupPolicy: wait-for-setup\nscripts:\n  setup: $ORCA_ROOT_PATH/.ai-toolkit/scripts/setup.sh\n  archive: $ORCA_ROOT_PATH/.ai-toolkit/scripts/archive.sh\n' > "$S/orca.yaml"
-printf '.claude/\n' > "$S/.gitignore"
+printf '.claude/\n.ai-toolkit/\n' > "$S/.gitignore"   # explicit: never rely on a global gitignore
 git -C "$S" add -A && git -C "$S" commit -q -m "chore: scratch repo" && git -C "$S" push -q -u origin main
 repo_id="$(orca_json repo add --path "$S" | jq -r '.result.repo.id')"
 [ -n "$repo_id" ] && [ "$repo_id" != null ] || fail "orca repo add"

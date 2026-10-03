@@ -5,7 +5,8 @@ AI_TOOLKIT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 1; }
 warn() { printf '%s: warning: %s\n' "${0##*/}" "$*" >&2; }
 
-# KEY=VALUE lines; a variable that is already set is never overwritten.
+# KEY=VALUE lines; a variable that is already set is never overwritten. Assigned, NOT exported:
+# the local file may hold secrets, and a caller that needs a key in a child env exports it itself.
 _load_env_file() {
   local line k v
   [ -f "$1" ] || return 0
@@ -14,7 +15,7 @@ _load_env_file() {
     k="${line%%=*}"; v="${line#*=}"
     case "$k" in '' | *[!A-Z0-9_]*) continue ;; esac
     v="${v#\"}"; v="${v%\"}"
-    if ! eval "[ -n \"\${$k+set}\" ]"; then export "$k=$v"; fi
+    if ! eval "[ -n \"\${$k+set}\" ]"; then printf -v "$k" %s "$v"; fi
   done < "$1"
 }
 

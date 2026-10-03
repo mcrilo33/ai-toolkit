@@ -24,8 +24,9 @@ def test_provisions_claude_dir_run_id_and_excludes_and_is_idempotent(run, repo, 
 def test_fails_loud_when_gh_fails_or_the_root_has_no_claude_dir(run, repo, stubs):
     stubs.reply("gh", "boom", rc=1)
     assert "issue 12" in setup(run, repo, "12-x")[1].stderr
+    wt, _ = setup(run, repo)
     shutil.rmtree(repo.root / ".claude")
-    wt, r = setup(run, repo)
+    r = setup(run, repo, wt=wt)[1]
     assert r.returncode != 0 and ".claude" in r.stderr and not (wt / ".ai-toolkit/setup-done").exists()
 
 

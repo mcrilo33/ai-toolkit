@@ -10,6 +10,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 real="${CLAUDE_REAL:-$(command -v claude || true)}"   # the real binary: this script is not named `claude`
 [ -n "$real" ] || die "no claude found on PATH"
+[ ! "$real" -ef "${BASH_SOURCE[0]}" ] || die "claude resolves to this script: set CLAUDE_REAL"
 
 top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 if [ "${AI_TOOLKIT_OTEL:-1}" = 1 ] && [ -s "$top/.ai-toolkit/spoke-run-id" ]; then

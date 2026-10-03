@@ -9,10 +9,10 @@ set -euo pipefail
 root="${ORCA_ROOT_PATH:?ORCA_ROOT_PATH unset: run me as the Orca setup hook}"
 wt="${ORCA_WORKTREE_PATH:-$PWD}"
 cd "$wt"
+rm -f .ai-toolkit/setup-done   # first, so a failed re-run never leaves a stale ready marker
 [ -d "$root/.claude" ] || die "$root/.claude is missing: sync ai-toolkit into the main checkout first"
 
 mkdir -p .claude .ai-toolkit
-rm -f .ai-toolkit/setup-done
 cp -R "$root/.claude/." .claude/
 
 # Keep the provisioning out of `git status` (info/exclude is shared by all worktrees).

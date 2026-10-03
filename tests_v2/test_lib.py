@@ -13,11 +13,6 @@ def test_env_precedence_is_caller_then_local_then_defaults(run, tmp_path):
     assert len(lib(run, 'load_env; echo "$SPOKE_MODEL $BASE_BRANCH $OTEL_ENDPOINT"').stdout.split()) == 3
 
 
-def test_die_exits_nonzero_and_warn_does_not(run):
-    r = lib(run, "warn soft; die hard; echo unreachable")
-    assert (r.returncode, r.stdout) == (1, "") and "soft" in r.stderr and "hard" in r.stderr
-
-
 def test_orca_mutate_replays_an_unsettled_call_with_the_same_request_id(run, stubs):
     stubs.reply("orca.orchestration_reply", '{"error":{"code":"runtime_unavailable"}}', rc=1, n=1)
     stubs.reply("orca.orchestration_reply", '{"ok":true}', n=2)

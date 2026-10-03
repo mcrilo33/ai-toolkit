@@ -1,7 +1,8 @@
 # v2 WP0 notes (skeleton): Q1 result and decisions
 
 Branch `v2-wp0`. All v2 files live under `v2/` mirroring the 06 section 3 tree; `tests_v2/` and
-`docs/v2/` are top-level. At cutover `git mv v2/* .` (scripts find siblings via their own dir).
+`docs/v2/` are top-level. At cutover `git mv v2/* .` and `git mv v2/.shellcheckrc .` (the glob skips dotfiles; scripts find siblings via
+their own dir).
 Only `orca.yaml` and `scripts/install.sh` collide with old names, but one rule beats a mixed tree, and
 the old root `orca.yaml` (used by real worktrees) stays untouched.
 
@@ -48,5 +49,5 @@ Switching later is one block in `v2/e2e/spoke-scenario.sh` (marked `--- launch p
 
 ## Budgets (lines, `wc -l`)
 
-lib.sh 59/100 · setup.sh 43/80 · archive.sh 6/20 · claude-spoke 26/30 · install.sh 21/40 · ai-toolkit.env 18/25 ·
-orca.yaml 5/6 · e2e 91/150 · tests_v2 (conftest + 3 files) 200/200. Run: `pytest -n auto tests_v2` (15 tests, ~2 s).
+lib.sh 60/100 · setup.sh 43/80 · archive.sh 6/20 · claude-spoke 27/30 · install.sh 21/40 · ai-toolkit.env 18/25 ·
+orca.yaml 5/6 · e2e 91/150 · tests_v2 (conftest + 3 files) 200/200. Run: `pytest -n auto tests_v2` (14 tests, ~2 s).

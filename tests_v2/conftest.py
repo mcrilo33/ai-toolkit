@@ -19,6 +19,8 @@ for f in "$d/$k.$c" "$d/$k" "$d/$n"; do [ -f "$f" ] && { cat "$f"; exit "$(cat "
 def isolated_env(monkeypatch, tmp_path):
     for k in [k for k in os.environ if k.startswith(("GIT_", "OTEL_", "ORCA_", "CLAUDE_CODE_", "AI_TOOLKIT_"))]:
         monkeypatch.delenv(k)
+    monkeypatch.delenv("CLAUDE_REAL", raising=False)
+    monkeypatch.chdir(tmp_path)  # no test may read the real checkout's local env
     (tmp_path / "gitconfig").write_text("[user]\n\tname = t\n\temail = t@t\n[init]\n\tdefaultBranch = main\n")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
