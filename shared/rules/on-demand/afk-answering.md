@@ -83,8 +83,8 @@ Reason as long as you need, then end with this block, each on its own line (noth
   scope-changing call; omit only for a plainly reversible in-scope answer. The coordinator comments it on the
   issue and sends a desktop notification.
 - `ANSWER: approve`, `ANSWER: approve with: <the change>` or `ANSWER: revise: <the change>`: replied to the spoke
-  (spacing normalized); the form decides the recorded `gate_answer_class` (approve = 1, revise = 2, approve with = 3: accepted
-  with a change the spoke applies unreviewed, the one a human double-checks). It is always an answer, never a hand-off to a human.
+  (spacing normalized); the form decides the recorded `gate_answer_class` (approve = 1, revise = 2, approve with = 3, appended so 1 and 2 keep their recorded
+  meaning: accepted with a change the spoke applies unreviewed, so give it a `WARN:` when the change is not trivially safe). It is always an answer, never a hand-off to a human.
   `ANSWER: approve` carries nothing after the word (any extra instruction makes it an `approve with:` or a `revise:`); both
   `with:` and `revise:` need a non-empty change. `answer.sh` rejects a line that is not exactly one of the three forms and
   escalates it to the human, so a stray sentence costs a stalled gate.

@@ -136,7 +136,7 @@ def test_reply_queues_a_one_line_request_in_a_private_spool_outside_any_worktree
 
 @pytest.mark.parametrize("args", [["--reply", "msg_q", "maybe"], ["--reply", "msg_q", "revise:"], ["--reply", "../x", "approve"], ["--reply", "msg_q"],
                                   ["--reply", "msg_q", "approve with:"], ["--reply", "msg_q", "approve with:  "], ["--reply", "msg_q", "approve with"],
-                                  ["--reply", "msg_q", "approve please"]])
+                                  ["--reply", "msg_q", "approve please"], ["--reply", "msg_q", "approve withdraw: x"]])
 def test_reply_refuses_a_bad_message_id_or_body_and_a_missing_run(C, tmp_path, args):
     assert C.go(*args).returncode == 2 and not C.spooled("msg_q") and not C.spooled("../x")
     assert C.go("--reply", "msg_q", "approve", run_id=None).returncode == 2

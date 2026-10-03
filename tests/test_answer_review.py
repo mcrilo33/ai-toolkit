@@ -54,7 +54,7 @@ def test_revise_and_approve_with_keep_their_text_and_warn_lines_follow_the_answe
 @pytest.mark.parametrize("out", [
     "", "I think it is fine\n", "ANSWER: maybe\n", "ANSWER:\n", "ANSWER: revise:\n", "ANSWER: revise\n", "ANSWER: approve it\n",
     "ANSWER: approve\nand then more text\n", "**ANSWER: approve**\n", "answer: approve please\n",
-    "ANSWER: approve with:\n", "ANSWER: approve with\n", "ANSWER: approve with:   \n", "ANSWER: approve withdraw\n",
+    "ANSWER: approve with:\n", "ANSWER: approve with\n", "ANSWER: approve with:   \n", "ANSWER: approve withdraw\n", "ANSWER: approve withdraw: x\n", "ANSWER: approve please with: x\n",
 ])
 def test_anything_but_a_clean_final_answer_line_is_never_an_approve(A, out):
     r = A.go(out)
