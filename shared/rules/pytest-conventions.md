@@ -13,6 +13,19 @@ paths:
 - Test failure modes explicitly — verify that errors are raised, messages are correct, and state is unchanged
 - Keep tests isolated; mock external dependencies at the boundary, not internals
 
+## Test economy
+
+A test earns its place only if it can fail for a reason that matters. Apply these before adding any test.
+
+1. **Extend before adding.** A bug fix first finds the test that should have caught it and adds a case or parameter there. A new test function is for a new behavior.
+2. **Name the defect.** Every test catches a defect you can name, in its name or docstring. If no plausible code change turns it red, delete it.
+3. **Lowest level that proves it.** One end-to-end test per flow; variations go to the cheapest level that proves them (a parametrized unit case, not another end-to-end run).
+4. **Deterministic or gone.** No sleeps, wall clocks or network. A flaky test is fixed or deleted in the same change, never retried or given a looser bound.
+5. **Tests die with their code.** Removing a mechanism removes its tests in the same commit.
+6. **No slow lane.** There is no marker that hides slow tests from the default run; a slow test is made fast or deleted.
+
+A plan's test strategy lists the tests extended, the tests new, and the net change in test count.
+
 ## File Layout
 
 ```
@@ -28,7 +41,7 @@ tests/
 
 - Test file names: `test_{module}.py` — always prefixed with `test_`
 - Mirror the source tree: `src/services/auth.py` → `tests/unit/test_auth.py`
-- One test file per source module; split large test files by class or concern
+- One test file per source module; extend it before creating another, and split only a file past the size limit
 
 ## Naming
 
@@ -49,7 +62,7 @@ def test_transfer_debits_source_account():
     assert target.balance == 30
 ```
 
-- One logical assertion per test (multiple `assert` on the same result is fine)
+- One behavior per test (multiple `assert` on the same result is fine)
 - Keep tests independent — no test should depend on another's side effects
 - No logic in tests (no `if`, `for`, `try`); if needed, parametrize instead
 
@@ -139,14 +152,13 @@ async def test_fetch_returns_data(http_client):
 
 ## Markers
 
-- `@pytest.mark.slow` — tests that take >1s; exclude from default run
-- `@pytest.mark.integration` — tests requiring external services
+- No `slow` marker: see Test economy, principle 6
+- `@pytest.mark.integration` — tests crossing a real local boundary (filesystem, subprocess, database); they run in the default suite and never use the network
 - Register custom markers in `pyproject.toml` to avoid warnings
 
 ```toml
 [tool.pytest.ini_options]
 markers = [
-    "slow: marks tests as slow",
     "integration: marks integration tests",
 ]
 ```

@@ -83,7 +83,7 @@ When updating tests after code changes:
    - Changed function signatures → update test calls
    - New parameters → add test cases for new params
    - Changed return types → update assertions
-   - Removed functionality → remove or mark obsolete tests
+   - Removed functionality → remove its tests in the same change
    - New behavior → add new test cases
 4. **Update tests** preserving existing test structure where possible
 5. **Verify** all imports still valid after changes
@@ -184,7 +184,7 @@ Test names must describe the behavior:
 
 ## Required Test Categories
 
-For each function/method, generate tests covering:
+Cover these categories as a checklist, not a quota: put variations in one parametrized test, skip a category no plausible defect needs, and extend an existing test before adding one (`pytest-conventions`, Test economy). For each function/method:
 
 ### 1. Happy Path (basic functionality)
 ```python

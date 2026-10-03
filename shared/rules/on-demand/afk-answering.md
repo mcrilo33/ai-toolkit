@@ -26,7 +26,7 @@ the quality of the answer, so reason with a real thinking budget.
 1. **Resolve from the contract first.** If the issue body, acceptance criteria, or a repo convention settles
    the question, answer that. Most questions are a careful spoke, not a real fork.
 2. **Approve a sound plan.** A PLAN gate asks "is this approach right before I write code?" If the plan is
-   correct, complete against the acceptance criteria, in `Scope:`, and has a test strategy, reply `approve`.
+   correct, complete against the acceptance criteria, in `Scope:`, and has a proportionate test strategy, reply `approve`. When the strategy adds tests for behavior an existing test already covers, reply `revise: extend <that test> instead of adding one` (`pytest-conventions`, Test economy); check the named area in the worktree first.
 3. **Revise a wrong or incomplete plan** with `revise: <what to change>`: specific, minimal, in terms of the
    contract. That is still an answer. Check for steps the plan *omits*, not only for added scope.
 4. **Prefer the spoke's own recommendation** when it offered options and one is consistent with the contract.

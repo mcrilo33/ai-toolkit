@@ -47,7 +47,7 @@ For each file below 100%, open the matching file in `cov_annotate/`.
 
 ### 4. Add tests for uncovered lines
 
-Write meaningful tests with real assertions — do not just touch lines to inflate coverage.
+Prefer extending an existing test or parameter over a new test function, and make each test catch a defect you can name (`pytest-conventions`, Test economy). A line no plausible defect would break is dead or defensive code: delete it or mark it `# pragma: no cover` with a justification, rather than writing a test that only touches it.
 
 If a line is intentionally uncovered (defensive branch, `TYPE_CHECKING`, platform-specific), mark it with `# pragma: no cover` and add a brief justification comment.
 

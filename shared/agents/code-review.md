@@ -49,9 +49,13 @@ Two fields in the verdict are checked on every review, because TDD is policy and
   the diff is docs, config, or chores with nothing to test.
 - `tests_weakened`: the diff gutted a test to go green: deleted or loosened assertions, a new `skip`/`xfail`, an
   inserted `sys.exit(0)`, a test that no longer calls the code under test, a widened tolerance. Any `true` is a
-  **blocker**.
+  **blocker**. A removal is legitimate, not weakened, when the behavior it covered was removed in the same diff, a
+  named remaining test still covers it (name that test in `summary`), or it deletes a flaky test or a test no
+  plausible change turns red under `pytest-conventions` Test economy (state why in `summary`).
 
-New code paths without tests are a **warning**, or a **blocker** when `tdd_followed` is false for a behavior change.
+New code paths without tests are a **WARNING**, or a **blocker** when `tdd_followed` is false for a behavior
+change. Redundant tests (a new function where a case on an existing test would do, a test no plausible change
+turns red, an end-to-end test where a unit test proves it) are a **WARNING** (`pytest-conventions`, Test economy).
 
 ## Findings
 

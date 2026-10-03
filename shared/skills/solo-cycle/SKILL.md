@@ -21,7 +21,8 @@ and never pushes the base branch.
 ## The PLAN gate (`Gate: plan`, the default)
 
 Before any code: explore, then run your preamble's `ask` with the **complete plan as the question** (files,
-approach, test strategy, open questions) and `--options approve,revise`. It blocks until the coordinator
+approach, test strategy, open questions) and `--options approve,revise`. The test strategy lists the tests
+extended, the tests new, and the net count (`pytest-conventions`, Test economy). It blocks until the coordinator
 (`answer.sh` or the human) replies.
 
 | Reply | You |
@@ -48,9 +49,9 @@ Then the next subtask, from step 2.
 
 ### RED and GREEN
 
-Write the failing test first and run it. Delegating to `tdd-red` / `tdd-green` / `tdd-refactor` is optional
+Extend the test that covers the area, or write a new failing test, first, and run it. Delegating to `tdd-red` / `tdd-green` / `tdd-refactor` is optional
 (clean context for larger work; each runs on the model in its own frontmatter). Commit RED and GREEN
-separately. Never weaken a test to get green: no deleted or loosened assertions, no `skip`/`xfail`, no
+separately. Never weaken a test to get green: no deleted or loosened assertions (deleting a test with the code it covered, or a flaky or never-red one per Test economy, is not weakening; say why in the commit), no `skip`/`xfail`, no
 `sys.exit(0)`. The independent reviewer reports `tdd_followed` and `tests_weakened`, and either one blocks
 the land.
 

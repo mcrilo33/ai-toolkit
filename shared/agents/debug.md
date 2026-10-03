@@ -69,7 +69,7 @@ Before making ANY changes:
 ## Phase 5: Verify and Report
 
 1. **Re-run the original reproduction steps** — confirm the bug is resolved end-to-end.
-2. **Add a regression test if none exists** — prevent this bug from returning.
+2. **Extend the test that should have caught it** — add a case or parameter there; add a new test only if none covers the area (`pytest-conventions`, Test economy).
 3. **Summarize concisely:**
    - **Root cause:** one sentence explaining why it broke.
    - **Fix:** one sentence explaining what you changed.
@@ -103,5 +103,5 @@ After 3 failed fix attempts, stop and present your findings to the user.
 - [ ] Fix is minimal and targeted
 - [ ] Original failing test passes
 - [ ] Full test suite passes (no regressions)
-- [ ] Regression test added (if applicable)
+- [ ] Regression covered by an extended or new test (if applicable)
 - [ ] Summary reported to user
