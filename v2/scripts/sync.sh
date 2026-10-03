@@ -5,7 +5,7 @@
 #   rules/*.md (minus guidelines)  -> .claude/rules/    (no paths: = always on; paths: = conditional)
 #   rules/guidelines.md            -> CLAUDE.md         rules/on-demand/*.md -> .ai-toolkit/rules/ (never auto-loaded)
 #   skills/ agents/ prompts/       -> .claude/{skills,agents,commands}
-#   v2/{scripts,bin,hooks}, ai-toolkit.env -> .ai-toolkit/    settings/claude/settings.json -> .claude/settings.json
+#   v2/{scripts,bin}, hooks/git, ai-toolkit.env -> .ai-toolkit/   hooks/claude -> .claude/hooks   settings/claude/settings.json -> .claude/settings.json
 #   orca.yaml generated (setup/archive run from $ORCA_ROOT_PATH, where a new worktree has no .ai-toolkit)
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -58,7 +58,8 @@ put_md "$SHARED/agents" .claude/agents
 put_md "$SHARED/prompts" .claude/commands
 put_tree "$V2/scripts" .ai-toolkit/scripts
 put_tree "$V2/bin" .ai-toolkit/bin
-put_tree "$V2/hooks" .ai-toolkit/hooks
+put_tree "$V2/hooks/claude" .claude/hooks   # setup.sh copies only .claude/ into a new worktree
+put_tree "$V2/hooks/git" .ai-toolkit/hooks/git
 put "$V2/settings/ai-toolkit.env" .ai-toolkit/ai-toolkit.env
 if [ -f "$V2/settings/claude/settings.json" ]; then put "$V2/settings/claude/settings.json" .claude/settings.json bak
 else warn "$V2/settings/claude/settings.json is missing: .claude/settings.json (hooks) not synced"; fi

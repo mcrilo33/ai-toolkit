@@ -21,8 +21,9 @@
 
 ## Findings for later WPs
 
-- WP3: `settings/claude/settings.json` is read from `v2/settings/claude/settings.json` (missing = warning, not an error); all of `v2/hooks/` is
-  copied to `.ai-toolkit/hooks/`, so settings paths should be `$CLAUDE_PROJECT_DIR/.ai-toolkit/hooks/claude/<hook>.sh`.
+- WP3 (per its follow-up): `v2/hooks/claude/` syncs to `.claude/hooks/` (setup.sh copies only `.claude/`), `v2/hooks/git/` to
+  `.ai-toolkit/hooks/git/`; `settings.json` is read from `v2/settings/claude/` (missing = warning). `install.sh` now sets `core.hooksPath` to
+  `<here>/hooks/git` for the repo it runs in and explains the jq hard requirement. Both are tested with copies/stubs, not WP3's real files.
 - WP1/WP2: the skills name these interfaces, so keep them: `dispatch.sh <n>|--next`, `land.sh <n> [--local-gate]`, `coordinator.sh --status|--answer
   auto|human|--until|--drain|--cap`, `review.sh <n>`, `orca terminal create --command` for the coordinator. `answer.sh` reads
   `.ai-toolkit/rules/afk-answering.md`; its last lines are `EVIDENCE/REVERSIBILITY/WARN/ANSWER`, and `ANSWER:` is `approve` or `revise: ...`
@@ -35,5 +36,5 @@
   frontend: ~1.9k) and python-style (413) dominate, untouched here. Pruning them is a separate decision.
 
 ## Budgets (lines)
-sync.sh 113/200 · test_sync.py 207 + test_policy_lint.py 151 = 358/450 · solo-cycle 95/120 · hub 58/60 · afk 40/40 · land 23/30 · start-task 56/60 ·
-quick 20/30 · workflow 70/100 · planning-hub 39/50 · afk-answering 73/120 · code-review 88/110. `pytest -n auto tests_v2`: 102 tests, ~3 s.
+sync.sh 114/200, install.sh 32/40 · test_sync.py 214 + test_policy_lint.py 151 + test_install_hooks.py 41 = 406/450 · solo-cycle 95/120 · hub 58/60 · afk 40/40 · land 23/30 · start-task 56/60 ·
+quick 20/30 · workflow 70/100 · planning-hub 39/50 · afk-answering 73/120 · code-review 88/110. `pytest -n auto tests_v2`: 105 tests, ~3 s.

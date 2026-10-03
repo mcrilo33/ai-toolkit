@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 
 import pytest
@@ -21,7 +22,8 @@ def src(tmp_path):
     (root / "v2" / "settings").mkdir(parents=True)
     shutil.copy(V2 / "settings" / "ai-toolkit.env", root / "v2" / "settings")
     write(root / "v2" / "settings" / "claude" / "settings.json", '{"hooks": {}}\n')
-    write(root / "v2" / "hooks" / "claude" / "guard.sh", "#!/bin/sh\n")
+    write(root / "v2" / "hooks" / "claude" / "guard.sh", "#!/bin/sh\n").chmod(0o755)
+    write(root / "v2" / "hooks" / "git" / "commit-msg", "#!/bin/sh\n").chmod(0o755)
     sh = root / "shared"
     write(sh / "rules" / "guidelines.md", '---\ndescription: "g"\n---\n# Guidelines\n')
     write(sh / "rules" / "security.md", "# Security\n")
@@ -74,8 +76,12 @@ def test_layout_in_target(sync, target):
     assert (target / ".claude" / "agents" / "debug.md").is_file()
     assert (target / ".claude" / "commands" / "commit-msg.md").is_file()
     assert (target / ".claude" / "settings.json").read_text() == '{"hooks": {}}\n'
-    for p in ("scripts/sync.sh", "scripts/lib.sh", "bin/claude-spoke", "hooks/claude/guard.sh", "ai-toolkit.env"):
+    for p in ("scripts/sync.sh", "scripts/lib.sh", "bin/claude-spoke", "hooks/git/commit-msg", "ai-toolkit.env"):
         assert (target / ".ai-toolkit" / p).is_file(), p
+    # Claude hooks ship under .claude/ (setup.sh copies only .claude/ into a new worktree); modes survive the copy
+    assert os.access(target / ".claude" / "hooks" / "guard.sh", os.X_OK)
+    assert os.access(target / ".ai-toolkit" / "hooks" / "git" / "commit-msg", os.X_OK)
+    assert not (target / ".ai-toolkit" / "hooks" / "claude").exists()
     assert not list(target.rglob("__pycache__")) and not list(target.rglob(".DS_Store"))
     assert not (target / ".claude" / "prompts").exists() and not (target / ".cursor").exists()
 
@@ -202,6 +208,7 @@ def test_migrate_v1_removes_what_the_v1_manifest_listed_and_nothing_else(sync, t
     victim = write(tmp_path / "victim.txt", "keep")
     assert sync("--migrate-v1").returncode == 0
     assert not (target / ".cursor" / "rules").exists() and not (target / ".github").exists()
-    assert not (target / ".claude" / "hooks").exists() and not (target / ".ai-toolkit-manifest.json").exists()
+    assert not (target / ".claude" / "hooks" / "scripts").exists() and not (target / ".ai-toolkit-manifest.json").exists()
+    assert (target / ".claude" / "hooks" / "guard.sh").is_file()  # the v2 hook outlives the GC of v1 hooks
     assert (target / ".cursor" / "mine.json").read_text() == "user" and victim.read_text() == "keep"
     assert (target / ".claude" / "settings.json").is_file()  # the v2 output survives the GC
