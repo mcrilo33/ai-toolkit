@@ -17,12 +17,13 @@ case "${1:-}" in
         die "set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY in .ai-toolkit/ai-toolkit.local.env"
       LANGFUSE_BASIC_AUTH="Basic $(printf '%s:%s' "$LANGFUSE_PUBLIC_KEY" "$LANGFUSE_SECRET_KEY" | base64 | tr -d '\n')"
     fi
-    host="${LANGFUSE_HOST:-http://localhost:3000}"
-    export LANGFUSE_BASIC_AUTH LANGFUSE_OTLP_ENDPOINT="${LANGFUSE_OTLP_ENDPOINT:-${host/localhost/host.docker.internal}/api/public/otel}"
-    mkdir -p "$AITK_OTEL_RAW_DIR"
-    if git -C "$AITK_OTEL_RAW_DIR" rev-parse --git-dir > /dev/null 2>&1; then
+    host="${LANGFUSE_HOST:-http://localhost:3000}"; host="${host/localhost/host.docker.internal}"
+    export LANGFUSE_BASIC_AUTH LANGFUSE_OTLP_ENDPOINT="${LANGFUSE_OTLP_ENDPOINT:-${host/127.0.0.1/host.docker.internal}/api/public/otel}"
+    d="$AITK_OTEL_RAW_DIR"; while [ ! -d "$d" ]; do d="$(dirname "$d")"; done  # nearest existing ancestor
+    if [ "$(env -u GIT_DIR -u GIT_WORK_TREE git -C "$d" rev-parse --is-inside-work-tree 2> /dev/null)" = true ]; then
       die "AITK_OTEL_RAW_DIR must not be inside a git worktree: $AITK_OTEL_RAW_DIR"
     fi
+    mkdir -p "$AITK_OTEL_RAW_DIR" && chmod 700 "$AITK_OTEL_RAW_DIR"  # holds prompts and tool output in plaintext
     dc up -d ;;
   down) dc down ;;
   status)

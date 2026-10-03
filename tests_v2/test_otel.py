@@ -40,7 +40,20 @@ def test_up_without_credentials_fails_before_docker(run, docker, tmp_path):
 
 def test_up_refuses_a_raw_dir_inside_a_git_worktree(run, docker, repo):
     r = run([OTEL, "up"], cwd=repo.root, AITK_OTEL_RAW_DIR=repo.root / "raw")
-    assert r.returncode != 0 and "git" in r.stderr and docker.calls("docker") == []
+    assert r.returncode != 0 and "inside a git worktree" in r.stderr and docker.calls("docker") == []
+    assert not (repo.root / "raw").exists()  # refused before mkdir: no stray dir
+
+
+def test_up_accepts_a_raw_dir_outside_any_repo_even_with_git_dir_exported(run, docker, repo, tmp_path):
+    r = run([OTEL, "up"], GIT_DIR=repo.root / ".git")  # what any git hook exports
+    assert r.returncode == 0, r.stderr
+    assert len(docker.calls("docker")) == 1 and (tmp_path / "raw").is_dir()
+
+
+def test_up_makes_the_raw_dir_private_and_rewrites_loopback_hosts(run, docker, tmp_path):
+    assert run([OTEL, "up"], LANGFUSE_HOST="http://127.0.0.1:3000").returncode == 0
+    assert (tmp_path / "raw").stat().st_mode & 0o777 == 0o700
+    assert "LANGFUSE_OTLP_ENDPOINT=http://host.docker.internal:3000/api/public/otel" in docker.env("docker")
 
 
 def test_down_and_status_argv_and_status_exit_code(run, docker):

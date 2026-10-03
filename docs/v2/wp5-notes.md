@@ -12,7 +12,8 @@ Files: `v2/langfuse/otelcol.yaml`, `v2/langfuse/compose.yaml`, `v2/scripts/otel.
   25 MB x (5 backups + 1) per signal, about 300 MB max. Logs carry `claude_code.api_request` (tokens/cost), `tool`
   decisions, `user_prompt`, `assistant_response`, `system_prompt`, hooks, MCP, each with `spoke_run_id`.
 - Dropped vs the old config: message bridge + `logs` fork, Prometheus/8889, `langfuse.environment` stamp, the
-  `trace.tags` repo tag, metadata for new_context/system_reminders/tools/system_prompt_preview.
+  `trace.tags` repo tag, metadata for new_context/system_reminders/tools/system_prompt_preview, the
+  `session.id` override (`langfuse.session.id` already wins) and the spanevent `bash_command` -> input fallback.
 - compose: container `lf-collector` (same name as today), image pinned `0.154.0` (was `:latest`), ports bound to
   127.0.0.1, `restart: unless-stopped`. `otel.sh` builds `LANGFUSE_BASIC_AUTH` from `LANGFUSE_PUBLIC_KEY` +
   `LANGFUSE_SECRET_KEY` (local env file) and passes it to docker via the environment only, never argv.
