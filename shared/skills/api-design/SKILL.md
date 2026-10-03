@@ -144,7 +144,7 @@ GET /api/v1/users?page=2&per_page=20
 **Pros:** Simple, supports "jump to page N".
 **Cons:** Inconsistent on inserts/deletes, slow on large offsets.
 
-### Cursor-Based (recommended for large datasets)
+### Keyset / Opaque Token (recommended for large datasets)
 
 ```
 GET /api/v1/users?cursor=eyJpZCI6MTAwfQ&limit=20

@@ -1,5 +1,5 @@
 ---
-description: "When you discover a confirmed defect during any work, file it via the bug-scoper agent immediately without asking — the agent verifies evidence against the code and dedups, so filing-by-default is safe. Auto-file confirmed bugs; only surface genuine is-this-intended-design uncertainty. ai-toolkit tooling defects go to the configured upstream (issue_routing.upstream_repo, default mcrilo33/ai-toolkit) even from a downstream project, never the host repo. Surfaced on demand, not auto-applied to every session."
+description: "When you discover a confirmed defect during any work, file it via the bug-scoper agent immediately without asking — the agent verifies evidence against the code and dedups, so filing-by-default is safe. Auto-file confirmed bugs; only surface genuine is-this-intended-design uncertainty. ai-toolkit tooling defects go to UPSTREAM_REPO (when set) even from a downstream project, never the host repo. Surfaced on demand, not auto-applied to every session."
 ---
 # Bug Triage
 
@@ -47,21 +47,16 @@ a fix direction, and any label/scope hints — so it verifies fast.
 ai-toolkit is synced *into* other projects, so where a bug is filed depends on **whose
 code is broken**, not on which repo you happen to be sitting in:
 
-- A defect in the **ai-toolkit tooling** — a synced rule, skill, hook, script, agent,
-  or the telemetry code (files matching the configured `issue_routing.tooling_paths`
-  manifest: `shared/`, `.claude/`, `.ai-toolkit/`, `scripts/telemetry/`, …) — is filed to
-  the **configured ai-toolkit upstream** (`issue_routing.upstream_repo` in
-  `settings/ai-toolkit.yml`, default `mcrilo33/ai-toolkit`), even when discovered inside a
-  host project. Otherwise the toolkit's own bugs scatter across downstream trackers and
-  never reach its maintainer.
-- A defect in the **host project's own code** is filed to the **host project's** repo,
-  as normal.
+- A defect in the **ai-toolkit tooling** — a synced rule, skill, agent, hook, script, `CLAUDE.md`, or
+  `orca.yaml` (anything under `.claude/` or `.ai-toolkit/` in a host project, `shared/` in the toolkit
+  repo) — is filed to `UPSTREAM_REPO` (`owner/repo`, set in `.ai-toolkit/ai-toolkit.local.env`; empty
+  means the project's own repo), even when discovered inside a host project. Otherwise the toolkit's own
+  bugs scatter across downstream trackers and never reach its maintainer.
+- A defect in the **host project's own code** is filed to the **host project's** repo, as normal.
 
-The `bug-scoper` agent resolves the upstream repo from the configured
-`issue_routing.upstream_repo` and classifies host-vs-tooling against `tooling_paths`,
-rather than defaulting to the current project's git remote or naming a bare literal — see
-its Phase 5. A fork/rename reroutes tooling defects by changing that config
-(`issue_routing.upstream_repo` or `git config ai-toolkit.upstream-repo`), not agent prose.
+The `bug-scoper` agent reads `UPSTREAM_REPO` and classifies host-vs-tooling by path, rather than
+defaulting to the current project's git remote or naming a bare literal (see its Phase 5). A fork or
+rename reroutes tooling defects by changing `UPSTREAM_REPO`, not agent prose.
 
 ## Deferred follow-ups: file them, don't lose them
 

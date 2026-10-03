@@ -13,6 +13,8 @@ orca worktree create --name quick-<slug> --agent claude --prompt "<what to fix>"
 
 The new worktree has its own Claude session (open it in Orca); the hub session does not edit code.
 
+- The branch is named `quick-<slug>`: that name is what exempts it from the `#<n>` issue anchor in `commit-msg`
+  (there is no issue). Keep the `quick-` prefix; other names need an anchor.
 - Work in that session: failing test first when behavior changes, small commits, `git push -u origin quick-<slug>`.
 - Landing is by hand: merge when CI is green (`git merge --ff-only`), then
   `orca worktree rm --worktree path:<worktree> --run-hooks`.

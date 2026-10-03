@@ -16,7 +16,7 @@ description: "Secrets management, credentials handling, macOS Keychain storage, 
 
 - All personal secrets are stored with macOS Keychain via `security add-generic-password`
 - Load in shell via `$(security find-generic-password -a "$USER" -s "KEY_NAME" -w 2>/dev/null)`
-- Reference as env vars in configs: `${env:VAR_NAME}` (VS Code) / `${VAR_NAME}` (Cursor)
+- Reference as env vars in configs: `${VAR_NAME}`
 - Never write secrets to `.env`, `.zshrc`, or config files — even temporarily
 
 ## Input Validation
