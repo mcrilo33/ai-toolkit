@@ -72,7 +72,7 @@ def C(stubs, repo, run, tmp_path):
     def go(*args, run_id="run_t", **env):
         cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh", "notify")}
         return run(["bash", CO, *(["--run", run_id] if run_id else []), *args], cwd=repo.root,
-                   **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", **cmd_env, **env})
+                   **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", "COORD_BELL_TTY": tmp_path / "bell", **cmd_env, **env})
 
     def trail():   # [("orca orchestration check ack", argv), ("gh issue edit", argv), ("land.sh", argv)...] in call order
         rows = (Path(os.environ["STUB_DIR"]) / "calls.log").read_text().splitlines()
@@ -310,3 +310,52 @@ def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply
     r = C.go("--status", ORCA_TERMINAL_HANDLE="")   # read-only: no coordinator terminal needed
     assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and REPLY in r.stdout and "msg_a" not in r.stdout
     assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in ("worker-list", "inbox")] == []
+
+
+LONG_Q = "\n".join(f"plan line {i}: " + "word " * 30 for i in range(40))   # long lines AND too many of them
+
+
+def lines_before(out, needle):   # the output lines above the first line that contains needle
+    ls = out.splitlines()
+    return ls[:next(i for i, ln in enumerate(ls) if needle in ln)]
+
+
+def test_the_human_sees_the_question_wrapped_and_capped_above_the_reply_line(C):
+    C.mail([msg("question", "msg_q", question=LONG_Q)])
+    r = C.go("--answer", "human")
+    shown = [ln for ln in lines_before(r.stdout, "--reply msg_q") if ln.startswith("  | ")]
+    assert r.returncode == 0 and 20 <= len(shown) <= 25 and "plan line 0:" in shown[0] and all(len(ln) <= 110 for ln in shown)
+    assert "plan line 30" not in r.stdout   # capped, not dumped
+
+
+def test_status_shows_each_open_question_text_above_its_reply_command(C):
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question="PLAN: add hello.py first"), "run_id": "run_t", "thread_id": "msg_q"}]}}))
+    out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
+    assert "  | PLAN: add hello.py first" in lines_before(out, "--reply msg_q")
+
+
+def test_a_failing_desktop_notification_is_warned_about_not_swallowed(C, stubs):
+    (Path(os.environ["STUB_DIR"]) / "bin" / "osascript").write_text(STUB)
+    (Path(os.environ["STUB_DIR"]) / "bin" / "osascript").chmod(0o755)
+    stubs.reply("osascript", "", rc=1)
+    C.mail([msg("question", "msg_q", question="PLAN?")])
+    r = C.go("--answer", "human", NOTIFY_CMD="")   # empty = the real osascript path
+    assert r.returncode == 0 and "osascript" in r.stderr and "warning" in r.stderr and C.stubs.calls("osascript")
+
+
+def test_a_pending_human_gate_sets_the_worktree_comment_and_rings_the_bell_then_the_reply_clears_the_comment(C, tmp_path):
+    C.mail([msg("question", "msg_q", question="PLAN: add hello.py\nthen a test")])
+    assert C.go("--answer", "human").returncode == 0
+    cm = [a for a in C.calls("orca worktree set")]
+    assert len(cm) == 1 and arg(cm[0], "--worktree") == f"path:{C.wt}"
+    assert arg(cm[0], "--comment") == f"GATE waiting: PLAN: add hello.py then a test | reply: coordinator.sh --reply msg_q approve"
+    assert (tmp_path / "bell").read_text() == "\a"   # one bell per gate, on the coordinator's terminal
+    C.inbox(["msg_q"]); C.spool("msg_q", "approve")
+    assert C.go().returncode == 0
+    assert arg(C.calls("orca worktree set")[-1], "--comment") == "" and arg(C.calls("orca worktree set")[-1], "--worktree") == f"path:{C.wt}"
+
+
+def test_an_auto_answered_gate_neither_rings_nor_comments(C, tmp_path):
+    C.mail([msg("question", "msg_q", question="PLAN?")])
+    assert C.go("--answer", "auto").returncode == 0
+    assert not C.calls("orca worktree set") and not (tmp_path / "bell").exists()

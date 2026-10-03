@@ -47,7 +47,8 @@ log() { printf '%s coordinator: %s\n' "$(date +%H:%M:%S)" "$*"; }
 notify() {   # one desktop notification (NOTIFY_CMD replaces it in tests); never fatal
   log "$1"
   if [ -n "${NOTIFY_CMD:-}" ]; then "$NOTIFY_CMD" "$1" || true
-  else osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "ai-toolkit"' -e 'end run' "$1" > /dev/null 2>&1 || true; fi
+  else osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "ai-toolkit"' -e 'end run' "$1" > /dev/null 2>&1 \
+    || warn "desktop notification failed (osascript): the reply line is in this log and in the issue comment"; fi
 }
 comment() { gh issue comment "$1" -b "$2" > /dev/null || warn "cannot comment on #$1"; }
 wl() {   # every page of the Run's workers (newest first, 100 a page), in the shape of one reply; live = dispatchStatus "dispatched"
@@ -60,6 +61,12 @@ wl() {   # every page of the Run's workers (newest first, 100 a page), in the sh
   jq -nc --argjson w "$all" '{result: {workers: $w}}'
 }
 pj() { jq -r --arg k "$2" '(.payload // "{}" | if type == "string" then fromjson else . end)[$k] // empty' <<< "$1"; }   # payload field of a message
+question_of() { local q; q="$(pj "$1" question)"; [ -n "$q" ] || q="$(jq -r '.body // ""' <<< "$1")"; printf '%s' "$q"; }
+show_q() { printf '%s\n' "$1" | fold -s -w 100 | head -n 25 | sed 's/^/  | /' || true; }   # the question as the human must read it: wrapped, at most 25 lines
+gate_flag() {   # $1 worktree path, $2 message id, $3 question: the stable Orca surfaces of a pending human gate: the worktree comment and a bell on this terminal
+  orca_json worktree set --worktree "path:$1" --comment "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: coordinator.sh --reply $2 approve" > /dev/null 2>&1 || warn "cannot set the worktree comment"
+  printf '\a' > "${COORD_BELL_TTY:-/dev/tty}" 2> /dev/null || true
+}
 mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
 now_min() { mins "${AI_TOOLKIT_NOW:-$(date +%H:%M)}"; }
 
@@ -74,7 +81,7 @@ if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the que
   log "run: $run"; echo "live workers:"
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "  \(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict)"'
   echo "pending questions:"
-  pending | jq -r '.open[] | "\(.id) \(.body[0:100])"' | while read -r id txt; do echo "  $id $txt"; echo "    reply: $(replycmd "$id")   (or 'revise: <change>')"; done
+  pending | jq -c '.open[]' | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"; echo "    reply: $(replycmd "$id")   (or 'revise: <change>')"; done
   exit 0
 fi
 
@@ -131,14 +138,14 @@ drain_replies() {   # send the queued human replies as the bound consumer. Dropp
       if jq -e --arg i "$id" '(.answered | index($i)) != null or (.truncated | not)' <<< "$pend" > /dev/null; then warn "reply to $id dropped: no such unanswered question"
       else warn "reply to $id kept: the inbox page is truncated and does not show that question"; continue; fi
     elif orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
-      log "gate $id answered by the human: $body"; if ctx "$(pj "$q" dispatchId)"; then comment "$issue" "Gate answered by the human: $body"; fi
+      log "gate $id answered by the human: $body"; if ctx "$(pj "$q" dispatchId)"; then comment "$issue" "Gate answered by the human: $body"; orca_json worktree set --worktree "path:$wtp" --comment "" > /dev/null 2>&1 || warn "cannot clear the worktree comment"; fi
     else warn "reply to $id failed, it stays queued"; continue; fi
     rm -f "$f"
   done
 }
 on_question() {
   local id q ans body warns
-  id="$(jq -r .id <<< "$1")"; q="$(pj "$1" question)"; [ -n "$q" ] || q="$(jq -r '.body // ""' <<< "$1")"
+  id="$(jq -r .id <<< "$1")"; q="$(question_of "$1")"
   ctx "$(pj "$1" dispatchId)" || { notify "gate question $id comes from an unknown worker: reply by hand"; return 1; }
   if [ "$answer" = auto ] && ans="$(printf '%s' "$q" | "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
@@ -146,7 +153,7 @@ on_question() {
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; notify "#$issue: $warns"; }
   else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
     comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: revise: <change>)"
-    notify "#$issue: gate question waiting: $(replycmd "$id")"
+    show_q "$q"; notify "#$issue: gate question waiting: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
   fi
 }
 on_done() {
