@@ -57,6 +57,12 @@ New code paths without tests are a **WARNING**, or a **blocker** when `tdd_follo
 change. Redundant tests (a new function where a case on an existing test would do, a test no plausible change
 turns red, an end-to-end test where a unit test proves it) are a **WARNING** (`pytest-conventions`, Test economy).
 
+## Growth
+
+Judge the diff against the Project Goal in `guidelines`. Name in `summary` any raised line cap or budget, the net code growth and the net test growth. Growth the diff does not justify against that goal (a raised cap, a new mechanism, tests beyond what the behavior needs, or a simpler way that meets the acceptance criteria) is a **WARNING**.
+
+Involve the human only for a decision you cannot make from the issue, the code and the policy, never for something a sensible default settles: an unclear call is a finding, not a question.
+
 ## Findings
 
 Each finding is one string: `<file>:<line> — <summary>. <why it is a problem>. Fix: <approach>`.
@@ -80,7 +86,7 @@ Your **final message is exactly one JSON object**: no prose before or after, no 
   `REQUEST_CHANGES`; otherwise `APPROVE`. Never output a third value; uncertainty about correctness is a blocker.
 - `"blockers"` and `"warnings"`: arrays of finding strings (empty arrays, not null).
 - `"tdd_followed"` and `"tests_weakened"`: booleans as defined above.
-- `"summary"`: one or two sentences: counts and the key concern, or "none".
+- `"summary"`: one or two sentences: counts, any raised cap, net code and test growth, and the key concern, or "none".
 
 Read-only means write nothing, including the verdict: it is your final message, not a file.
 

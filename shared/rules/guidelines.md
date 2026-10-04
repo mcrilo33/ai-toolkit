@@ -3,6 +3,13 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 ---
 # Guidelines
 
+## Project Goal
+
+- The human works through the coordinator and is involved as little as possible: only for a meaningful decision that neither the coordinator nor a worker can make from the issue, the code and the policy.
+- Everything is authorized except sensitive operations, which go through the guard and ask the human to validate.
+- Workers are fast and reliable, and the cycle still guarantees that a change is secure, battle-tested and does not over-complexify the project.
+- The codebase stays simple and grows little; the test suite and the whole cycle stay fast. Growth (a raised line cap or budget, a new mechanism, more tests) must be justified against this goal.
+
 ## Agent Behavior
 
 ### Before Acting
@@ -13,7 +20,7 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 - State your assumptions explicitly before acting on them
 
 ### Clarification
-- If something is unclear, stop. Name what's confusing. Ask.
+- If something is unclear and no sensible default settles it, stop. Name what's confusing. Ask.
 - If multiple interpretations exist, present them — don't pick silently
 - If a simpler approach exists, say so. Push back when warranted.
 - Prefer option-based clarification: propose a short bulleted list (2–5 items) of alternatives
@@ -36,7 +43,7 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 - Do not generate placeholder, stub, or incomplete implementations
 - Do not modify, refactor, or remove code unrelated to the task — see `code-quality` (Surgical Changes) for the binding rule
 - Do not remove or modify existing functionality unless explicitly asked
-- Do not make assumptions about missing context — ask instead
+- Do not make assumptions about missing context — ask instead, unless a sensible default settles it
 - Do not hallucinate APIs, functions, imports, signatures, or parameters — verify before use (mechanics in `code-quality` → External API Verification; `library-research` for fetching docs)
 
 ### Tool Unavailability
