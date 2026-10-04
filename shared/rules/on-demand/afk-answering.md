@@ -93,7 +93,7 @@ Reason as long as you need, then end with this block, each on its own line (noth
 - `REVERSIBILITY: reversible|outward|scope|irreversible`: the class of the decision you took.
 - `WARN: <what the human should double-check>`: **required** for any irreversible, outward-facing, or
   scope-changing call; omit only for a plainly reversible in-scope answer. The coordinator comments it on the
-  issue and sends a desktop notification.
+  issue and flags the worktree (its Orca comment and a bell; notifications are Orca's).
 - `ANSWER: approve`, `ANSWER: approve with: <the change>` or `ANSWER: revise: <the change>`: replied to the spoke
   (spacing normalized); the form decides the recorded `gate_answer_class` (approve = 1, revise = 2, approve with = 3, appended so 1 and 2 keep their recorded
   meaning: accepted with a change the spoke applies unreviewed, so give it a `WARN:` when the change is not trivially safe). It is always an answer, never a hand-off to a human.

@@ -24,7 +24,7 @@ body="Create hello.py with a function greet(name) returning 'hello ' + name, and
 phase happy && { A=$(mkissue "Add hello.py with a tested greet function" "$(printf '%b' "$body")"); mine="$mine $A"; }
 body="Create calc.py with a function double(x) returning 2*x, and tests/test_calc.py testing it. Run pytest before pushing.\n\nScope: calc.py tests/test_calc.py\nGate: none\nModel: ${SPOKE_MODEL} low"
 phase negative && { B=$(mkissue "Add calc.py with a tested double function" "$(printf '%b' "$body")"); mine="$mine $B"; }
-renv="NOTIFY_CMD=true"; [ -z "${E2E_HUMAN_WAIT:-}" ] || renv=""
+renv=""
 if [ -n "$B" ]; then   # the real reviewer for A, a stub that always rejects B (a real one would accept the fix in round 1)
   # shellcheck disable=SC2016
   printf '#!/bin/sh\n[ "$1" = %s ] && { n=$(($(cat %s/n 2>/dev/null || echo 0) + 1)); echo $n > %s/n; echo "BLOCKER: calc.py:1 - add the comment line # review round $n at the top of calc.py"; exit 3; }\nexec bash %s/.ai-toolkit/scripts/review.sh "$@"\n' "$B" "$E" "$E" "$G" > "$E/review.sh"

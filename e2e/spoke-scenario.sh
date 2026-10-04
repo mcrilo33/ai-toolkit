@@ -2,7 +2,7 @@
 # End-to-end acceptance (06 section 7) against a LOCAL scratch repo with a local bare origin and a stubbed gh: no GitHub.
 # WP2 = steps 1-7 UNATTENDED: coordinator.sh (in its own Orca terminal on the scratch main, own scratch Run) dispatches the issue,
 # answers the PLAN gate (answer.sh, real claude -p), reviews (review.sh, real claude -p, Opus) and lands (land.sh --local-gate).
-# E2E_ANSWER=human: the coordinator only notifies and this script replies after the ack. E2E_NEGATIVE=1: a REVIEW_CMD stub rejects
+# E2E_ANSWER=human: the coordinator only flags the gate (worktree comment, bell) and this script replies after the ack. E2E_NEGATIVE=1: a REVIEW_CMD stub rejects
 # once, so the re-dispatch to the same worker is proven live. Langfuse (D1) is out. Run it from a dedicated Orca terminal, e.g.
 #   orca terminal create --worktree active --command "bash e2e/spoke-scenario.sh"   (v2/e2e/ until the cutover)
 # Exits non-zero on the first failed assert and prints the Orca object ids. Cleans up after itself.

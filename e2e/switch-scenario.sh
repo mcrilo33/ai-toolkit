@@ -26,7 +26,7 @@ orca_json orchestration check --run "$run" --terminal "$H" --ack "$(jq -r '.resu
 [ "$(replies)" = 1 ] || fail "the Run does not show the session's reply"
 step=4; say "/coordinate auto: coordinator.sh --answer auto takes the same Run, the session is fenced"
 # shellcheck disable=SC2016
-printf '#!/usr/bin/env bash\nNOTIFY_CMD=true bash %s/coordinator.sh --run %s --answer auto --cap 1 2>&1 | tee %s/coord.log\necho "${PIPESTATUS[0]}" > %s/coord.rc\n' "$S" "$run" "$E" "$E" > "$E/run.sh"
+printf '#!/usr/bin/env bash\nbash %s/coordinator.sh --run %s --answer auto --cap 1 2>&1 | tee %s/coord.log\necho "${PIPESTATUS[0]}" > %s/coord.rc\n' "$S" "$run" "$E" "$E" > "$E/run.sh"
 coord="$(orca_json terminal create --worktree "path:$G" --title coordinator --command "bash $E/run.sh" | jq -r '.result.terminal.handle // empty')"; [ -n "$coord" ] || fail "terminal create"
 wait_for 90 grep -q "(was held by $H)" "$E/coord.log" 2> /dev/null || fail "the coordinator did not take the Run over from the session"
 case "$(held)" in "coordinator.sh (auto"*) ;; *) fail "status after the switch says '$(held)'" ;; esac

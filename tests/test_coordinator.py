@@ -31,7 +31,7 @@ def in_order(kinds, *seq):
 def C(stubs, repo, run, tmp_path):
     cmds, wt = tmp_path / "cmds", str(repo.wt("1-x"))
     cmds.mkdir()
-    for n in ("dispatch.sh", "land.sh", "answer.sh", "notify"):   # sub-commands are stubs that also record their stdin
+    for n in ("dispatch.sh", "land.sh", "answer.sh"):   # sub-commands are stubs that also record their stdin
         (cmds / n).write_text(STUB.replace("n=$(basename", 'cat > "$STUB_DIR/$(basename "$0").stdin"; n=$(basename', 1))
         (cmds / n).chmod(0o755)
 
@@ -70,7 +70,7 @@ def C(stubs, repo, run, tmp_path):
     mail()
 
     def go(*args, run_id="run_t", **env):
-        cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh", "notify")}
+        cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh")}
         return run(["bash", CO, *(["--run", run_id] if run_id else []), *args], cwd=repo.root,
                    **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", "COORD_BELL_TTY": tmp_path / "bell", **cmd_env, **env})
 
@@ -82,9 +82,10 @@ def C(stubs, repo, run, tmp_path):
     def calls(kind):
         return [a for k, a in trail() if k == kind]
 
-    def blocked():   # label + comment + notification + release; the worktree is kept and nothing is re-dispatched
+    def blocked():   # label + comment + Orca surfaces (worktree comment, bell) + release; the worktree is kept and nothing is re-dispatched
         ks = [k for k, _ in trail()]
-        return (any(a[3:] == ["--add-label", "blocked"] for a in calls("gh issue edit")) and "gh issue comment" in ks and "notify" in ks
+        return (any(a[3:] == ["--add-label", "blocked"] for a in calls("gh issue edit")) and "gh issue comment" in ks and (tmp_path / "bell").exists()
+                and any(arg(a, "--comment").startswith("BLOCKED #1") and arg(a, "--worktree") == f"path:{wt}" for a in calls("orca worktree set"))
                 and "orca orchestration worker-release" in ks and "--address" not in sum(stubs.calls("dispatch.sh"), []) and "orca worktree rm" not in ks)
 
     return type("C", (), dict(go=staticmethod(go), mail=staticmethod(mail), inbox=staticmethod(inbox), spool=staticmethod(spool), spooled=lambda m: (tmp_path / "state/run_t/replies" / m).exists(), workers=staticmethod(workers), row=staticmethod(row), wt=wt,
@@ -101,7 +102,7 @@ def test_a_given_run_is_rebound_without_one_a_run_is_created_and_every_wait_name
     assert arg(C.calls("orca orchestration check")[-1], "--run") == "run_new"
 
 
-def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_acks(C):
+def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_acks(C, tmp_path):
     C.stubs.reply("answer.sh", "revise: drop the extra file\nWARN: touches CI\n")
     C.mail([msg("question", "msg_q", question="PLAN: do X?")])
     assert C.go("--answer", "auto").returncode == 0
@@ -109,19 +110,20 @@ def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_ac
     rep = C.calls("orca orchestration reply")[0]
     assert (arg(rep, "--id"), arg(rep, "--body"), arg(rep, "--run")) == ("msg_q", "revise: drop the extra file", "run_t")
     in_order(C.kinds(), "answer.sh", "orca orchestration reply", "orca orchestration check ack")   # the warning goes to the human
-    assert arg(C.calls("orca orchestration check ack")[0], "--ack") == "d0" and "touches CI" in C.calls("gh issue comment")[0][-1] and C.stubs.calls("notify")
+    assert arg(C.calls("orca orchestration check ack")[0], "--ack") == "d0" and "touches CI" in C.calls("gh issue comment")[0][-1]
+    assert "touches CI" in arg(C.calls("orca worktree set")[0], "--comment") and (tmp_path / "bell").read_text() == "\a"   # Orca's surfaces: worktree comment + bell
 
 
 REPLY = "bash {}/scripts/coordinator.sh --run run_t --reply msg_q approve".format(V2)
 
 
 @pytest.mark.parametrize("mode, rc", [("human", 0), ("auto", 1)])   # auto: the answerer found nothing usable. Never a blind approve
-def test_a_question_for_the_human_is_notified_with_the_exact_reply_command_and_acked_without_waiting(C, mode, rc):
+def test_a_question_for_the_human_is_flagged_with_the_exact_reply_command_and_acked_without_waiting(C, mode, rc, tmp_path):
     C.stubs.reply("answer.sh", "", rc=rc)
     C.mail([msg("question", "msg_q", question="PLAN?")])
     assert C.go("--answer", mode).returncode == 0
     assert not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack") and (len(C.stubs.calls("answer.sh")) == 1) == (mode == "auto")
-    assert REPLY in C.calls("gh issue comment")[0][-1] and "revise:" in C.calls("gh issue comment")[0][-1] and "--reply msg_q" in C.stubs.calls("notify")[0][0]
+    assert REPLY in C.calls("gh issue comment")[0][-1] and "revise:" in C.calls("gh issue comment")[0][-1] and "--reply msg_q" in arg(C.calls("orca worktree set")[0], "--comment") and (tmp_path / "bell").exists()
     assert "approve with: <change>" in C.calls("gh issue comment")[0][-1]
 
 
@@ -133,7 +135,7 @@ REPLY_P = REPLY.replace("msg_q approve", "msg_p allow")
 
 @pytest.mark.parametrize("q", [PQ, "\n  " + PQ])
 @pytest.mark.parametrize("answerer", ["approve\n", "approve with: x\n", "allow\n"])
-def test_auto_denies_a_permission_question_and_never_hands_it_to_the_answerer(C, q, answerer):
+def test_auto_denies_a_permission_question_and_never_hands_it_to_the_answerer(C, q, answerer, tmp_path):
     C.stubs.reply("answer.sh", answerer)   # even an answerer that would approve is never asked
     C.mail([msg("question", "msg_p", question=q)])
     assert C.go("--answer", "auto").returncode == 0 and not C.stubs.calls("answer.sh")
@@ -142,7 +144,7 @@ def test_auto_denies_a_permission_question_and_never_hands_it_to_the_answerer(C,
     c = C.calls("gh issue comment")[0][-1]
     assert "Bash" in c and "denied" in c and "curl" not in c and "secret" not in c   # the issue comment names the tool and the answer only, never the command
     in_order(C.kinds(), "orca orchestration reply", "orca orchestration check ack")
-    assert C.stubs.calls("notify") and not C.calls("orca worktree set")
+    assert not C.calls("orca worktree set") and not (tmp_path / "bell").exists()   # nothing for the human to do: log and issue comment only
 
 
 def test_auto_whose_deny_cannot_be_sent_falls_back_to_the_human_never_to_an_allow(C):
@@ -166,7 +168,7 @@ def test_human_mode_leaves_a_permission_question_open_with_an_allow_or_deny_repl
     c = C.calls("gh issue comment")[0][-1]
     assert REPLY_P in c and "deny" in c and "curl" not in c and "approve" not in c and "Bash" in c
     cm = C.calls("orca worktree set")
-    assert len(cm) == 1 and f"reply: {REPLY_P}" in arg(cm[0], "--comment") and "--reply msg_p allow" in C.stubs.calls("notify")[0][0]
+    assert len(cm) == 1 and f"reply: {REPLY_P}" in arg(cm[0], "--comment") and "--reply msg_p allow" in arg(cm[0], "--comment")
 
 
 def test_the_human_sees_the_whole_permission_change_not_the_25_line_cap_of_a_plan(C):
@@ -304,7 +306,7 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
     C.mail([msg("question", "msg_q", question="q"), msg("worker_done", "msg_d", outcome="succeeded")])
     C.go()
     assert C.stubs.calls("land.sh") == [["--review", "1"]] and len(C.calls("orca orchestration check ack")) == 1
-    assert "msg_q" in C.calls("gh issue comment")[0][-1] and C.stubs.calls("notify")   # the unreplied question is handed to the human
+    assert "msg_q" in C.calls("gh issue comment")[0][-1] and C.calls("orca worktree set")   # the unreplied question is flagged for the human
     in_order(C.kinds(), "orca orchestration reply", "land.sh", "orca orchestration check ack")
 
 
@@ -411,15 +413,6 @@ def test_status_shows_each_open_question_text_above_its_reply_command(C):
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question="PLAN: add hello.py first"), "run_id": "run_t", "thread_id": "msg_q"}]}}))
     out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
     assert "  | PLAN: add hello.py first" in lines_before(out, "--reply msg_q")
-
-
-def test_a_failing_desktop_notification_is_warned_about_not_swallowed(C, stubs):
-    (Path(os.environ["STUB_DIR"]) / "bin" / "osascript").write_text(STUB)
-    (Path(os.environ["STUB_DIR"]) / "bin" / "osascript").chmod(0o755)
-    stubs.reply("osascript", "", rc=1)
-    C.mail([msg("question", "msg_q", question="PLAN?")])
-    r = C.go("--answer", "human", NOTIFY_CMD="")   # empty = the real osascript path
-    assert r.returncode == 0 and "osascript" in r.stderr and "warning" in r.stderr and C.stubs.calls("osascript")
 
 
 def test_a_pending_human_gate_sets_the_worktree_comment_and_rings_the_bell_then_the_reply_overwrites_the_comment(C, tmp_path):

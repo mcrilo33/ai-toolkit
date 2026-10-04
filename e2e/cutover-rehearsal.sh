@@ -78,7 +78,7 @@ printf '#!/bin/sh\necho "$*" >> %s/gh.log\ncase "$1 $2" in "issue view") cat %s/
 chmod +x "$E/gh"; printf 'AI_TOOLKIT_GH=%s/gh\nCHECK_CMD="test -f hello.txt"\nLOCAL_GATE=1\nANSWER_MODEL=claude-sonnet-5-5\n' "$E" > .ai-toolkit/ai-toolkit.local.env
 : > "$E/coord.log"
 coord="$(orca_json terminal create --worktree "path:$C" --title coordinator --command \
-  "NOTIFY_CMD=true bash $C/scripts/coordinator.sh --answer auto --cap 1 --drain > $E/coord.log 2>&1; echo \$? > $E/coord.rc" | jq -r '.result.terminal.handle // empty')"
+  "bash $C/scripts/coordinator.sh --answer auto --cap 1 --drain > $E/coord.log 2>&1; echo \$? > $E/coord.rc" | jq -r '.result.terminal.handle // empty')"
 [ -n "$coord" ] || fail "terminal create"
 wait_for 90 grep -q ' coordinator: run run_' "$E/coord.log" || fail "the coordinator did not start"
 run="$(sed -n 's/.* coordinator: run \(run_[0-9a-f]*\).*/\1/p' "$E/coord.log" | head -n 1)"

@@ -50,7 +50,7 @@ orca.yaml                  Orca hooks of THIS repo (setup/archive); a synced tar
 8. **Land.** fast-forward the main checkout to the gated tip, push, `gh issue close -c "landed in <sha>"`, delete the remote branch (lease-guarded),
    `worker-release` every dispatch, `worktree rm --run-hooks`.
 9. **Rounds.** A rejected review (max 2 rounds), red CI or a merge conflict (1 round) goes back to the worker as a fresh dispatch whose spec starts with
-   `address:`. Still failing, a timeout, a `failed` completion or an escalation: label `blocked` + comment + desktop notification, the worker is released,
+   `address:`. Still failing, a timeout, a `failed` completion or an escalation: label `blocked` + comment + the Orca surfaces (worktree comment, terminal bell), the worker is released,
    the **worktree is kept** for the human.
 
 ## Two modes, one switch
@@ -146,7 +146,8 @@ or re-bind after a restart: everything else is re-derived from `worker-list`, `w
 
 - **Human answers (`--answer human`, or when `answer.sh` has no usable answer).** The loop never pauses. It prints the question (wrapped, at most 25 lines) above the exact
   reply line in the coordinator terminal (and in `--status`), comments on the issue, sets the spoke worktree's Orca comment to `GATE waiting: ... | reply: ...`, rings the bell
-  of its terminal (Orca's `terminalBell` notification) and sends a best-effort desktop notification (osascript, warned when it fails; macOS may drop it silently). Run the reply line from ANY terminal (a bare `orca orchestration reply` is refused outside the Run's bound terminal):
+  of its terminal. Notifications are Orca's, the project raises none itself: Orca turns that bell into its own notification when Settings > Notifications > Terminal Bell is on (off by default;
+  the notification says only "Bell in <worktree>", never the event: the worktree comment, the issue comment and this log carry the text). A `blocked` issue and an auto-answer `WARN:` flag the same way. Run the reply line from ANY terminal (a bare `orca orchestration reply` is refused outside the Run's bound terminal):
   `bash .ai-toolkit/scripts/coordinator.sh --run <run-id> --reply <message-id> approve` or `... 'approve with: <small change>'` or `... 'revise: <what to change>'`; a permission question takes `allow` or `deny` instead.
   It queues one file in `~/.ai-toolkit/coordinator/<run-id>/replies/` (`AITK_STATE_DIR` relocates it); the loop sends it at its next wake (30 s while a question waits).
 - **`blocked` issue.** Read the comment, then fix by hand in the kept worktree (`orca worktree show --worktree issue:<n>`), push, and `land.sh <n>`; or remove the label

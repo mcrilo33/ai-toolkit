@@ -6,7 +6,7 @@
 # --review inline (lands are serialized by construction); a rejected review, red CI or a conflict goes back to the SAME worker for a
 # bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked. Every 10th empty wait: a sweep.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
-# back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD NOTIFY_CMD.
+# back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
 # consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
 # the Run from this terminal, then wait until the loop is gone.
@@ -34,12 +34,6 @@ DISPATCH_CMD="${DISPATCH_CMD:-$here/dispatch.sh}"; LAND_CMD="${LAND_CMD:-$here/l
 cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
 log() { printf '%s coordinator: %s\n' "$(date +%H:%M:%S)" "$*"; }
-notify() {   # one desktop notification (NOTIFY_CMD replaces it in tests); never fatal
-  log "$1"
-  if [ -n "${NOTIFY_CMD:-}" ]; then "$NOTIFY_CMD" "$1" || true
-  else osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "ai-toolkit"' -e 'end run' "$1" > /dev/null 2>&1 \
-    || warn "desktop notification failed (osascript): the reply line is in this log and in the issue comment"; fi
-}
 comment() { gh issue comment "$1" -b "$2" > /dev/null || warn "cannot comment on #$1"; }
 wl() {   # every page of the Run's workers (newest first, 100 a page), in the shape of one reply; live = dispatchStatus "dispatched"
   local cur="" out all="[]"
@@ -59,10 +53,11 @@ show_q() {   # the question as the human must read it: control bytes dropped, wr
   printf '%s\n' "$all" | head -n "$n" | sed 's/^/  | /' || true
   total="$(printf '%s\n' "$all" | wc -l)"; [ "$total" -le "$n" ] || echo "  [display truncated: $((total - n)) more lines; deny if unsure]"
 }
-gate_flag() {   # $1 worktree path, $2 message id, $3 question, $4 the reply word shown: the stable Orca surfaces of a pending human gate: the worktree comment and a bell on this terminal
-  orca_json worktree set --worktree "path:$1" --comment "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2" "${4:-approve}")" > /dev/null 2>&1 || warn "cannot set the worktree comment"
-  printf '\a' > "${COORD_BELL_TTY:-/dev/tty}" 2> /dev/null || true
+flag() {   # $1 worktree path ("" = none known), $2 its comment: the Orca surfaces of anything the human must see: the worktree comment, and a bell on this terminal
+  [ -z "$1" ] || orca_json worktree set --worktree "path:$1" --comment "$(printf '%s' "$2" | tr '\n' ' ')" > /dev/null 2>&1 || warn "cannot set the worktree comment"   # (Orca turns the bell into its own
+  printf '\a' > "${COORD_BELL_TTY:-/dev/tty}" 2> /dev/null || true   # notification when terminalBell is on; it carries no text, the text is the comment, the issue comment and this log)
 }
+gate_flag() { flag "$1" "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2" "${4:-approve}")"; }   # $1 worktree path, $2 message id, $3 question, $4 the reply word shown
 mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
 now_min() { mins "${AI_TOOLKIT_NOW:-$(date +%H:%M)}"; }
 
@@ -127,10 +122,10 @@ ctx() {
 }
 rounds() { wl | jq --arg p "::$wtp" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] | length - 1'; }   # dispatches so far - 1
 release() { [ -z "$1" ] || orca_mutate orchestration worker-release --dispatch "$1" > /dev/null 2>&1 || orca_mutate orchestration worker-stop --dispatch "$1" > /dev/null 2>&1 || true; }
-block() {   # $1 = why. Label, comment, notify, free the slot; the worktree stays for the human. Never when the Run was taken back (yield).
+block() {   # $1 = why. Label, comment, flag (log, worktree comment, bell), free the slot; the worktree stays for the human. Never when the Run was taken back (yield).
   yield; gh issue edit "$issue" --add-label blocked > /dev/null 2>&1 \
     || { gh label create blocked --color B60205 > /dev/null 2>&1 || true; gh issue edit "$issue" --add-label blocked > /dev/null || warn "cannot label #$issue"; }
-  comment "$issue" "blocked: $1"; notify "#$issue blocked: $1"; release "$disp"
+  comment "$issue" "blocked: $1"; log "#$issue blocked: $1"; flag "$wtp" "BLOCKED #$issue: ${1:0:80}"; release "$disp"
 }
 redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds are spent. A fresh terminal and a NEW Task (dispatch.sh --address):
   local r out; r="$(rounds)"   # worker-start refuses --task with --spec, and Orca refuses a new task on the idle two-step terminal
@@ -168,30 +163,30 @@ drain_replies() {   # send the queued human replies as the bound consumer. Dropp
 }
 on_permission() {   # $1 message id, $2 question, $3 dispatch id: a worker's tool-permission prompt. Never answer.sh and never an allow: auto denies it, a human answers allow|deny.
   local tool known=1; tool="$(tool_of "$2")"   # Issue comments name the tool and the answer only, never the command or content (it can hold secrets).
-  ctx "$3" || known=0   # the deny needs no issue: a worker the loop cannot resolve is still denied at once, not left to the relay's timeout
+  ctx "$3" || { known=0; wtp=""; }   # the deny needs no issue: a worker the loop cannot resolve is still denied at once, not left to the relay's timeout
   if [ "$answer" = auto ] && orca_mutate orchestration reply --run "$run" --from "$H" --id "$1" --body deny > /dev/null; then
     log "permission denied (tool: $tool, message $1): an unattended run never approves one"
     [ "$known" = 0 ] || comment "$issue" "Permission denied (tool: $tool): an unattended run never approves a permission prompt; the worker reports it in worker_done."
-    notify "permission request for $tool denied (unattended)"
+    log "permission request for $tool denied (unattended)"
   else   # human mode, or the deny could not be sent (the worker's relay denies on its own timeout): the human decides, nothing waits
     yield
     [ "$known" = 0 ] || comment "$issue" "A permission request needs a human (message $1, tool: $tool). Reply from any terminal: $(replycmd "$1" allow)   (or deny)"
-    show_q "$2" 300; notify "permission request waiting: $(replycmd "$1" allow)"; [ "$known" = 0 ] || gate_flag "$wtp" "$1" "$2" allow
+    show_q "$2" 300; log "permission request waiting: $(replycmd "$1" allow)"; gate_flag "$wtp" "$1" "$2" allow
   fi
 }
 on_question() {
   local id q ans body warns
   id="$(jq -r .id <<< "$1")"; q="$(question_of "$1")"
   if is_perm "$q"; then on_permission "$id" "$q" "$(pj "$1" dispatchId)"; return 0; fi
-  ctx "$(pj "$1" dispatchId)" || { notify "gate question $id comes from an unknown worker: reply by hand"; return 1; }
+  ctx "$(pj "$1" dispatchId)" || { log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; flag "" ""; return 1; }
   if [ "$answer" = auto ] && ans="$(printf '%s' "$q" | "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
-    [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; notify "#$issue: $warns"; }
+    [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; log "#$issue: $warns"; flag "$wtp" "WARN #$issue: ${warns:0:80}"; }
   else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
     yield   # ...unless the reply failed because the Run was taken back meanwhile
     comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: approve with: <change> to approve with a small change, or revise: <change> to amend the plan)"
-    show_q "$q"; notify "#$issue: gate question waiting: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
+    show_q "$q"; log "#$issue: gate question waiting: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
   fi
 }
 on_done() {
@@ -234,7 +229,7 @@ fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --n
     if out="$(RUN="$run" "$DISPATCH_CMD" "$n" 2>&1)"; then log "dispatched #$n"
     else   # may have left a half-made worktree behind: remove it and park the issue
       warn "dispatch #$n failed: $out"; yield; orca_json worktree rm --worktree "issue:$n" --force > /dev/null 2>&1 || true
-      issue="$n"; disp=""; block "dispatch failed: $(tail -n 1 <<< "$out")"
+      issue="$n"; disp=""; wtp=""; block "dispatch failed: $(tail -n 1 <<< "$out")"
     fi
   done
 }
