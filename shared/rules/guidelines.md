@@ -3,6 +3,13 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 ---
 # Guidelines
 
+## Project Goal
+
+- The human works through the coordinator and is involved as little as possible: only for a meaningful decision that neither the coordinator nor a worker can make from the issue, the code and the policy.
+- Everything is authorized except sensitive operations, which go through the guard and ask the human to validate.
+- Workers are fast and reliable, and the cycle still guarantees that a change is secure, battle-tested and does not over-complexify the project.
+- The codebase stays simple and grows little; the test suite and the whole cycle stay fast. Growth (a raised line cap or budget, a new mechanism, more tests) must be justified against this goal.
+
 ## Agent Behavior
 
 ### Before Acting

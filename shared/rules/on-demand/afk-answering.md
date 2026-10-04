@@ -51,6 +51,12 @@ Three forms; this section is the only place that says which to pick, and every o
 Test: if you would want to read the corrected plan again, `revise:`; if you would approve it unseen, `approve with:`.
 The change is one sentence the spoke applies literally. When in doubt, `revise:`: a second gate is cheap, an unreviewed wrong change is not.
 
+## Growth and the human
+
+Weigh every plan against the Project Goal in `guidelines`. A plan that raises a line cap or budget, adds a mechanism (a new script, hook, reply form, state file) or grows the test count must say so and justify it against that goal. Reply `revise: <name the growth and the simpler way>` when it does not, or when a simpler way meets the acceptance criteria.
+
+The human is for a decision you cannot make from the issue, the code and the policy, never for something a sensible default settles. You still answer: take the reversible in-scope option and flag it with `WARN:`.
+
 ## Permission questions are not yours
 
 A question whose first line is `PERMISSION REQUEST` is a worker's tool-permission prompt (relayed by `permission-relay.sh`), not a gate. `coordinator.sh` replies
