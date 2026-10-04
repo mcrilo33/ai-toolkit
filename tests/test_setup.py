@@ -92,10 +92,8 @@ def test_archive_is_a_noop_and_orca_yaml_points_at_real_scripts(run, tmp_path):
     assert [(V2 / s).is_file() for s in re.findall(r"(?:setup|archive): \./(\S+)", text)] == [True, True]
 
 
-def test_setup_reads_the_gh_override_from_the_local_env_file(run, repo, tmp_path):
-    alt = tmp_path / "alt-gh"
-    alt.write_text('#!/bin/sh\necho \'{"number":12,"title":"Via alt","body":""}\'\n')
-    alt.chmod(0o755)
+def test_setup_reads_the_gh_override_from_the_local_env_file(run, repo, tmp_path, link_script):
+    alt = link_script(tmp_path / "alt-gh", '#!/bin/sh\necho \'{"number":12,"title":"Via alt","body":""}\'\n')
     (repo.root / ".ai-toolkit").mkdir()
     (repo.root / ".ai-toolkit/ai-toolkit.local.env").write_text(f"AI_TOOLKIT_GH={alt}\n")
     wt, r = setup(run, repo, "12-x")
