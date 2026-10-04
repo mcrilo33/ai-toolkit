@@ -350,21 +350,35 @@ def test_landed_but_cleanup_incomplete_finishes_once_and_parks_a_still_open_issu
     assert bool(C.calls("gh issue edit")) == (cleanup_rc == 6)   # else `--next` would pick the open issue again
 
 
-def test_a_worker_that_exited_without_worker_done_is_retried_once_on_the_nth_empty_wait_then_blocked(C):
+SWEEP = dict(COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=2)   # the sweep runs on every 2nd empty wait here (10 by default): two ticks reach it
+
+
+def relaunches(C):
+    return [a for a in C.stubs.calls("dispatch.sh") if a[0] == "--retry-of"]
+
+
+def test_a_worker_that_exited_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C):
     C.workers(C.row(lv="exited"))
-    C.go("--cap", "1", COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=3)
-    assert not C.stubs.calls("dispatch.sh")
-    C.go("--cap", "1", COORD_MAX_TICKS=3, COORD_SWEEP_EVERY=3)
-    assert C.stubs.calls("dispatch.sh")[-1] == ["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]
-    C.workers(C.row(st="completed", lv="exited"))   # a settled worker's process is expected to be gone
-    C.go("--cap", "0", COORD_MAX_TICKS=3, COORD_SWEEP_EVERY=3)
-    assert len(C.stubs.calls("dispatch.sh")) == 1
-    C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2", lv="live"))   # the relaunched worker is alive: left alone
-    C.go("--cap", "1", COORD_MAX_TICKS=3, COORD_SWEEP_EVERY=3)
-    assert len(C.stubs.calls("dispatch.sh")) == 1 and not C.calls("gh issue edit")
-    C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2", lv="exited"))   # it died too
-    C.go("--cap", "1", COORD_MAX_TICKS=3, COORD_SWEEP_EVERY=3)
-    assert C.blocked() and len(C.stubs.calls("dispatch.sh")) == 1
+    C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
+    assert not relaunches(C)
+    C.go("--cap", "1", **SWEEP)
+    assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]]
+
+
+@pytest.mark.parametrize("rows", [
+    [dict(st="completed", lv="exited")],   # a settled worker's process is expected to be gone
+    [dict(d="ctx_1", st="failed", lv="exited"), dict(d="ctx_2", lv="live")],   # the relaunched worker is alive: left alone
+])
+def test_a_sweep_leaves_a_settled_worker_and_a_live_relaunch_alone(C, rows):
+    C.workers(*[C.row(**r) for r in rows])
+    C.go("--cap", "0", **SWEEP)
+    assert not relaunches(C) and not C.calls("gh issue edit")
+
+
+def test_a_worker_that_died_again_after_its_relaunch_blocks_the_issue(C):
+    C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2", lv="exited"))
+    C.go("--cap", "1", **SWEEP)
+    assert C.blocked() and not relaunches(C)
 
 
 def test_slots_are_filled_up_to_the_cap_and_a_failed_dispatch_is_cleaned_up_and_blocks_the_issue(C, tmp_path):
