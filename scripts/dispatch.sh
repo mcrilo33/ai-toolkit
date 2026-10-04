@@ -3,7 +3,8 @@
 # The Run is explicit (--run or $RUN, never inferred: a coordinator's Run must not be picked up by accident).
 # --retry-of D --task T <issue>: relaunch the issue's worker (a new claude-spoke terminal in its worktree) on the same task; Orca re-seeds the spec.
 # --address "<spec>" <issue>: same fresh terminal, but a NEW task whose spec is the text (a review/CI round: worker-start refuses --task with --spec,
-# and Orca does not accept a new task on an idle two-step terminal: agent_unconfigured).
+# and Orca does not accept a new task on an idle two-step terminal: agent_unconfigured). Both first refresh the worktree's installed
+# copies from the main checkout (setup.sh --refresh), keeping its spoke-run-id; a failed refresh starts no agent.
 # Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -84,6 +85,8 @@ launch_twostep() {
 launch_retry() {
   wt="$(orca_json worktree show --worktree "issue:$n")" || die "retry: no worktree for issue $n"
   wt="$(printf '%s' "$wt" | jq -r '.result.worktree.path // empty')"; [ -n "$wt" ] || die "retry: no worktree path for issue $n"
+  # A kept worktree still holds the copies it was created with: bring them up to date first, as a new worktree's setup does.
+  ORCA_ROOT_PATH="$main" ORCA_WORKTREE_PATH="$wt" bash "$here/setup.sh" --refresh || die "refresh of $wt failed: no agent was started in it"
   term="$(spawn_claude "$wt" "$name-agent" "$model" "$effort")"
   start_worker --worktree "path:$wt" --terminal "$term"; sel="path:$wt"
 }

@@ -2,7 +2,11 @@
 # Orca setup hook (orca.yaml scripts.setup). Runs in the NEW worktree before the agent starts
 # (wait-for-setup), so a non-zero exit keeps the agent off a half-provisioned tree. Idempotent.
 # Orca env: ORCA_ROOT_PATH (main checkout), ORCA_WORKTREE_PATH. Claude Code only (D4).
+# --refresh: the same provisioning for a KEPT worktree (dispatch.sh --address / --retry-of), minus task.md: the main checkout's current
+# .claude/ and setup.local.sh output land again, spoke-run-id stays, and the task text is left as the worker found it.
 set -euo pipefail
+refresh=0
+case "${1:-}" in '') ;; --refresh) refresh=1 ;; *) echo "usage: setup.sh [--refresh]" >&2; exit 2 ;; esac
 # shellcheck source=lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 load_env   # the main checkout's local env (AI_TOOLKIT_GH)
@@ -28,8 +32,9 @@ for p in $patterns; do grep -qxF "$p" "$excl" 2>/dev/null || echo "$p" >> "$excl
 
 # task.md from the linked issue: Orca's link, else the `<n>-<slug>` branch name (worker-start
 # links the issue only after setup).
-n="$(orca_json worktree show --worktree "path:$wt" 2>/dev/null | jq -r '.result.worktree.linkedIssue // empty' 2>/dev/null || true)"
-if [ -z "$n" ]; then
+n=""
+[ "$refresh" = 1 ] || n="$(orca_json worktree show --worktree "path:$wt" 2>/dev/null | jq -r '.result.worktree.linkedIssue // empty' 2>/dev/null || true)"
+if [ -z "$n" ] && [ "$refresh" = 0 ]; then
   b="$(git branch --show-current)"
   case "${b%%-*}" in '' | *[!0-9]*) ;; *) n="${b%%-*}" ;; esac
 fi

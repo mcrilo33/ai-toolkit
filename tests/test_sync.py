@@ -109,11 +109,19 @@ def test_second_run_changes_nothing(sync, target):
     assert tree(target) == before  # same bytes AND no rewrite (mtime) churn
 
 
-def test_edit_in_source_reaches_target(sync, src, target):
+def test_edit_in_source_reaches_target_by_rename_so_a_running_script_is_not_corrupted(sync, src, target):
     sync()
     write(src / "shared" / "skills" / "land" / "SKILL.md", "new\n")
-    sync()
+    source = src / "v2" / "scripts" / "coordinator.sh"
+    installed = target / ".ai-toolkit" / "scripts" / "coordinator.sh"
+    old, inode = installed.read_text(), installed.stat().st_ino
+    with installed.open() as running:   # a running bash holds its script open and reads it by offset
+        source.write_text("#!/bin/sh\nnew\n")
+        sync()
+        assert running.read() == old   # the old inode is untouched: an in-place write would have changed what the loop reads next
+    assert installed.read_text() == "#!/bin/sh\nnew\n" and installed.stat().st_ino != inode
     assert (target / ".claude" / "skills" / "land" / "SKILL.md").read_text() == "new\n"
+    assert not [p for p in target.rglob("*.new.*")]
 
 
 def test_gc_removes_what_a_previous_sync_wrote_and_nothing_else(sync, src, target):

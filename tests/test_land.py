@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 
 import pytest
@@ -86,6 +87,8 @@ def test_ci_land_runs_every_step_in_order(L):
         ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks"),
     ]
     assert "--retry-request" in t[6]
+    # a repo without the sync sources is no toolkit checkout: land installs nothing and touches no installed copy
+    assert not (L.root / ".ai-toolkit").exists() and (L.root / ".claude/hooks/guard.sh").read_text() == "#!/bin/sh\n"
 
 
 def test_explicit_dispatch_skips_the_worker_list_lookup(L):
@@ -340,3 +343,38 @@ def test_a_missing_worktree_is_refused_unless_cleanup_only_can_name_the_branch_a
     r = L.go(*args)   # the last case: origin/<branch> is gone too, so there is nothing to derive the tip from
     assert r.returncode == 2 and why in r.stderr
     assert not [t for t in L.trail()[gone:] if t[:3] == ("gh", "issue", "close")]
+
+
+def toolkit_sources(L):
+    """The spoke adds the sync sources and edits one synced file per class (hook, script, policy): the landed tip is a toolkit."""
+    (L.wt / "scripts").mkdir(exist_ok=True)
+    for name in ("sync.sh", "lib.sh"):
+        shutil.copy(V2 / "scripts" / name, L.wt / "scripts" / name)
+    files = {"scripts/dispatch.sh": "#!/bin/sh\nlanded\n", "hooks/claude/guard.sh": "#!/bin/sh\nlanded\n", "shared/rules/guidelines.md": "# G\n",
+             "shared/rules/security.md": "# landed\n", "settings/ai-toolkit.env": "X=1\n"}
+    for rel, text in files.items():
+        (L.wt / rel).parent.mkdir(parents=True, exist_ok=True)
+        (L.wt / rel).write_text(text)
+    git(L.wt, "add", "-A")
+    git(L.wt, "commit", "-qm", "toolkit sources")
+    git(L.wt, "push", "-q", "origin", BRANCH)
+    return {".ai-toolkit/scripts/dispatch.sh": files["scripts/dispatch.sh"], ".claude/hooks/guard.sh": files["hooks/claude/guard.sh"],
+            ".claude/rules/security.md": files["shared/rules/security.md"], ".ai-toolkit/scripts/sync.sh": (L.wt / "scripts/sync.sh").read_text()}
+
+
+@pytest.mark.parametrize("broken", [False, True], ids=["refreshed", "refresh-fails-then-cleanup-only"])
+def test_a_land_in_the_toolkit_checkout_refreshes_the_installed_copies(L, broken):
+    want = toolkit_sources(L)
+    if broken:
+        (L.root / ".ai-toolkit").write_text("not a dir")   # the sync cannot install; everything else about the land is fine
+    r = L.go("9")
+    sha = main_sha(L)
+    assert sha == git(L.wt, "rev-parse", "HEAD") and git(L.root, "rev-parse", "HEAD") == sha   # main is landed and pushed either way
+    assert ("gh", "issue", "close", "9", "-c", f"landed in {sha}") in L.trail()
+    if broken:
+        assert r.returncode == 6 and "installed copies" in r.stderr and "scripts/sync.sh" in r.stderr   # distinct, visible, never a red land
+        assert (L.root / ".claude/hooks/guard.sh").read_text() != want[".claude/hooks/guard.sh"]
+        (L.root / ".ai-toolkit").unlink()
+        r = L.go("--cleanup-only", "9")   # the existing way to finish an exit-6 land also retries the refresh
+    assert r.returncode == 0, r.stderr
+    assert {rel: (L.root / rel).read_text() for rel in want} == want
