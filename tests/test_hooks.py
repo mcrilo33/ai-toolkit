@@ -168,13 +168,19 @@ def test_danger_guard_a_home_inside_a_temp_root_is_still_protected(shared):
     check("danger-guard.sh", shared, "spoke", 0, env={"HOME": f"{scratch}/h"}, command="rm -rf /tmp/x")
 
 
-@pytest.mark.parametrize("where,cmd,want", [
-    ("root", "git reset --hard", 2), ("root", "git reset --hard HEAD~1", 2), ("root", 'bash -c "git reset --hard"', 2),
-    ("wt", "git -C {root} reset --hard", 2), ("root", "git -C . reset --hard", 2), ("wt", "git reset --hard", 0),
-    ("wt", "git --work-tree={root} reset --hard", 2), ("root", "git reset --soft HEAD~1", 0), ("root", "git reset HEAD README", 0), ("wt", "git -C {wt} reset --hard", 0),
+@pytest.mark.parametrize("where,cmd,asks", [
+    ("root", "git reset --hard", True), ("root", "git reset --hard HEAD~1", True), ("root", 'bash -c "git reset --hard"', True),
+    ("wt", "git -C {root} reset --hard", True), ("root", "git -C . reset --hard", True), ("wt", "git reset --hard", False),
+    ("wt", "git --work-tree={root} reset --hard", True), ("root", "git reset --soft HEAD~1", False), ("root", "git reset HEAD README", False),
+    ("wt", "git -C {wt} reset --hard", False),
 ])
-def test_danger_guard_reset_hard_only_in_the_main_checkout(shared, where, cmd, want):
-    check("danger-guard.sh", shared, where, want, command=cmd)
+def test_danger_guard_reset_hard_asks_only_in_the_main_checkout(shared, where, cmd, asks):
+    r = call("danger-guard.sh", shared[where], command=cmd.replace("{root}", str(shared["root"])).replace("{wt}", str(shared["wt"])), env=shared["env"])
+    assert r.returncode == 0 and r.stderr == ""
+    if asks:
+        assert "reset --hard" in json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+    else:
+        assert r.stdout == ""
 
 
 @pytest.mark.parametrize("tool,key,path", [
@@ -195,21 +201,25 @@ def test_danger_guard_allows_ordinary_file_writes(shared, path):
     check("danger-guard.sh", shared, "spoke", 0, tool="Write", file_path=path)
 
 
-def test_spoke_only_protections_do_not_bind_the_human_session(shared):
+def test_spoke_only_protections_do_not_bind_the_human_session(shared, tmp_path):
     def dg(where, want, tool="Write", **ti):
         check("danger-guard.sh", shared, where, want, tool=tool, **ti)
     for p in (".claude/settings.json", ".claude/hooks/x.sh", ".claude/settings.local.json"):
         dg("root", 0, file_path=p)
     dg("root", 0, "Bash", command="echo > .claude/settings.json")
     dg("root", 0, "Bash", command="rm -rf .claude")
-    dg("root", 2, file_path="{home}/.claude/settings.json")
     dg("root", 0, "AskUserQuestion", questions="[]")
     dg("wt", 0, "AskUserQuestion", questions="[]")
     dg("spoke", 2, "AskUserQuestion", questions="[]")
+    install_relay(tmp_path / "w", "installed")  # not a permission, so never an ask: denied in a worker even when someone could answer
+    r = call("danger-guard.sh", tmp_path / "w", "AskUserQuestion", env=shared["env"], questions="[]")
+    assert r.returncode == 2 and r.stdout == "" and "AskUserQuestion is off in a spoke" in r.stderr
 
 
-# where, how the worker is set up, does a workflows write ask? (every other protected path is denied whatever the setup). A worker asks only when the
-# PermissionRequest relay is installed (hook file + registered in its settings): the relay then puts the question to the Run; a local ask nobody sees would hang.
+# where, how the worker is set up, does a sensitive operation ask? Everything danger-guard guards asks when someone can answer (no worker: the human's own
+# prompt; a worker with the PermissionRequest relay installed: the relay puts it to the Run) and is denied when no one can (a worker without the relay: a
+# local ask nobody sees would hang). Denied in both, never asked: AskUserQuestion in a worker (below), a worker's write to the human's reply spool (lanes
+# marked D) and an unparsable payload (the fail-closed test).
 WF_SCENARIOS = {
     "no-run-main-checkout": ("root", None, True), "no-run-plain-worktree": ("wt", None, True),
     "worker-with-the-relay-installed": ("spoke", "installed", True),
@@ -217,7 +227,9 @@ WF_SCENARIOS = {
     "worker-without-the-relay-file": ("spoke", "nofile", False),
     "worker-without-any-claude-dir": ("spoke", "bare", False),
 }
-# tool, tool_input, the text the ask must carry ("" = a protected path that never asks; "spoke-only" = same, protected in a spoke only)
+W = "worker-only"  # first element of a lane's names: the operation is sensitive in a worker only
+D = "hard-deny"  # a lane's name: denied in every scenario, never asked (the human's reply spool: an approved write would forge the human's reply)
+# tool, tool_input, what the ask's reason must name (one string, or a tuple: a compound names every sensitive segment; D: never asks)
 WF_LANES = [
     ("Write", {"file_path": ".github/workflows/ci.yml"}, ".github/workflows/ci.yml"),
     ("Edit", {"file_path": "{spoke}/.github/workflows/new.yml"}, "new.yml"),
@@ -226,16 +238,33 @@ WF_LANES = [
     ("Bash", {"command": "echo x > .github/workflows/ci.yml"}, "echo x > .github/workflows/ci.yml"),
     ("Bash", {"command": "sed -i s/a/b/ .github/workflows/ci.yml"}, "sed -i s/a/b/ .github/workflows/ci.yml"),
     ("Bash", {"command": "cd .github/workflows && echo x > ci.yml"}, "cd .github/workflows && echo x > ci.yml"),
-    ("Bash", {"command": "echo x > .github/workflows/ci.yml; rm -rf /usr"}, ""),
-    ("Bash", {"command": "echo x > .github/workflows/ci.yml && echo y > orca.yaml"}, ""),
-    ("Write", {"file_path": "orca.yaml"}, ""), ("Write", {"file_path": "{home}/.claude/settings.json"}, ""),
-    ("Bash", {"command": "echo x > orca.yaml"}, ""), ("Bash", {"command": "cp x ~/.claude/settings.json"}, ""),
-    ("Write", {"file_path": ".claude/settings.json"}, "spoke-only"), ("Write", {"file_path": ".claude/hooks/push-guard.sh"}, "spoke-only"),
-    ("Write", {"file_path": ".ai-toolkit/spoke-run-id"}, "spoke-only"), ("Bash", {"command": "rm .claude/settings.local.json"}, "spoke-only"),
+    ("Write", {"file_path": "orca.yaml"}, "orca.yaml"), ("Edit", {"file_path": "./orca.yaml"}, "./orca.yaml"),
+    ("Write", {"file_path": "{home}/.claude/settings.json"}, ".claude/settings.json"),
+    ("Write", {"file_path": "~/.claude/settings.json"}, "~/.claude/settings.json"),
+    ("Bash", {"command": "echo x > orca.yaml"}, "echo x > orca.yaml"), ("Bash", {"command": "cp x ~/.claude/settings.json"}, "cp x ~/.claude/settings.json"),
+    ("Bash", {"command": "rm ~/.claude/settings.json"}, "rm ~/.claude/settings.json"),
+    ("Write", {"file_path": ".claude/settings.json"}, (W, ".claude/settings.json")),
+    ("Edit", {"file_path": ".claude/settings.local.json"}, (W, ".claude/settings.local.json")),
+    ("Write", {"file_path": ".claude/hooks/push-guard.sh"}, (W, ".claude/hooks/push-guard.sh")),
+    ("Write", {"file_path": ".ai-toolkit/spoke-run-id"}, (W, ".ai-toolkit/spoke-run-id")),
+    ("Bash", {"command": "rm .claude/settings.local.json"}, (W, "rm .claude/settings.local.json")),
     # the coordinator's reply spool: a worker writing there would answer its own gate or permission question as the human
-    ("Write", {"file_path": "{home}/.ai-toolkit/coordinator/run_t/replies/msg_p"}, "spoke-only"),
-    ("Bash", {"command": "echo allow > ~/.ai-toolkit/coordinator/run_t/replies/msg_p"}, "spoke-only"),
-    ("Bash", {"command": "cp x $HOME/.ai-toolkit/coordinator/run_t/replies/msg_p"}, "spoke-only"),
+    ("Write", {"file_path": "{home}/.ai-toolkit/coordinator/run_t/replies/msg_p"}, (W, D)),
+    ("Bash", {"command": "echo allow > ~/.ai-toolkit/coordinator/run_t/replies/msg_p"}, (W, D)),
+    ("Bash", {"command": "cp x $HOME/.ai-toolkit/coordinator/run_t/replies/msg_p"}, (W, D)),
+    # rm -r: outside the worktree, the worktree root, home, another checkout, an unexpanded variable
+    ("Bash", {"command": "rm -rf /usr"}, "outside the worktree: /usr"), ("Bash", {"command": "rm -rf ~/x"}, "rm -r of ~/x (worktree root or home)"),
+    ("Bash", {"command": "rm -rf ."}, "rm -r of . (worktree root or home)"), ("Bash", {"command": "rm -rf {other}"}, "another git checkout or worktree: {other}"),
+    ("Bash", {"command": "rm -rf $FOO/x"}, "unexpanded variable"),
+    # git: reset --hard in the main checkout (or one the guard cannot pin down), and the clean/stash verbs that remove the ignored .claude/ and .ai-toolkit/
+    ("Bash", {"command": "git -C {root} reset --hard"}, "reset --hard in the main checkout"),
+    ("Bash", {"command": "git --work-tree={root} reset --hard"}, "reset --hard with --git-dir/--work-tree"),
+    ("Bash", {"command": "git clean -fdx"}, "git clean -fdx"), ("Bash", {"command": "git stash -a"}, "git stash -a"),
+    # a compound asks once and names every sensitive segment, not only the first
+    ("Bash", {"command": "echo x > .github/workflows/ci.yml; rm -rf /usr"}, ("ci.yml", "outside the worktree: /usr")),
+    ("Bash", {"command": "echo x > .github/workflows/ci.yml && echo y > orca.yaml"}, ("ci.yml", "orca.yaml")),
+    ("Bash", {"command": "rm -rf /usr; echo x > orca.yaml; git -C {root} reset --hard; git clean -fdx"},
+     ("outside the worktree: /usr", "orca.yaml", "reset --hard in the main checkout", "git clean -fdx")),
 ]
 
 
@@ -253,20 +282,25 @@ def install_relay(spoke, how):
 
 @pytest.mark.parametrize("scenario", WF_SCENARIOS)
 @pytest.mark.parametrize("tool,ti,named", WF_LANES)
-def test_danger_guard_workflow_writes_ask_only_where_the_prompt_reaches_someone(shared, tmp_path, scenario, tool, ti, named):
+def test_danger_guard_sensitive_operations_ask_only_where_the_prompt_reaches_someone(shared, tmp_path, scenario, tool, ti, named):
     where, how, asks = WF_SCENARIOS[scenario]
-    if where != "spoke" and named == "spoke-only":
-        pytest.skip("spoke-only protections")
-    named = "" if named == "spoke-only" else named
+    named = (named,) if isinstance(named, str) else named
+    if named[0] == W:
+        named = named[1:]
+        if where != "spoke":
+            pytest.skip("worker-only protections")
+    if named[0] == D:
+        asks, named = False, ()
     places = {**shared, "spoke": tmp_path / "w"}
     if where == "spoke":
         install_relay(places["spoke"], how)
-    ti = {k: v.replace("{spoke}", str(places[where])).replace("{home}", str(shared["home"])) for k, v in ti.items()}
+    sub = lambda v: v.replace("{spoke}", str(places[where])).replace("{home}", str(shared["home"])).replace("{root}", str(shared["root"])).replace("{other}", str(shared["spoke"]))  # noqa: E731
+    ti, named = {k: sub(v) for k, v in ti.items()}, [sub(n) for n in named]
     r = call("danger-guard.sh", places[where], tool, env=shared["env"], **ti)
-    if asks and named:
-        out = json.loads(r.stdout)["hookSpecificOutput"]
+    if asks:
+        out = json.loads(r.stdout)["hookSpecificOutput"]  # one object: a compound asks once
         assert (r.returncode, out["hookEventName"], out["permissionDecision"], r.stderr) == (0, "PreToolUse", "ask", "")
-        assert named in out["permissionDecisionReason"] and "danger-guard" in out["permissionDecisionReason"]
+        assert all(n in out["permissionDecisionReason"] for n in named) and "danger-guard" in out["permissionDecisionReason"], out["permissionDecisionReason"]
     else:
         assert r.returncode == 2 and r.stdout == "" and "danger-guard: blocked" in r.stderr, (r.returncode, r.stdout, r.stderr)
         assert r.stderr.count("\n") == 1 and "cannot parse" not in r.stderr, r.stderr  # one clear reason, no trap noise
@@ -411,7 +445,7 @@ def record_reason(shared, relay, why=None, epoch=None):
 
 def test_relay_joins_the_reason_a_pretooluse_ask_recorded_and_ignores_a_stale_or_unrelated_one(shared, relay):
     record_reason(shared, relay)
-    assert "reason: danger-guard: write to .github/workflows needs your approval" in relay.run("Write", WF).question
+    assert "reason: danger-guard: needs your approval: write to .github/workflows" in relay.run("Write", WF).question
     assert "reason: unknown" in relay.run("Write", WF).question  # single use
     record_reason(shared, relay)
     assert "reason: unknown" in relay.run("Write", {**WF, "content": "y"}).question  # keyed by tool + input
@@ -495,6 +529,8 @@ def test_settings_register_the_hooks_at_the_synced_path(shared, tmp_path):
     cfg = json.loads((V2 / "settings/claude/settings.json").read_text())
     assert "permissions" not in cfg and set(cfg["hooks"]) == {"PreToolUse", "PermissionRequest"}  # no auto-allow, no TDD/plan hooks (D2/D8)
     shutil.copytree(CLAUDE, tmp_path / "proj/.claude/hooks")  # what sync (WP4) puts in a target
+    (tmp_path / "proj/.ai-toolkit").mkdir()  # a worker whose settings do not register the relay: nobody can answer an ask, so danger-guard denies
+    (tmp_path / "proj/.ai-toolkit/spoke-run-id").write_text("rid\n")
     seen = {}
     for e in cfg["hooks"]["PreToolUse"]:
         cmd = e["hooks"][0]["command"]
@@ -559,5 +595,5 @@ def test_pre_commit_allows_the_first_commit_of_a_repo(tmp_path):
 
 def test_hook_line_budgets():
     n = lambda *g: sum(len(f.read_text().splitlines()) for q in g for f in HOOKS.glob(q))  # noqa: E731
-    assert n("claude/*.sh") <= 200 and n("git/*") <= 40
+    assert n("claude/*.sh") <= 204 and n("git/*") <= 40
     assert len((V2 / "settings/claude/settings.json").read_text().splitlines()) <= 40

@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2086  # `check $seg` splits a segment into words on purpose (globbing is off: set -f)
-# danger-guard: PreToolUse(Bash|Write|Edit|MultiEdit|NotebookEdit|AskUserQuestion). Yolo mode (D8) has no prompts of its own, so
-# this deny-list is the brake: rm -r outside the worktree, git reset --hard in the main checkout, writes to orca.yaml,
-# ~/.claude/settings.json and, in a spoke, the project .claude/{settings*.json,hooks/}; AskUserQuestion in a spoke.
-# Exit 2 + stderr = deny; a crash (bad JSON, no jq) is exit 2 too (fail-closed). A pattern list, not a sandbox.
-# Writes to .github/workflows/ ASK instead (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode): outside a spoke the
-# human's own prompt, in a spoke only when the permission-relay hook is installed and registered (it then puts the question to the Run: the user
-# answers an attended one, the auto loop denies it), else denied like the rest since a local ask nobody sees would hang. The ask's reason is recorded
-# for the relay to join (.ai-toolkit/ask-reasons/<sha256 of tool+input>, the one thing a PermissionRequest payload lacks). The ask is emitted last, so
-# a deny in a compound still wins.
+# danger-guard: PreToolUse(Bash|Write|Edit|MultiEdit|NotebookEdit|AskUserQuestion). Yolo mode (D8) has no prompts of its own, so this is the brake.
+# The rule: everything is authorized except sensitive operations, which ASK the user when someone can answer and are DENIED when no one can.
+# Asks (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode), one per call whose reason names every sensitive segment: writes
+# to orca.yaml, ~/.claude/settings.json, .github/workflows/ and, in a worker, the project .claude/{settings*.json,hooks/} and .ai-toolkit/spoke-run-id;
+# rm -r outside the worktree, of its root or home, of another git checkout, or with an unexpanded variable; git reset --hard in the main checkout (or
+# with --git-dir/--work-tree); git clean -x and git stash -a. Someone can answer when there is no worker marker (the human's own prompt) or when a worker
+# has the permission-relay hook installed and registered (it puts the question to the Run: the user answers an attended one, the auto loop denies it);
+# else the ask is denied like a hard deny, since a local ask nobody sees would hang. The reason is recorded for the relay to join
+# (.ai-toolkit/ask-reasons/<sha256 of tool+input>, the one thing a PermissionRequest payload lacks).
+# Always denied (exit 2 + stderr), never asked: AskUserQuestion in a worker (not a permission: it has the Run's ask), a write to the human's reply spool
+# ~/.ai-toolkit/coordinator/ in a worker (an approved write would forge the human's reply), and an unparsable payload (bad JSON, no jq: fail-closed).
+# A pattern list, not a sandbox.
 set -Eeuo pipefail
 deny() { echo "danger-guard: blocked: $*" >&2; exit 2; }
 trap 'deny "cannot parse the tool payload (fail-closed)"' ERR
@@ -21,13 +24,14 @@ record_reason() { # $1 = why, for the relay: one single-use file per tool+input,
   local d="$root/.ai-toolkit/ask-reasons" k; k="$(jq -cS '[.tool_name,.tool_input]' <<<"$in" | shasum -a 256 | cut -d' ' -f1)"
   (umask 077; mkdir -p "$d"; printf '%s\n%s\n' "$(date +%s)" "$1" > "$d/$k")
 }
-wf=""; wfd="write to a protected path (.github/workflows, orca.yaml, claude settings/hooks)" # a .github/workflows/ write (what, deny text), settled by finish()
+m="" # the sensitive findings of this call, settled by finish()
+sens() { local t="${*//$'\n'/ }"; case "; $m; " in *"; $t; "*) return 0;; esac; m="${m:+$m; }$t"; } # once each: the guard scans a command twice
 finish() {
-  [ -n "$wf" ] || exit 0
-  if [ -z "$spoke" ] || relay_ready; then local r="danger-guard: write to .github/workflows needs your approval: $wf"
+  [ -n "$m" ] || exit 0
+  if [ -z "$spoke" ] || relay_ready; then local r="danger-guard: needs your approval: $m"
     [ -z "$spoke" ] || record_reason "$r"
     jq -nc --arg r "$r" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: $r}}'; exit 0; fi
-  deny "$wfd"
+  deny "$m"
 }
 cwd="$(j .cwd)"; cwd="${cwd:-$PWD}" # root = the project dir, not the cwd: a `cd` out of the repo must not move it
 root="$(phys "${CLAUDE_PROJECT_DIR:-$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "$cwd")}")"
@@ -40,42 +44,46 @@ canon() { local p="$1"; case "$p" in \~ | \~/*) p="$HOME${p#\~}";; esac; case "$
   local rest="" d="$p"; while [ ! -d "$d" ]; do rest="/${d##*/}$rest"; d="$(dirname "$d")"; done
   rest="$(printf '%s' "$rest" | sed -E -e ':a' -e 's#/[^/]+/\.\./#/#' -e 'ta')"; printf '%s%s' "$(phys "$d")" "$rest"; }
 prot() { case "$1" in "$root/orca.yaml" | "$home/.claude/settings.json") return 0;; esac
-  [ -n "$spoke" ] && case "$1" in "$root/.claude/settings.json" | "$root/.claude/settings.local.json" | "$root/.claude/hooks" | "$root/.claude/hooks/"* | "$root/.ai-toolkit/spoke-run-id" | "$home/.ai-toolkit/coordinator" | "$home/.ai-toolkit/coordinator/"*) return 0;; esac # the last two: the human's reply spool
+  [ -n "$spoke" ] && case "$1" in "$root/.claude/settings.json" | "$root/.claude/settings.local.json" | "$root/.claude/hooks" | "$root/.claude/hooks/"* | "$root/.ai-toolkit/spoke-run-id") return 0;; esac
   return 1; }
 fp="$(j '.tool_input.file_path // .tool_input.notebook_path')"
-if [ -n "$fp" ]; then fc="$(canon "$fp")"; if prot "$fc"; then deny "write to a protected path ($fp)"; fi
-  case "$fc" in "$root/.github/workflows" | "$root/.github/workflows/"*) wf="$fp"; wfd="write to a protected path ($fp)";; esac; fi
+spool="(~|HOME\}?|$home)/\.ai-toolkit/coordinator" # the human's reply spool: a file there is sent as the human's answer, so a worker never writes it
+if [ -n "$fp" ]; then fc="$(canon "$fp")"; if prot "$fc"; then sens "write to a protected path ($fp)"; fi
+  [ -z "$spoke" ] || case "$fc" in "$home/.ai-toolkit/coordinator" | "$home/.ai-toolkit/coordinator/"*) deny "write to the human's reply spool ($fp)";; esac
+  case "$fc" in "$root/.github/workflows" | "$root/.github/workflows/"*) sens "write to .github/workflows ($fp)";; esac; fi
 cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || finish
 
 c=" $(printf '%s' "$cmd" | sed -E "s/[\"'\\\\]//g; s/[0-9&]*>+ *(\/dev\/null|&[0-9])//g; s/[[:space:]>]/& /g")" # writes to a protected path
 pre="((^|[^[:alnum:]_./-])(\./)?|$root/|\\\$\{?(PWD|CLAUDE_PROJECT_DIR)\}?/|\\\$\(pwd\)/)"; e="([^[:alnum:]_./-]|$)" # project-root paths only: v2/orca.yaml is fine
 p="$pre(orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$home)/\.claude/settings\.json"
-if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e|\.ai-toolkit/spoke-run-id)|(~|HOME\}?|$home)/\.ai-toolkit/coordinator"; fi
+if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e|\.ai-toolkit/spoke-run-id)"; fi
 w="(>|[[:space:]](tee|cp|mv|rm|touch|ln|dd|install|rsync|truncate|patch|chmod|python[0-9.]*|perl|ruby|node)[[:space:]]|[[:space:]]sed[[:space:]][^;|&]*(-[a-z]*i|--in-place))"
 va="${w}[^;|&]*|[[:space:]](cd|pushd)[[:space:]][^;|&]*" # a verb before the path, or a cd into it
-if [[ $c =~ ($va)($p) ]]; then deny "write to a protected path (orca.yaml, claude settings/hooks)"; fi
-if [[ $c =~ ($va)($pre\.github/workflows) ]]; then wf="${cmd:0:200}"; fi
+if [ -n "$spoke" ] && [[ $c =~ ($va)($spool) ]]; then deny "write to the human's reply spool (${cmd:0:200})"; fi
+bw=""; if [[ $c =~ ($va)($p) ]]; then bw="a protected path (orca.yaml, claude settings/hooks)"; fi
+if [[ $c =~ ($va)($pre\.github/workflows) ]]; then bw="${bw:+$bw and }.github/workflows"; fi
+[ -z "$bw" ] || sens "write to $bw: ${cmd:0:200}"
 
 target() { # one `rm -r` target: inside the worktree, or strictly below a temp root
   local p="$1" v; for v in HOME TMPDIR; do p="${p/#\$$v/${!v:-}}"; p="${p/#\$\{$v\}/${!v:-}}"; done
-  case "$p" in *\$* | \~[!/]*) deny "rm -r target $1 has an unexpanded variable: use a literal path";; esac
+  case "$p" in *\$* | \~[!/]*) sens "rm -r target $1 has an unexpanded variable: use a literal path"; return 0;; esac
   p="$(canon "$p")"
-  case "$p" in "$root"/?*) return 0;; "$root" | "$home" | "$home"/*) deny "rm -r of $1 (worktree root or home)";; esac
-  if [ -e "$p/.git" ]; then deny "rm -r of another git checkout or worktree: $1"; fi
+  case "$p" in "$root"/?*) return 0;; "$root" | "$home" | "$home"/*) sens "rm -r of $1 (worktree root or home)"; return 0;; esac
+  if [ -e "$p/.git" ]; then sens "rm -r of another git checkout or worktree: $1"; return 0; fi
   case "$p" in /tmp/?* | /private/tmp/?* | "$(phys "${TMPDIR:-/nonexistent}")"/?*) return 0;; esac
-  deny "rm -r outside the worktree: $1"
+  sens "rm -r outside the worktree: $1"
 }
 check() { # the words of one command segment
   while [ $# -gt 0 ] && [[ ${1##*/} != rm && ${1##*/} != git ]]; do shift; done
   [ $# -gt 0 ] || return 0
   local k="${1##*/}" d t="" rec="" a; shift
   if [[ $k == git ]]; then
-    if [[ " $* " == *" clean "* || " $* " == *" stash "* ]]; then for a in "$@"; do [[ $a =~ ^(--all|-[a-zA-Z]*[xa][a-zA-Z]*)$ ]] && deny "git clean -x / stash -a remove the ignored .claude/ and .ai-toolkit/"; done; fi
+    if [[ " $* " == *" clean "* || " $* " == *" stash "* ]]; then for a in "$@"; do [[ $a =~ ^(--all|-[a-zA-Z]*[xa][a-zA-Z]*)$ ]] && { sens "git clean -x / stash -a remove the ignored .claude/ and .ai-toolkit/: git $*"; break; }; done; fi
     case " $* " in *" reset "*"--hard "*) ;; *) return 0;; esac
-    case " $* " in *" --git-dir"* | *" --work-tree"*) deny "git reset --hard with --git-dir/--work-tree";; esac
+    case " $* " in *" --git-dir"* | *" --work-tree"*) sens "git reset --hard with --git-dir/--work-tree: git $*"; return 0;; esac
     d="$(printf '%s' " $* " | sed -n 's/.* -C *\([^ ]*\).*/\1/p')"; d="${d:-.}"; case "$d" in /*) ;; *) d="$cwd/$d";; esac
     a="$(git -C "$d" rev-parse --path-format=absolute --git-dir 2>/dev/null || echo x)"
-    [ "$a" != "$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo y)" ] || deny "git reset --hard in the main checkout"
+    [ "$a" != "$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo y)" ] || sens "git reset --hard in the main checkout ($(phys "$d")): git $*"
     return 0
   fi
   for a in "$@"; do case "$a" in --recursive | -[rR]* | -[!-]*[rR]*) rec=1;; -*) ;; *) t="$t $a";; esac; done
