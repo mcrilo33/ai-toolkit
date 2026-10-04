@@ -20,7 +20,7 @@ own branch, driven by its own agent. The hub thinks, decides, decomposes, dispat
 - **Decide and decompose**: turn rough ideas into focused, self-contained issues. The issue is the contract;
   the spoke starts with clean context and no planning noise.
 - **Dispatch**: `start-task` files the issue and runs `dispatch.sh`; `/afk` hands the whole backlog to `coordinator.sh`.
-- **Answer**: a PLAN gate arrives as an Orca question; reply `approve` or `revise: …` (or let `answer.sh` do it).
+- **Answer**: a PLAN gate arrives as an Orca question; reply `approve`, `approve with: <change>` or `revise: …` (which one: `afk-answering`, Choosing the reply; or let `answer.sh` do it).
 - **Review and land**: `land.sh <n>` after the independent review and green CI. The hub never merges by hand
   past a red review or red CI.
 

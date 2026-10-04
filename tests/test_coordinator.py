@@ -122,28 +122,33 @@ def test_a_question_for_the_human_is_notified_with_the_exact_reply_command_and_a
     assert C.go("--answer", mode).returncode == 0
     assert not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack") and (len(C.stubs.calls("answer.sh")) == 1) == (mode == "auto")
     assert REPLY in C.calls("gh issue comment")[0][-1] and "revise:" in C.calls("gh issue comment")[0][-1] and "--reply msg_q" in C.stubs.calls("notify")[0][0]
+    assert "approve with: <change>" in C.calls("gh issue comment")[0][-1]
 
 
-def test_reply_queues_a_one_line_request_in_a_private_spool_outside_any_worktree_and_needs_no_orca(C, tmp_path):
-    r = C.go("--reply", "msg_q", "revise:  use tmp", ORCA_TERMINAL_HANDLE="", AITK_STATE_DIR="")
+@pytest.mark.parametrize("given, queued", [("revise:  use tmp", "revise: use tmp"), ("approve with:   use tmp", "approve with: use tmp")])
+def test_reply_queues_a_one_line_request_in_a_private_spool_outside_any_worktree_and_needs_no_orca(C, tmp_path, given, queued):
+    r = C.go("--reply", "msg_q", given, ORCA_TERMINAL_HANDLE="", AITK_STATE_DIR="")
     d = tmp_path / "home/.ai-toolkit/coordinator/run_t/replies"
-    assert r.returncode == 0 and (d / "msg_q").read_text() == "revise: use tmp\n" and stat.S_IMODE(d.stat().st_mode) == 0o700
+    assert r.returncode == 0 and (d / "msg_q").read_text() == f"{queued}\n" and stat.S_IMODE(d.stat().st_mode) == 0o700
     assert not C.stubs.calls("orca") and not list(d.glob(".*"))
     assert C.go("--reply", "msg_q", "approve", ORCA_TERMINAL_HANDLE="").returncode == 0 and C.spooled("msg_q")   # AITK_STATE_DIR is a base: <dir>/<run-id>/replies
 
 
-@pytest.mark.parametrize("args", [["--reply", "msg_q", "maybe"], ["--reply", "msg_q", "revise:"], ["--reply", "../x", "approve"], ["--reply", "msg_q"]])
+@pytest.mark.parametrize("args", [["--reply", "msg_q", "maybe"], ["--reply", "msg_q", "revise:"], ["--reply", "../x", "approve"], ["--reply", "msg_q"],
+                                  ["--reply", "msg_q", "approve with:"], ["--reply", "msg_q", "approve with:  "], ["--reply", "msg_q", "approve with"],
+                                  ["--reply", "msg_q", "approve please"], ["--reply", "msg_q", "approve withdraw: x"]])
 def test_reply_refuses_a_bad_message_id_or_body_and_a_missing_run(C, tmp_path, args):
     assert C.go(*args).returncode == 2 and not C.spooled("msg_q") and not C.spooled("../x")
     assert C.go("--reply", "msg_q", "approve", run_id=None).returncode == 2
 
 
-def test_a_queued_reply_is_sent_as_the_bound_consumer_deleted_and_commented_on_the_issue(C):
+@pytest.mark.parametrize("body", ["revise: use tmp", "approve with: use tmp"])
+def test_a_queued_reply_is_sent_as_the_bound_consumer_deleted_and_commented_on_the_issue(C, body):
     C.inbox(["msg_q"])
-    C.spool("msg_q", "revise: use tmp")
+    C.spool("msg_q", body)
     assert C.go().returncode == 0
     rep = C.calls("orca orchestration reply")[0]
-    assert (arg(rep, "--id"), arg(rep, "--body"), arg(rep, "--run"), arg(rep, "--from")) == ("msg_q", "revise: use tmp", "run_t", "term_c")
+    assert (arg(rep, "--id"), arg(rep, "--body"), arg(rep, "--run"), arg(rep, "--from")) == ("msg_q", body, "run_t", "term_c")
     assert not C.spooled("msg_q") and "use tmp" in C.calls("gh issue comment")[0][-1]
 
 
@@ -169,7 +174,7 @@ def test_a_queued_reply_is_only_dropped_when_its_question_is_seen_answered_or_th
     assert not C.spooled("msg_old")
 
 
-@pytest.mark.parametrize("body", ["rm -rf /", "revise:", "approve please", ""])
+@pytest.mark.parametrize("body", ["rm -rf /", "revise:", "approve please", "", "approve with:", "approve with"])
 def test_a_spool_file_with_a_tampered_body_is_dropped_unsent(C, body):
     C.inbox(["msg_q"])
     C.spool("msg_q", body)

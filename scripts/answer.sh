@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # answer.sh <worktree> < question: the auto-answerer for a spoke's gate (06 section 4 step 7, D5). Headless, read-only claude
-# in the spoke's worktree, driven by the afk-answering rule. stdout = the reply body (`approve` | `revise: <change>`), then any
+# in the spoke's worktree, driven by the afk-answering rule. stdout = the reply body (`approve` | `approve with: <change>` | `revise: <change>`), then any
 # `WARN:` lines for the human. Exit 0 answered; 1 no usable answer (garbage, claude failed, rule missing): the caller escalates
 # to the human, never a blind approve.
 set -euo pipefail
@@ -21,6 +21,9 @@ last="$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 1)"
 body="$(printf '%s' "$last" | sed -n 's/^ANSWER:[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p')"
 case "$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]')" in
   approve) body=approve ;;
+  approve*with*:*[![:space:]]*)   # only exactly `approve`, blanks, `with`, `:`, then a non-empty change
+    printf '%s' "$body" | grep -Eiq '^approve[[:space:]]+with[[:space:]]*:[[:space:]]*[^[:space:]]' || die "no usable ANSWER line: '$last'"
+    body="approve with: $(printf '%s' "${body#*:}" | sed 's/^[[:space:]]*//')" ;;
   revise:*[![:space:]]*) body="revise: $(printf '%s' "${body#*:}" | sed 's/^[[:space:]]*//')" ;;
   *) die "no usable ANSWER line: '$last'" ;;
 esac

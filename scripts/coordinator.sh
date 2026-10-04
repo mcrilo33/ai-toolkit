@@ -22,7 +22,7 @@ while [ $# -gt 0 ]; do
     --cap) cap="${2:-}"; shift ;; --until) until="${2:-}"; shift ;;
     --drain) drain=1 ;; --status) status=1 ;; --stop) stop=1 ;;
     --reply) reply=1; reply_id="${2:-}"; reply_body="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
-    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'revise: ...'" ;;
+    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'" ;;
   esac; shift
 done
 case "$answer" in auto | human) ;; *) usage_exit "--answer takes auto or human" ;; esac
@@ -85,7 +85,7 @@ if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the que
   echo "live workers:"
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "  \(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict)"'
   echo "pending questions:"
-  pending | jq -c '.open[]' | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"; echo "    reply: $(replycmd "$id")   (or 'revise: <change>')"; done
+  pending | jq -c '.open[]' | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"; echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; done
   exit 0
 fi
 
@@ -141,7 +141,7 @@ drain_replies() {   # send the queued human replies as the bound consumer. Dropp
     [ -f "$f" ] || continue
     id="${f##*/}"; body="$(head -n 1 "$f")"; q="$(jq -c --arg i "$id" '[.open[] | select(.id == $i)][0] // empty' <<< "$pend")"
     case "$body" in
-      approve | revise:*[![:space:]]*) ;;
+      approve | "approve with: "*[![:space:]]* | revise:*[![:space:]]*) ;;
       *) warn "reply to $id dropped: malformed body"; rm -f "$f"; continue ;;
     esac
     if [ -z "$q" ]; then
@@ -163,7 +163,7 @@ on_question() {
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; notify "#$issue: $warns"; }
   else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
     yield   # ...unless the reply failed because the Run was taken back meanwhile
-    comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: revise: <change>)"
+    comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: approve with: <change> to approve with a small change, or revise: <change> to amend the plan)"
     show_q "$q"; notify "#$issue: gate question waiting: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
   fi
 }

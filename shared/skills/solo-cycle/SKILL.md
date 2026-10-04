@@ -28,6 +28,7 @@ extended, the tests new, and the net count (`pytest-conventions`, Test economy).
 | Reply | You |
 |-------|-----|
 | `approve` | start the cycle |
+| `approve with: <change>` | apply the change to the plan and start the cycle; never `ask` again. If you cannot apply it without altering the approach, say so in your `worker_done` report |
 | `revise: …` | amend the plan, `ask` again (max 2 rounds, then `worker_done --outcome failed` naming the blocker) |
 | the call times out | re-run the same `ask`; never start coding unanswered |
 

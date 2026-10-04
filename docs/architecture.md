@@ -39,7 +39,7 @@ orca.yaml                  Orca hooks of THIS repo (setup/archive); a synced tar
 3. **Dispatch.** `dispatch.sh <n>`: `worktree create` (Orca runs `scripts/setup.sh` first: `.claude/` copied from the main checkout, `spoke-run-id`,
    `task.md` from the issue), a `claude-spoke` terminal (the two-step launch: Orca's own agent launch cannot carry the per-spoke OTel env), then `worker-start --terminal` with the seed prompt, then `worktree set --issue n
    --workspace-status in-progress`. Branch = Orca's `<n>-<slug>`.
-4. **Gate.** Full lane (`Gate: plan`): the worker explores, then blocks in its preamble's `orchestration ask` with the plan (options approve, revise).
+4. **Gate.** Full lane (`Gate: plan`): the worker explores, then blocks in its preamble's `orchestration ask` with the plan (options approve, revise; the reply is `approve`, `approve with: <change>` or `revise: <change>`, chosen per `afk-answering`, Choosing the reply).
    The coordinator answers it (`answer.sh`, auto) or hands it to the human (below). No edit happens before `approve`.
 5. **Work.** Policy only inside the spoke: RED, GREEN, REFACTOR, in-spoke `code-review` (not in the light lane), `git push -u origin HEAD`. Hooks deny base-branch
    pushes, force pushes, `--no-verify`, and the destructive shapes of D8. Then `worker_done --outcome succeeded` (or `failed`).
@@ -57,7 +57,7 @@ orca.yaml                  Orca hooks of THIS repo (setup/archive); a synced tar
 
 A Run has one consumer at a time. **Attended**: a Claude Code session on the main checkout (the `coordinate` skill) holds the Run; Orca pushes
 `You have N orchestration messages` into it, the user discusses a worker's plan with the session, decides, and the session replies to the waiting
-worker (`approve` or `revise: ...`), lands finished work with `land.sh --review`, and dispatches on request. **Auto**: `coordinator.sh --answer auto`
+worker (`approve`, `approve with: ...` or `revise: ...`), lands finished work with `land.sh --review`, and dispatches on request. **Auto**: `coordinator.sh --answer auto`
 holds the Run (the loop below). The switch is explicit, never inferred from presence: `/coordinate auto [--until HH:MM] [--drain]` (alias `/afk`) starts the loop
 in an Orca terminal bound to the SAME Run; `/coordinate attended` runs `coordinator.sh --stop --run <run>` and summarizes what happened while away from Orca,
 git and GitHub. Mechanics stay in the scripts; the session only converses, decides and calls them.
@@ -73,7 +73,7 @@ sequenceDiagram
     O-->>S: You have 1 orchestration message
     S->>U: issue, plan, recommendation
     U->>S: decision
-    S->>O: reply approve | revise: ...
+    S->>O: reply approve | approve with: ... | revise: ...
     W->>O: worker_done succeeded
     O-->>S: push
     S->>S: land.sh --review n
@@ -113,7 +113,7 @@ or re-bind after a restart: everything else is re-derived from `worker-list`, `w
 - **Human answers (`--answer human`, or when `answer.sh` has no usable answer).** The loop never pauses. It prints the question (wrapped, at most 25 lines) above the exact
   reply line in the coordinator terminal (and in `--status`), comments on the issue, sets the spoke worktree's Orca comment to `GATE waiting: ... | reply: ...`, rings the bell
   of its terminal (Orca's `terminalBell` notification) and sends a best-effort desktop notification (osascript, warned when it fails; macOS may drop it silently). Run the reply line from ANY terminal (a bare `orca orchestration reply` is refused outside the Run's bound terminal):
-  `bash .ai-toolkit/scripts/coordinator.sh --run <run-id> --reply <message-id> approve` or `... 'revise: <what to change>'`.
+  `bash .ai-toolkit/scripts/coordinator.sh --run <run-id> --reply <message-id> approve` or `... 'approve with: <small change>'` or `... 'revise: <what to change>'`.
   It queues one file in `~/.ai-toolkit/coordinator/<run-id>/replies/` (`AITK_STATE_DIR` relocates it); the loop sends it at its next wake (30 s while a question waits).
 - **`blocked` issue.** Read the comment, then fix by hand in the kept worktree (`orca worktree show --worktree issue:<n>`), push, and `land.sh <n>`; or remove the label
   after fixing the cause and `dispatch.sh <n>` again; or `orca worktree rm --worktree issue:<n> --force --run-hooks`.

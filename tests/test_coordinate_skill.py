@@ -26,7 +26,7 @@ def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
 
 @pytest.mark.parametrize("needle", [
     "orca orchestration run-use --id", "orca orchestration run-create", "--from $H", "check --run", "--ack", "reply --run", "--id <message-id>",
-    '"approve"', '"revise: ', "land.sh --review", "dispatch.sh --address", "dispatch.sh --next", "coordinator.sh --status",
+    '"approve"', '"approve with: ', '"revise: ', "land.sh --review", "dispatch.sh --address", "dispatch.sh --next", "coordinator.sh --status",
     "/coordinate auto", "--answer auto", "--until HH:MM", "--drain", "/coordinate attended", "coordinator.sh --stop --run", "You have", "heartbeat",
     "land.sh --cleanup-only", "worker-release", "blocked", "thread_id", "a land is in flight"])
 def test_the_skill_covers_each_mechanic_of_the_brief(needle):
@@ -45,9 +45,9 @@ def test_every_orchestration_verb_the_skill_names_exists_in_orca():
     assert {"run-use", "run-create", "check", "reply"} <= verbs and verbs <= ORCHESTRATION_VERBS
 
 
-def test_a_question_is_turned_into_exactly_one_of_two_replies_and_never_a_blind_approve():
+def test_a_question_is_turned_into_exactly_one_of_three_replies_and_never_a_blind_approve():
     q = section("On each message")
-    assert q.count('--body "approve"') + q.count('"revise: ') >= 2 and re.search(r"never .*approve|unless the user", q, re.I)
+    assert q.count('--body "approve"') + q.count('"approve with: ') + q.count('"revise: ') >= 3 and "afk-answering" in q and re.search(r"never .*approve|unless the user", q, re.I)
 
 
 def test_the_switch_never_reads_state_files_for_the_summary():
