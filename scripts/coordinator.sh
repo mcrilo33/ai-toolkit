@@ -53,9 +53,9 @@ show_q() {   # the question as the human must read it: control bytes dropped, wr
   printf '%s\n' "$all" | head -n "$n" | sed 's/^/  | /' || true
   total="$(printf '%s\n' "$all" | wc -l)"; [ "$total" -le "$n" ] || echo "  [display truncated: $((total - n)) more lines; deny if unsure]"
 }
-flag() {   # $1 worktree path ("" = none known), $2 its comment: the Orca surfaces of anything the human must see: the worktree comment, and a bell on this terminal
+flag() {   # $1 worktree path ("" = none known), $2 its comment (optional with no path): the Orca surfaces of anything the human must see: the worktree comment, and a bell on this terminal
   [ -z "$1" ] || orca_json worktree set --worktree "path:$1" --comment "$(printf '%s' "$2" | tr '\n' ' ')" > /dev/null 2>&1 || warn "cannot set the worktree comment"   # (Orca turns the bell into its own
-  printf '\a' > "${COORD_BELL_TTY:-/dev/tty}" 2> /dev/null || true   # notification when terminalBell is on; it carries no text, the text is the comment, the issue comment and this log)
+  { printf '\a' > "${COORD_BELL_TTY:-/dev/tty}"; } 2> /dev/null || true   # notification when terminalBell is on; it carries no text, the text is the comment, the issue comment and this log)
 }
 gate_flag() { flag "$1" "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2" "${4:-approve}")"; }   # $1 worktree path, $2 message id, $3 question, $4 the reply word shown
 mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
@@ -167,7 +167,6 @@ on_permission() {   # $1 message id, $2 question, $3 dispatch id: a worker's too
   if [ "$answer" = auto ] && orca_mutate orchestration reply --run "$run" --from "$H" --id "$1" --body deny > /dev/null; then
     log "permission denied (tool: $tool, message $1): an unattended run never approves one"
     [ "$known" = 0 ] || comment "$issue" "Permission denied (tool: $tool): an unattended run never approves a permission prompt; the worker reports it in worker_done."
-    log "permission request for $tool denied (unattended)"
   else   # human mode, or the deny could not be sent (the worker's relay denies on its own timeout): the human decides, nothing waits
     yield
     [ "$known" = 0 ] || comment "$issue" "A permission request needs a human (message $1, tool: $tool). Reply from any terminal: $(replycmd "$1" allow)   (or deny)"
@@ -178,11 +177,11 @@ on_question() {
   local id q ans body warns
   id="$(jq -r .id <<< "$1")"; q="$(question_of "$1")"
   if is_perm "$q"; then on_permission "$id" "$q" "$(pj "$1" dispatchId)"; return 0; fi
-  ctx "$(pj "$1" dispatchId)" || { log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; flag "" ""; return 1; }
+  ctx "$(pj "$1" dispatchId)" || { log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; flag ""; return 1; }
   if [ "$answer" = auto ] && ans="$(printf '%s' "$q" | "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
-    [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; log "#$issue: $warns"; flag "$wtp" "WARN #$issue: ${warns:0:80}"; }
+    [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; log "#$issue: $warns"; flag "$wtp" "#$issue ${warns:0:80}"; }
   else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
     yield   # ...unless the reply failed because the Run was taken back meanwhile
     comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: approve with: <change> to approve with a small change, or revise: <change> to amend the plan)"

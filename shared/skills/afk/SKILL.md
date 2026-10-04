@@ -17,5 +17,5 @@ Orca terminal, stop consuming). State lives in Orca, git and issue labels; nothi
 | `/afk off` | `/coordinate attended`: take the Run back and summarize what happened while away |
 
 Gates are answered by `answer.sh` under the `afk-answering` rule; blocked issues are labelled, commented, and flagged through Orca (worktree comment, terminal bell) for you to decide
-when you are back. `--cap N` (default `CONCURRENCY_CAP`, 3) bounds the concurrent spokes: the shared usage window saturates past ~4.
+when you are back (turn on Orca's Settings > Notifications > Terminal Bell, or the bell is only an unread dot). `--cap N` (default `CONCURRENCY_CAP`, 3) bounds the concurrent spokes: the shared usage window saturates past ~4.
 Never edit the coordinator's scripts while it runs.

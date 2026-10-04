@@ -161,14 +161,20 @@ def test_auto_denies_a_permission_question_from_a_worker_it_cannot_resolve_witho
     assert [arg(a, "--body") for a in C.calls("orca orchestration reply")] == ["deny"] and not C.calls("gh issue comment")   # nothing to comment on, still denied
 
 
-def test_human_mode_leaves_a_permission_question_open_with_an_allow_or_deny_reply_command(C):
+def test_human_mode_flags_a_permission_question_from_a_worker_it_cannot_resolve_with_a_bell_and_no_worktree_comment(C, tmp_path):
+    C.stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": []}}))
+    C.mail([msg("question", "msg_p", question=PQ)])
+    assert C.go("--answer", "human").returncode == 0 and (tmp_path / "bell").exists() and not C.calls("orca worktree set")
+
+
+def test_human_mode_leaves_a_permission_question_open_with_an_allow_or_deny_reply_command(C, tmp_path):
     C.mail([msg("question", "msg_p", question=PQ)])
     assert C.go("--answer", "human").returncode == 0
     assert not C.stubs.calls("answer.sh") and not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack")
     c = C.calls("gh issue comment")[0][-1]
     assert REPLY_P in c and "deny" in c and "curl" not in c and "approve" not in c and "Bash" in c
     cm = C.calls("orca worktree set")
-    assert len(cm) == 1 and f"reply: {REPLY_P}" in arg(cm[0], "--comment") and "--reply msg_p allow" in arg(cm[0], "--comment")
+    assert len(cm) == 1 and f"reply: {REPLY_P}" in arg(cm[0], "--comment") and (tmp_path / "bell").exists()
 
 
 def test_the_human_sees_the_whole_permission_change_not_the_25_line_cap_of_a_plan(C):
@@ -361,7 +367,7 @@ def test_a_worker_that_exited_without_worker_done_is_retried_once_on_the_tenth_e
     assert C.blocked() and len(C.stubs.calls("dispatch.sh")) == 1
 
 
-def test_slots_are_filled_up_to_the_cap_and_a_failed_dispatch_is_cleaned_up_and_blocks_the_issue(C):
+def test_slots_are_filled_up_to_the_cap_and_a_failed_dispatch_is_cleaned_up_and_blocks_the_issue(C, tmp_path):
     C.stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "5\n")
     C.stubs.reply(key("dispatch.sh", "5"), '{"issue":5}')
     C.go("--cap", "2")
@@ -369,8 +375,9 @@ def test_slots_are_filled_up_to_the_cap_and_a_failed_dispatch_is_cleaned_up_and_
     C.go("--cap", "1")
     assert len(C.stubs.calls("dispatch.sh")) == 2
     C.stubs.reply(key("dispatch.sh", "5"), "boom", rc=1)
-    C.go("--cap", "2")
+    assert C.go("--cap", "2").returncode == 0
     assert C.calls("orca worktree rm")[0][2:4] == ["--worktree", "issue:5"] and C.calls("gh issue edit")[0][:3] == ["issue", "edit", "5"]
+    assert (tmp_path / "bell").exists() and not C.calls("orca worktree set")   # the worktree is gone: bell only, never a comment on a stale one
 
 
 def test_drain_stops_when_nothing_is_ready_and_no_worker_is_live_but_not_before(C):
