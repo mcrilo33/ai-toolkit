@@ -8,6 +8,8 @@ on:
   pull_request:
 jobs:
   checks:
+    # deliberate ceiling on suite duration; raising it is a reviewed decision
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
