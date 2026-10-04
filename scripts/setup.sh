@@ -19,12 +19,13 @@ rm -f .ai-toolkit/setup-done   # first, so a failed re-run never leaves a stale 
 
 mkdir -p .claude .ai-toolkit
 if [ "$refresh" = 0 ]; then cp -R "$root/.claude/." .claude/
-else   # a kept worktree: tracked .claude files come from the branch (copying main's would dirty it and clobber the worker's edits)
-  tracked="$(git ls-files .claude)"
+else   # a kept worktree: tracked .claude files reach it through git (the branch's own, and main's via land's merge); copying them would
+  # dirty the tree, clobber the worker's edits, or leave an untracked file that makes that merge fail. Only the untracked copies are refreshed.
+  tracked="$(git -c core.quotePath=false ls-files .claude; git -C "$root" -c core.quotePath=false ls-files .claude)"
   while IFS= read -r f; do
-    ! printf '%s\n' "$tracked" | grep -qxF -- ".claude/$f" || continue
-    mkdir -p ".claude/$(dirname "$f")"; cp "$root/.claude/$f" ".claude/$f"
-  done < <(cd "$root/.claude" && find . -type f | sed 's|^\./||')
+    ! grep -qxF -- ".claude/$f" <<< "$tracked" || continue
+    mkdir -p ".claude/$(dirname "$f")"; cp -P "$root/.claude/$f" ".claude/$f"
+  done < <(cd "$root/.claude" && find . \( -type f -o -type l \) | sed 's|^\./||')
 fi
 
 # Keep the provisioning out of `git status` (info/exclude is shared by all worktrees).
