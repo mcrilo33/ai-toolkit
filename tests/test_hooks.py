@@ -82,8 +82,8 @@ PUSH_DENY = [
 ] + [("root", c) for c in ["git push", "git push origin", "git push -u origin main"]]
 PUSH_ALLOW = [
     ("wt", c) for c in [
-        "git push -u origin 2-y", "git push origin mainline", "git push origin feature-main", 'git commit -m "feat: running tests #1"',
-        "git commit -am wip", "git commit -mrunning", "git checkout -b new", "git checkout main -- README", "git",
+        "git push -u origin 2-y", "git push origin mainline", "git push origin HEAD", 'git commit -m "feat: running tests #1"',
+        "git commit -am wip", "git commit --amend --no-edit", "git commit -mrunning", "git checkout -b new", "git checkout main -- README", "git",
     ]
 ] + [("root", c) for c in ["git checkout main", "git push -u origin topic"]]
 
@@ -108,7 +108,7 @@ def test_push_guard_base_branch_comes_from_env_then_origin_head(places):
 
 # --- danger-guard -------------------------------------------------------------------------------
 RM_DENY = [
-    "rm -rf /", "rm -fr /usr/local", "rm -rf ~", "rm --recursive /usr", "rm /usr/x -rf", "rm -rf ../../../../../../../..", "rm -rf .", "rm -rf {wt}",
+    "rm -rf /", "rm -rf /tmp", "rm -rf ~", "rm --recursive /usr", "rm /usr/x -rf", "rm -rf ../../../../../../../..", "rm -rf .", "rm -rf {wt}",
     "rm -rf {home}/x", "rm -rf build /etc/x", "rm -rf $FOO/x", 'bash -c "rm -rf /usr"', "bash -c'rm -rf /usr'", "echo hi && rm -rf /usr", 'r""m -rf /usr',
     "rm -rf ~root/x", "git stash -a", "git stash --all", "git clean -fdx", "git clean -xdf", "git stash push -au",   # the x/a letter anywhere in its cluster
 ]
@@ -126,7 +126,7 @@ WRITE_DENY = [
 ]
 WRITE_ALLOW = [
     "touch sub/orca.yaml", "echo x > v2/orca.yaml", "rm -rf .claude/cache", "cat .ai-toolkit/task.md",
-    "cat orca.yaml >/dev/null 2>&1", "cat orca.yaml > out.txt", "git commit -m 'update orca.yaml'", "echo x > .claude/rules/a.md",
+    "grep -n x 2>/dev/null orca.yaml", "cat orca.yaml > out.txt", "git commit -m 'update orca.yaml'", "echo x > .claude/rules/a.md",
 ]
 
 
@@ -411,7 +411,7 @@ def test_relay_joins_the_reason_a_pretooluse_ask_recorded_and_ignores_a_stale_or
     assert "reason: unknown" in relay.run("Write", WF).question  # recorded at epoch 1: stale
 
 
-@pytest.mark.parametrize("epoch", ["08", "99999999999999999999"])
+@pytest.mark.parametrize("epoch", ["abc", "08", "99999999999999999999"])
 def test_relay_still_asks_when_the_recorded_epoch_is_corrupt(shared, relay, epoch):
     record_reason(shared, relay, epoch=epoch)  # a leading zero is no octal error, and a bad file never turns a prompt into a hang
     r = relay.run("Write", WF)
