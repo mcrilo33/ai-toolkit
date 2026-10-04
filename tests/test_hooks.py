@@ -305,8 +305,141 @@ def test_danger_guard_uses_the_project_dir_for_the_marker_and_the_worktree_root(
         assert r.returncode == want, (cwd, cmd, r.stderr)
 
 
+# --- permission-relay ---------------------------------------------------------------------------
+# PermissionRequest fires for every tool-permission dialog a worker would show (a PreToolUse "ask", an `ask` rule, a prompt Claude Code raises itself
+# in bypass mode, a subagent's), measured on claude 2.1.289 in bypass mode. Its payload: tool_name, tool_input, cwd, permission_mode; no reason, no tool_use_id.
+ASK_SHIM = """#!/bin/bash
+printf '%s\\0' "$@" > "$SHIM_ARGS"; echo x >> "$SHIM_ARGS.n"
+sleep "${SHIM_SLEEP:-0}"; printf '%s' "${SHIM_REPLY-}"; exit "${SHIM_RC:-0}"
+"""
+
+
+@pytest.fixture
+def relay(tmp_path):
+    """A worker dir (marker + task.md), a shim `orca` that records its argv and prints SHIM_REPLY, and a runner returning (hook output, the ask argv or None)."""
+    spoke, shim = tmp_path / "w", tmp_path / "shim"
+    (spoke / ".ai-toolkit").mkdir(parents=True)
+    shim.mkdir()
+    (spoke / ".ai-toolkit/spoke-run-id").write_text("rid\n")
+    (spoke / ".ai-toolkit/task.md").write_text("# #394 feat(gate): relay every permission prompt\n\nbody\n")
+    (shim / "orca").write_text(ASK_SHIM)
+    (shim / "orca").chmod(0o755)
+
+    def run(tool="Write", ti=None, reply="allow", rc=0, raw=None, env=None, where=None, **e):
+        payload = {"hook_event_name": "PermissionRequest", "tool_name": tool, "cwd": str(where or spoke), "permission_mode": "bypassPermissions",
+                   "tool_input": {"file_path": ".github/workflows/ci.yml", "content": "x"} if ti is None else ti}
+        env = {"PATH": f"{shim}:{os.environ['PATH']}", "SHIM_ARGS": str(tmp_path / "args"), "SHIM_REPLY": reply, "SHIM_RC": str(rc), "ORCA_TERMINAL_HANDLE": "term_w",
+               **(env or {}), **{k: str(v) for k, v in e.items()}}
+        r = call("permission-relay.sh", where or spoke, raw=raw if raw is not None else json.dumps(payload), env=env)
+        args = (tmp_path / "args").read_bytes().decode().split("\0")[:-1] if (tmp_path / "args").exists() else None
+        out = json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
+        return SimpleNamespace(rc=r.returncode, out=out, args=args, stderr=r.stderr, asks=len((tmp_path / "args.n").read_text().split()) if (tmp_path / "args.n").exists() else 0,
+                               behavior=out and out["decision"]["behavior"], question=args and args[args.index("--question") + 1])
+
+    return SimpleNamespace(run=run, dir=spoke, shim=shim, tmp=tmp_path)
+
+
+@pytest.mark.parametrize("reply, behavior", [("allow", "allow"), ("allow\n", "allow"), ("  allow  \n", "allow"), ("deny", "deny"), ("", "deny"), ("allowed", "deny"),
+                                             ("approve", "deny"), ("allow please", "deny"), ("ALLOW", "deny"), ("allow\ndeny", "deny"), ("no", "deny")])
+def test_relay_allows_only_on_the_exact_word_allow(relay, reply, behavior):
+    r = relay.run(reply=reply)
+    assert (r.rc, r.out["hookEventName"], r.behavior) == (0, "PermissionRequest", behavior) and r.asks == 1
+    assert ("message" in r.out["decision"]) == (behavior == "deny")
+
+
+def test_relay_does_nothing_outside_a_worker(relay):
+    (relay.dir / ".ai-toolkit/spoke-run-id").unlink()
+    r = relay.run()
+    assert (r.rc, r.out, r.asks, r.stderr) == (0, None, 0, "")  # no output = the local prompt stays
+
+
+def test_relay_asks_the_run_one_question_with_options_a_timeout_and_the_workers_handle(relay):
+    r = relay.run("Bash", {"command": "cd wf && rm -rf *", "description": "wipe the dir"})
+    assert r.asks == 1 and r.args[:2] == ["orchestration", "ask"] and r.args[r.args.index("--from") + 1] == "term_w"
+    assert r.args[r.args.index("--options") + 1] == "allow,deny" and 0 < int(r.args[r.args.index("--timeout-ms") + 1]) <= 560000
+    q = r.question
+    assert q.startswith("PERMISSION REQUEST") and "not a plan gate" in q.splitlines()[0]  # what the loop and the coordinate skill key on
+    assert "#394" in q and str(relay.dir) in q and "tool: Bash" in q and "cd wf && rm -rf *" in q and "wipe the dir" in q and "bypassPermissions" in q
+
+
+@pytest.mark.parametrize("tool, ti, shown", [
+    ("Write", {"file_path": "/w/.github/workflows/ci.yml", "content": "name: ci\non: push\n"}, ["/w/.github/workflows/ci.yml", "name: ci", "on: push"]),
+    ("Edit", {"file_path": "/w/a.py", "old_string": "OLD TEXT", "new_string": "NEW TEXT"}, ["/w/a.py", "OLD TEXT", "NEW TEXT"]),
+    ("NotebookEdit", {"notebook_path": "/w/n.ipynb", "new_source": "print(1)"}, ["/w/n.ipynb", "print(1)"]),
+    ("Bash", {"command": "line one\nline two"}, ["line one", "line two"]),
+    ("mcp__x__do", {"target": "prod", "n": 3}, ["tool: mcp__x__do", "target", "prod"])])
+def test_relay_question_carries_the_whole_change_whatever_the_tool(relay, tool, ti, shown):
+    q = relay.run(tool, ti).question
+    assert all(s in q for s in shown) and f"tool: {tool}" in q and "reason: unknown" in q
+
+
+def test_relay_truncates_only_past_a_cap_and_says_so(relay):
+    q = relay.run("Write", {"file_path": "/w/a", "content": "A" * 300}, PERMISSION_RELAY_CAP=100).question
+    assert "A" * 100 in q and "A" * 101 not in q and "truncated" in q
+    q = relay.run("Write", {"file_path": "/w/a", "content": "B" * 300}).question  # the default cap is generous
+    assert "B" * 300 in q and "truncated" not in q
+
+
+@pytest.mark.parametrize("tool", ["AskUserQuestion", "ExitPlanMode"])
+def test_relay_denies_the_tools_a_yes_cannot_answer_without_asking(relay, tool):
+    r = relay.run(tool, {"questions": []}, reply="allow")  # measured: a hook allow does not resolve ExitPlanMode; AskUserQuestion needs the user's answers
+    assert (r.rc, r.behavior, r.asks) == (0, "deny", 0) and "worker_done" in r.out["decision"]["message"]
+
+
+def fail_closed(relay, **kw):
+    r = relay.run(**kw)
+    assert (r.rc, r.behavior) == (0, "deny") and "worker_done" in r.out["decision"]["message"], (kw, r.stderr)
+    return r
+
+
+def test_relay_denies_when_the_ask_fails_even_if_it_printed_allow(relay):
+    assert fail_closed(relay, reply="allow", rc=1).asks == 1  # orca erroring, or no Run to ask
+
+
+def test_relay_denies_without_a_terminal_handle(relay):
+    assert fail_closed(relay, env={"ORCA_TERMINAL_HANDLE": ""}).asks == 0
+
+
+def test_relay_denies_when_orca_is_missing(relay):
+    fail_closed(relay, env={"PATH": "/usr/bin:/bin"})  # no orca on the path at all
+
+
+def test_relay_denies_on_a_timeout_before_the_hook_does_so_no_dialog_is_left_waiting(relay):
+    r = fail_closed(relay, SHIM_SLEEP=20, PERMISSION_RELAY_KILL_S=1)  # measured: when the hook times out it is killed with NO decision and the local dialog stays
+    assert "timed out" in r.out["decision"]["message"]
+
+
+@pytest.mark.parametrize("raw", ["not json", "", "{"])
+def test_relay_denies_an_unparsable_payload(relay, raw):
+    assert fail_closed(relay, raw=raw).asks == 0
+
+
+def test_relay_denies_without_jq(relay):
+    (relay.tmp / "nojq").mkdir()
+    fail_closed(relay, env={"PATH": str(relay.tmp / "nojq")})
+
+
+def test_relay_joins_the_reason_a_pretooluse_ask_recorded_and_ignores_a_stale_or_unrelated_one(shared, relay):
+    wf = {"file_path": ".github/workflows/ci.yml", "content": "x"}
+    env = {**shared["env"], "PATH": f"{relay.shim}:{os.environ['PATH']}", "CLAUDE_PROJECT_DIR": str(relay.dir)}
+    for n, d in (("settings.json", relay.dir / ".claude"), ("permission-relay.sh", relay.dir / ".claude/hooks")):
+        d.mkdir(parents=True, exist_ok=True)
+        (d / n).write_text("permission-relay")
+    g = call("danger-guard.sh", relay.dir, "Write", env=env, **wf)  # in a worker with the relay installed it asks and records why
+    assert json.loads(g.stdout)["hookSpecificOutput"]["permissionDecision"] == "ask"
+    q = relay.run("Write", wf).question
+    assert "reason: danger-guard: write to .github/workflows needs your approval" in q
+    assert "reason: unknown" in relay.run("Write", wf).question  # single use
+    call("danger-guard.sh", relay.dir, "Write", env=env, **wf)
+    assert "reason: unknown" in relay.run("Write", {**wf, "content": "y"}).question  # keyed by tool + input
+    call("danger-guard.sh", relay.dir, "Write", env=env, **wf)
+    for f in (relay.dir / ".ai-toolkit/ask-reasons").iterdir():
+        f.write_text("1\n" + f.read_text().split("\n", 1)[1])  # recorded at epoch 1: stale
+    assert "reason: unknown" in relay.run("Write", wf).question
+
+
 # --- secrets-scan -------------------------------------------------------------------------------
-SECRETS = [AWS, GHP, "sk-ant-api03-" + "a" * 10 + "_-" + "b" * 10, "sk-" + "a" * 24, "sk-lf-" + "a" * 24, "xoxb-1234567890-" + "a" * 24, "k=sk_live_" + "a" * 24,
+SECRETS =[AWS, GHP, "sk-ant-api03-" + "a" * 10 + "_-" + "b" * 10, "sk-" + "a" * 24, "sk-lf-" + "a" * 24, "xoxb-1234567890-" + "a" * 24, "k=sk_live_" + "a" * 24,
            "github_pat_" + "a" * 30, "eyJ" + "a" * 12 + ".eyJ" + "b" * 12 + "." + "c" * 12,
            "LANGFUSE_BASIC_AUTH='Basic " + "QUJD" * 6 + "'", "x\n" * 50 + f"token {AWS} end"]
 CLEAN = ["KEY = os.environ['API_KEY']\n", "sk-short AKIA123 ghp_tooShort key-abc", ""]
@@ -348,7 +481,7 @@ def test_unparseable_payload_or_missing_jq_is_a_deny(shared, tmp_path, script):
 
 def test_settings_register_the_hooks_at_the_synced_path(shared, tmp_path):
     cfg = json.loads((V2 / "settings/claude/settings.json").read_text())
-    assert "permissions" not in cfg and set(cfg["hooks"]) == {"PreToolUse"}  # no auto-allow, no TDD/plan hooks (D2/D8)
+    assert "permissions" not in cfg and set(cfg["hooks"]) == {"PreToolUse", "PermissionRequest"}  # no auto-allow, no TDD/plan hooks (D2/D8)
     shutil.copytree(CLAUDE, tmp_path / "proj/.claude/hooks")  # what sync (WP4) puts in a target
     seen = {}
     for e in cfg["hooks"]["PreToolUse"]:
@@ -360,6 +493,8 @@ def test_settings_register_the_hooks_at_the_synced_path(shared, tmp_path):
                            input=json.dumps({"tool_name": tool, "cwd": str(tmp_path / "proj"), "tool_input": ti}))
         assert r.returncode == 2 and script.removesuffix(".sh") in r.stderr, (cmd, r.stderr)
     assert seen["push-guard.sh"] == ["Bash"] and "AskUserQuestion" in seen["danger-guard.sh"] and "Bash" not in seen["secrets-scan.sh"]
+    (rel,) = cfg["hooks"]["PermissionRequest"]  # every tool-permission dialog, whatever raised it; the hook timeout outlasts the relay's own kill timer (570 s)
+    assert rel["matcher"] == "*" and rel["hooks"][0]["command"] == 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/permission-relay.sh"' and rel["hooks"][0]["timeout"] == 600
 
 
 # --- native git hooks ---------------------------------------------------------------------------
