@@ -51,6 +51,12 @@ Three forms; this section is the only place that says which to pick, and every o
 Test: if you would want to read the corrected plan again, `revise:`; if you would approve it unseen, `approve with:`.
 The change is one sentence the spoke applies literally. When in doubt, `revise:`: a second gate is cheap, an unreviewed wrong change is not.
 
+## Permission questions are not yours
+
+A question whose first line is `PERMISSION REQUEST` is a worker's tool-permission prompt (relayed by `permission-relay.sh`), not a gate. `coordinator.sh` replies
+`deny` to it without calling you, and `answer.sh` refuses it (exit 1). If one reaches you anyway, never approve or allow it: only the user allows a permission, and
+a `deny` is the only unattended outcome. `allow` and `deny` are replies to that question type alone; a plan gate takes `approve`, `approve with:` or `revise:`.
+
 ## Irreversible, outward-facing, or scope-changing asks
 
 These are answered too, with the **reversible alternative**, so nothing irreversible happens unattended.

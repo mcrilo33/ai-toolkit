@@ -51,6 +51,13 @@ orca orchestration reply --run <run> --from $H --id <message-id> --body "approve
 orca orchestration reply --run <run> --from $H --id <message-id> --body "revise: <the change, one paragraph>"
 ```
 
+**`question` starting `PERMISSION REQUEST`** (not a plan gate: a worker's permission prompt, relayed by its `permission-relay` hook; it waits at most 9 minutes and then denies itself, so ignore a stale one): show the user the issue, the tool, the full command or change, the cwd and the `reason`. Never reply `allow` or `deny` without the user's decision in this conversation (a standing "allow this class" counts only if they said it), and say what you would answer and why. Reply with exactly that one word, then comment `Permission answered by the user: <body> (tool: <tool>)` on the issue: the tool and the answer only, never the command or content.
+
+```bash
+orca orchestration reply --run <run> --from $H --id <message-id> --body "allow"
+orca orchestration reply --run <run> --from $H --id <message-id> --body "deny"
+```
+
 **`worker_done` succeeded**: run `.ai-toolkit/scripts/land.sh --review <n>` (independent review, CI on the exact tip, fast-forward, close,
 release, remove the worktree; it takes minutes) and report by exit code. 0 landed (say the sha). 2 refused (a precondition: say which).
 3 review rejected, 4 gate red or timed out, 5 merge conflict: show the `BLOCKER:` lines or the last line, and **offer** the re-dispatch
@@ -116,5 +123,5 @@ Present blocked issues and pending questions first, then lands, then running wor
 ## Rules of thumb
 
 - A bare `orca orchestration reply` only works from the bound terminal: when the loop holds the Run, a human answers with
-  `coordinator.sh --run <run> --reply <message-id> approve`; the loop sends it at its next wake.
+  `coordinator.sh --run <run> --reply <message-id> approve` (`allow` or `deny` for a permission question); the loop sends it at its next wake.
 - Surface what the user must decide (gates, blocked issues, rejected reviews) before what runs fine; one recommendation, not a menu.

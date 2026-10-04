@@ -22,7 +22,7 @@ while [ $# -gt 0 ]; do
     --cap) cap="${2:-}"; shift ;; --until) until="${2:-}"; shift ;;
     --drain) drain=1 ;; --status) status=1 ;; --stop) stop=1 ;;
     --reply) reply=1; reply_id="${2:-}"; reply_body="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
-    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'" ;;
+    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny" ;;
   esac; shift
 done
 case "$answer" in auto | human) ;; *) usage_exit "--answer takes auto or human" ;; esac
@@ -52,9 +52,11 @@ wl() {   # every page of the Run's workers (newest first, 100 a page), in the sh
 }
 pj() { jq -r --arg k "$2" '(.payload // "{}" | if type == "string" then fromjson else . end)[$k] // empty' <<< "$1"; }   # payload field of a message
 question_of() { local q; q="$(pj "$1" question)"; [ -n "$q" ] || q="$(jq -r '.body // ""' <<< "$1")"; printf '%s' "$q"; }
+is_perm() { local t="${1#"${1%%[![:space:]]*}"}"; [[ $t == "PERMISSION REQUEST"* ]]; }   # a worker's permission prompt (hooks/claude/permission-relay.sh), not a PLAN gate
+tool_of() { sed -n 's/^tool: //p' <<< "$1" | head -n 1; }
 show_q() { printf '%s\n' "$1" | fold -s -w 100 | head -n 25 | sed 's/^/  | /' || true; }   # the question as the human must read it: wrapped, at most 25 lines
-gate_flag() {   # $1 worktree path, $2 message id, $3 question: the stable Orca surfaces of a pending human gate: the worktree comment and a bell on this terminal
-  orca_json worktree set --worktree "path:$1" --comment "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2")" > /dev/null 2>&1 || warn "cannot set the worktree comment"
+gate_flag() {   # $1 worktree path, $2 message id, $3 question, $4 the reply word shown: the stable Orca surfaces of a pending human gate: the worktree comment and a bell on this terminal
+  orca_json worktree set --worktree "path:$1" --comment "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2" "${4:-approve}")" > /dev/null 2>&1 || warn "cannot set the worktree comment"
   printf '\a' > "${COORD_BELL_TTY:-/dev/tty}" 2> /dev/null || true
 }
 mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
@@ -78,14 +80,15 @@ yield() {   # exit 0 when another terminal holds the Run. $1 set = Orca already 
   local h; h="$(holder)"; [ -n "$h" ] || h="${1:+another terminal}"
   [ -z "$h" ] || [ "$h" = "${H:-}" ] || { log "Run $run taken back by $h: exiting; an unfinished batch replays to it"; exit 0; }
 }
-replycmd() { printf 'bash %s --run %s --reply %s approve' "$here/coordinator.sh" "$run" "$1"; }
+replycmd() { printf 'bash %s --run %s --reply %s %s' "$here/coordinator.sh" "$run" "$1" "${2:-approve}"; }
 if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to
   [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"
   log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold eq "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
   echo "live workers:"
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "  \(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict)"'
   echo "pending questions:"
-  pending | jq -c '.open[]' | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"; echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; done
+  pending | jq -c '.open[]' | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"
+    if is_perm "$(question_of "$m")"; then echo "    reply: $(replycmd "$id" allow)   (or deny)"; else echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; fi; done
   exit 0
 fi
 
@@ -140,23 +143,42 @@ drain_replies() {   # send the queued human replies as the bound consumer. Dropp
   for f in "$sd/replies"/*; do
     [ -f "$f" ] || continue
     id="${f##*/}"; body="$(head -n 1 "$f")"; q="$(jq -c --arg i "$id" '[.open[] | select(.id == $i)][0] // empty' <<< "$pend")"
-    case "$body" in
-      approve | "approve with: "*[![:space:]]* | revise:*[![:space:]]*) ;;
+    kind=any; [ -z "$q" ] || { kind=plan; ! is_perm "$(question_of "$q")" || kind=perm; }   # a plan gate takes approve|approve with|revise, a permission question allow|deny
+    case "$kind:$body" in
+      any:approve | any:allow | any:deny | "any:approve with: "*[![:space:]]* | any:revise:*[![:space:]]*) ;;
+      plan:approve | "plan:approve with: "*[![:space:]]* | plan:revise:*[![:space:]]* | perm:allow | perm:deny) ;;
       *) warn "reply to $id dropped: malformed body"; rm -f "$f"; continue ;;
     esac
     if [ -z "$q" ]; then
       if jq -e --arg i "$id" '(.answered | index($i)) != null or (.truncated | not)' <<< "$pend" > /dev/null; then warn "reply to $id dropped: no such unanswered question"
       else warn "reply to $id kept: the inbox page is truncated and does not show that question"; continue; fi
     elif orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
-      log "gate $id answered by the human: $body"; if ctx "$(pj "$q" dispatchId)"; then comment "$issue" "Gate answered by the human: $body"; orca_json worktree set --worktree "path:$wtp" --comment "gate answered by the human: ${body:0:60}" > /dev/null 2>&1 || warn "cannot update the worktree comment"; fi
+      log "gate $id answered by the human: $body"
+      if ctx "$(pj "$q" dispatchId)"; then
+        if [ "$kind" = perm ]; then comment "$issue" "Permission answered by the human: $body (tool: $(tool_of "$(question_of "$q")"))"; else comment "$issue" "Gate answered by the human: $body"; fi
+        orca_json worktree set --worktree "path:$wtp" --comment "gate answered by the human: ${body:0:60}" > /dev/null 2>&1 || warn "cannot update the worktree comment"
+      fi
     else warn "reply to $id failed, it stays queued"; continue; fi
     rm -f "$f"
   done
+}
+on_permission() {   # $1 message id, $2 question: a worker's tool-permission prompt. Never answer.sh and never an allow: auto denies it, a human answers allow|deny.
+  local tool; tool="$(tool_of "$2")"   # Issue comments name the tool and the answer only, never the command or content (it can hold secrets).
+  if [ "$answer" = auto ] && orca_mutate orchestration reply --run "$run" --from "$H" --id "$1" --body deny > /dev/null; then
+    log "#$issue permission denied (tool: $tool): an unattended run never approves one"
+    comment "$issue" "Permission denied (tool: $tool): an unattended run never approves a permission prompt; the worker reports it in worker_done."
+    notify "#$issue: permission request for $tool denied (unattended)"
+  else   # human mode, or the deny could not be sent (the worker's relay denies on its own timeout): the human decides, nothing waits
+    yield
+    comment "$issue" "A permission request needs a human (message $1, tool: $tool). Reply from any terminal: $(replycmd "$1" allow)   (or deny)"
+    show_q "$2"; notify "#$issue: permission request waiting: $(replycmd "$1" allow)"; gate_flag "$wtp" "$1" "$2" allow
+  fi
 }
 on_question() {
   local id q ans body warns
   id="$(jq -r .id <<< "$1")"; q="$(question_of "$1")"
   ctx "$(pj "$1" dispatchId)" || { notify "gate question $id comes from an unknown worker: reply by hand"; return 1; }
+  if is_perm "$q"; then on_permission "$id" "$q"; return 0; fi
   if [ "$answer" = auto ] && ans="$(printf '%s' "$q" | "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"

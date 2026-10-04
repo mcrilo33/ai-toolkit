@@ -98,6 +98,40 @@ the loop has really exited, because a land may be in flight; exit 1 means it is 
 `held by: a session (<handle>)` or `held by: nobody`: the mode comes from `holder.<pid>` in the spool dir. That file is also what `--stop` waits on (never `run-show`, which already names the caller on a second `--stop`):
 `--stop` returns 0 only when no live `coordinator.sh` (its pid's command must still say so) is bound as another handle. A replayed `worker_done` for a closed issue is acked as already landed.
 
+## Permission relay
+
+A worker's permission prompt would otherwise sit in its own terminal where nobody looks. `hooks/claude/permission-relay.sh` (a `PermissionRequest` hook, matcher `*`, registered in `settings/claude/settings.json`
+with `timeout: 600`) puts every tool-permission dialog a worker would show to the Run and resolves it with the reply. Measured on claude 2.1.289: the event fires in bypass mode for each source (a `PreToolUse`
+`ask` such as danger-guard's workflow write, an `ask` permission rule, a prompt Claude Code raises itself such as the built-in dangerous-`rm` check, and a subagent's prompt), an `allow` or `deny` from it dismisses
+the dialog, and it runs next to Orca's own global `PermissionRequest` hook without losing either decision. The payload carries `tool_name`, `tool_input`, `cwd` and `permission_mode` only: no reason and no `tool_use_id`,
+so danger-guard records the reason of its ask under `.ai-toolkit/ask-reasons/<sha256 of tool+input>` (single use, 10 minutes) and the relay joins it, else prints `reason: unknown`. Not seen, because they are not
+tool-permission dialogs: the folder-trust and bypass-mode startup dialogs (dispatch answers them) and MCP elicitation (not exercised). `AskUserQuestion` and `ExitPlanMode` are denied without asking (a hook `allow` does not resolve `ExitPlanMode`).
+
+```mermaid
+sequenceDiagram
+    participant W as Worker (relay hook)
+    participant O as Orca (Run inbox)
+    participant S as Session (attended)
+    participant U as User
+    participant L as coordinator.sh (auto)
+    W->>O: ask "PERMISSION REQUEST ..." (allow, deny)
+    O-->>S: You have 1 orchestration message
+    S->>U: tool, command or change, reason
+    U->>S: decision
+    S->>O: reply allow | deny
+    O-->>W: allow: the call runs; anything else: denied
+    W->>O: ask "PERMISSION REQUEST ..." (unattended)
+    O-->>L: check --wait
+    L->>O: reply deny (never answer.sh)
+    O-->>W: denied; the worker reports it in worker_done
+```
+
+The question's first line, `PERMISSION REQUEST (not a plan gate: ...)`, is what tells it from a PLAN gate. `coordinator.sh --answer auto` replies `deny` at once and never runs `answer.sh` (which refuses such a question too);
+`--answer human` leaves it open like a gate and the human replies `allow` or `deny` with `--reply`; the coordinate skill shows it to the user and replies only with their decision. Issue comments name the tool and the
+answer only, never the command or content. The relay is **fail-closed**: exactly `allow` lets the call through, and a missing handle, no Run, `orca` erroring, an unparsable payload or reply, no `jq` and a timeout all answer
+`deny`. A hook that exceeds its own timeout is killed with no decision and the local dialog stays waiting, so the relay bounds its ask with its own timer (`--timeout-ms` 540000, kill at 570 s) under the hook timeout (600 s).
+While it waits, the dialog is drawn in the worker too; the relay's answer dismisses it. Outside a worker (no `.ai-toolkit/spoke-run-id`) the hook prints nothing and the local prompt stays.
+
 ## Coordinator runbook
 
 ```bash
@@ -113,7 +147,7 @@ or re-bind after a restart: everything else is re-derived from `worker-list`, `w
 - **Human answers (`--answer human`, or when `answer.sh` has no usable answer).** The loop never pauses. It prints the question (wrapped, at most 25 lines) above the exact
   reply line in the coordinator terminal (and in `--status`), comments on the issue, sets the spoke worktree's Orca comment to `GATE waiting: ... | reply: ...`, rings the bell
   of its terminal (Orca's `terminalBell` notification) and sends a best-effort desktop notification (osascript, warned when it fails; macOS may drop it silently). Run the reply line from ANY terminal (a bare `orca orchestration reply` is refused outside the Run's bound terminal):
-  `bash .ai-toolkit/scripts/coordinator.sh --run <run-id> --reply <message-id> approve` or `... 'approve with: <small change>'` or `... 'revise: <what to change>'`.
+  `bash .ai-toolkit/scripts/coordinator.sh --run <run-id> --reply <message-id> approve` or `... 'approve with: <small change>'` or `... 'revise: <what to change>'`; a permission question takes `allow` or `deny` instead.
   It queues one file in `~/.ai-toolkit/coordinator/<run-id>/replies/` (`AITK_STATE_DIR` relocates it); the loop sends it at its next wake (30 s while a question waits).
 - **`blocked` issue.** Read the comment, then fix by hand in the kept worktree (`orca worktree show --worktree issue:<n>`), push, and `land.sh <n>`; or remove the label
   after fixing the cause and `dispatch.sh <n>` again; or `orca worktree rm --worktree issue:<n> --force --run-hooks`.
@@ -144,9 +178,8 @@ CI (`.github/workflows/ci.yml`): tests, shellcheck, sync-twice-no-drift, macOS +
 ## Known limits (D8, D9)
 
 `danger-guard.sh` denies (exit 2) `rm -r` outside the worktree, `git reset --hard` in the main checkout, writes to `orca.yaml` and `~/.claude/settings.json`, and in a spoke the project `.claude/settings*.json`, `.claude/hooks/` and `.ai-toolkit/spoke-run-id`.
-Writes to `.github/workflows/` are the one exception: the hook returns a permission **ask** (exit 0, `permissionDecision: "ask"`, reason naming the path) when a human attends, so the user approves or refuses in that terminal (the prompt shows under `--dangerously-skip-permissions`, in the file-tool and Bash lanes alike), and denies exactly as above when nobody does.
-Attended means: outside a spoke (a plain interactive session, no Run), or in a spoke when the terminal holding its Run is a Claude session. The hook reads that from Orca (`worker-list` for this terminal's dispatched row and its Run, `run-show` for the holder, `terminal show` for the holder's `agentIdentity` and `title`). Orca reports `claude` for the `coordinator.sh` loop terminal too (the loop runs headless `claude -p` children, and the identity stays once one has run), so `identity == claude` alone cannot tell a session from the loop. Measured live, Orca titles a terminal by its foreground process and overwrites a custom title, so the loop's terminal reads `bash` while a session's reads a topic (`✳ …`) or a path: a holder whose title is a bare shell name (`bash`, `zsh`, `-bash`, `tcsh`, ...), is empty, or is still the launch title `coordinator` is the loop and is unattended, in `auto` and `human` mode alike. Any answer the hook cannot read is unattended too (no `ORCA_TERMINAL_HANDLE`, `orca` failing or slower than 5 s, a missing or non-string `title`): fail-closed, identity and title come from the same `terminal show`.
-The ask comes last, so a deny anywhere in a compound command still wins. Known limits: the loop is told from a session by Orca's process-derived title, so if Orca stops titling the loop terminal by its foreground shell, or the loop runs under a differently named process, a worker's workflow write asks a prompt nobody answers (never a silent allow); and `orca` is resolved from the hook's `PATH`, so a worker able to plant an `orca` in a writable `PATH` directory ahead of the real one can turn a deny into an ask (still a user prompt, never a silent allow); like the rest of the deny-list it is a brake, not a sandbox.
+Writes to `.github/workflows/` are the one exception: the hook returns a permission **ask** (exit 0, `permissionDecision: "ask"`, reason naming the path), which shows even under `--dangerously-skip-permissions`, in the file-tool and Bash lanes alike. Outside a spoke the user answers it in their own terminal. In a spoke it is asked only when the permission relay is installed (`.claude/hooks/permission-relay.sh` present and registered in `.claude/settings.json`): the relay puts it to the Run, so an attended session shows it to the user and the auto loop denies it. Without the relay the write is denied like the rest, since a local ask nobody sees would hang. Deciding attended or not no longer reads Orca (no holder terminal title heuristic).
+The ask comes last, so a deny anywhere in a compound command still wins. Known limits: like the rest of the deny-list it is a brake, not a sandbox; the relay answers the Run's question with the user's word, so a user who says `allow` takes the risk.
 
 Spokes run with `--dangerously-skip-permissions` (Orca's default). The hooks are a **deny-list over command text, not a sandbox**: indirection (`eval`, variables, base64, a script written and run
 later, git aliases), `cd` then relative paths, writes through MCP tools and secret reads are not caught. Spokes use the user's own `gh` login with its full scopes. Something stronger
