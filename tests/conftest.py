@@ -30,11 +30,12 @@ def pytest_addoption(parser):
 def pytest_runtest_makereport(item, call):   # no marker or option opts a test out: a slow test is made fast or deleted
     rep = (yield).get_result()
     phases = item.stash.setdefault(PHASES, {})
-    phases[call.when] = call.duration
+    phases[call.when] = (call.duration, rep.passed)
+    spent = sum(d for d, _ in phases.values())
     limit = float(item.config.getini("test_time_limit"))
-    if call.when == "teardown" and rep.passed and sum(phases.values()) > limit:
-        parts = " + ".join(f"{k} {v:.2f}" for k, v in phases.items())
-        rep.outcome, rep.longrepr = "failed", f"{item.nodeid} took {sum(phases.values()):.2f} s ({parts}), limit {limit:g} s"
+    if call.when == "teardown" and all(ok for _, ok in phases.values()) and spent > limit:   # a test that already failed is not reported twice
+        parts = " + ".join(f"{k} {d:.2f}" for k, (d, _) in phases.items())
+        rep.outcome, rep.longrepr = "failed", f"{item.nodeid} took {spent:.2f} s ({parts}), limit {limit:g} s"
 
 
 def pytest_terminal_summary(terminalreporter):   # each CI leg shows its margin: the three slowest tests

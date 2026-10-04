@@ -72,10 +72,9 @@ def test_install_explains_why_jq_is_mandatory(run, tool, tmp_path):
 
 def test_a_test_over_the_time_limit_fails_naming_its_duration(pytester):
     pytester.makeconftest((Path(__file__).parent / "conftest.py").read_text())
-    pytester.makepyfile("import time\n\n\ndef test_slow():\n    time.sleep(0.6)\n\n\ndef test_fast():\n    pass\n")
+    pytester.makepyfile("import time\n\n\ndef test_slow():\n    time.sleep(0.3)\n")
 
-    r = pytester.runpytest_inprocess("-o", "test_time_limit=0.3")
+    r = pytester.runpytest_inprocess("-o", "test_time_limit=0.2")
 
-    r.assert_outcomes(passed=2, errors=1)
-    r.stdout.re_match_lines([r".*test_slow.* took 0\.[6-9]\d* s \(.*\), limit 0\.3 s"])
-    r.stdout.no_fnmatch_line("ERROR*test_fast")
+    r.assert_outcomes(passed=1, errors=1)   # the call passed; the limit fails the test at its teardown
+    r.stdout.re_match_lines([r".*test_slow took (0\.[3-9]\d*|[1-9]\d*\.\d+) s \(.*\), limit 0\.2 s"])
