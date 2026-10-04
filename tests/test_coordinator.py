@@ -176,6 +176,13 @@ def test_the_human_sees_the_whole_permission_change_not_the_25_line_cap_of_a_pla
     assert r.returncode == 0 and "line 79" in r.stdout and "tool: Bash" in r.stdout
 
 
+def test_the_human_view_of_a_permission_request_drops_control_bytes_and_says_when_it_cut_lines(C):
+    q = PQ.replace("curl", "cu\x1b[2K\rrl") + "".join(f"  pad {i}\n" for i in range(400))
+    C.mail([msg("question", "msg_p", question=q)])
+    r = C.go("--answer", "human")
+    assert r.returncode == 0 and "\x1b" not in r.stdout and "\r" not in r.stdout and "display truncated" in r.stdout and "pad 399" not in r.stdout
+
+
 def permission_inbox(C, ids):   # open permission questions in the Run's inbox
     rows = [{**msg("question", i, question=PQ), "run_id": "run_t", "thread_id": i} for i in ids]
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))

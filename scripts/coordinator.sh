@@ -54,7 +54,11 @@ pj() { jq -r --arg k "$2" '(.payload // "{}" | if type == "string" then fromjson
 question_of() { local q; q="$(pj "$1" question)"; [ -n "$q" ] || q="$(jq -r '.body // ""' <<< "$1")"; printf '%s' "$q"; }
 is_perm() { local t="${1#"${1%%[![:space:]]*}"}"; [[ $t == "PERMISSION REQUEST"* ]]; }   # a worker's permission prompt (hooks/claude/permission-relay.sh), not a PLAN gate
 tool_of() { sed -n 's/^tool: //p' <<< "$1" | head -n 1; }
-show_q() { printf '%s\n' "$1" | fold -s -w 100 | head -n "${2:-25}" | sed 's/^/  | /' || true; }   # the question as the human must read it: wrapped, at most 25 lines (a permission request: 300, the change must be seen whole)
+show_q() {   # the question as the human must read it: control bytes dropped, wrapped, at most $2 lines (25; a permission request 300, the change must be seen whole), a marker when lines were cut
+  local all n="${2:-25}" total; all="$(printf '%s\n' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177' | fold -s -w 100)"
+  printf '%s\n' "$all" | head -n "$n" | sed 's/^/  | /' || true
+  total="$(printf '%s\n' "$all" | wc -l)"; [ "$total" -le "$n" ] || echo "  [display truncated: $((total - n)) more lines; deny if unsure]"
+}
 gate_flag() {   # $1 worktree path, $2 message id, $3 question, $4 the reply word shown: the stable Orca surfaces of a pending human gate: the worktree comment and a bell on this terminal
   orca_json worktree set --worktree "path:$1" --comment "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2" "${4:-approve}")" > /dev/null 2>&1 || warn "cannot set the worktree comment"
   printf '\a' > "${COORD_BELL_TTY:-/dev/tty}" 2> /dev/null || true

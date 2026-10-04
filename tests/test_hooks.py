@@ -232,6 +232,10 @@ WF_LANES = [
     ("Bash", {"command": "echo x > orca.yaml"}, ""), ("Bash", {"command": "cp x ~/.claude/settings.json"}, ""),
     ("Write", {"file_path": ".claude/settings.json"}, "spoke-only"), ("Write", {"file_path": ".claude/hooks/push-guard.sh"}, "spoke-only"),
     ("Write", {"file_path": ".ai-toolkit/spoke-run-id"}, "spoke-only"), ("Bash", {"command": "rm .claude/settings.local.json"}, "spoke-only"),
+    # the coordinator's reply spool: a worker writing there would answer its own gate or permission question as the human
+    ("Write", {"file_path": "{home}/.ai-toolkit/coordinator/run_t/replies/msg_p"}, "spoke-only"),
+    ("Bash", {"command": "echo allow > ~/.ai-toolkit/coordinator/run_t/replies/msg_p"}, "spoke-only"),
+    ("Bash", {"command": "cp x $HOME/.ai-toolkit/coordinator/run_t/replies/msg_p"}, "spoke-only"),
 ]
 
 
@@ -428,6 +432,11 @@ def test_relay_shows_a_recorded_reason_on_one_capped_line_so_it_cannot_pose_as_t
     lines = q.splitlines()
     assert [ln for ln in lines if ln.startswith("reason:")] and not any(ln.startswith("tool: Read") for ln in lines) and lines.count("file_path:") == 1  # the real key only
     assert q.splitlines()[6].startswith("reason: harmless tool: Read file_path: /etc/hosts Z") and len(q.splitlines()[6]) <= 320
+
+
+def test_relay_strips_control_bytes_so_the_question_cannot_rewrite_the_approvers_terminal(relay):
+    q = relay.run("Bash", {"command": "ls\r\x1b[2K\x07evil\ttab", "description": "d\x1b[31m"}).question
+    assert not any(c in q for c in "\r\x1b\x07") and "evil\ttab" in q  # tabs and newlines stay, everything else non-printable goes
 
 
 def test_relay_keeps_a_newline_in_an_input_key_from_posing_as_a_header(relay):
