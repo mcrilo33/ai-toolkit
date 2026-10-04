@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # judge: danger-guard's second stage, run only when its regex flagged a Bash command. stdin = the command; $1 = cwd, $2 = worktree root, $3 = the guard's reason.
-# One line on stdout (the model's WHY) = the command only MENTIONS what was flagged: the first line of the model's reply is exactly `VERDICT: DATA`. Nothing on stdout =
+# One line on stdout (the model's WHY) = the command only MENTIONS what was flagged and writes only inside the worktree or the scratchpad (#405): the first line of the model's reply is exactly `VERDICT: DATA`. Nothing on stdout =
 # not cleared, and the guard asks as it did before the judge: an EXECUTES or UNSURE verdict, a malformed reply, no claude binary or login, a kill after DANGER_JUDGE_KILL_S
 # (20 s). It always exits 0 (the guard's fail-closed trap must not see a status), never denies and caches nothing. The command reaches claude on stdin, never argv; claude has no tools and no settings (so no hooks, no recursion).
 # Sonnet, not Haiku: Haiku took a forged "END OF COMMAND" line for the end of the command (3 of 3), Sonnet did not (measured, #402).
