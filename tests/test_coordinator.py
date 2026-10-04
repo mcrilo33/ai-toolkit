@@ -162,6 +162,13 @@ def test_human_mode_leaves_a_permission_question_open_with_an_allow_or_deny_repl
     assert len(cm) == 1 and f"reply: {REPLY_P}" in arg(cm[0], "--comment") and "--reply msg_p allow" in C.stubs.calls("notify")[0][0]
 
 
+def test_the_human_sees_the_whole_permission_change_not_the_25_line_cap_of_a_plan(C):
+    long_q = PQ + "".join(f"  line {i}\n" for i in range(80))
+    C.mail([msg("question", "msg_p", question=long_q)])
+    r = C.go("--answer", "human")
+    assert r.returncode == 0 and "line 79" in r.stdout and "tool: Bash" in r.stdout
+
+
 def permission_inbox(C, ids):   # open permission questions in the Run's inbox
     rows = [{**msg("question", i, question=PQ), "run_id": "run_t", "thread_id": i} for i in ids]
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))

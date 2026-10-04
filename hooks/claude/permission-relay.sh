@@ -15,16 +15,16 @@ in="$(cat)"; tool="$(jq -er .tool_name <<< "$in")"
 case "$tool" in AskUserQuestion | ExitPlanMode) deny "$tool is not a permission: ask the coordinator with your preamble's orchestration ask";; esac
 h="${ORCA_TERMINAL_HANDLE:-}"; [ -n "$h" ] || deny "no Orca terminal handle"
 reason=unknown; rf="$root/.ai-toolkit/ask-reasons/$(jq -cS '[.tool_name,.tool_input]' <<< "$in" | shasum -a 256 | cut -d' ' -f1)" # why a PreToolUse ask raised it (danger-guard records it)
-if [ -f "$rf" ]; then ts="$(head -n1 "$rf")"; case "$ts" in '' | *[!0-9]*) ts=0;; esac
-  if [ $(($(date +%s) - ts)) -le 600 ]; then reason="$(tail -n +2 "$rf")"; fi; rm -f "$rf"; fi
+if [ -f "$rf" ]; then ts="$(head -n1 "$rf")"; case "$ts" in '' | *[!0-9]*) ts=0;; esac; ts=$((10#${ts:0:10})) # a corrupt epoch is stale, never an arithmetic error
+  age=$(($(date +%s) - ts)); if [ "$age" -ge 0 ] && [ "$age" -le 600 ]; then reason="$(tail -n +2 "$rf" | tr -s '[:space:]' ' ' | cut -c1-300)"; fi; rm -f "$rf"; fi # one capped line: it cannot pose as a request field
 issue="$(sed -n '1s/^# *//p' "$root/.ai-toolkit/task.md" 2> /dev/null || :)"
 q="$(jq -r --arg root "$root" --arg issue "${issue:-unknown}" --arg reason "$reason" --argjson cap "${PERMISSION_RELAY_CAP:-6000}" '
   def show: tostring | if length > $cap then .[:$cap] + "\n[truncated: \(length) chars in all]" else . end;
   "PERMISSION REQUEST (not a plan gate: reply allow or deny)", "issue: \($issue)", "worktree: \($root)", "tool: \(.tool_name)", "cwd: \(.cwd // "?")",
   "mode: \(.permission_mode // "?")", "reason: \($reason)",
-  (.tool_input | to_entries[]? | "\(.key):", (.value | if type == "string" then . else tojson end | show | split("\n") | map("  " + .) | join("\n")))' <<< "$in")"
+  (.tool_input // {} | if type == "object" then to_entries[] else {key: "input", value: .} end | "\(.key):", (.value | if type == "string" then . else tojson end | show | split("\n") | map("  " + .) | join("\n")))' <<< "$in")"
 o="$(mktemp)"; orca orchestration ask --from "$h" --question "$q" --options allow,deny --timeout-ms "${PERMISSION_RELAY_ASK_MS:-540000}" > "$o" 2> /dev/null & p=$!
-{ sleep "${PERMISSION_RELAY_KILL_S:-570}"; touch "$o.killed"; kill -9 $p; } > /dev/null 2>&1 & w=$!
+{ sleep "${PERMISSION_RELAY_KILL_S:-570}" && touch "$o.killed" && kill -9 $p; } > /dev/null 2>&1 & w=$!   # && : a sleep killed on the normal path must not go on to kill
 rc=0; wait $p 2> /dev/null || rc=$?; pkill -P $w 2> /dev/null || :; kill $w 2> /dev/null || :; wait $w 2> /dev/null || :
 reply="$(cat "$o")"; killed=0; [ ! -e "$o.killed" ] || killed=1; rm -f "$o" "$o.killed"
 [ "$killed" = 0 ] || deny "no answer before the relay timed out"

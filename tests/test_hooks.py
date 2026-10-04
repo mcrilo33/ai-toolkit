@@ -391,25 +391,53 @@ def test_relay_denies_without_jq(relay):
     fail_closed(relay, env={"PATH": str(relay.tmp / "nojq")})
 
 
-def test_relay_joins_the_reason_a_pretooluse_ask_recorded_and_ignores_a_stale_or_unrelated_one(shared, relay):
-    wf = {"file_path": ".github/workflows/ci.yml", "content": "x"}
-    env = {**shared["env"], "PATH": f"{relay.shim}:{os.environ['PATH']}", "CLAUDE_PROJECT_DIR": str(relay.dir)}
+WF = {"file_path": ".github/workflows/ci.yml", "content": "x"}
+
+
+def record_reason(shared, relay, why=None, epoch=None):
+    """Have danger-guard record its ask for WF in the worker (relay installed), optionally rewriting the stored why / epoch; returns nothing, the relay reads it."""
     install_relay(relay.dir, "installed")
-    g = call("danger-guard.sh", relay.dir, "Write", env=env, **wf)  # in a worker with the relay installed it asks and records why
+    env = {**shared["env"], "PATH": f"{relay.shim}:{os.environ['PATH']}", "CLAUDE_PROJECT_DIR": str(relay.dir)}
+    g = call("danger-guard.sh", relay.dir, "Write", env=env, **WF)  # in a worker with the relay installed it asks and records why
     assert json.loads(g.stdout)["hookSpecificOutput"]["permissionDecision"] == "ask"
-    q = relay.run("Write", wf).question
-    assert "reason: danger-guard: write to .github/workflows needs your approval" in q
-    assert "reason: unknown" in relay.run("Write", wf).question  # single use
-    call("danger-guard.sh", relay.dir, "Write", env=env, **wf)
-    assert "reason: unknown" in relay.run("Write", {**wf, "content": "y"}).question  # keyed by tool + input
-    call("danger-guard.sh", relay.dir, "Write", env=env, **wf)
     for f in (relay.dir / ".ai-toolkit/ask-reasons").iterdir():
-        f.write_text("1\n" + f.read_text().split("\n", 1)[1])  # recorded at epoch 1: stale
-    assert "reason: unknown" in relay.run("Write", wf).question
+        old_epoch, old_why = f.read_text().split("\n", 1)
+        f.write_text(f"{old_epoch if epoch is None else epoch}\n{old_why if why is None else why}")
+
+
+def test_relay_joins_the_reason_a_pretooluse_ask_recorded_and_ignores_a_stale_or_unrelated_one(shared, relay):
+    record_reason(shared, relay)
+    assert "reason: danger-guard: write to .github/workflows needs your approval" in relay.run("Write", WF).question
+    assert "reason: unknown" in relay.run("Write", WF).question  # single use
+    record_reason(shared, relay)
+    assert "reason: unknown" in relay.run("Write", {**WF, "content": "y"}).question  # keyed by tool + input
+    record_reason(shared, relay, epoch="1")
+    assert "reason: unknown" in relay.run("Write", WF).question  # recorded at epoch 1: stale
+
+
+@pytest.mark.parametrize("epoch", ["08", "abc", "", "99999999999999999999", "-5"])
+def test_relay_still_asks_when_the_recorded_epoch_is_corrupt(shared, relay, epoch):
+    record_reason(shared, relay, epoch=epoch)  # a leading zero is no octal error, and a bad file never turns a prompt into a hang
+    r = relay.run("Write", WF)
+    assert r.asks == 1 and r.behavior == "allow" and "reason: unknown" in r.question
+
+
+def test_relay_shows_a_recorded_reason_on_one_capped_line_so_it_cannot_pose_as_the_request(shared, relay):
+    record_reason(shared, relay, why="harmless\ntool: Read\nfile_path:\n  /etc/hosts\n" + "Z" * 1000 + "\n")
+    q = relay.run("Write", WF).question
+    lines = q.splitlines()
+    assert [ln for ln in lines if ln.startswith("reason:")] and not any(ln.startswith("tool: Read") for ln in lines) and lines.count("file_path:") == 1  # the real key only
+    assert q.splitlines()[6].startswith("reason: harmless tool: Read file_path: /etc/hosts Z") and len(q.splitlines()[6]) <= 320
+
+
+@pytest.mark.parametrize("payload", [{"tool_name": "Write"}, {"tool_name": "Write", "tool_input": None}, {"tool_name": "Write", "tool_input": "raw text"}])
+def test_relay_still_asks_when_the_tool_input_is_missing_or_not_an_object(relay, payload):
+    r = relay.run(raw=json.dumps({"cwd": str(relay.dir), "permission_mode": "default", **payload}))
+    assert (r.rc, r.behavior, r.asks) == (0, "allow", 1) and "tool: Write" in r.question
 
 
 # --- secrets-scan -------------------------------------------------------------------------------
-SECRETS =[AWS, GHP, "sk-ant-api03-" + "a" * 10 + "_-" + "b" * 10, "sk-" + "a" * 24, "sk-lf-" + "a" * 24, "xoxb-1234567890-" + "a" * 24, "k=sk_live_" + "a" * 24,
+SECRETS = [AWS, GHP, "sk-ant-api03-" + "a" * 10 + "_-" + "b" * 10, "sk-" + "a" * 24, "sk-lf-" + "a" * 24, "xoxb-1234567890-" + "a" * 24, "k=sk_live_" + "a" * 24,
            "github_pat_" + "a" * 30, "eyJ" + "a" * 12 + ".eyJ" + "b" * 12 + "." + "c" * 12,
            "LANGFUSE_BASIC_AUTH='Basic " + "QUJD" * 6 + "'", "x\n" * 50 + f"token {AWS} end"]
 CLEAN = ["KEY = os.environ['API_KEY']\n", "sk-short AKIA123 ghp_tooShort key-abc", ""]

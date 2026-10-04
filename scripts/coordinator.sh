@@ -54,7 +54,7 @@ pj() { jq -r --arg k "$2" '(.payload // "{}" | if type == "string" then fromjson
 question_of() { local q; q="$(pj "$1" question)"; [ -n "$q" ] || q="$(jq -r '.body // ""' <<< "$1")"; printf '%s' "$q"; }
 is_perm() { local t="${1#"${1%%[![:space:]]*}"}"; [[ $t == "PERMISSION REQUEST"* ]]; }   # a worker's permission prompt (hooks/claude/permission-relay.sh), not a PLAN gate
 tool_of() { sed -n 's/^tool: //p' <<< "$1" | head -n 1; }
-show_q() { printf '%s\n' "$1" | fold -s -w 100 | head -n 25 | sed 's/^/  | /' || true; }   # the question as the human must read it: wrapped, at most 25 lines
+show_q() { printf '%s\n' "$1" | fold -s -w 100 | head -n "${2:-25}" | sed 's/^/  | /' || true; }   # the question as the human must read it: wrapped, at most 25 lines (a permission request: 300, the change must be seen whole)
 gate_flag() {   # $1 worktree path, $2 message id, $3 question, $4 the reply word shown: the stable Orca surfaces of a pending human gate: the worktree comment and a bell on this terminal
   orca_json worktree set --worktree "path:$1" --comment "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2" "${4:-approve}")" > /dev/null 2>&1 || warn "cannot set the worktree comment"
   printf '\a' > "${COORD_BELL_TTY:-/dev/tty}" 2> /dev/null || true
@@ -171,7 +171,7 @@ on_permission() {   # $1 message id, $2 question: a worker's tool-permission pro
   else   # human mode, or the deny could not be sent (the worker's relay denies on its own timeout): the human decides, nothing waits
     yield
     comment "$issue" "A permission request needs a human (message $1, tool: $tool). Reply from any terminal: $(replycmd "$1" allow)   (or deny)"
-    show_q "$2"; notify "#$issue: permission request waiting: $(replycmd "$1" allow)"; gate_flag "$wtp" "$1" "$2" allow
+    show_q "$2" 300; notify "#$issue: permission request waiting: $(replycmd "$1" allow)"; gate_flag "$wtp" "$1" "$2" allow
   fi
 }
 on_question() {

@@ -130,7 +130,7 @@ The question's first line, `PERMISSION REQUEST (not a plan gate: ...)`, is what 
 `--answer human` leaves it open like a gate and the human replies `allow` or `deny` with `--reply`; the coordinate skill shows it to the user and replies only with their decision. Issue comments name the tool and the
 answer only, never the command or content. The relay is **fail-closed**: exactly `allow` lets the call through, and a missing handle, no Run, `orca` erroring, an unparsable payload or reply, no `jq` and a timeout all answer
 `deny`. A hook that exceeds its own timeout is killed with no decision and the local dialog stays waiting, so the relay bounds its ask with its own timer (`--timeout-ms` 540000, kill at 570 s) under the hook timeout (600 s).
-While it waits, the dialog is drawn in the worker too; the relay's answer dismisses it. Outside a worker (no `.ai-toolkit/spoke-run-id`) the hook prints nothing and the local prompt stays.
+While it waits, the dialog is drawn in the worker too; the relay's answer dismisses it. Orca leaves a question pending after its ask times out, so a question the relay already denied stays open in the Run until replied: a late reply changes nothing (the coordinate skill ignores a stale one). Outside a worker (no `.ai-toolkit/spoke-run-id`) the hook prints nothing and the local prompt stays.
 
 ## Coordinator runbook
 
