@@ -11,9 +11,8 @@ COMPOSE = yaml.safe_load((V2 / "langfuse/compose.yaml").read_text())
 
 
 @pytest.fixture
-def docker(stubs, tmp_path, monkeypatch):
-    (tmp_path / "stubs/bin/docker").write_text(STUB)
-    (tmp_path / "stubs/bin/docker").chmod(0o755)
+def docker(stubs, tmp_path, monkeypatch, link_script):
+    link_script(tmp_path / "stubs/bin/docker", STUB)
     (tmp_path / "local.env").write_text("LANGFUSE_PUBLIC_KEY=pk-lf-1\nLANGFUSE_SECRET_KEY=sk-lf-2\n")
     monkeypatch.setenv("AI_TOOLKIT_LOCAL_ENV", str(tmp_path / "local.env"))
     monkeypatch.setenv("AITK_OTEL_RAW_DIR", str(tmp_path / "raw"))

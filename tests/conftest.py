@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -11,12 +12,32 @@ pytest_plugins = ["pytester"]  # the time-limit pin runs an inner session
 ROOT = Path(__file__).resolve().parent.parent
 V2 = ROOT / "v2" if (ROOT / "v2").is_dir() else ROOT  # cutover.sh moves v2/* to the root
 # records argv (US-separated) + env; replays <name>.<arg1>_<arg2>.<call#> > <name>.<arg1>_<arg2> > <name>
-STUB = """#!/bin/sh
-n=$(basename "$0"); d=$STUB_DIR; [ -n "$STUB_NOENV" ] || env > "$d/$n.env"
+STUB = """#!/bin/bash
+n=${0##*/}; d=$STUB_DIR; [ -n "$STUB_NOENV" ] || env > "$d/$n.env"
 printf '%s' "$n" >> "$d/calls.log"; for a in "$@"; do printf '\\037%s' "$a" >> "$d/calls.log"; done; echo >> "$d/calls.log"
-k="$n.$(echo "$1_$2" | tr -c 'A-Za-z0-9_\\n' _)"; c=$(( $(cat "$d/$k.count" 2>/dev/null || echo 0) + 1 )); echo $c > "$d/$k.count"
-for f in "$d/$k.$c" "$d/$k" "$d/$n"; do [ -f "$f" ] && { cat "$f"; exit "$(cat "$f.rc" 2>/dev/null || echo 0)"; }; done; exit 0
+k="$1_$2"; k="$n.${k//[^A-Za-z0-9_]/_}"; c=0; [ -f "$d/$k.count" ] && read -r c < "$d/$k.count"; c=$((c + 1)); echo $c > "$d/$k.count"
+for f in "$d/$k.$c" "$d/$k" "$d/$n"; do   # builtins only: a stub call costs one process, since the suite is bound by spawning
+  [ -f "$f" ] || continue; IFS= read -r -d '' out < "$f"; printf '%s' "$out"; rc=0; [ -f "$f.rc" ] && read -r rc < "$f.rc"; exit "$rc"
+done; exit 0
 """
+
+
+STUB_TEE = STUB.replace("n=${0##*/}", """IFS= read -r -d '' in; printf '%s' "$in" > "$STUB_DIR/${0##*/}.stdin"; n=${0##*/}""", 1)   # also records its stdin
+
+
+@pytest.fixture(scope="session")
+def link_script(tmp_path_factory):   # (path, text) -> path: a script is written once per worker and every call links to it
+    d, made = tmp_path_factory.mktemp("scripts"), {}   # the first run of each new executable file costs ~0.1 s on macOS and queues behind every other worker's, so a test never writes one; a symlink to a file already run is free
+
+    def link(path, text):
+        if text not in made:
+            made[text] = d / str(len(made))
+            made[text].write_text(text)
+            made[text].chmod(0o755)
+        path.unlink(missing_ok=True)
+        path.symlink_to(made[text])
+        return path
+    return link
 
 
 PHASES = pytest.StashKey[dict]()
@@ -60,12 +81,11 @@ def isolated_env(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def stubs(monkeypatch, tmp_path):
+def stubs(monkeypatch, tmp_path, link_script):
     d = tmp_path / "stubs"
     (d / "bin").mkdir(parents=True)
     for name in ("orca", "gh", "claude"):
-        (d / "bin" / name).write_text(STUB)
-        (d / "bin" / name).chmod(0o755)
+        link_script(d / "bin" / name, STUB)
     monkeypatch.setenv("STUB_DIR", str(d))
     monkeypatch.setenv("PATH", f"{d / 'bin'}:{os.environ['PATH']}")
 
@@ -86,7 +106,7 @@ def git(cwd, *a):
 
 
 @pytest.fixture(scope="session")
-def origin_template(tmp_path_factory):  # one bare origin per xdist worker, with `init` on main; each test gets a copy
+def origin_template(tmp_path_factory):  # per xdist worker: a bare origin with `init` on main and a clone of it; each test gets copies of both
     base = tmp_path_factory.mktemp("origin_template")
     env = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 
@@ -98,14 +118,17 @@ def origin_template(tmp_path_factory):  # one bare origin per xdist worker, with
     (base / "seed" / "README").write_text("x")
     for a in (["add", "."], ["commit", "-qm", "init"], ["push", "-q", "origin", "main"]):
         sh(*a, cwd=base / "seed")
-    return base / "origin.git"
+    sh("clone", "-q", "origin.git", "root")   # after the push, so origin/HEAD is set as in a real clone
+    return base
 
 
 @pytest.fixture
 def repo(tmp_path, origin_template):
     origin, root = tmp_path / "origin.git", tmp_path / "root"
-    shutil.copytree(origin_template, origin)
-    subprocess.run(["git", "clone", "-q", str(origin), str(root)], check=True, capture_output=True)
+    shutil.copytree(origin_template / "origin.git", origin)
+    shutil.copytree(origin_template / "root", root)   # a copy, not a clone: one git process fewer per test
+    config = root / ".git" / "config"
+    config.write_text(re.sub(r"(?m)^(\s*url = ).*$", lambda m: m[1] + str(origin), config.read_text()))
     (root / ".claude" / "hooks").mkdir(parents=True)
     (root / ".claude" / "hooks" / "guard.sh").write_text("#!/bin/sh\n")
 

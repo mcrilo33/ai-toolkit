@@ -5,7 +5,7 @@ import stat
 from pathlib import Path
 
 import pytest
-from conftest import STUB, V2
+from conftest import STUB_TEE, V2
 
 CO = str(V2 / "scripts/coordinator.sh")
 EMPTY = json.dumps({"result": {"messages": [], "deliveryId": None}})
@@ -28,13 +28,12 @@ def in_order(kinds, *seq):
 
 
 @pytest.fixture
-def C(stubs, repo, run, tmp_path, monkeypatch):
+def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     monkeypatch.setenv("STUB_NOENV", "1")   # no test here reads a stub's env: one process fewer per stub call
     cmds, wt = tmp_path / "cmds", str(repo.wt("1-x"))
     cmds.mkdir()
     for n in ("dispatch.sh", "land.sh", "answer.sh"):   # sub-commands are stubs that also record their stdin
-        (cmds / n).write_text(STUB.replace("n=$(basename", 'cat > "$STUB_DIR/$(basename "$0").stdin"; n=$(basename', 1))
-        (cmds / n).chmod(0o755)
+        link_script(cmds / n, STUB_TEE)
 
     def row(d="ctx_1", st="dispatched", lv="live"):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",

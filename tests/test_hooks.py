@@ -287,15 +287,14 @@ sleep "${SHIM_SLEEP:-0}"; printf '%s' "${SHIM_REPLY-}"; exit "${SHIM_RC:-0}"
 
 
 @pytest.fixture
-def relay(tmp_path):
+def relay(tmp_path, link_script):
     """A worker dir (marker + task.md), a shim `orca` that records its argv and prints SHIM_REPLY, and a runner returning (hook output, the ask argv or None)."""
     spoke, shim = tmp_path / "w", tmp_path / "shim"
     (spoke / ".ai-toolkit").mkdir(parents=True)
     shim.mkdir()
     (spoke / ".ai-toolkit/spoke-run-id").write_text("rid\n")
     (spoke / ".ai-toolkit/task.md").write_text("# #394 feat(gate): relay every permission prompt\n\nbody\n")
-    (shim / "orca").write_text(ASK_SHIM)
-    (shim / "orca").chmod(0o755)
+    link_script(shim / "orca", ASK_SHIM)
 
     def run(tool="Write", ti=None, reply="allow", rc=0, raw=None, env=None, where=None, **e):
         payload = {"hook_event_name": "PermissionRequest", "tool_name": tool, "cwd": str(where or spoke), "permission_mode": "bypassPermissions",

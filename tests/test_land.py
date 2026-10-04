@@ -27,10 +27,9 @@ def commit(cwd, name, text="x", push=None):
 
 
 @pytest.fixture
-def L(stubs, repo, run, tmp_path):
+def L(stubs, repo, run, tmp_path, link_script):
     origin = tmp_path / "origin.git"
-    (origin / "hooks/post-receive").write_text(HOOK)
-    (origin / "hooks/post-receive").chmod(0o755)
+    link_script(origin / "hooks/post-receive", HOOK)
     wt = repo.wt(BRANCH)
     tip = commit(wt, "feature.txt", push=BRANCH)
     git(repo.root, "fetch", "-q")
@@ -176,9 +175,8 @@ def test_main_moving_during_the_gate_triggers_another_round(L):
     assert git(L.root, "ls-tree", "--name-only", "-r", main_sha(L)).split() == ["README", "feature.txt", "seed.txt", "z.txt"]
 
 
-def test_a_rejected_main_push_restores_local_main_and_closes_nothing(L):
-    (L.origin / "hooks/pre-receive").write_text('#!/bin/sh\nwhile read o n r; do [ "$r" = refs/heads/main ] && exit 1; done\nexit 0\n')
-    (L.origin / "hooks/pre-receive").chmod(0o755)
+def test_a_rejected_main_push_restores_local_main_and_closes_nothing(L, link_script):
+    link_script(L.origin / "hooks/pre-receive", '#!/bin/sh\nwhile read o n r; do [ "$r" = refs/heads/main ] && exit 1; done\nexit 0\n')
     before = git(L.root, "rev-parse", "HEAD")
     r = L.go("9")
     assert r.returncode == 1 and "push" in r.stderr
@@ -222,20 +220,17 @@ def test_refuses_an_unpushed_or_dirty_spoke(L):
     assert r.returncode == 2 and "dirty" in r.stderr
 
 
-def review_script(tmp_path):
-    rev = tmp_path / "review.sh"
-    rev.write_text('#!/bin/sh\ngh review "$@"\nexit "${REVIEW_RC:-0}"\n')
-    rev.chmod(0o755)
-    return rev
+def review_script(tmp_path, link_script):
+    return link_script(tmp_path / "review.sh", '#!/bin/sh\ngh review "$@"\nexit "${REVIEW_RC:-0}"\n')
 
 
-def test_review_is_skipped_by_default(L, tmp_path):
-    assert L.go("9", REVIEW_CMD=review_script(tmp_path)).returncode == 0
+def test_review_is_skipped_by_default(L, tmp_path, link_script):
+    assert L.go("9", REVIEW_CMD=review_script(tmp_path, link_script)).returncode == 0
     assert ("gh", "review", "9") not in L.trail()
 
 
-def test_review_runs_first_and_a_non_approval_exits_3(L, tmp_path):
-    rev = review_script(tmp_path)
+def test_review_runs_first_and_a_non_approval_exits_3(L, tmp_path, link_script):
+    rev = review_script(tmp_path, link_script)
     before = main_sha(L)
     r = L.go("--review", "9", REVIEW_CMD=rev, REVIEW_RC=1)
     assert r.returncode == 3 and "review" in r.stderr

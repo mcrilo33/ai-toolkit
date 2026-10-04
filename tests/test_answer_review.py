@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import STUB, V2
+from conftest import STUB_TEE, V2
 
 ANSWER, REVIEW = str(V2 / "scripts/answer.sh"), str(V2 / "scripts/review.sh")
 OK = {"verdict": "APPROVE", "blockers": [], "warnings": ["a.py:1 - nit"], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
@@ -14,15 +14,15 @@ def sh(argv, cwd, input="", **env):
     return subprocess.run(argv, cwd=cwd, input=input, capture_output=True, text=True, env={**os.environ, **{k: str(v) for k, v in env.items()}})
 
 
-def tee_stdin():   # the claude stub also records the prompt it was given on stdin
+def tee_stdin(link_script):   # the claude stub also records the prompt it was given on stdin
     d = Path(os.environ["STUB_DIR"])
-    (d / "bin/claude").write_text(STUB.replace("n=$(basename", 'cat > "$STUB_DIR/claude.stdin"; n=$(basename', 1))
+    link_script(d / "bin/claude", STUB_TEE)
     return lambda: (d / "claude.stdin").read_text()
 
 
 @pytest.fixture
-def A(stubs, tmp_path):
-    stdin, wt, rule = tee_stdin(), tmp_path / "wt", tmp_path / "rule.md"
+def A(stubs, tmp_path, link_script):
+    stdin, wt, rule = tee_stdin(link_script), tmp_path / "wt", tmp_path / "rule.md"
     wt.mkdir()
     rule.write_text("be decisive")
 
@@ -74,8 +74,8 @@ def test_a_failing_claude_or_a_missing_rule_is_an_escalation_not_an_approve(A, t
 
 
 @pytest.fixture
-def R(stubs, repo):
-    stdin, wt = tee_stdin(), repo.wt("9-feat")
+def R(stubs, repo, link_script):
+    stdin, wt = tee_stdin(link_script), repo.wt("9-feat")
     show = json.dumps({"result": {"worktree": {"path": str(wt), "branch": "refs/heads/9-feat"}}})
     stubs.reply("orca.worktree_show", show)
 
