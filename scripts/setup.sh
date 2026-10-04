@@ -33,6 +33,7 @@ else   # a kept worktree: tracked .claude files reach it through git (the branch
   dropped="$(grep '^\.claude/' "$installed" 2> /dev/null | grep -v '\.\.' | grep -vxFf <(printf '%s\n' "$synced" "$tracked") || true)"   # the record is data in the worktree: never leave .claude/
   if [ -n "$dropped" ]; then
     tr '\n' '\0' <<< "$dropped" | xargs -0 rm -f --
+    # shellcheck disable=SC2001  # ${var//} anchors on the whole multi-line string, not each line's last component; one sed covers the list
     sed 's|/[^/]*$||' <<< "$dropped" | sort -u | tr '\n' '\0' | xargs -0 rmdir -p 2> /dev/null || true
   fi
   copy="$(grep -vxFf <(printf '%s\n' "$tracked") <<< "$synced" || true)"
