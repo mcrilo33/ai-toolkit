@@ -66,7 +66,7 @@ def test_two_step_launch_runs_the_exact_orca_calls_in_order(d):
                   "--terminal", "term_agent", "--task-title", "#7 Add Hello, World!", "--spec", seed, "--timeout-ms", "120000"]
     assert calls[-1] == ["worktree", "set", "--worktree", f"path:{d.wt}", "--issue", "7", "--workspace-status", "in-progress"]
     assert json.loads(r.stdout) == {"issue": 7, "dispatch": "ctx_1", "worktree": str(d.wt), "terminal": "term_agent"}
-    assert d.stubs.calls("gh") == [["issue", "view", "7", "--json", "number,title,body"]]
+    assert d.stubs.calls("gh") == [["issue", "view", "7", "--json", "number,title,body"], ["issue", "edit", "7", "--add-label", "status:in-progress"]]
 
 
 def test_seed_for_a_plan_gate_asks_before_coding_and_never_touches_the_base(d):
@@ -212,7 +212,7 @@ def test_next_dispatches_the_pick(d):
     stub_board(d, [issue(5, "Scope: b.py"), issue(3, "Scope: a.py")], [])
     r = d.go("--next")
     assert r.returncode == 0, r.stderr
-    assert json.loads(r.stdout)["issue"] == 3 and d.stubs.calls("gh")[-1] == ["issue", "view", "3", "--json", "number,title,body"]
+    assert json.loads(r.stdout)["issue"] == 3 and d.stubs.calls("gh")[-2:] == [["issue", "view", "3", "--json", "number,title,body"], ["issue", "edit", "3", "--add-label", "status:in-progress"]]
     assert any(c[:2] == ["orchestration", "worker-start"] for c in d.orca())
 
 
@@ -252,7 +252,7 @@ def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d)
         "/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")   # keeps the shim's OTel env
     assert calls[3] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}",
                         "--terminal", "term_agent", "--task", "task_7", "--retry-of", "ctx_old", "--timeout-ms", "120000"]
-    assert json.loads(r.stdout)["terminal"] == "term_agent"
+    assert json.loads(r.stdout)["terminal"] == "term_agent" and ["issue", "edit", "7", "--add-label", "status:in-progress"] in d.stubs.calls("gh")
 
 
 @pytest.mark.parametrize("args", [("--retry-of", "ctx_old", "--task", "task_7"), ("--address", "fix it")], ids=["retry", "address"])
@@ -273,8 +273,11 @@ def test_retry_needs_a_task_and_an_existing_worktree(d):
 
 def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_the_existing_worktree(d):
     stale_worktree(d)
+    d.stubs.reply("gh.issue_edit", "boom", rc=1)
+    d.stubs.reply("gh.label_create", "boom", rc=1)
     r = d.go("--address", "address: fix the blocker", "7")
-    assert r.returncode == 0, r.stderr
+    assert r.returncode == 0, r.stderr   # a label that cannot be set warns and changes nothing else
+    assert "warning" in r.stderr and ["issue", "edit", "7", "--add-label", "status:in-progress"] in d.stubs.calls("gh") and ["label", "create", "status:in-progress", "--color", "FBCA04"] in d.stubs.calls("gh")
     assert_refreshed_before_the_agent_starts(d, r)
     calls = d.orca()
     assert [c[:2] for c in calls] == [["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]

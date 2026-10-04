@@ -60,6 +60,15 @@ gh() { command "${AI_TOOLKIT_GH:-gh}" "$@"; }
 # gh_issue <n>: {number,title,body} of one issue.
 gh_issue() { gh issue view "$1" --json number,title,body; }
 
+# status_label <add|remove> <issue>: the one `status:in-progress` marker follows the worker. A failure only warns: the work it marks is already done.
+status_label() {
+  local l="status:in-progress"
+  if [ "$1" = add ]; then
+    gh issue edit "$2" --add-label "$l" > /dev/null 2>&1 \
+      || { gh label create "$l" --color FBCA04 > /dev/null 2>&1 || true; gh issue edit "$2" --add-label "$l" > /dev/null || warn "cannot label #$2 $l"; }
+  else gh issue edit "$2" --remove-label "$l" > /dev/null || warn "cannot remove $l from #$2"; fi
+}
+
 # issue_footer <body> <Key>: value of the last `Key: value` line (Scope:, Gate:, Model:).
 issue_footer() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | tail -n 1; }
 

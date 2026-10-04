@@ -70,7 +70,7 @@ happened in two sentences, then propose either `blocked` or one retry with `disp
 `blocked` = label, comment, free the slot, keep the worktree for the human:
 
 ```bash
-gh issue edit <n> --add-label blocked && gh issue comment <n> -b "blocked: <why>"
+gh issue edit <n> --add-label blocked --remove-label status:in-progress && gh issue comment <n> -b "blocked: <why>"
 orca orchestration worker-release --dispatch <dispatch-id> --json
 ```
 

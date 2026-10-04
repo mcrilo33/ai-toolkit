@@ -125,6 +125,7 @@ release() { [ -z "$1" ] || orca_mutate orchestration worker-release --dispatch "
 block() {   # $1 = why. Label, comment, flag (log, worktree comment, bell), free the slot; the worktree stays for the human. Never when the Run was taken back (yield).
   yield; gh issue edit "$issue" --add-label blocked > /dev/null 2>&1 \
     || { gh label create blocked --color B60205 > /dev/null 2>&1 || true; gh issue edit "$issue" --add-label blocked > /dev/null || warn "cannot label #$issue"; }
+  status_label remove "$issue"
   comment "$issue" "blocked: $1"; log "#$issue blocked: $1"; flag "$wtp" "BLOCKED #$issue: ${1:0:80}"; release "$disp"
 }
 redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds are spent. A fresh terminal and a NEW Task (dispatch.sh --address):

@@ -80,12 +80,13 @@ def test_ci_land_runs_every_step_in_order(L):
         ("gh", "run", "list", "--commit", L.tip, "status,conclusion,url"),
         ("git", "push", "main"),
         ("gh", "issue", "close", "9", "-c", f"landed in {sha}"),
+        ("gh", "issue", "edit", "9", "--remove-label", "status:in-progress"),
         ("git", "delete", BRANCH),
         ("orca", "orchestration", "worker-list"),
-        ("orca", "orchestration", "worker-release", "--dispatch", "ctx_9", *t[6][5:]),
+        ("orca", "orchestration", "worker-release", "--dispatch", "ctx_9", *t[7][5:]),
         ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks"),
     ]
-    assert "--retry-request" in t[6]
+    assert "--retry-request" in t[7]
     # a repo without the sync sources is no toolkit checkout: land installs nothing and touches no installed copy
     assert not (L.root / ".ai-toolkit").exists() and (L.root / ".claude/hooks/guard.sh").read_text() == "#!/bin/sh\n"
 
@@ -280,11 +281,14 @@ def test_cleanup_only_finishes_the_post_push_steps_after_exit_6(L):
     L.stubs.reply("gh.issue_close", "boom", rc=1)
     assert L.go("9").returncode == 6
     L.stubs.reply("gh.issue_close", "")
+    L.stubs.reply("gh.issue_edit", "boom", rc=1)   # a label that cannot be removed is a warning, not a cleanup failure
     n = len(L.trail())
     r = L.go("--cleanup-only", "9")
     assert r.returncode == 0, r.stderr
+    assert "status:in-progress" in r.stderr
     t = L.trail()[n:]
-    assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close")] and t[1][3:] == ("9", "-c", f"landed in {L.tip}")
+    assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close"), ("gh", "issue", "edit")] and t[1][3:] == ("9", "-c", f"landed in {L.tip}")
+    assert ("gh", "issue", "edit", "9", "--remove-label", "status:in-progress") in t
     assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "show"), ("orca", "orchestration", "worker-list"),
                                                       ("orca", "orchestration", "worker-release"), ("orca", "worktree", "rm")]
     assert not [x for x in t if x[0] == "git"]   # branch already deleted: nothing to push, main untouched
@@ -311,7 +315,7 @@ def test_cleanup_only_works_when_the_worktree_is_gone_given_the_branch_and_tip(L
     r = L.go("--cleanup-only", "--branch", BRANCH, "--tip", L.tip, "9")
     assert r.returncode == 0, r.stderr
     t = L.trail()[gone:]
-    assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close")] and t[-1][3:] == ("9", "-c", f"landed in {L.tip}")
+    assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close"), ("gh", "issue", "edit")] and t[-2][3:] == ("9", "-c", f"landed in {L.tip}")
     assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "show")]   # no worker-list, release or rm
 
 

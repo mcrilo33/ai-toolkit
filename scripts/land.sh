@@ -118,6 +118,7 @@ if [ -f "$main/scripts/sync.sh" ] && [ -d "$main/shared" ] && [ -d "$main/hooks/
     || { warn "installed copies NOT refreshed: run scripts/sync.sh . in $main (this land is done; running workers keep their old copies until re-dispatched)"; bad=1; }
 fi
 step gh issue close "$n" -c "landed in $sha"
+status_label remove "$n"
 # Delete the remote branch only while it is still at the gated tip: a later worker push must not be dropped.
 if git rev-parse -q --verify "refs/remotes/origin/$branch" > /dev/null; then
   step git push -q --force-with-lease="refs/heads/$branch:$tip" origin ":refs/heads/$branch"

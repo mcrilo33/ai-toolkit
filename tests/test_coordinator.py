@@ -84,7 +84,8 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
 
     def blocked():   # label + comment + Orca surfaces (worktree comment, bell) + release; the worktree is kept and nothing is re-dispatched
         ks = [k for k, _ in trail()]
-        return (any(a[3:] == ["--add-label", "blocked"] for a in calls("gh issue edit")) and "gh issue comment" in ks and (tmp_path / "bell").exists()
+        edits = [a[3:] for a in calls("gh issue edit")]   # one in-progress or blocked label, never both
+        return (["--add-label", "blocked"] in edits and edits.index(["--remove-label", "status:in-progress"]) > edits.index(["--add-label", "blocked"]) and "gh issue comment" in ks and (tmp_path / "bell").exists()
                 and any(arg(a, "--comment").startswith("BLOCKED #1") and arg(a, "--worktree") == f"path:{wt}" for a in calls("orca worktree set"))
                 and "orca orchestration worker-release" in ks and "--address" not in sum(stubs.calls("dispatch.sh"), []) and "orca worktree rm" not in ks)
 
@@ -301,6 +302,7 @@ def test_a_pending_human_question_does_not_stop_dispatch_or_land(C):
 
 @pytest.mark.parametrize("kind, extra", [("worker_done", {"outcome": "failed"}), ("escalation", {})])
 def test_a_failed_or_escalating_worker_blocks_the_issue(C, kind, extra):
+    C.stubs.reply("gh.issue_edit", "boom", rc=1, n=2)   # the in-progress label cannot be removed: a warning, the issue is still blocked
     C.mail([msg(kind, **extra)])
     C.go()
     assert C.blocked() and not C.stubs.calls("land.sh") and C.calls("orca orchestration check ack")

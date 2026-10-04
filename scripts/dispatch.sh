@@ -111,6 +111,7 @@ dispatch() {
   slug="$(printf '%s' "$title" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
   name="$n-${slug:-issue}"
   if [ -n "$retry_of$address" ]; then launch_retry; else "launch_${DISPATCH_LAUNCH:-twostep}"; fi
+  status_label add "$n"
   orca_json worktree set --worktree "$sel" --issue "$n" --workspace-status in-progress > /dev/null || die "worktree set failed for $sel"
   jq -nc --argjson issue "$n" --arg dispatch "$disp" --arg worktree "$wt" --arg terminal "$term" \
     '{issue: $issue, dispatch: $dispatch, worktree: $worktree, terminal: $terminal}'
