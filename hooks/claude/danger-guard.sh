@@ -31,7 +31,7 @@ clip() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-200; } # on
 audit() { (umask 077; mkdir -p "$home/.ai-toolkit" && [ ! -L "$home/.ai-toolkit/judge-cleared.log" ] && printf '%s\t%s\t%s\t%s\n' "$(date +%s)" Bash "$(clip "$m")" "$(clip "$1")" >> "$home/.ai-toolkit/judge-cleared.log") 2> /dev/null; } # no trace, no clear
 finish() {
   [ -n "$m" ] || exit 0
-  if [ -n "${cmd:-}" ] && why="$(printf '%s' "$cmd" | bash "$(dirname "$0")/judge.sh" "$cwd" "$root" "$m" 2> /dev/null)" && [ -n "$why" ] && audit "$why"; then exit 0; fi # the judge cleared a command that only mentions it
+  if [ "$(j .tool_name)" = Bash ] && [ -n "${cmd:-}" ] && why="$(printf '%s' "$cmd" | bash "$(dirname "$0")/judge.sh" "$cwd" "$root" "$m" "$(j .session_id)" 2> /dev/null || :)" && [ -n "$why" ] && audit "$why"; then exit 0; fi # the judge cleared a command that only mentions it
   if [ -z "$spoke" ] || relay_ready; then local r="danger-guard: needs your approval: $m"
     [ -z "$spoke" ] || record_reason "$r"
     jq -nc --arg r "$r" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: $r}}'; exit 0; fi
