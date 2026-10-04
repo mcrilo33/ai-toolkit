@@ -18,6 +18,34 @@ for f in "$d/$k.$c" "$d/$k" "$d/$n"; do [ -f "$f" ] && { cat "$f"; exit "$(cat "
 """
 
 
+PHASES = pytest.StashKey[dict]()
+
+
+def pytest_addoption(parser):
+    parser.addini("test_time_limit", "seconds one test may take, setup + call + teardown; over it the test fails", default="5")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):   # no marker or option opts a test out: a slow test is made fast or deleted
+    rep = (yield).get_result()
+    phases = item.stash.setdefault(PHASES, {})
+    phases[call.when] = call.duration
+    limit = float(item.config.getini("test_time_limit"))
+    if call.when == "teardown" and rep.passed and sum(phases.values()) > limit:
+        parts = " + ".join(f"{k} {v:.2f}" for k, v in phases.items())
+        rep.outcome, rep.longrepr = "failed", f"{item.nodeid} took {sum(phases.values()):.2f} s ({parts}), limit {limit:g} s"
+
+
+def pytest_terminal_summary(terminalreporter):   # each CI leg shows its margin: the three slowest tests
+    spent = {}
+    for reports in terminalreporter.stats.values():
+        for rep in reports:
+            if hasattr(rep, "duration"):
+                spent[rep.nodeid] = spent.get(rep.nodeid, 0) + rep.duration
+    for nodeid, secs in sorted(spent.items(), key=lambda kv: -kv[1])[:3]:
+        terminalreporter.write_line(f"slowest: {secs:6.2f} s {nodeid[:150]}")
+
+
 @pytest.fixture(autouse=True)
 def isolated_env(monkeypatch, tmp_path):
     for k in [k for k in os.environ if k.startswith(("GIT_", "OTEL_", "ORCA_", "CLAUDE_CODE_", "AI_TOOLKIT_"))]:

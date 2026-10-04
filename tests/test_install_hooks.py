@@ -78,4 +78,4 @@ def test_a_test_over_the_time_limit_fails_naming_its_duration(pytester):
 
     r.assert_outcomes(passed=2, errors=1)
     r.stdout.re_match_lines([r".*test_slow.* took 0\.[6-9]\d* s \(.*\), limit 0\.3 s"])
-    assert "test_fast" not in r.stdout.str().split("ERRORS")[-1]
+    r.stdout.no_fnmatch_line("ERROR*test_fast")
