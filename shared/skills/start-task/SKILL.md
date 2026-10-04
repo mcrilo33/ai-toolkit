@@ -11,7 +11,8 @@ Hub to spoke: the **issue is the contract**. The worker starts with a fresh cont
 ## 1. Scope
 
 Restate the task as a draft issue: **title**, **body** (problem, proposal, acceptance criteria drawn from the
-conversation). Get an OK before filing; do not invent scope.
+conversation). Get an OK before filing; do not invent scope. If the work falls into independent file groups,
+draft one issue per group (`issue-hygiene`, Split what does not collide) and tell the user.
 
 ## 2. File the issue
 
