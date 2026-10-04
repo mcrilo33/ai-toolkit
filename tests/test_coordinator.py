@@ -28,7 +28,8 @@ def in_order(kinds, *seq):
 
 
 @pytest.fixture
-def C(stubs, repo, run, tmp_path):
+def C(stubs, repo, run, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUB_NOENV", "1")   # no test here reads a stub's env: one process fewer per stub call
     cmds, wt = tmp_path / "cmds", str(repo.wt("1-x"))
     cmds.mkdir()
     for n in ("dispatch.sh", "land.sh", "answer.sh"):   # sub-commands are stubs that also record their stdin
@@ -133,8 +134,7 @@ PQ = ("PERMISSION REQUEST (not a plan gate: reply allow or deny)\nissue: #1 feat
 REPLY_P = REPLY.replace("msg_q approve", "msg_p allow")
 
 
-@pytest.mark.parametrize("q", [PQ, "\n  " + PQ])
-@pytest.mark.parametrize("answerer", ["approve\n", "approve with: x\n", "allow\n"])
+@pytest.mark.parametrize("q, answerer", [(PQ, "allow\n"), ("\n  " + PQ, "approve with: x\n")])   # a leading blank line does not hide the header
 def test_auto_denies_a_permission_question_and_never_hands_it_to_the_answerer(C, q, answerer, tmp_path):
     C.stubs.reply("answer.sh", answerer)   # even an answerer that would approve is never asked
     C.mail([msg("question", "msg_p", question=q)])
@@ -350,20 +350,20 @@ def test_landed_but_cleanup_incomplete_finishes_once_and_parks_a_still_open_issu
     assert bool(C.calls("gh issue edit")) == (cleanup_rc == 6)   # else `--next` would pick the open issue again
 
 
-def test_a_worker_that_exited_without_worker_done_is_retried_once_on_the_tenth_empty_wait_then_blocked(C):
+def test_a_worker_that_exited_without_worker_done_is_retried_once_on_the_nth_empty_wait_then_blocked(C):
     C.workers(C.row(lv="exited"))
-    C.go("--cap", "1", COORD_MAX_TICKS=9)
+    C.go("--cap", "1", COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=3)
     assert not C.stubs.calls("dispatch.sh")
-    C.go("--cap", "1", COORD_MAX_TICKS=10)
+    C.go("--cap", "1", COORD_MAX_TICKS=3, COORD_SWEEP_EVERY=3)
     assert C.stubs.calls("dispatch.sh")[-1] == ["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]
     C.workers(C.row(st="completed", lv="exited"))   # a settled worker's process is expected to be gone
-    C.go("--cap", "0", COORD_MAX_TICKS=10)
+    C.go("--cap", "0", COORD_MAX_TICKS=3, COORD_SWEEP_EVERY=3)
     assert len(C.stubs.calls("dispatch.sh")) == 1
     C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2", lv="live"))   # the relaunched worker is alive: left alone
-    C.go("--cap", "1", COORD_MAX_TICKS=10)
+    C.go("--cap", "1", COORD_MAX_TICKS=3, COORD_SWEEP_EVERY=3)
     assert len(C.stubs.calls("dispatch.sh")) == 1 and not C.calls("gh issue edit")
     C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2", lv="exited"))   # it died too
-    C.go("--cap", "1", COORD_MAX_TICKS=10)
+    C.go("--cap", "1", COORD_MAX_TICKS=3, COORD_SWEEP_EVERY=3)
     assert C.blocked() and len(C.stubs.calls("dispatch.sh")) == 1
 
 

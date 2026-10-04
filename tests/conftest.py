@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 V2 = ROOT / "v2" if (ROOT / "v2").is_dir() else ROOT  # cutover.sh moves v2/* to the root
 # records argv (US-separated) + env; replays <name>.<arg1>_<arg2>.<call#> > <name>.<arg1>_<arg2> > <name>
 STUB = """#!/bin/sh
-n=$(basename "$0"); d=$STUB_DIR; env > "$d/$n.env"
+n=$(basename "$0"); d=$STUB_DIR; [ -n "$STUB_NOENV" ] || env > "$d/$n.env"
 printf '%s' "$n" >> "$d/calls.log"; for a in "$@"; do printf '\\037%s' "$a" >> "$d/calls.log"; done; echo >> "$d/calls.log"
 k="$n.$(echo "$1_$2" | tr -c 'A-Za-z0-9_\\n' _)"; c=$(( $(cat "$d/$k.count" 2>/dev/null || echo 0) + 1 )); echo $c > "$d/$k.count"
 for f in "$d/$k.$c" "$d/$k" "$d/$n"; do [ -f "$f" ] && { cat "$f"; exit "$(cat "$f.rc" 2>/dev/null || echo 0)"; }; done; exit 0
@@ -83,14 +84,27 @@ def git(cwd, *a):
     return subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True, text=True).stdout.strip()
 
 
+@pytest.fixture(scope="session")
+def origin_template(tmp_path_factory):  # one bare origin per xdist worker, with `init` on main; each test gets a copy
+    base = tmp_path_factory.mktemp("origin_template")
+    env = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def sh(*a, cwd=base):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, env=env, check=True, capture_output=True)
+
+    sh("init", "-q", "--bare", "-b", "main", "origin.git")
+    sh("clone", "-q", "origin.git", "seed")
+    (base / "seed" / "README").write_text("x")
+    for a in (["add", "."], ["commit", "-qm", "init"], ["push", "-q", "origin", "main"]):
+        sh(*a, cwd=base / "seed")
+    return base / "origin.git"
+
+
 @pytest.fixture
-def repo(tmp_path):
+def repo(tmp_path, origin_template):
     origin, root = tmp_path / "origin.git", tmp_path / "root"
-    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    shutil.copytree(origin_template, origin)
     subprocess.run(["git", "clone", "-q", str(origin), str(root)], check=True, capture_output=True)
-    (root / "README").write_text("x")
-    for args in (["add", "."], ["commit", "-qm", "init"], ["push", "-q", "origin", "main"]):
-        git(root, *args)
     (root / ".claude" / "hooks").mkdir(parents=True)
     (root / ".claude" / "hooks" / "guard.sh").write_text("#!/bin/sh\n")
 
