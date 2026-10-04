@@ -18,7 +18,14 @@ rm -f .ai-toolkit/setup-done   # first, so a failed re-run never leaves a stale 
 [ -d "$root/.claude" ] || die "$root/.claude is missing: sync ai-toolkit into the main checkout first"
 
 mkdir -p .claude .ai-toolkit
-cp -R "$root/.claude/." .claude/
+if [ "$refresh" = 0 ]; then cp -R "$root/.claude/." .claude/
+else   # a kept worktree: tracked .claude files come from the branch (copying main's would dirty it and clobber the worker's edits)
+  tracked="$(git ls-files .claude)"
+  while IFS= read -r f; do
+    ! printf '%s\n' "$tracked" | grep -qxF -- ".claude/$f" || continue
+    mkdir -p ".claude/$(dirname "$f")"; cp "$root/.claude/$f" ".claude/$f"
+  done < <(cd "$root/.claude" && find . -type f | sed 's|^\./||')
+fi
 
 # Keep the provisioning out of `git status` (info/exclude is shared by all worktrees).
 excl="$(git rev-parse --path-format=absolute --git-path info/exclude)"

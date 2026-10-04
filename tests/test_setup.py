@@ -64,6 +64,15 @@ def test_refresh_recopies_claude_but_keeps_run_id_and_task_md_and_asks_nobody(ru
     assert (wt / ".claude/hooks/guard.sh").read_text() == "#!/bin/sh\nnewer\n" and (wt / ".ai-toolkit/setup-done").exists()
     assert (wt / ".ai-toolkit/spoke-run-id").read_text() == rid and (wt / ".ai-toolkit/task.md").read_text() == "edited by the worker" != task
     assert len(stubs.calls("gh")) + len(stubs.calls("orca")) == calls   # no issue fetch, no orca lookup
+    git(repo.root, "add", "-f", ".claude/hooks/guard.sh")   # the repo tracks part of .claude: a refresh must not dirty or clobber it
+    git(repo.root, "commit", "-qm", "track guard")
+    (wt / ".claude/hooks/guard.sh").unlink()
+    git(wt, "merge", "-q", "main")   # the branch now tracks it too
+    (repo.root / ".claude/hooks/guard.sh").write_text("main moved again\n")
+    (repo.root / ".claude/hooks/extra.sh").write_text("untracked\n")
+    (wt / ".claude/hooks/guard.sh").write_text("worker edit\n")
+    assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0
+    assert (wt / ".claude/hooks/extra.sh").read_text() == "untracked\n" and (wt / ".claude/hooks/guard.sh").read_text() == "worker edit\n"
     shutil.rmtree(repo.root / ".claude")
     r = setup(run, repo, wt=wt, mode=("--refresh",))[1]   # a failed refresh is loud and leaves no ready marker
     assert r.returncode != 0 and ".claude" in r.stderr and not (wt / ".ai-toolkit/setup-done").exists()

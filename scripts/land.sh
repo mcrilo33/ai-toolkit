@@ -12,6 +12,8 @@
 # the landed code. Another repo (no sync sources) is untouched. sync replaces files by rename, so a running coordinator loop keeps its
 # own script intact (old code, consistent) while every script it launches next is the new copy. Workers live at that moment keep the
 # copies they started with; they get the new ones only when re-dispatched (dispatch.sh --address / --retry-of refresh the worktree).
+# A loop keeps its OLD coordinator.sh but calls the NEW dispatch/land/answer/lib: restart it after a land that changed coordinator.sh
+# or lib.sh (or any contract between them), since the loop does not re-exec itself.
 # Exit: 0 landed, 1 error, 2 refused (precondition), 3 review not approved, 4 gate red/timeout, 5 merge conflict,
 #       6 landed but a cleanup step failed, a failed refresh of the installed copies included (main is already pushed; finish by hand,
 #         --cleanup-only retries the refresh too).

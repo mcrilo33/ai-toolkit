@@ -124,6 +124,19 @@ def test_edit_in_source_reaches_target_by_rename_so_a_running_script_is_not_corr
     assert not [p for p in target.rglob("*.new.*")]
 
 
+def test_a_rewrite_keeps_the_destinations_mode_and_writes_through_a_symlink(sync, src, target, tmp_path):
+    sync()
+    (target / "CLAUDE.md").chmod(0o644)   # the source is a 0600 temp file: the existing mode must survive an update
+    real = write(tmp_path / "elsewhere.json", "{}\n")
+    (target / ".claude" / "settings.json").unlink()
+    (target / ".claude" / "settings.json").symlink_to(real)
+    write(src / "shared" / "rules" / "guidelines.md", "---\ndescription: g\n---\n# Changed\n")
+    write(src / "v2" / "settings" / "claude" / "settings.json", '{"hooks": {"x": 1}}\n')
+    sync()
+    assert (target / "CLAUDE.md").read_text() == "# Changed\n" and (target / "CLAUDE.md").stat().st_mode & 0o777 == 0o644
+    assert (target / ".claude" / "settings.json").is_symlink() and real.read_text() == '{"hooks": {"x": 1}}\n'
+
+
 def test_gc_removes_what_a_previous_sync_wrote_and_nothing_else(sync, src, target):
     sync()
     mine = write(target / ".claude" / "skills" / "hub" / "mine.md", "user file")

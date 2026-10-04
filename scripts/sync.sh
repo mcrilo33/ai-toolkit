@@ -22,19 +22,25 @@ done
 git -C "$TARGET" rev-parse --git-dir > /dev/null 2>&1 || die "$TARGET is not a git repository"
 TARGET="$(cd "$TARGET" && pwd)"
 OLD="$TARGET/.ai-toolkit/sync-manifest"
-NEW="$(mktemp)"; TMP="$(mktemp)"
-trap 'rm -f "$NEW" "$TMP"' EXIT
+NEW="$(mktemp)"; TMP="$(mktemp)"; PUT_TMP=""
+trap 'rm -f "$NEW" "$TMP" "$PUT_TMP"' EXIT   # PUT_TMP: a put() cut short must not leave its half-written <dst>.new.<pid> behind
 
 # put <src> <dst-rel> [bak]: copy when different (no mtime churn) and record it. bak = a singleton
 # (CLAUDE.md, settings.json, orca.yaml): an existing file this tool never wrote is kept once as <dst>.bak.
 # The copy is a rename, never an in-place write: land.sh syncs under a live coordinator loop, and bash reads its script by offset,
 # so a truncate+write would corrupt the next line it reads. A renamed-over file leaves the loop's open inode complete (old code, consistent).
+# The new file takes the destination's mode (cp -p of it, then its content) and a symlinked destination is written through, as an in-place cp did.
 put() {
   local d="$TARGET/$2"
   mkdir -p "$(dirname "$d")"
   if ! cmp -s "$1" "$d"; then
     if [ "${3:-}" = bak ] && [ -f "$d" ] && [ ! -e "$d.bak" ] && ! grep -qxF "$2" "$OLD" 2> /dev/null; then cp "$d" "$d.bak"; fi
-    cp "$1" "$d.new.$$" && mv -f "$d.new.$$" "$d" || { rm -f "$d.new.$$"; return 1; }
+    if [ -L "$d" ]; then cp "$1" "$d"
+    else
+      PUT_TMP="$d.new.$$"
+      if [ -f "$d" ]; then cp -p "$d" "$PUT_TMP" && cat "$1" > "$PUT_TMP"; else cp "$1" "$PUT_TMP"; fi && mv -f "$PUT_TMP" "$d" || { rm -f "$PUT_TMP"; return 1; }
+      PUT_TMP=""
+    fi
   fi
   echo "$2" >> "$NEW"
 }
