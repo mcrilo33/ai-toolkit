@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -67,3 +68,14 @@ def test_install_explains_why_jq_is_mandatory(run, tool, tmp_path):
         (bin_ / name).chmod(0o755)
     r = run(["/bin/bash", str(tool / "scripts" / "install.sh")], PATH=str(bin_))
     assert r.returncode != 0 and "jq" in r.stderr and "fail closed" in r.stderr
+
+
+def test_a_test_over_the_time_limit_fails_naming_its_duration(pytester):
+    pytester.makeconftest((Path(__file__).parent / "conftest.py").read_text())
+    pytester.makepyfile("import time\n\n\ndef test_slow():\n    time.sleep(0.6)\n\n\ndef test_fast():\n    pass\n")
+
+    r = pytester.runpytest_inprocess("-o", "test_time_limit=0.3")
+
+    r.assert_outcomes(passed=2, errors=1)
+    r.stdout.re_match_lines([r".*test_slow.* took 0\.[6-9]\d* s \(.*\), limit 0\.3 s"])
+    assert "test_fast" not in r.stdout.str().split("ERRORS")[-1]

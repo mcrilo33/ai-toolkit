@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest_plugins = ["pytester"]  # the time-limit pin runs an inner session
+
 ROOT = Path(__file__).resolve().parent.parent
 V2 = ROOT / "v2" if (ROOT / "v2").is_dir() else ROOT  # cutover.sh moves v2/* to the root
 # records argv (US-separated) + env; replays <name>.<arg1>_<arg2>.<call#> > <name>.<arg1>_<arg2> > <name>
