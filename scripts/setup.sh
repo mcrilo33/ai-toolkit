@@ -28,15 +28,15 @@ else   # a kept worktree: tracked .claude files reach it through git (the branch
   # dirty the tree, clobber the worker's edits, or leave an untracked file that makes that merge fail. Only the untracked synced copies are refreshed.
   [ -n "$synced" ] || die "$manifest lists no .claude/ files (missing, empty or cut short): sync ai-toolkit into the main checkout first"   # never delete against an empty set
   tracked="$(git -c core.quotePath=false ls-files .claude; git -C "$root" -c core.quotePath=false ls-files .claude)"
-  while IFS= read -r p; do
-    case "$p" in .claude/*..*) continue ;; .claude/*) ;; *) continue ;; esac   # the record is data in the worktree: never leave .claude/
-    ! grep -qxF -- "$p" <<< "$synced" && ! grep -qxF -- "$p" <<< "$tracked" || continue
-    rm -f "$p"; rmdir -p "$(dirname "$p")" 2> /dev/null || true
-  done < <(cat "$installed" 2> /dev/null || true)
-  while IFS= read -r p; do
-    [ -n "$p" ] && ! grep -qxF -- "$p" <<< "$tracked" || continue
-    mkdir -p "$(dirname "$p")"; cp -P "$root/$p" "$p"
-  done <<< "$synced"
+  # One pass over the lists (grep -vxFf: the lines of the first not in the second), then one rm and one tar for the whole set, so the
+  # number of processes stays flat as the tree grows.
+  dropped="$(grep '^\.claude/' "$installed" 2> /dev/null | grep -v '\.\.' | grep -vxFf <(printf '%s\n' "$synced" "$tracked") || true)"   # the record is data in the worktree: never leave .claude/
+  if [ -n "$dropped" ]; then
+    tr '\n' '\0' <<< "$dropped" | xargs -0 rm -f --
+    sed 's|/[^/]*$||' <<< "$dropped" | sort -u | tr '\n' '\0' | xargs -0 rmdir -p 2> /dev/null || true
+  fi
+  copy="$(grep -vxFf <(printf '%s\n' "$tracked") <<< "$synced" || true)"
+  [ -z "$copy" ] || printf '%s\n' "$copy" | tar -C "$root" -cf - -T - | tar -xf -   # symlinks stay symlinks
 fi
 printf '%s\n' "$synced" > "$installed"
 
