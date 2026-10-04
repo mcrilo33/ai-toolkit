@@ -137,7 +137,7 @@ redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds 
 }
 
 drain_replies() {   # send the queued human replies as the bound consumer. Dropped: a malformed body, a question seen answered, or (page not full)
-  local f id body q pend   # unknown. Kept and retried: a failed send, or an id the full inbox page does not show (it may be older than the page)
+  local f id body q pend kind   # unknown. Kept and retried: a failed send, or an id the full inbox page does not show (it may be older than the page)
   ls "$sd/replies"/* > /dev/null 2>&1 || return 0
   pend="$(pending)" || return 0
   for f in "$sd/replies"/*; do
@@ -162,23 +162,24 @@ drain_replies() {   # send the queued human replies as the bound consumer. Dropp
     rm -f "$f"
   done
 }
-on_permission() {   # $1 message id, $2 question: a worker's tool-permission prompt. Never answer.sh and never an allow: auto denies it, a human answers allow|deny.
-  local tool; tool="$(tool_of "$2")"   # Issue comments name the tool and the answer only, never the command or content (it can hold secrets).
+on_permission() {   # $1 message id, $2 question, $3 dispatch id: a worker's tool-permission prompt. Never answer.sh and never an allow: auto denies it, a human answers allow|deny.
+  local tool known=1; tool="$(tool_of "$2")"   # Issue comments name the tool and the answer only, never the command or content (it can hold secrets).
+  ctx "$3" || known=0   # the deny needs no issue: a worker the loop cannot resolve is still denied at once, not left to the relay's timeout
   if [ "$answer" = auto ] && orca_mutate orchestration reply --run "$run" --from "$H" --id "$1" --body deny > /dev/null; then
-    log "#$issue permission denied (tool: $tool): an unattended run never approves one"
-    comment "$issue" "Permission denied (tool: $tool): an unattended run never approves a permission prompt; the worker reports it in worker_done."
-    notify "#$issue: permission request for $tool denied (unattended)"
+    log "permission denied (tool: $tool, message $1): an unattended run never approves one"
+    [ "$known" = 0 ] || comment "$issue" "Permission denied (tool: $tool): an unattended run never approves a permission prompt; the worker reports it in worker_done."
+    notify "permission request for $tool denied (unattended)"
   else   # human mode, or the deny could not be sent (the worker's relay denies on its own timeout): the human decides, nothing waits
     yield
-    comment "$issue" "A permission request needs a human (message $1, tool: $tool). Reply from any terminal: $(replycmd "$1" allow)   (or deny)"
-    show_q "$2" 300; notify "#$issue: permission request waiting: $(replycmd "$1" allow)"; gate_flag "$wtp" "$1" "$2" allow
+    [ "$known" = 0 ] || comment "$issue" "A permission request needs a human (message $1, tool: $tool). Reply from any terminal: $(replycmd "$1" allow)   (or deny)"
+    show_q "$2" 300; notify "permission request waiting: $(replycmd "$1" allow)"; [ "$known" = 0 ] || gate_flag "$wtp" "$1" "$2" allow
   fi
 }
 on_question() {
   local id q ans body warns
   id="$(jq -r .id <<< "$1")"; q="$(question_of "$1")"
+  if is_perm "$q"; then on_permission "$id" "$q" "$(pj "$1" dispatchId)"; return 0; fi
   ctx "$(pj "$1" dispatchId)" || { notify "gate question $id comes from an unknown worker: reply by hand"; return 1; }
-  if is_perm "$q"; then on_permission "$id" "$q"; return 0; fi
   if [ "$answer" = auto ] && ans="$(printf '%s' "$q" | "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"

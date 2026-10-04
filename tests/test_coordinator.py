@@ -152,6 +152,13 @@ def test_auto_whose_deny_cannot_be_sent_falls_back_to_the_human_never_to_an_allo
     assert REPLY_P in C.calls("gh issue comment")[0][-1] and all(arg(a, "--body") == "deny" for a in C.calls("orca orchestration reply"))
 
 
+def test_auto_denies_a_permission_question_from_a_worker_it_cannot_resolve_without_waiting_for_the_relay_timeout(C):
+    C.stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": []}}))   # no row for the dispatch: ctx fails
+    C.mail([msg("question", "msg_p", question=PQ)])
+    assert C.go("--answer", "auto").returncode == 0 and not C.stubs.calls("answer.sh")
+    assert [arg(a, "--body") for a in C.calls("orca orchestration reply")] == ["deny"] and not C.calls("gh issue comment")   # nothing to comment on, still denied
+
+
 def test_human_mode_leaves_a_permission_question_open_with_an_allow_or_deny_reply_command(C):
     C.mail([msg("question", "msg_p", question=PQ)])
     assert C.go("--answer", "human").returncode == 0

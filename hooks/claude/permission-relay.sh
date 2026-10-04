@@ -22,7 +22,7 @@ q="$(jq -r --arg root "$root" --arg issue "${issue:-unknown}" --arg reason "$rea
   def show: tostring | if length > $cap then .[:$cap] + "\n[truncated: \(length) chars in all]" else . end;
   "PERMISSION REQUEST (not a plan gate: reply allow or deny)", "issue: \($issue)", "worktree: \($root)", "tool: \(.tool_name)", "cwd: \(.cwd // "?")",
   "mode: \(.permission_mode // "?")", "reason: \($reason)",
-  (.tool_input // {} | if type == "object" then to_entries[] else {key: "input", value: .} end | "\(.key):", (.value | if type == "string" then . else tojson end | show | split("\n") | map("  " + .) | join("\n")))' <<< "$in")"
+  (.tool_input // {} | if type == "object" then to_entries[] else {key: "input", value: .} end | "\(.key | gsub("\n"; " ")):", (.value | if type == "string" then . else tojson end | show | split("\n") | map("  " + .) | join("\n")))' <<< "$in")"
 o="$(mktemp)"; orca orchestration ask --from "$h" --question "$q" --options allow,deny --timeout-ms "${PERMISSION_RELAY_ASK_MS:-540000}" > "$o" 2> /dev/null & p=$!
 { sleep "${PERMISSION_RELAY_KILL_S:-570}" && touch "$o.killed" && kill -9 $p; } > /dev/null 2>&1 & w=$!   # && : a sleep killed on the normal path must not go on to kill
 rc=0; wait $p 2> /dev/null || rc=$?; pkill -P $w 2> /dev/null || :; kill $w 2> /dev/null || :; wait $w 2> /dev/null || :
