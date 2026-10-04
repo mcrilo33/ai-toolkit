@@ -4,13 +4,11 @@
 # this deny-list is the brake: rm -r outside the worktree, git reset --hard in the main checkout, writes to orca.yaml,
 # ~/.claude/settings.json and, in a spoke, the project .claude/{settings*.json,hooks/}; AskUserQuestion in a spoke.
 # Exit 2 + stderr = deny; a crash (bad JSON, no jq) is exit 2 too (fail-closed). A pattern list, not a sandbox.
-# Writes to .github/workflows/ ASK instead (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode)
-# when a human attends, and are denied like the rest when nobody does. Attended = outside a spoke (no Run), or in a spoke when the
-# terminal holding its Run is a Claude session. Read from Orca: worker-list (this terminal's dispatched row -> Run), run-show
-# (-> holder terminal), terminal show (-> agentIdentity claude AND a string title that is no bare shell name, empty, or the skill's `coordinator`). The loop
-# terminal reports claude too (sticky once a headless `claude -p` child ran) but Orca titles it by its foreground process, `bash`; a session's
-# title is a topic or a path. Anything else (a missing handle or title, orca failing or timing out, an unreadable answer) is unattended: deny. The ask is
-# emitted last, so a deny in a compound still wins.
+# Writes to .github/workflows/ ASK instead (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode): outside a spoke the
+# human's own prompt, in a spoke only when the permission-relay hook is installed and registered (it then puts the question to the Run: the user
+# answers an attended one, the auto loop denies it), else denied like the rest since a local ask nobody sees would hang. The ask's reason is recorded
+# for the relay to join (.ai-toolkit/ask-reasons/<sha256 of tool+input>, the one thing a PermissionRequest payload lacks). The ask is emitted last, so
+# a deny in a compound still wins.
 set -Eeuo pipefail
 deny() { echo "danger-guard: blocked: $*" >&2; exit 2; }
 trap 'deny "cannot parse the tool payload (fail-closed)"' ERR
@@ -18,25 +16,17 @@ set -f; shopt -s nocasematch # macOS is case-insensitive: RM, ORCA.YAML and .Git
 in="$(cat)"
 j() { jq -r "$1 // empty" <<<"$in"; }
 phys() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
-orc() { # `orca ...` stdout (empty on any failure), killed after 5s: a hung CLI must deny, not time the hook out into an allow
-  local o p w; o="$(mktemp)"; orca "$@" > "$o" 2> /dev/null & p=$!; { sleep 5; kill -9 $p; } > /dev/null 2>&1 & w=$!
-  if wait $p 2> /dev/null; then cat "$o"; fi; kill $w 2> /dev/null; wait $w 2> /dev/null; rm -f "$o"; return 0
-}
-attended() { # 0 = a human attends (outside a spoke, or a Claude session holds the spoke's Run); every unreadable answer is empty
-  [ -n "$spoke" ] || return 0
-  local h="${ORCA_TERMINAL_HANDLE:-}" run holder
-  [ -n "$h" ] || return 1
-  run="$(orc orchestration worker-list --json --limit 100 | jq -r --arg h "$h" '[.result.workers[] | select(.agentTerminalHandle == $h and .dispatchStatus == "dispatched")][0].runId // empty' 2> /dev/null || :)"
-  [ -n "$run" ] || return 1
-  holder="$(orc orchestration run-show --id "$run" --json | jq -r '.result.run.coordinator_handle // empty' 2> /dev/null || :)"
-  [ -n "$holder" ] || return 1
-  [ "$(orc terminal show --terminal "$holder" --json | jq -r '.result.terminal | select(.agentIdentity == "claude" and (.title | type) == "string" and (.title | test("^(-?(ba|z|da|k|fi|t?c)?sh|coordinator)?$") | not)) | "session"' 2> /dev/null || :)" = session ]
+relay_ready() { [ -f "$root/.claude/hooks/permission-relay.sh" ] && grep -q 'hooks/permission-relay.sh' "$root/.claude/settings.json" 2> /dev/null; }
+record_reason() { # $1 = why, for the relay: one single-use file per tool+input, first line the epoch
+  local d="$root/.ai-toolkit/ask-reasons" k; k="$(jq -cS '[.tool_name,.tool_input]' <<<"$in" | shasum -a 256 | cut -d' ' -f1)"
+  (umask 077; mkdir -p "$d"; printf '%s\n%s\n' "$(date +%s)" "$1" > "$d/$k")
 }
 wf=""; wfd="write to a protected path (.github/workflows, orca.yaml, claude settings/hooks)" # a .github/workflows/ write (what, deny text), settled by finish()
 finish() {
   [ -n "$wf" ] || exit 0
-  if attended; then jq -nc --arg r "danger-guard: write to .github/workflows needs your approval: $wf" \
-    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: $r}}'; exit 0; fi
+  if [ -z "$spoke" ] || relay_ready; then local r="danger-guard: write to .github/workflows needs your approval: $wf"
+    [ -z "$spoke" ] || record_reason "$r"
+    jq -nc --arg r "$r" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: $r}}'; exit 0; fi
   deny "$wfd"
 }
 cwd="$(j .cwd)"; cwd="${cwd:-$PWD}" # root = the project dir, not the cwd: a `cd` out of the repo must not move it
