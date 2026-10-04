@@ -3,7 +3,7 @@
 # (wait-for-setup), so a non-zero exit keeps the agent off a half-provisioned tree. Idempotent.
 # Orca env: ORCA_ROOT_PATH (main checkout), ORCA_WORKTREE_PATH. Claude Code only (D4).
 # --refresh: the same provisioning for a KEPT worktree (dispatch.sh --address / --retry-of), minus task.md: the main checkout's current
-# .claude/ and setup.local.sh output land again, spoke-run-id stays, and the task text is left as the worker found it.
+# .claude/ synced files (and the removal of those main dropped) and setup.local.sh output land again, spoke-run-id stays, and the task text is left as the worker found it.
 set -euo pipefail
 refresh=0
 case "${1:-}" in '') ;; --refresh) refresh=1 ;; *) echo "usage: setup.sh [--refresh]" >&2; exit 2 ;; esac
@@ -18,15 +18,28 @@ rm -f .ai-toolkit/setup-done   # first, so a failed re-run never leaves a stale 
 [ -d "$root/.claude" ] || die "$root/.claude is missing: sync ai-toolkit into the main checkout first"
 
 mkdir -p .claude .ai-toolkit
+# The synced set is the .claude/ files sync installed in main (its manifest is the source of truth); everything else under .claude/ is local.
+# The worktree records the set it was given, so the next refresh removes what main's sync has dropped since.
+manifest="$root/.ai-toolkit/sync-manifest"
+installed=.ai-toolkit/synced-claude
+synced="$(grep '^\.claude/' "$manifest" 2> /dev/null | grep -v '\.\.' || true)"
 if [ "$refresh" = 0 ]; then cp -R "$root/.claude/." .claude/
 else   # a kept worktree: tracked .claude files reach it through git (the branch's own, and main's via land's merge); copying them would
-  # dirty the tree, clobber the worker's edits, or leave an untracked file that makes that merge fail. Only the untracked copies are refreshed.
+  # dirty the tree, clobber the worker's edits, or leave an untracked file that makes that merge fail. Only the untracked synced copies are refreshed.
+  [ -n "$synced" ] || die "$manifest lists no .claude/ files (missing, empty or cut short): sync ai-toolkit into the main checkout first"   # never delete against an empty set
   tracked="$(git -c core.quotePath=false ls-files .claude; git -C "$root" -c core.quotePath=false ls-files .claude)"
-  while IFS= read -r f; do
-    ! grep -qxF -- ".claude/$f" <<< "$tracked" || continue
-    mkdir -p ".claude/$(dirname "$f")"; cp -P "$root/.claude/$f" ".claude/$f"
-  done < <(cd "$root/.claude" && find . \( -type f -o -type l \) | sed 's|^\./||')
+  # One pass over the lists (grep -vxFf: the lines of the first not in the second), then one rm and one tar for the whole set, so the
+  # number of processes stays flat as the tree grows.
+  dropped="$(grep '^\.claude/' "$installed" 2> /dev/null | grep -v '\.\.' | grep -vxFf <(printf '%s\n' "$synced" "$tracked") || true)"   # the record is data in the worktree: never leave .claude/
+  if [ -n "$dropped" ]; then
+    tr '\n' '\0' <<< "$dropped" | xargs -0 rm -f --
+    # shellcheck disable=SC2001  # ${var//} anchors on the whole multi-line string, not each line's last component; one sed covers the list
+    sed 's|/[^/]*$||' <<< "$dropped" | sort -u | tr '\n' '\0' | xargs -0 rmdir -p 2> /dev/null || true
+  fi
+  copy="$(grep -vxFf <(printf '%s\n' "$tracked") <<< "$synced" || true)"
+  [ -z "$copy" ] || printf '%s\n' "$copy" | tar -C "$root" -cf - -T - | tar -xf -   # symlinks stay symlinks
 fi
+printf '%s\n' "$synced" > "$installed"
 
 # Keep the provisioning out of `git status` (info/exclude is shared by all worktrees).
 excl="$(git rev-parse --path-format=absolute --git-path info/exclude)"

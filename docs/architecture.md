@@ -48,10 +48,13 @@ orca.yaml                  Orca hooks of THIS repo (setup/archive); a synced tar
 7. **Gate on tests.** `land.sh`: CI must be green for the EXACT tip (`gh run list --commit <sha>`); if the base moved, merge it on the spoke, push,
    gate again. `LOCAL_GATE=1` runs `CHECK_CMD` in the spoke instead (repos without CI).
 8. **Land.** fast-forward the main checkout to the gated tip, push, `gh issue close -c "landed in <sha>"`, delete the remote branch (lease-guarded),
-   `worker-release` every dispatch, `worktree rm --run-hooks`.
+   `worker-release` every dispatch, `worktree rm --run-hooks`. In the toolkit's own checkout the cleanup first re-runs `sync.sh` on it, so the toolkit's self-sync is automatic after a land;
+   a running loop keeps its own `coordinator.sh` until it is restarted (sync replaces files by rename).
 9. **Rounds.** A rejected review (max 2 rounds), red CI or a merge conflict (1 round) goes back to the worker as a fresh dispatch whose spec starts with
    `address:`. Still failing, a timeout, a `failed` completion or an escalation: label `blocked` + comment + the Orca surfaces (worktree comment, terminal bell), the worker is released,
    the **worktree is kept** for the human.
+   `dispatch.sh --address` / `--retry-of` refresh the kept worktree's installed copies first (`setup.sh --refresh`, output to stderr): the synced `.claude/` set listed in main's `sync-manifest`
+   is copied, what main's sync has dropped since is removed, and files outside that set (`settings.local.json`, locks, anything the worker made) are left alone.
 
 ## Two modes, one switch
 
@@ -153,7 +156,7 @@ or re-bind after a restart: everything else is re-derived from `worker-list`, `w
 - **`blocked` issue.** Read the comment, then fix by hand in the kept worktree (`orca worktree show --worktree issue:<n>`), push, and `land.sh <n>`; or remove the label
   after fixing the cause and `dispatch.sh <n>` again; or `orca worktree rm --worktree issue:<n> --force --run-hooks`.
 - **`land.sh` exit codes.** 0 landed, 2 refused (precondition), 3 review no, 4 gate red/timeout, 5 merge conflict, 6 landed but cleanup incomplete (main is pushed:
-  finish with `land.sh --cleanup-only <n>`, never land again).
+  finish with `land.sh --cleanup-only <n>`, never land again; it also covers a failed refresh of the toolkit's installed copies: run `scripts/sync.sh .` in the main checkout).
 - **Restart / stop.** `coordinator.sh --stop --run <run-id>` from any Orca terminal (or `/coordinate attended`), or Ctrl-C in its terminal; start again with `--run <run-id>` (it takes the Run over).
 - **Dispatch failure.** `dispatch.sh` can leave a half-made worktree: the coordinator removes it and labels the issue `blocked`.
 

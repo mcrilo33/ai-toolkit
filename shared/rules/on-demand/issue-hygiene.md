@@ -107,6 +107,16 @@ Guardrails:
   umbrella) so future work touches disjoint files — converting chains into real
   parallelism instead of managing them.
 
+## Independent file groups: split
+
+**Split what does not collide.** When a task's work falls into groups of files that do
+not depend on one another, file one issue per group, each with its own disjoint
+`Scope:`, so the dispatcher can run them in parallel and a rejected review on one does
+not hold the others. Split only on a real file boundary: parts that edit the same file,
+or where one needs the other's result, stay one issue (ordered subtasks, or a
+blocked-by edge). Do not split a small task: each issue pays a full cycle. Say in each
+issue which sibling issues it was split from.
+
 ## Declared as a checked step at creation
 
 Answering "does this depend on open work?" is a **checked step** of issue creation — the
