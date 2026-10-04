@@ -26,7 +26,7 @@ synced="$(grep '^\.claude/' "$manifest" 2> /dev/null | grep -v '\.\.' || true)"
 if [ "$refresh" = 0 ]; then cp -R "$root/.claude/." .claude/
 else   # a kept worktree: tracked .claude files reach it through git (the branch's own, and main's via land's merge); copying them would
   # dirty the tree, clobber the worker's edits, or leave an untracked file that makes that merge fail. Only the untracked synced copies are refreshed.
-  [ -f "$manifest" ] || die "$manifest is missing: sync ai-toolkit into the main checkout first"
+  [ -n "$synced" ] || die "$manifest lists no .claude/ files (missing, empty or cut short): sync ai-toolkit into the main checkout first"   # never delete against an empty set
   tracked="$(git -c core.quotePath=false ls-files .claude; git -C "$root" -c core.quotePath=false ls-files .claude)"
   while IFS= read -r p; do
     case "$p" in .claude/*..*) continue ;; .claude/*) ;; *) continue ;; esac   # the record is data in the worktree: never leave .claude/

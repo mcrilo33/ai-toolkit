@@ -96,6 +96,14 @@ def test_refresh_recopies_claude_but_keeps_run_id_and_task_md_and_asks_nobody(ru
     git(repo.root, "commit", "-qm", "main starts tracking a rule")
     assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0
     git(wt, "merge", "-q", "--no-edit", "main")   # land's merge of main must not trip over an untracked copy of what main tracks
+    (wt / "escape").write_text("outside .claude\n")
+    with (wt / ".ai-toolkit/synced-claude").open("a") as f:
+        f.write(".claude/../escape\n")   # a record entry that climbs out of .claude/ is never deleted
+    assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0 and (wt / "escape").exists()
+    for cut in (None, ""):   # a missing or empty manifest is a failed refresh, not a licence to delete every recorded copy
+        manifest.unlink(missing_ok=True) if cut is None else manifest.write_text(cut)
+        r = setup(run, repo, wt=wt, mode=("--refresh",))[1]
+        assert r.returncode != 0 and "manifest" in r.stderr and (wt / ".claude/hooks/extra.sh").exists() and not (wt / ".ai-toolkit/setup-done").exists()
     shutil.rmtree(repo.root / ".claude")
     r = setup(run, repo, wt=wt, mode=("--refresh",))[1]   # a failed refresh is loud and leaves no ready marker
     assert r.returncode != 0 and ".claude" in r.stderr and not (wt / ".ai-toolkit/setup-done").exists()
