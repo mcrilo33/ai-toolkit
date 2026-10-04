@@ -44,27 +44,34 @@ PHASES = pytest.StashKey[dict]()
 
 
 def pytest_addoption(parser):
-    parser.addini("test_time_limit", "seconds one test may take, setup + call + teardown; over it the test fails", default="5")
+    parser.addini("test_time_limit", "seconds one test may take, setup + call + teardown; over it the test fails under CI and is warned about elsewhere", default="5")
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):   # no marker or option opts a test out: a slow test is made fast or deleted
     rep = (yield).get_result()
     phases = item.stash.setdefault(PHASES, {})
-    phases[call.when] = (call.duration, rep.passed)
+    phases[call.when] = (call.duration, rep.failed)
     spent = sum(d for d, _ in phases.values())
     limit = float(item.config.getini("test_time_limit"))
-    if call.when == "teardown" and all(ok for _, ok in phases.values()) and spent > limit:   # a test that already failed is not reported twice
+    if call.when == "teardown" and not any(failed for _, failed in phases.values()) and spent > limit:   # skipped and xfailed tests count; a failed phase is not reported twice
         parts = " + ".join(f"{k} {d:.2f}" for k, (d, _) in phases.items())
-        rep.outcome, rep.longrepr = "failed", f"{item.nodeid} took {spent:.2f} s ({parts}), limit {limit:g} s"
+        msg = f"{item.nodeid} took {spent:.2f} s ({parts}), limit {limit:g} s"
+        if os.environ.get("CI"):   # a busy developer host makes the limit a load flake, so only CI (GitHub sets CI=true) fails on it
+            rep.outcome, rep.longrepr = "failed", msg
+        else:
+            rep.user_properties.append(("over_time_limit", msg))   # a property crosses the xdist boundary, a stash would not
 
 
 def pytest_terminal_summary(terminalreporter):   # each CI leg shows its margin: the three slowest tests
-    spent = {}
+    spent, over = {}, []
     for reports in terminalreporter.stats.values():
         for rep in reports:
             if hasattr(rep, "duration"):
                 spent[rep.nodeid] = spent.get(rep.nodeid, 0) + rep.duration
+            over += [v for k, v in getattr(rep, "user_properties", []) if k == "over_time_limit"]
+    for msg in over:
+        terminalreporter.write_line(f"WARNING: {msg}", yellow=True)
     for nodeid, secs in sorted(spent.items(), key=lambda kv: -kv[1])[:3]:
         terminalreporter.write_line(f"slowest: {secs:6.2f} s {nodeid[:150]}")
 

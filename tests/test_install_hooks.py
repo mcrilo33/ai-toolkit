@@ -69,11 +69,15 @@ def test_install_explains_why_jq_is_mandatory(run, tool, tmp_path, link_script):
     assert r.returncode != 0 and "jq" in r.stderr and "fail closed" in r.stderr
 
 
-def test_a_test_over_the_time_limit_fails_naming_its_duration(pytester):
+@pytest.mark.parametrize("ci,errors", [("true", 2), ("", 0)])
+def test_a_test_over_the_time_limit_fails_under_ci_and_only_warns_elsewhere(pytester, monkeypatch, ci, errors):
+    monkeypatch.setenv("CI", ci)
     pytester.makeconftest((Path(__file__).parent / "conftest.py").read_text())
-    pytester.makepyfile("import time\n\n\ndef test_slow():\n    time.sleep(0.3)\n")
+    pytester.makepyfile(
+        "import time\nimport pytest\n\n\ndef test_slow():\n    time.sleep(0.3)\n\n\n"
+        "def test_slow_skipped():\n    time.sleep(0.3)\n    pytest.skip('x')\n")
 
     r = pytester.runpytest_inprocess("-o", "test_time_limit=0.2")
 
-    r.assert_outcomes(passed=1, errors=1)   # the call passed; the limit fails the test at its teardown
-    r.stdout.re_match_lines([r".*test_slow took (0\.[3-9]\d*|[1-9]\d*\.\d+) s \(.*\), limit 0\.2 s"])
+    r.assert_outcomes(passed=1, skipped=1, errors=errors)   # under CI the limit fails each test at its teardown, a skipped one included
+    r.stdout.re_match_lines([r".*test_slow took (0\.[3-9]\d*|[1-9]\d*\.\d+) s \(.*\), limit 0\.2 s", r".*test_slow_skipped took (0\.[3-9]\d*|[1-9]\d*\.\d+) s \(.*\), limit 0\.2 s"])
