@@ -374,7 +374,12 @@ JUDGE_ROWS = [(RELAYED, reply, env, want) for reply, env, want in [
       (NO_RELAY, "VERDICT: EXECUTES", {}, "deny"), (NO_RELAY, "", KILL, "deny")]  # an outage is never deny-everything: it is the old decision, per scenario
 
 
-@pytest.mark.parametrize("rows", [[r for r in JUDGE_ROWS if r[3] == "allow"], [r for r in JUDGE_ROWS if r[3] != "allow"]], ids=["clears", "falls-back"])
+CLEARS, FALLS_BACK = [r for r in JUDGE_ROWS if r[3] == "allow"], [r for r in JUDGE_ROWS if r[3] != "allow"]
+# a few judge calls per test: each spawns the hook, so one test over every row outruns the per-test time limit on a loaded runner
+JUDGE_CHUNKS = [CLEARS[i:i + 3] for i in range(0, len(CLEARS), 3)] + [FALLS_BACK[i:i + 4] for i in range(0, len(FALLS_BACK), 4)]
+
+
+@pytest.mark.parametrize("rows", JUDGE_CHUNKS, ids=[f"rows-{i}" for i in range(len(JUDGE_CHUNKS))])
 def test_danger_guard_judge_clears_only_the_exact_data_verdict_and_anything_else_is_todays_decision(judge, rows):
     for scenario, reply, env, want in rows:
         j = judge(scenario, "Bash", FLAG, reply, env)
