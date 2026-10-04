@@ -20,7 +20,7 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 - State your assumptions explicitly before acting on them
 
 ### Clarification
-- If something is unclear, stop. Name what's confusing. Ask.
+- If something is unclear and no sensible default settles it, stop. Name what's confusing. Ask.
 - If multiple interpretations exist, present them — don't pick silently
 - If a simpler approach exists, say so. Push back when warranted.
 - Prefer option-based clarification: propose a short bulleted list (2–5 items) of alternatives
@@ -43,7 +43,7 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 - Do not generate placeholder, stub, or incomplete implementations
 - Do not modify, refactor, or remove code unrelated to the task — see `code-quality` (Surgical Changes) for the binding rule
 - Do not remove or modify existing functionality unless explicitly asked
-- Do not make assumptions about missing context — ask instead
+- Do not make assumptions about missing context — ask instead, unless a sensible default settles it
 - Do not hallucinate APIs, functions, imports, signatures, or parameters — verify before use (mechanics in `code-quality` → External API Verification; `library-research` for fetching docs)
 
 ### Tool Unavailability
