@@ -7,7 +7,8 @@
 # rm -r outside the worktree, of its root or home, of another git checkout, or with an unexpanded variable; git reset --hard in the main checkout (or
 # with --git-dir/--work-tree); git clean -x and git stash -a. Someone can answer when there is no worker marker (the human's own prompt) or when a worker
 # has the permission-relay hook installed and registered (it puts the question to the Run: the user answers an attended one, the auto loop denies it);
-# else the ask is denied like a hard deny, since a local ask nobody sees would hang. The reason is recorded for the relay to join
+# else the ask is denied like a hard deny, since a local ask nobody sees would hang. Before either, a Bash hit goes to judge.sh (a ~4 s model call, so the regex stays the fast
+# first stage): it clears a command that only MENTIONS the operation (a message, a pattern), logging it to ~/.ai-toolkit/judge-cleared.log; any doubt or error is today's ask. The reason is recorded for the relay to join
 # (.ai-toolkit/ask-reasons/<sha256 of tool+input>, the one thing a PermissionRequest payload lacks).
 # Always denied (exit 2 + stderr), never asked: AskUserQuestion in a worker (not a permission: it has the Run's ask), a write to the human's reply spool
 # ~/.ai-toolkit/coordinator/ in a worker (an approved write would forge the human's reply), and an unparsable payload (bad JSON, no jq: fail-closed).
@@ -26,8 +27,11 @@ record_reason() { # $1 = why, for the relay: one single-use file per tool+input,
 }
 m="" # the sensitive findings of this call, settled by finish()
 sens() { local t="${*//$'\n'/ }"; case "; $m; " in *"; $t; "*) return 0;; esac; m="${m:+$m; }$t"; } # once each: the guard scans a command twice
+clip() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-200; } # one capped line, no control bytes
+audit() { (umask 077; mkdir -p "$home/.ai-toolkit" && [ ! -L "$home/.ai-toolkit/judge-cleared.log" ] && printf '%s\t%s\t%s\t%s\n' "$(date +%s)" Bash "$(clip "$m")" "$(clip "$1")" >> "$home/.ai-toolkit/judge-cleared.log") 2> /dev/null; } # no trace, no clear
 finish() {
   [ -n "$m" ] || exit 0
+  if [ -n "${cmd:-}" ] && why="$(printf '%s' "$cmd" | bash "$(dirname "$0")/judge.sh" "$cwd" "$root" "$m" 2> /dev/null)" && [ -n "$why" ] && audit "$why"; then exit 0; fi # the judge cleared a command that only mentions it
   if [ -z "$spoke" ] || relay_ready; then local r="danger-guard: needs your approval: $m"
     [ -z "$spoke" ] || record_reason "$r"
     jq -nc --arg r "$r" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: $r}}'; exit 0; fi
