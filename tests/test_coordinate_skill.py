@@ -19,7 +19,7 @@ def section(title):
 
 
 def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
-    assert SKILL and len(SKILL.splitlines()) <= 120
+    assert SKILL and len(SKILL.splitlines()) <= 130
     head = SKILL.split("\n---\n")[0]
     assert head.startswith("---\nname: coordinate\n") and "\ndescription: \"" in head and "argument-hint:" in head
 
@@ -28,7 +28,8 @@ def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
     "orca orchestration run-use --id", "orca orchestration run-create", "--from $H", "check --run", "--ack", "reply --run", "--id <message-id>",
     '"approve"', '"approve with: ', '"revise: ', "land.sh --review", "dispatch.sh --address", "dispatch.sh --next", "coordinator.sh --status",
     "/coordinate auto", "--answer auto", "--until HH:MM", "--drain", "/coordinate attended", "coordinator.sh --stop --run", "You have", "heartbeat",
-    "land.sh --cleanup-only", "worker-release", "blocked", "thread_id", "a land is in flight"])
+    "land.sh --cleanup-only", "worker-release", "blocked", "thread_id", "a land is in flight", "PERMISSION REQUEST", '--body "allow"', '--body "deny"',
+    "Permission answered by the user"])
 def test_the_skill_covers_each_mechanic_of_the_brief(needle):
     assert needle in SKILL
 
@@ -50,6 +51,20 @@ def test_a_question_is_turned_into_exactly_one_of_three_replies_and_never_a_blin
     assert q.count('--body "approve"') + q.count('"approve with: ') + q.count('"revise: ') >= 3 and "afk-answering" in q and re.search(r"never .*approve|unless the user", q, re.I)
 
 
+def test_a_permission_question_is_shown_to_the_user_answered_only_with_their_decision_and_commented_without_the_command():
+    q = section("On each message")
+    p = q[q.index("PERMISSION REQUEST"):]
+    p = p[:p.index("**`worker_done` succeeded**")]   # that question type's paragraph
+    assert "not a plan gate" in p and "allow" in p and "deny" in p and re.search(r"never .*without the user", p, re.I | re.S)
+    assert re.search(r"tool and the (answer|decision) only|never the command", p, re.I) and "stale" in p and "afk-answering" not in p
+
+
+def test_the_answerer_rule_and_the_planning_rule_say_a_permission_question_is_never_auto_approved():
+    afk, hub = (SHARED / "rules/on-demand/afk-answering.md").read_text(), (SHARED / "rules/on-demand/planning-hub.md").read_text()
+    assert "PERMISSION REQUEST" in afk and re.search(r"never .*(approv|allow)", afk, re.I) and "deny" in afk
+    assert "permission" in hub.lower() and "relay" in hub.lower()
+
+
 def test_the_switch_never_reads_state_files_for_the_summary():
     summary = section("`/coordinate attended`")
     assert all(w in summary for w in ("gh ", "git log", "orca orchestration inbox", "orca worktree"))
@@ -65,6 +80,7 @@ def test_afk_and_hub_point_at_coordinate_instead_of_duplicating_it():
 def test_the_architecture_doc_describes_both_modes_the_switch_and_the_attended_flow():
     doc = next(p for p in (ROOT / "docs/architecture.md", ROOT / "docs/v2/architecture.md") if p.exists()).read_text()  # before/after cutover
     assert all(w in doc for w in ("/coordinate", "attended", "--stop", "taken back", "```mermaid"))
+    assert all(w in doc for w in ("PermissionRequest", "permission-relay.sh", "PERMISSION REQUEST", "fail-closed", "allow"))  # the permission relay and how it fails
 
 
 def test_between_stop_and_its_exit_the_session_handles_nothing():

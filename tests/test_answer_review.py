@@ -33,6 +33,12 @@ def A(stubs, tmp_path):
     return type("A", (), {"go": staticmethod(go), "wt": wt, "rule": rule, "stubs": stubs, "stdin": staticmethod(stdin)})
 
 
+@pytest.mark.parametrize("q", ["PERMISSION REQUEST (not a plan gate: reply allow or deny)\ntool: Bash\ncommand:\n  ls\n", "\n  PERMISSION REQUEST\ntool: Write"])
+def test_answer_never_answers_a_permission_question_even_when_claude_would_approve(A, q):
+    r = A.go("EVIDENCE: fine\nANSWER: approve\n", input=q)   # the auto loop denies these itself; this is the backstop if one is ever piped here
+    assert r.returncode == 1 and r.stdout == "" and "permission" in r.stderr.lower() and not A.stubs.calls("claude")
+
+
 def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_question(A):
     r = A.go("thinking...\nREVERSIBILITY: reversible\nANSWER:   Approve  \n", input="PLAN: do X. Approve?", ANSWER_MODEL="m-1")
     assert r.returncode == 0 and r.stdout == "approve\n", r.stderr
