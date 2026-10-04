@@ -76,13 +76,14 @@ PUSH_DENY = [
         "git --git-dir /nonexistent push -f", "git -C {root} push",  # another repo's options
         "git checkout main", "git switch main",  # leaves the spoke branch
         "bash -c'git push -f'", "echo $(git push -f)", "git push origin main>/dev/null",  # the quote pass and the separators it splits on
-        "git --namespace foo push -f", "git --work-tree /x push origin main",  # more global options
+        "git --namespace foo push -f", "git --work-tree /x push origin main", "git --no-pager push -f",  # more global options, flag-only ones included
+        "git commit --no-verify -m x", "git commit -an -m x", "git push --repo=origin main",  # --no-verify on any subcommand, n inside a flag cluster, the remote given as a flag
     ]
 ] + [("root", c) for c in ["git push", "git push origin", "git push -u origin main"]]
 PUSH_ALLOW = [
     ("wt", c) for c in [
         "git push -u origin 2-y", "git push origin mainline", "git push origin feature-main", 'git commit -m "feat: running tests #1"',
-        "git commit -am wip", "git checkout -b new", "git checkout main -- README", "git",
+        "git commit -am wip", "git commit -mrunning", "git checkout -b new", "git checkout main -- README", "git",
     ]
 ] + [("root", c) for c in ["git checkout main", "git push -u origin topic"]]
 
@@ -109,10 +110,11 @@ def test_push_guard_base_branch_comes_from_env_then_origin_head(places):
 RM_DENY = [
     "rm -rf /", "rm -fr /usr/local", "rm -rf ~", "rm --recursive /usr", "rm /usr/x -rf", "rm -rf ../../../../../../../..", "rm -rf .", "rm -rf {wt}",
     "rm -rf {home}/x", "rm -rf build /etc/x", "rm -rf $FOO/x", 'bash -c "rm -rf /usr"', "bash -c'rm -rf /usr'", "echo hi && rm -rf /usr", 'r""m -rf /usr',
-    "rm -rf ~root/x", "git stash -a", "git stash --all", "git clean -fdx",
+    "rm -rf ~root/x", "git stash -a", "git stash --all", "git clean -fdx", "git clean -xdf", "git stash push -au",   # the x/a letter anywhere in its cluster
 ]
 RM_ALLOW = [
     "rm -rf build", 'rm -rf "$TMPDIR"/x', "rm -rf /tmp/absent-x/", "rm -rf {spoke}/sub",
+    "git stash pop", "git clean -fd -e keep",   # clean and stash without the sensitive flag
 ]
 WRITE_DENY = [
     "echo x >> {spoke}/.github/workflows/ci.yml", "sed -i '' s/a/b/ orca.yaml",
