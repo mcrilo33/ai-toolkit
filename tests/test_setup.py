@@ -48,19 +48,32 @@ def test_task_md_comes_from_the_linked_issue_or_the_branch_number(run, repo, stu
 def test_runs_the_hosts_setup_local_hook(run, repo, stubs, mode):
     (repo.root / ".ai-toolkit").mkdir()
     (repo.root / ".ai-toolkit/setup.local.sh").write_text("touch hook-ran\n")
+    (repo.root / ".ai-toolkit/sync-manifest").write_text(".claude/hooks/guard.sh\n")
     assert (setup(run, repo, mode=mode)[0] / "hook-ran").exists()
 
 
 def test_refresh_recopies_claude_but_keeps_run_id_and_task_md_and_asks_nobody(run, repo, stubs):
     stubs.reply("gh", '{"number":12,"title":"Add hello","body":"Do it."}')
+    (repo.root / ".ai-toolkit").mkdir()
+    manifest = repo.root / ".ai-toolkit/sync-manifest"
+    (repo.root / ".claude/hooks/old.sh").write_text("old\n")
+    (repo.root / ".claude/settings.local.json").write_text("main local\n")
+    manifest.write_text(".claude/hooks/guard.sh\n.claude/hooks/old.sh\n")
     wt, r = setup(run, repo, "12-x")
     rid, task = (wt / ".ai-toolkit/spoke-run-id").read_text(), (wt / ".ai-toolkit/task.md").read_text()
     (repo.root / ".claude/hooks/guard.sh").write_text("#!/bin/sh\nnewer\n")   # main moved on while this worktree was kept
     (wt / ".ai-toolkit/task.md").write_text("edited by the worker")
     (wt / ".ai-toolkit/setup-done").unlink()
+    (wt / ".claude/settings.local.json").write_text("worker grants\n")   # outside the synced set: neither copied over nor deleted
+    (wt / ".claude/worker-note").write_text("mine\n")
+    (repo.root / ".claude/settings.local.json").write_text("main local moved\n")
+    (repo.root / ".claude/hooks/old.sh").unlink()   # a land's sync dropped old.sh from main
+    manifest.write_text(".claude/hooks/guard.sh\n")
     calls = len(stubs.calls("gh")) + len(stubs.calls("orca"))
     r = setup(run, repo, wt=wt, mode=("--refresh",))[1]
     assert r.returncode == 0, r.stderr
+    assert not (wt / ".claude/hooks/old.sh").exists() and (wt / ".claude/worker-note").read_text() == "mine\n"
+    assert (wt / ".claude/settings.local.json").read_text() == "worker grants\n"
     assert (wt / ".claude/hooks/guard.sh").read_text() == "#!/bin/sh\nnewer\n" and (wt / ".ai-toolkit/setup-done").exists()
     assert (wt / ".ai-toolkit/spoke-run-id").read_text() == rid and (wt / ".ai-toolkit/task.md").read_text() == "edited by the worker" != task
     assert len(stubs.calls("gh")) + len(stubs.calls("orca")) == calls   # no issue fetch, no orca lookup
@@ -70,9 +83,12 @@ def test_refresh_recopies_claude_but_keeps_run_id_and_task_md_and_asks_nobody(ru
     git(wt, "merge", "-q", "main")   # the branch now tracks it too
     (repo.root / ".claude/hooks/guard.sh").write_text("main moved again\n")
     (repo.root / ".claude/hooks/extra.sh").write_text("untracked\n")
+    manifest.write_text(".claude/hooks/guard.sh\n.claude/hooks/extra.sh\n")
     (wt / ".claude/hooks/guard.sh").write_text("worker edit\n")
     assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0
     assert (wt / ".claude/hooks/extra.sh").read_text() == "untracked\n" and (wt / ".claude/hooks/guard.sh").read_text() == "worker edit\n"
+    manifest.write_text(".claude/hooks/extra.sh\n")   # the branch tracks guard.sh, so main dropping it from the synced set does not delete it
+    assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0 and (wt / ".claude/hooks/guard.sh").read_text() == "worker edit\n"
     (repo.root / ".git/info/exclude").write_text("")   # a repo that tracks .claude does not ignore it (an ignored file would be merged over silently)
     (repo.root / ".claude/rules").mkdir()
     (repo.root / ".claude/rules/added.md").write_text("tracked on main only\n")

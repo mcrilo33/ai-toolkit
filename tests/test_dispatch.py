@@ -229,10 +229,12 @@ def stale_worktree(d):
     (d.wt / ".claude/hooks/guard.sh").write_text("stale\n")
     (d.wt / ".ai-toolkit/spoke-run-id").write_text("keep-me\n")
     (d.repo.root / ".ai-toolkit").mkdir(exist_ok=True)
-    (d.repo.root / ".ai-toolkit/setup.local.sh").write_text('echo refreshed >> "$STUB_DIR/calls.log"\n')
+    (d.repo.root / ".ai-toolkit/sync-manifest").write_text(".claude/hooks/guard.sh\n")
+    (d.repo.root / ".ai-toolkit/setup.local.sh").write_text('echo refreshed >> "$STUB_DIR/calls.log"\necho noise from the host hook\n')
 
 
-def assert_refreshed_before_the_agent_starts(d):
+def assert_refreshed_before_the_agent_starts(d, r):
+    assert len(r.stdout.splitlines()) == 1 and json.loads(r.stdout) and "noise from the host hook" in r.stderr   # the refresh's output never reaches stdout
     assert (d.wt / ".claude/hooks/guard.sh").read_text() == (d.repo.root / ".claude/hooks/guard.sh").read_text() != "stale\n"
     assert (d.wt / ".ai-toolkit/spoke-run-id").read_text() == "keep-me\n" and (d.wt / ".ai-toolkit/setup-done").exists()
     log = (d.stubs_dir / "calls.log").read_text().splitlines()
@@ -243,7 +245,7 @@ def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d)
     stale_worktree(d)
     r = d.go("--retry-of", "ctx_old", "--task", "task_7", "7", AI_TOOLKIT_POLL=0)
     assert r.returncode == 0, r.stderr
-    assert_refreshed_before_the_agent_starts(d)
+    assert_refreshed_before_the_agent_starts(d, r)
     calls = d.orca()
     assert [c[:2] for c in calls] == [["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
     assert calls[1][2:6] == ["--worktree", f"path:{d.wt}", "--title", f"{NAME}-agent"] and calls[1][7].endswith(
@@ -273,7 +275,7 @@ def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_th
     stale_worktree(d)
     r = d.go("--address", "address: fix the blocker", "7")
     assert r.returncode == 0, r.stderr
-    assert_refreshed_before_the_agent_starts(d)
+    assert_refreshed_before_the_agent_starts(d, r)
     calls = d.orca()
     assert [c[:2] for c in calls] == [["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
     assert calls[1][7].endswith("/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")
