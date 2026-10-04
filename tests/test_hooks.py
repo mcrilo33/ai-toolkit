@@ -208,56 +208,14 @@ def test_spoke_only_protections_do_not_bind_the_human_session(shared):
     dg("spoke", 2, "AskUserQuestion", questions="[]")
 
 
-SHIM = """#!/bin/bash
-[ "${SHIM_RC:-0}" = 0 ] || exit "$SHIM_RC"
-case "$1 $2" in
-  "orchestration worker-list") printf '%s' "${SHIM_WORKERS-}" ;;
-  "orchestration run-show") printf '%s' "${SHIM_RUN-}" ;;
-  "terminal show") printf '%s' "${SHIM_TERM-}" ;;
-esac
-"""
-ROW = {"agentTerminalHandle": "term_w", "dispatchStatus": "dispatched", "runId": "run_1"}
-
-
-def shim_env(*, workers=(ROW,), holder="term_h", identity="claude", title="✳ fix the thing", rc=0, raw=None, handle="term_w"):
-    """The orca answers a spoke's guard reads: its worker row -> the Run -> the holder terminal -> its agentIdentity and title."""
-    out = {"SHIM_RC": str(rc), "SHIM_WORKERS": json.dumps({"result": {"workers": list(workers)}}),
-           "SHIM_RUN": json.dumps({"result": {"run": {"coordinator_handle": holder} if holder else {}}}),
-           "SHIM_TERM": json.dumps({"result": {"terminal": {k: v for k, v in (("agentIdentity", identity or None), ("title", title)) if v is not None}}})}
-    if raw is not None:
-        out.update(SHIM_WORKERS=raw, SHIM_RUN=raw, SHIM_TERM=raw)
-    return {**out, "ORCA_TERMINAL_HANDLE": handle} if handle else out
-
-
-@pytest.fixture(scope="module")
-def shim_bin(tmp_path_factory):
-    d = tmp_path_factory.mktemp("shim")
-    (d / "orca").write_text(SHIM)
-    (d / "orca").chmod(0o755)
-    return d
-
-
-# where, orca answers, does a workflows write ask? (every other protected path is denied whatever the answers)
+# where, how the worker is set up, does a workflows write ask? (every other protected path is denied whatever the setup). A worker asks only when the
+# PermissionRequest relay is installed (hook file + registered in its settings): the relay then puts the question to the Run; a local ask nobody sees would hang.
 WF_SCENARIOS = {
     "no-run-main-checkout": ("root", None, True), "no-run-plain-worktree": ("wt", None, True),
-    "session-holds-the-run": ("spoke", shim_env(), True),
-    # Measured live: the coordinator.sh loop terminal reports agentIdentity `claude` (sticky once a headless `claude -p` child ran) and the title `bash`
-    # (Orca titles a terminal by its foreground process and overwrites a custom title); a Claude session's title is a topic or a path, never a bare shell
-    "auto-loop-holds-the-run": ("spoke", shim_env(title="bash"), False),
-    "loop-run-by-zsh": ("spoke", shim_env(title="zsh"), False), "loop-run-by-a-login-shell": ("spoke", shim_env(title="-bash"), False),
-    "loop-run-by-tcsh": ("spoke", shim_env(title="tcsh"), False), "holder-with-an-empty-title": ("spoke", shim_env(title=""), False),
-    "loop-terminal-still-on-its-launch-title": ("spoke", shim_env(title="coordinator"), False),
-    "holder-without-a-title": ("spoke", shim_env(title=None), False), "holder-with-a-non-string-title": ("spoke", shim_env(title=7), False),
-    "session-with-a-topic-title-holds-the-run": ("spoke", shim_env(title="✳ danger-guard.sh attended test accuracy"), True),
-    "session-with-a-working-glyph-title": ("spoke", shim_env(title="◐ fix the loop"), True),
-    "session-with-a-path-title": ("spoke", shim_env(title="..-for-workflow"), True),
-    "session-whose-topic-says-bash": ("spoke", shim_env(title="✳ bash completion"), True),
-    "holder-is-no-agent": ("spoke", shim_env(identity=""), False),
-    "other-agent-holds-the-run": ("spoke", shim_env(identity="codex"), False),
-    "orca-fails": ("spoke", shim_env(rc=1), False), "orca-prints-garbage": ("spoke", shim_env(raw="not json"), False),
-    "no-worker-row": ("spoke", shim_env(workers=()), False), "row-not-dispatched": ("spoke", shim_env(workers=({**ROW, "dispatchStatus": "completed"},)), False),
-    "other-terminals-row": ("spoke", shim_env(workers=({**ROW, "agentTerminalHandle": "term_x"},)), False),
-    "no-terminal-handle": ("spoke", shim_env(handle=""), False), "no-holder": ("spoke", shim_env(holder=""), False),
+    "worker-with-the-relay-installed": ("spoke", "installed", True),
+    "worker-whose-settings-lack-the-relay": ("spoke", "unregistered", False),
+    "worker-without-the-relay-file": ("spoke", "nofile", False),
+    "worker-without-any-claude-dir": ("spoke", "bare", False),
 }
 # tool, tool_input, the text the ask must carry ("" = a protected path that never asks; "spoke-only" = same, protected in a spoke only)
 WF_LANES = [
@@ -277,16 +235,30 @@ WF_LANES = [
 ]
 
 
+def install_relay(spoke, how):
+    """A worker dir as sync leaves it: the marker, and per `how` the relay file and its registration in .claude/settings.json."""
+    (spoke / ".ai-toolkit").mkdir(parents=True)
+    (spoke / ".ai-toolkit/spoke-run-id").write_text("rid\n")
+    if how != "bare":
+        (spoke / ".claude/hooks").mkdir(parents=True)
+        (spoke / ".claude/settings.json").write_text(json.dumps({"hooks": {"PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": (
+            'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/permission-relay.sh"' if how != "unregistered" else "true")}]}]}}))
+    if how in ("installed", "unregistered"):
+        (spoke / ".claude/hooks/permission-relay.sh").write_text("#!/bin/bash\n")
+
+
 @pytest.mark.parametrize("scenario", WF_SCENARIOS)
 @pytest.mark.parametrize("tool,ti,named", WF_LANES)
-def test_danger_guard_workflow_writes_ask_only_when_a_session_attends(shared, shim_bin, scenario, tool, ti, named):
-    where, answers, asks = WF_SCENARIOS[scenario]
+def test_danger_guard_workflow_writes_ask_only_where_the_prompt_reaches_someone(shared, tmp_path, scenario, tool, ti, named):
+    where, how, asks = WF_SCENARIOS[scenario]
     if where != "spoke" and named == "spoke-only":
         pytest.skip("spoke-only protections")
     named = "" if named == "spoke-only" else named
-    ti = {k: v.replace("{spoke}", str(shared[where])).replace("{home}", str(shared["home"])) for k, v in ti.items()}
-    env = {**shared["env"], "PATH": f"{shim_bin}:{os.environ['PATH']}", **(answers or {})}
-    r = call("danger-guard.sh", shared[where], tool, env=env, **ti)
+    places = {**shared, "spoke": tmp_path / "w"}
+    if where == "spoke":
+        install_relay(places["spoke"], how)
+    ti = {k: v.replace("{spoke}", str(places[where])).replace("{home}", str(shared["home"])) for k, v in ti.items()}
+    r = call("danger-guard.sh", places[where], tool, env=shared["env"], **ti)
     if asks and named:
         out = json.loads(r.stdout)["hookSpecificOutput"]
         assert (r.returncode, out["hookEventName"], out["permissionDecision"], r.stderr) == (0, "PreToolUse", "ask", "")
