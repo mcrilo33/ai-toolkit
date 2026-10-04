@@ -1,4 +1,5 @@
 import json
+import shutil
 
 import pytest
 from conftest import V2
@@ -40,7 +41,8 @@ def d(stubs, repo, run):
     def orca():
         return [strip(c) for c in stubs.calls("orca")]
 
-    return type("D", (), {"go": staticmethod(go), "orca": staticmethod(orca), "wt": wt, "root": root, "stubs": stubs, "repo": repo})
+    return type("D", (), {"go": staticmethod(go), "orca": staticmethod(orca), "wt": wt, "root": root, "stubs": stubs, "repo": repo,
+                          "stubs_dir": wt.parent / "stubs"})
 
 
 def worker_start(d):
@@ -220,10 +222,28 @@ def test_nothing_ready_dispatches_nothing(d):
     assert not any(c[:2] == ["orchestration", "worker-start"] for c in d.orca())
 
 
-def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d):
+def stale_worktree(d):
+    """A kept worktree provisioned before main's .claude moved on; setup.local.sh in main marks WHEN the refresh ran in the call log."""
     d.stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(d.wt), "branch": f"refs/heads/{NAME}"}}}))
+    (d.wt / ".claude/hooks").mkdir(parents=True)
+    (d.wt / ".claude/hooks/guard.sh").write_text("stale\n")
+    (d.wt / ".ai-toolkit/spoke-run-id").write_text("keep-me\n")
+    (d.repo.root / ".ai-toolkit").mkdir(exist_ok=True)
+    (d.repo.root / ".ai-toolkit/setup.local.sh").write_text('echo refreshed >> "$STUB_DIR/calls.log"\n')
+
+
+def assert_refreshed_before_the_agent_starts(d):
+    assert (d.wt / ".claude/hooks/guard.sh").read_text() == (d.repo.root / ".claude/hooks/guard.sh").read_text() != "stale\n"
+    assert (d.wt / ".ai-toolkit/spoke-run-id").read_text() == "keep-me\n" and (d.wt / ".ai-toolkit/setup-done").exists()
+    log = (d.stubs_dir / "calls.log").read_text().splitlines()
+    assert log.index("refreshed") < next(i for i, ln in enumerate(log) if ln.startswith("orca\x1fterminal\x1fcreate"))
+
+
+def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d):
+    stale_worktree(d)
     r = d.go("--retry-of", "ctx_old", "--task", "task_7", "7", AI_TOOLKIT_POLL=0)
     assert r.returncode == 0, r.stderr
+    assert_refreshed_before_the_agent_starts(d)
     calls = d.orca()
     assert [c[:2] for c in calls] == [["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
     assert calls[1][2:6] == ["--worktree", f"path:{d.wt}", "--title", f"{NAME}-agent"] and calls[1][7].endswith(
@@ -231,6 +251,15 @@ def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d)
     assert calls[3] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}",
                         "--terminal", "term_agent", "--task", "task_7", "--retry-of", "ctx_old", "--timeout-ms", "120000"]
     assert json.loads(r.stdout)["terminal"] == "term_agent"
+
+
+@pytest.mark.parametrize("args", [("--retry-of", "ctx_old", "--task", "task_7"), ("--address", "fix it")], ids=["retry", "address"])
+def test_a_failed_refresh_keeps_the_agent_off_the_worktree(d, args):
+    stale_worktree(d)
+    shutil.rmtree(d.repo.root / ".claude")   # setup.sh refuses a main checkout with no .claude to copy
+    r = d.go(*args, "7")
+    assert r.returncode == 1 and "refresh" in r.stderr
+    assert not any(c[:2] in (["terminal", "create"], ["orchestration", "worker-start"]) for c in d.orca())
 
 
 def test_retry_needs_a_task_and_an_existing_worktree(d):
@@ -241,9 +270,10 @@ def test_retry_needs_a_task_and_an_existing_worktree(d):
 
 
 def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_the_existing_worktree(d):
-    d.stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(d.wt), "branch": f"refs/heads/{NAME}"}}}))
+    stale_worktree(d)
     r = d.go("--address", "address: fix the blocker", "7")
     assert r.returncode == 0, r.stderr
+    assert_refreshed_before_the_agent_starts(d)
     calls = d.orca()
     assert [c[:2] for c in calls] == [["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
     assert calls[1][7].endswith("/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")

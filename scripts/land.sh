@@ -7,8 +7,16 @@
 # --cleanup-only finishes close/delete/release/rm idempotently for an issue already on main (after exit 6). If the worktree
 # is already gone, name it with --branch <b> [--tip <sha>] (tip defaults to origin/<b>): the landed check stays, worker/worktree steps are skipped.
 # --review is WP2's hook: $REVIEW_CMD (default review.sh) <issue> must exit 0 on APPROVE; skipped by default until WP2.
+# In the toolkit's own checkout (it carries scripts/sync.sh, shared/ and hooks/claude) the cleanup first re-runs `sync.sh` on it, so the
+# installed copies (.claude/{hooks,rules,skills,agents}, .ai-toolkit/scripts) are the landed tip's: the next dispatch, answer and land use
+# the landed code. Another repo (no sync sources) is untouched. sync replaces files by rename, so a running coordinator loop keeps its
+# own script intact (old code, consistent) while every script it launches next is the new copy. Workers live at that moment keep the
+# copies they started with; they get the new ones only when re-dispatched (dispatch.sh --address / --retry-of refresh the worktree).
+# A loop keeps its OLD coordinator.sh but calls the NEW dispatch/land/answer/lib: restart it after a land that changed coordinator.sh
+# or lib.sh (or any contract between them), since the loop does not re-exec itself.
 # Exit: 0 landed, 1 error, 2 refused (precondition), 3 review not approved, 4 gate red/timeout, 5 merge conflict,
-#       6 landed but a cleanup step failed (main is already pushed; finish by hand).
+#       6 landed but a cleanup step failed, a failed refresh of the installed copies included (main is already pushed; finish by hand,
+#         --cleanup-only retries the refresh too).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
@@ -104,6 +112,11 @@ fi
 # --- cleanup: main is the source of truth from here on, so a failure is reported (exit 6), not fatal
 sha="$tip"; bad=0
 step() { "$@" > /dev/null || { warn "cleanup failed: $*"; bad=1; }; }
+main="$(dirname "$(abs --git-common-dir)")"
+if [ -f "$main/scripts/sync.sh" ] && [ -d "$main/shared" ] && [ -d "$main/hooks/claude" ]; then
+  bash "$main/scripts/sync.sh" "$main" > /dev/null \
+    || { warn "installed copies NOT refreshed: run scripts/sync.sh . in $main (this land is done; running workers keep their old copies until re-dispatched)"; bad=1; }
+fi
 step gh issue close "$n" -c "landed in $sha"
 # Delete the remote branch only while it is still at the gated tip: a later worker push must not be dropped.
 if git rev-parse -q --verify "refs/remotes/origin/$branch" > /dev/null; then

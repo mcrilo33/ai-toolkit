@@ -6,9 +6,9 @@ import pytest
 from conftest import V2, git
 
 
-def setup(run, repo, branch="wp0", wt=None):
+def setup(run, repo, branch="wp0", wt=None, mode=()):
     wt = wt or repo.wt(branch)
-    return wt, run(["bash", f"{V2}/scripts/setup.sh"], cwd=wt, ORCA_ROOT_PATH=repo.root, ORCA_WORKTREE_PATH=wt)
+    return wt, run(["bash", f"{V2}/scripts/setup.sh", *mode], cwd=wt, ORCA_ROOT_PATH=repo.root, ORCA_WORKTREE_PATH=wt)
 
 
 def test_provisions_claude_dir_run_id_and_excludes_and_is_idempotent(run, repo, stubs):
@@ -44,10 +44,45 @@ def test_task_md_comes_from_the_linked_issue_or_the_branch_number(run, repo, stu
         assert stubs.calls("gh") == [] and not (wt / ".ai-toolkit/task.md").exists()
 
 
-def test_runs_the_hosts_setup_local_hook(run, repo, stubs):
+@pytest.mark.parametrize("mode", [(), ("--refresh",)], ids=["setup", "refresh"])
+def test_runs_the_hosts_setup_local_hook(run, repo, stubs, mode):
     (repo.root / ".ai-toolkit").mkdir()
     (repo.root / ".ai-toolkit/setup.local.sh").write_text("touch hook-ran\n")
-    assert (setup(run, repo)[0] / "hook-ran").exists()
+    assert (setup(run, repo, mode=mode)[0] / "hook-ran").exists()
+
+
+def test_refresh_recopies_claude_but_keeps_run_id_and_task_md_and_asks_nobody(run, repo, stubs):
+    stubs.reply("gh", '{"number":12,"title":"Add hello","body":"Do it."}')
+    wt, r = setup(run, repo, "12-x")
+    rid, task = (wt / ".ai-toolkit/spoke-run-id").read_text(), (wt / ".ai-toolkit/task.md").read_text()
+    (repo.root / ".claude/hooks/guard.sh").write_text("#!/bin/sh\nnewer\n")   # main moved on while this worktree was kept
+    (wt / ".ai-toolkit/task.md").write_text("edited by the worker")
+    (wt / ".ai-toolkit/setup-done").unlink()
+    calls = len(stubs.calls("gh")) + len(stubs.calls("orca"))
+    r = setup(run, repo, wt=wt, mode=("--refresh",))[1]
+    assert r.returncode == 0, r.stderr
+    assert (wt / ".claude/hooks/guard.sh").read_text() == "#!/bin/sh\nnewer\n" and (wt / ".ai-toolkit/setup-done").exists()
+    assert (wt / ".ai-toolkit/spoke-run-id").read_text() == rid and (wt / ".ai-toolkit/task.md").read_text() == "edited by the worker" != task
+    assert len(stubs.calls("gh")) + len(stubs.calls("orca")) == calls   # no issue fetch, no orca lookup
+    git(repo.root, "add", "-f", ".claude/hooks/guard.sh")   # the repo tracks part of .claude: a refresh must not dirty or clobber it
+    git(repo.root, "commit", "-qm", "track guard")
+    (wt / ".claude/hooks/guard.sh").unlink()
+    git(wt, "merge", "-q", "main")   # the branch now tracks it too
+    (repo.root / ".claude/hooks/guard.sh").write_text("main moved again\n")
+    (repo.root / ".claude/hooks/extra.sh").write_text("untracked\n")
+    (wt / ".claude/hooks/guard.sh").write_text("worker edit\n")
+    assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0
+    assert (wt / ".claude/hooks/extra.sh").read_text() == "untracked\n" and (wt / ".claude/hooks/guard.sh").read_text() == "worker edit\n"
+    (repo.root / ".git/info/exclude").write_text("")   # a repo that tracks .claude does not ignore it (an ignored file would be merged over silently)
+    (repo.root / ".claude/rules").mkdir()
+    (repo.root / ".claude/rules/added.md").write_text("tracked on main only\n")
+    git(repo.root, "add", "-f", ".claude/rules/added.md")
+    git(repo.root, "commit", "-qm", "main starts tracking a rule")
+    assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0
+    git(wt, "merge", "-q", "--no-edit", "main")   # land's merge of main must not trip over an untracked copy of what main tracks
+    shutil.rmtree(repo.root / ".claude")
+    r = setup(run, repo, wt=wt, mode=("--refresh",))[1]   # a failed refresh is loud and leaves no ready marker
+    assert r.returncode != 0 and ".claude" in r.stderr and not (wt / ".ai-toolkit/setup-done").exists()
 
 
 def test_archive_is_a_noop_and_orca_yaml_points_at_real_scripts(run, tmp_path):
