@@ -89,7 +89,6 @@ def make_user():
 ```
 
 - Don't use fixtures for trivial data — inline simple values in the test
-- Don't write a fresh executable a test runs (a stub, a hook) per test: on macOS its first run costs ~0.1 s and queues behind every other worker's, so link to a script written once per worker
 - Name fixtures after what they *provide*, not what they *do*: `db_session` not `setup_database`
 
 ## Parametrize

@@ -73,9 +73,9 @@ PUSH_DENY = [
         "git push origin 'refs/heads/*:refs/heads/*'", "git push --all", "git push --mirror",  # every ref at once
         "git push --no-verify", "git commit -nm x", "git -c core.HOOKSpath=x commit -m x", "git config core.hooksPath /dev/null",  # the hooks switched off
         'bash -c "git push --force"', 'git pu""sh -f', "cd sub && git push origin main", "/usr/bin/GIT push origin main",  # disguised
-        "git --git-dir /nonexistent push -f", "git -C {root} push",  # another repo's options
+        "git --git-dir /nonexistent push -f", "git -C {root} push", "git -C",  # another repo's options, and a dangling one (fail-closed)
         "git checkout main", "git switch main",  # leaves the spoke branch
-        "bash -c'git push -f'", "echo $(git push -f)", "git push origin main>/dev/null",  # the quote pass and the separators it splits on
+        "env git push -f", "bash -c'git push -f'", "echo $(git push -f)", "git push origin main>/dev/null",  # the quote pass and the separators it splits on
         "git --namespace foo push -f", "git --work-tree /x push origin main", "git --no-pager push -f",  # more global options, flag-only ones included
         "git commit --no-verify -m x", "git commit -an -m x", "git push --repo=origin main",  # --no-verify on any subcommand, n inside a flag cluster, the remote given as a flag
     ]
@@ -83,7 +83,7 @@ PUSH_DENY = [
 PUSH_ALLOW = [
     ("wt", c) for c in [
         "git push -u origin 2-y", "git push origin mainline", "git push origin HEAD", 'git commit -m "feat: running tests #1"',
-        "git commit -am wip", "git commit --amend --no-edit", "git commit -mrunning", "git checkout -b new", "git checkout main -- README", "git",
+        "git commit -am wip", "git commit --amend --no-edit", "git commit -mrunning", "git checkout -b new", "git checkout main -- README", "git", "ls -la",
     ]
 ] + [("root", c) for c in ["git checkout main", "git push -u origin topic"]]
 
@@ -108,20 +108,20 @@ def test_push_guard_base_branch_comes_from_env_then_origin_head(places):
 
 # --- danger-guard -------------------------------------------------------------------------------
 RM_DENY = [
-    "rm -rf /", "rm -rf /tmp", "rm -rf ~", "rm --recursive /usr", "rm /usr/x -rf", "rm -rf ../../../../../../../..", "rm -rf .", "rm -rf {wt}",
+    "rm -rf /", "rm -rf /tmp", "rm -rf /private/tmp", "rm -rf ~", "rm --recursive /usr", "rm /usr/x -rf", "rm -rf ../../../../../../../..", "rm -rf .", "rm -rf {wt}",
     "rm -rf {home}/x", "rm -rf build /etc/x", "rm -rf $FOO/x", 'bash -c "rm -rf /usr"', "bash -c'rm -rf /usr'", "echo hi && rm -rf /usr", 'r""m -rf /usr',
-    "rm -rf ~root/x", "git stash -a", "git stash --all", "git clean -fdx", "git clean -xdf", "git stash push -au",   # the x/a letter anywhere in its cluster
+    "rm -rf ~root/x", "rm -fr /usr/local", "'r'm -rf /usr", "bash -c 'git clean -fdx'", "git stash -a", "git stash --all", "git clean -fdx", "git clean -xdf", "git stash push -au",   # the x/a letter anywhere in its cluster
 ]
 RM_ALLOW = [
-    "rm -rf build", 'rm -rf "$TMPDIR"/x', "rm -rf /tmp/absent-x/", "rm -rf {spoke}/sub",
+    "rm -rf build", 'rm -rf "$TMPDIR"/x', 'rm -rf "${TMPDIR}"/x', "rm -rf /tmp/absent-x/", "rm -rf {spoke}/sub",
     "git stash pop", "git clean -fd -e keep",   # clean and stash without the sensitive flag
 ]
 WRITE_DENY = [
     "echo x >> {spoke}/.github/workflows/ci.yml", "sed -i '' s/a/b/ orca.yaml",
     "cp x ~/.claude/settings.json", 'cat y > "$HOME/.claude/settings.json"', "mv a {home}/.claude/settings.json", "echo x > ${PWD}/orca.yaml",
-    'echo x > "$(pwd)/orca.yaml"', "echo x > $CLAUDE_PROJECT_DIR/orca.yaml", "rm -rf .claude/", "rm -rf .ai-toolkit", "rm .ai-toolkit/spoke-run-id", "rm -rf .claude/hooks", "chmod -x .claude/hooks/push-guard.sh",
+    'echo x > "$(pwd)/orca.yaml"', 'echo x > "$PWD"/orca.yaml', "echo x > $CLAUDE_PROJECT_DIR/orca.yaml", "rm -rf .claude; ls", "rm -rf .claude/", "rm -rf .ai-toolkit", "rm .ai-toolkit/spoke-run-id", "rm -rf .claude/hooks", "chmod -x .claude/hooks/push-guard.sh",
     "tee orca.yaml", "echo x > .claude/settings.json",
-    "python3 -c \"open('orca.yaml','w')\"", 'bash -c "echo > orca.yaml"',
+    "python3 -c \"open('orca.yaml','w')\"", "python3 - <<EOF\nopen('orca.yaml','w')\nEOF", 'bash -c "echo > orca.yaml"',
     "cd .github/workflows && echo x > ci.yml", "echo x >./ORCA.YAML",
 ]
 WRITE_ALLOW = [
@@ -162,7 +162,7 @@ def test_danger_guard_reset_hard_asks_only_in_the_main_checkout(shared, where, c
 @pytest.mark.parametrize("tool,key,path", [
     ("MultiEdit", "file_path", "sub/../.github/workflows/ci.yml"), ("Write", "file_path", "orca.yaml"), ("Edit", "file_path", ".claude/settings.local.json"), ("Write", "file_path", "{home}/.claude/settings.json"),
     ("NotebookEdit", "notebook_path", ".github/workflows/n.ipynb"), ("Write", "file_path", ".claude/hooks/push-guard.sh"),
-    ("Write", "file_path", ".ai-toolkit/spoke-run-id"),
+    ("Write", "file_path", ".claude/hooks"), ("Write", "file_path", ".ai-toolkit/spoke-run-id"),
 ])
 def test_danger_guard_denies_protected_file_writes(shared, tool, key, path):
     check("danger-guard.sh", shared, "spoke", 2, tool=tool, **{key: path})
@@ -213,10 +213,12 @@ WF_LANES = [
     ("Bash", {"command": "cp x $HOME/.ai-toolkit/coordinator/run_t/replies/msg_p"}, (W, D)),
     ("Bash", {"command": "echo x > orca.yaml;\necho allow > ~/.ai-toolkit/coordinator/run_t/replies/msg_p"}, (W, D)),  # a hard deny beats an ask in a compound
     # rm -r: outside the worktree, the worktree root, home, another checkout, an unexpanded variable
-    ("Bash", {"command": "rm -rf /usr"}, "outside the worktree: /usr"),
+    ("Bash", {"command": "rm -rf /usr"}, "outside the worktree: /usr"), ("Bash", {"command": "rm -rf ."}, "rm -r of . (worktree root or home)"),
+    ("Bash", {"command": "rm -rf $FOO/x"}, "unexpanded variable"),
     ("Bash", {"command": "rm -rf {other}"}, "another git checkout or worktree: {other}"),
     # git: reset --hard in the main checkout (or one the guard cannot pin down), and the clean/stash verbs that remove the ignored .claude/ and .ai-toolkit/
     ("Bash", {"command": "git -C {root} reset --hard"}, "reset --hard in the main checkout"),
+    ("Bash", {"command": "git --work-tree={root} reset --hard"}, "reset --hard with --git-dir/--work-tree"),
     ("Bash", {"command": "git clean -fdx"}, "git clean -fdx"),
     # a compound asks once and names every sensitive segment, not only the first
     ("Bash", {"command": "echo x > .github/workflows/ci.yml; rm -rf /usr"}, ("ci.yml", "outside the worktree: /usr")),
@@ -516,7 +518,7 @@ def hooked(places):
 
 
 @pytest.mark.parametrize("msg", [
-    "feat: add x #12", "chore!: z Refs #4", "refactor(a/b): c\n\nbody\n\nCloses #9", "Merge branch 'x'", "fixup! feat: a", 'Revert "feat: a"', "feat: x\n\n#7 is the anchor",
+    "feat: add x #12", "fix(core): y (#3)", "docs(Readme): x #1", "chore!: z Refs #4", "refactor(a/b): c\n\nbody\n\nCloses #9", "Merge branch 'x'", "fixup! feat: a", 'Revert "feat: a"', "feat: x\n\n#7 is the anchor",
 ])
 def test_commit_msg_accepts(hooked, msg):
     r = commit(hooked["wt"], msg)
@@ -524,7 +526,7 @@ def test_commit_msg_accepts(hooked, msg):
 
 
 @pytest.mark.parametrize("msg,why", [
-    ("add x #12", "<type>"), ("feat: add x", "#"), ("feat:no space #1", "<type>"), ("feat: x\n\n# only a comment line mentions #5", "#"),
+    ("add x #12", "<type>"), ("feat: add x", "#"), ("feat:no space #1", "<type>"), ("Feat: x #1", "<type>"), ("feat: x\n\n# only a comment line mentions #5", "#"),
 ])
 def test_commit_msg_rejects(hooked, msg, why):
     r = commit(hooked["wt"], msg)
