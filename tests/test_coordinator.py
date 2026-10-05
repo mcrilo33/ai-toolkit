@@ -33,7 +33,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     monkeypatch.setenv("STUB_NOENV", "1")   # no test here reads a stub's env: one process fewer per stub call
     cmds, wt = tmp_path / "cmds", str(repo.wt("1-x"))
     cmds.mkdir()
-    for n in ("dispatch.sh", "land.sh", "answer.sh", "judge.sh"):   # sub-commands are stubs that also record their stdin
+    for n in ("dispatch.sh", "land.sh", "answer.sh"):   # sub-commands are stubs that also record their stdin
         link_script(cmds / n, STUB_TEE)
     link_script(tmp_path / "stubs/bin/claude", STUB_TEE)   # the post-land triage prompt goes on its stdin
 
@@ -89,7 +89,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     mail()
 
     def go(*args, run_id="run_t", **env):
-        cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh", "judge.sh")}
+        cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh")}
         return run(["bash", CO, *(["--run", run_id] if run_id else []), *args], cwd=repo.root,
                    **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", "COORD_BELL_TTY": tmp_path / "bell", **cmd_env, **env})
 
@@ -193,40 +193,6 @@ def test_auto_denies_a_permission_question_and_never_hands_it_to_the_answerer(C,
     assert not C.calls("orca worktree set") and not (tmp_path / "bell").exists()   # nothing for the human to do: log and issue comment only
 
 
-def perm(cmd, tool="Bash", cwd=None, cut=False, wt=None, reason="unknown"):   # a relayed permission request as permission-relay.sh words it
-    body = "\n".join("  " + ln for ln in cmd.splitlines()) + ("\n  [truncated: 9000 chars in all]" if cut else "")
-    return f"PERMISSION REQUEST (not a plan gate: reply allow or deny)\nissue: #1 feat\nworktree: {wt}\ntool: {tool}\ncwd: {cwd or wt}\nmode: bypassPermissions\nreason: {reason}\ncommand:\n{body}\n"
-
-
-@pytest.mark.parametrize("cmd, kw, judged, verdict", [
-    ("echo hi > build/out.txt", {}, True, "only writes build/"),   # the judge cleared it: allowed
-    ("echo hi > build/out.txt", {}, True, ""),   # not cleared: left open
-    ("echo '# stays inside the worktree' > ../../outside.txt", {}, False, "x"), ("echo x > ~/y", {}, False, "x"), ("echo x > $HOME/y", {}, False, "x"), ("echo x > `pwd`/../y", {}, False, "x"),   # claims to stay inside, writes outside: a path the shell resolves later is never judged, whatever the judge would say
-    ("echo x > .claude/settings.json", {}, False, "x"), ("cat .AI-TOOLKIT/spoke-run-id > a", {}, False, "x"), ("sed -i s/a/b/ orca.yaml", {}, False, "x"),   # a protected name: never judged
-    ("printf x > .cl\"\"aude/settings.json", {}, False, "x"), ("rm -rf .cla\\ude/hooks", {}, False, "x"), ("echo x > '.github'/workflows/ci.yml", {}, False, "x"),   # quotes and backslashes do not split the name
-    ("echo x | tee .cl{a,}ude/settings.json", {}, False, "x"), ("cd .github && rm workflows/ci.yml", {}, False, "x"),   # a brace expansion, a path split by cd
-    ("git clean -fdx", {"reason": "danger-guard: needs your approval: git clean -x / stash -a remove the ignored .claude/"}, False, "x"), ("rm -rf build/", {"reason": "danger-guard: needs your approval: rm -r outside the worktree"}, False, "x"),   # the guard already found it sensitive: never self-approved
-    ("ls", {"cwd": "/etc"}, False, "x"), ("ls", {"cwd": "{wt}/../elsewhere"}, False, "x"), ("ls", {"cwd": "{wt}x"}, False, "x"),   # the cwd must be under the worktree
-    ("ls", {"tool": "Write"}, False, "x"), ("ls", {"cut": True}, False, "x"),   # only a Bash command shown whole
-    ("echo hi > build/out.txt", {"mode": "auto"}, False, "x"), ("echo hi > build/out.txt", {"mode": "human"}, False, "x"),   # only attended ever asks the judge: auto denies at once, human leaves it open, as before
-])
-def test_attended_allows_only_a_contained_permission_request_and_leaves_every_other_one_open_for_the_human(C, cmd, kw, judged, verdict):
-    kw = {k: v.replace("{wt}", C.wt) if isinstance(v, str) else v for k, v in kw.items()}
-    mode = kw.pop("mode", "attended")
-    C.stubs.reply("judge.sh", verdict + "\n" if verdict else "")
-    C.mail([msg("question", "msg_p", question=perm(cmd, wt=C.wt, **kw))])
-    assert C.go("--answer", mode).returncode == 0 and not C.stubs.calls("answer.sh") and C.calls("orca orchestration check ack")
-    assert len(C.stubs.calls("judge.sh")) == int(judged)
-    allowed = bool(judged and verdict)
-    assert [arg(a, "--body") for a in C.calls("orca orchestration reply")] == (["deny"] if mode == "auto" else ["allow"] if allowed else [])
-    c = C.calls("gh issue comment")[0][-1]
-    assert cmd not in c and "stays inside" not in c   # the issue comment names the tool and the answer only, never the command
-    assert (c == "Permission allowed (tool: Bash): it writes only inside the worker's worktree or scratchpad.") == allowed and (allowed or mode == "auto" or REPLY_P in c)
-    if judged:
-        args, slug = C.stubs.calls("judge.sh")[0], re.sub(r"[^A-Za-z0-9]", "-", C.wt)
-        assert args == [kw.get("cwd", C.wt), C.wt, "worker permission request", slug, "contained"] and C.stdin("judge.sh") == cmd
-
-
 def test_auto_whose_deny_cannot_be_sent_falls_back_to_the_human_never_to_an_allow(C):
     C.stubs.reply("orca.orchestration_reply", "boom", rc=1)
     C.mail([msg("question", "msg_p", question=PQ)])
@@ -247,14 +213,15 @@ def test_human_mode_flags_a_permission_question_from_a_worker_it_cannot_resolve_
     assert C.go("--answer", "human").returncode == 0 and (tmp_path / "bell").exists() and not C.calls("orca worktree set")
 
 
-def test_human_mode_leaves_a_permission_question_open_with_an_allow_or_deny_reply_command(C, tmp_path):
+@pytest.mark.parametrize("mode", ["human", "attended"])   # attended too: the loop never approves a permission request, it queues it for the human
+def test_human_mode_leaves_a_permission_question_open_with_an_allow_or_deny_reply_command(C, tmp_path, mode):
     C.mail([msg("question", "msg_p", question=PQ)])
-    assert C.go("--answer", "human").returncode == 0
+    assert C.go("--answer", mode).returncode == 0
     assert not C.stubs.calls("answer.sh") and not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack")
     c = C.calls("gh issue comment")[0][-1]
     assert REPLY_P in c and "deny" in c and "curl" not in c and "approve" not in c and "Bash" in c
     cm = C.calls("orca worktree set")
-    assert len(cm) == 1 and f"reply: {REPLY_P}" in arg(cm[0], "--comment") and (tmp_path / "bell").exists()
+    assert len(cm) == 1 and f"reply: {REPLY_P}" in arg(cm[0], "--comment") and (tmp_path / "bell").exists() == (mode == "human")   # attended rings from the queue, once per decision (below)
 
 
 def test_the_human_sees_the_whole_permission_change_not_the_25_line_cap_of_a_plan(C):
@@ -602,7 +569,7 @@ def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply
     assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in ("worker-list", "worker-show", "inbox", "run-show")] == []
 
 
-def queued(C, *, held=True):   # two open questions (the newer first, as Orca lists them) plus a third nobody handled, and a blocked issue; one parked on purpose with the hold label
+def queued(C, *, held=True):   # three open questions (the newer first, as Orca lists them) and a blocked issue; one parked on purpose with the hold label
     rows = [{**msg("question", i), "run_id": "run_t", "thread_id": i, "sequence": n} for i, n in (("msg_c", 9), ("msg_b", 7), ("msg_a", 5))]
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
     issues = [{"number": 4, "title": "t4\x1b[2Kx", "labels": [{"name": "blocked"}]}] + ([{"number": 5, "title": "t5", "labels": [{"name": "blocked"}, {"name": "hold"}]}] if held else [])
@@ -636,8 +603,7 @@ BLOCKED = issue_json(labels=["blocked"])
 DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed; one that cannot keeps its file with the reason on line 2 (only a closed issue is dropped)
     "plain": {}, "fresh-with-message": dict(text="do it test-first", v7=BLOCKED, why="no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"),
     "kept-worktree-with-message": dict(text="do it test-first", v7=BLOCKED, kept=True, expect=("--address", "do it test-first", "7"), label=True), "kept-worktree-default-message": dict(kept=True, expect="default"),
-    "cap": dict(cap=1, why="waiting for a free slot (cap 1)"), "scope": dict(v7=issue_json(scope="a.py b.py"), v1=issue_json(scope="b.py"), why="Scope overlaps #1"),
-    "scope-star": dict(v7=issue_json(scope="*"), why="Scope overlaps #1"), "closed": dict(v7=issue_json(state="CLOSED"), dropped=True),
+    "cap": dict(cap=1, why="waiting for a free slot (cap 1)"), "refused": dict(refuses=True, why="dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"), "closed": dict(v7=issue_json(state="CLOSED"), dropped=True),
     "hold": dict(v7=issue_json(labels=["hold"]), why="on hold: remove the hold label to start it"), "blocked-no-message": dict(v7=BLOCKED, why="blocked: remove the label, or give a message to re-dispatch it"),
     "running": dict(kept=True, running=True, why="already running (dispatch ctx_7)"), "unreadable": dict(unreadable=True, why="cannot read the issue (unknown, or GitHub did not answer)"),
     "worktrees": dict(no_worktrees=True, why="cannot read the worktrees"), "dispatch-fails": dict(fails=True, why="dispatch failed: boom"),
@@ -646,7 +612,7 @@ DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed
 
 @pytest.mark.parametrize("case", DISPATCH_CASES.values(), ids=list(DISPATCH_CASES))
 def test_a_queued_dispatch_request_runs_ahead_of_the_automatic_pick_within_the_cap_and_the_scope_rule(C, tmp_path, case):
-    c = {"text": "", "cap": 3, "v7": issue_json(), "v1": issue_json(scope="z.py"), **case}
+    c = {"text": "", "cap": 3, "v7": issue_json(), **case}
     req = tmp_path / "state/run_t/requests/7"
     req.parent.mkdir(parents=True)
     req.write_text(c["text"] + "\n")
@@ -654,21 +620,24 @@ def test_a_queued_dispatch_request_runs_ahead_of_the_automatic_pick_within_the_c
     C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": wts}}), rc=1 if c.get("no_worktrees") else 0)
     if c.get("running"):
         C.workers(C.row(), {**C.row("ctx_7"), "resource": {"worktreeId": "r::/k7"}})
-    C.stubs.reply("gh.issue_view", "boom" if c.get("unreadable") else c["v7"], rc=1 if c.get("unreadable") else 0, n=1); C.stubs.reply("gh.issue_view", c["v1"], n=2)
-    C.stubs.reply("dispatch.sh", "boom" if c.get("fails") else '{"issue":7}', rc=1 if c.get("fails") else 0)
+    C.stubs.reply("gh.issue_view", "boom" if c.get("unreadable") else c["v7"], rc=1 if c.get("unreadable") else 0)
+    C.stubs.reply("dispatch.sh", "boom" if c.get("fails") else "dispatch: #7 is not ready: Scope overlaps #1" if c.get("refuses") else '{"issue":7}', rc=1 if c.get("fails") else 3 if c.get("refuses") else 0)
     assert C.go("--answer", "attended", "--cap", str(c["cap"])).returncode == 0
-    ran = [a for a in C.stubs.calls("dispatch.sh") if "--next" not in a]
+    ran = lambda: [a for a in C.stubs.calls("dispatch.sh") if a != ["--next", "--dry-run"]]   # noqa: E731  (the fill's own pick is not a request)
     if "why" not in c and not c.get("dropped"):   # dispatch.sh (the existing script) starts it; a blocked issue loses its label only after that; the request is consumed
-        want = c.get("expect", ("7",))
-        assert len(ran) == 1 and not req.exists() and (ran[0][:2] == ["--address", ran[0][1]] and ran[0][1].startswith("address: continue from the pushed branch") and ran[0][2:] == ["7"] if want == "default" else ran == [list(want)])
+        want, r = c.get("expect", ("--next", "7")), ran()   # a fresh issue goes through dispatch.sh --next <n>: its ready rule decides
+        assert len(r) == 1 and not req.exists() and (r[0][:2] == ["--address", r[0][1]] and r[0][1].startswith("address: continue from the pushed branch") and r[0][2:] == ["7"] if want == "default" else r == [list(want)])
         edits = [a[3:] for a in C.calls("gh issue edit")]
         assert (["--remove-label", "blocked"] in edits) == c.get("label", False) and (not c.get("label") or in_order(C.kinds(), "dispatch.sh", "gh issue edit") is None)
     elif c.get("dropped"):
-        assert not ran and not req.exists()
+        assert not ran() and not req.exists()
     else:
-        assert len(ran) == int(bool(c.get("fails"))) and req.read_text().splitlines() == [c["text"], c["why"]]   # line 2 is the reason, --status shows it
-        assert bool(C.calls("orca worktree rm")) == bool(c.get("fails"))   # a failed fresh dispatch may leave a half-made worktree: removed, as fill() does
-        assert not (c.get("fails") and C.go("--answer", "attended") and len([a for a in C.stubs.calls("dispatch.sh") if "--next" not in a]) > 1)   # a failed dispatch is not retried on every tick: the human asks again or cancels
+        asked = c.get("fails") or c.get("refuses")   # dispatch.sh was asked and said no: its own last line (and exit code, when it is a refusal) is the reason
+        assert len(ran()) == int(bool(asked)) and req.read_text().splitlines() == [c["text"], c["why"]]   # line 2 is the reason, --status shows it
+        assert bool(C.calls("orca worktree rm")) == bool(c.get("fails"))   # a failed fresh dispatch may leave a half-made worktree: removed, as fill() does; a refusal made none
+        if asked:
+            C.go("--answer", "attended")
+            assert len(ran()) == (1 if c.get("fails") else 2)   # a failed dispatch is not retried on every tick (the human asks again or cancels); a refusal is asked again at the next wake: the board may have changed
 
 
 def test_status_lists_the_queue_in_the_order_to_present_it_and_the_dispatch_requests_with_their_reason(C, tmp_path):
@@ -686,19 +655,19 @@ def test_status_lists_the_queue_in_the_order_to_present_it_and_the_dispatch_requ
 def test_attended_rings_once_for_each_new_queued_decision_on_its_terminal_and_never_for_a_routine_event(C, tmp_path):
     bell = tmp_path / "bell"
 
-    def run(*args, **env):   # the loop handles a batch of two plans (the answerer hands both over); a third question is open in the inbox but arrived mid-batch: this loop has not handled it yet
+    def run(*args, **env):   # the loop handles a batch of two plans (the answerer hands both over); a third question was already open when it started (a restart)
         queued(C)
         C.stubs.reply("answer.sh", WHY + "\n", rc=3)
         C.mail([msg("question", i, question="PLAN?") for i in ("msg_a", "msg_b")])
         return C.go("--answer", "attended", *args, **env)
 
     assert run(COORD_MAX_TICKS=2).returncode == 0
-    assert bell.read_text() == "\a\a\a"   # msg_a, msg_b and #4 once each on the first pass; msg_c is not queued until handled (it may be a routine plan); the unchanged queue rings nothing on the second; #5 is on hold
+    assert bell.read_text() == "\a\a\a\a"   # msg_a, msg_b, msg_c (open at the start: seeded, so a restart rings once for it) and #4 once each on the first pass; the unchanged queue rings nothing on the second; #5 is on hold
     bell.unlink()
     assert run("--bell-tty", "/dev/null").returncode == 0 and not bell.exists()   # --bell-tty is where it rings: a terminal, not the loop's own
     err = run("--bell-tty", str(tmp_path / "plain")).stderr
-    assert "not a terminal" in err and bell.read_text() == "\a\a\a" and not (tmp_path / "plain").exists()   # anything else falls back to this terminal, the decision is never lost
-    bell.unlink(missing_ok=True); C.stubs.reply("gh.issue_list", "[]"); C.stubs.reply("answer.sh", "approve\nWARN: touches CI\n")   # a routine approval, with a warning: a worktree comment and an issue comment, no bell (auto and human keep their per-event bell: tests above)
+    assert "not a terminal" in err and bell.read_text() == "\a\a\a\a" and not (tmp_path / "plain").exists()   # anything else falls back to this terminal, the decision is never lost
+    bell.unlink(missing_ok=True); C.stubs.reply("gh.issue_list", "[]"); C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": []}})); C.stubs.reply("answer.sh", "approve\nWARN: touches CI\n")   # a routine approval, with a warning: a worktree comment and an issue comment, no bell (auto and human keep their per-event bell: tests above)
     C.mail([msg("question", "msg_q", question="PLAN?")])
     assert C.go("--answer", "attended").returncode == 0 and C.calls("orca worktree set") and not bell.exists()
     C.stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": []}}))   # a question from a worker the loop cannot resolve is left for the human by hand: it rings too

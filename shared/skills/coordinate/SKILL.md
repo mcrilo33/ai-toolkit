@@ -7,7 +7,7 @@ argument-hint: "[attended | auto [--until HH:MM] [--drain] | status]"
 
 One Run, and the loop (`coordinator.sh`, in its own Orca terminal) always holds it and does the routine work: dispatch to the cap, land, retry, block, route leftovers. Two modes, switched only on the user's explicit word, never inferred:
 
-- **attended**: the loop answers only what is routine (approves a routine plan, allows a permission request contained in the worker's worktree or scratchpad; `afk-answering`) and **queues everything else for the user**: a plan it handed over, a permission request that is not contained, a blocked issue. This session only presents that queue.
+- **attended**: the loop answers only what is routine (approves a routine plan; `afk-answering`) and **queues everything else for the user**: a plan it handed over, every permission request (the loop never approves one), a blocked issue. This session only presents that queue.
 - **auto**: the loop answers every plan itself, denies every permission request and labels `blocked`; the user decides when back.
 
 This session never binds the Run, `check`s or reads the inbox, never writes task code (`.ai-toolkit/rules/planning-hub.md`), keeps no state: ids live in the conversation. Scripts are in `.ai-toolkit/scripts/` (`coordinator.sh`, `dispatch.sh`, `land.sh`).
@@ -36,7 +36,7 @@ Before switching to auto tell the user that gates are then answered by `answer.s
 ## The queue (attended)
 
 When the user arrives, or asks what needs them, `coordinator.sh --status --run <run>` is the queue in the order to present it: open questions oldest first, then blocked issues, then dispatch requests. Present **one decision at a time**, stop for the answer, relay it,
-then the next; when it is empty, say so. Never show a heartbeat, a land, an allow the loop gave, a retry or any other routine event; report what landed only when asked (below). Each item: the issue (`gh issue view <n>`, its `Scope:`/`Gate:` footer), what the
+then the next; when it is empty, say so. Never show a heartbeat, a land, a retry or any other routine event; report what landed only when asked (below). Each item: the issue (`gh issue view <n>`, its `Scope:`/`Gate:` footer), what the
 loop shows, what bears on it (the files, the acceptance criteria, conflicts with other live issues), and **one recommendation with its reason**, not a menu. The user's answer is relayed with `--reply`, which queues it for the loop's next wake (the loop sends it and comments the issue):
 
 ```bash

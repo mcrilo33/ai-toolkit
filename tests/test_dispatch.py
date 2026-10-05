@@ -211,6 +211,10 @@ def test_next_picks_the_first_ready_issue(d, nodes, busy, want):
         assert r.returncode == 0 and r.stdout.strip() == str(want), r.stderr
     # a dry run launches nothing; only THIS repo's worktrees are in flight (issue numbers of other registered repos must not collide)
     assert d.orca() == [["worktree", "list", "--repo", f"path:{d.root}"]]
+    # --next <issue> is the same pick restricted to that issue (how the coordinator asks "may this one start?"): the one it would pick is ready, an in-flight one never is, and nothing ready refuses every issue
+    for i in sorted({*busy, *([want] if want else [n["number"] for n in nodes])}):
+        r = d.go("--next", "--dry-run", str(i))
+        assert (r.returncode, r.stdout.strip()) == ((0, str(i)) if i == want else (3, "")) and (i == want or f"#{i} is not ready" in r.stderr), r.stderr
 
 
 def test_next_dispatches_the_pick(d):

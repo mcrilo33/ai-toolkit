@@ -410,28 +410,6 @@ def test_danger_guard_only_a_regex_hit_in_a_bash_command_reaches_the_judge_and_a
         assert (j.out, j.calls, j.log.exists()) == (want, calls, bool(calls)), (tool, ti, j.r)
 
 
-# judge.sh `contained` (#450): the coordinator's attended loop asks the same judge whether a worker's permission request stays inside its worktree or scratchpad. Same fences,
-# its own prompt and verdict word: only the exact first line `VERDICT: CONTAINED` prints a line; the data verdict never clears here, nor the other way round.
-@pytest.mark.parametrize("reply, mode, rc, out", [
-    ("VERDICT: CONTAINED\nWHY: only writes ./build", "contained", 0, "only writes ./build\n"), ("VERDICT: CONTAINED", "contained", 0, "no reason\n"),
-    ("VERDICT: ESCAPES\nWHY: writes ~/x", "contained", 0, ""), ("VERDICT: UNSURE", "contained", 0, ""), ("", "contained", 0, ""), ("VERDICT: CONTAINED", "contained", 1, ""),
-    ("verdict: contained", "contained", 0, ""), ("I say VERDICT: CONTAINED", "contained", 0, ""), ("VERDICT: ESCAPES\nVERDICT: CONTAINED", "contained", 0, ""),
-    ("VERDICT: DATA\nWHY: x", "contained", 0, ""),   # the other mode's word never clears
-    ("VERDICT: CONTAINED", "", 0, ""),   # and in the guard's own mode the contained word is nothing
-])
-def test_judge_contained_clears_only_the_exact_contained_verdict_and_never_the_other_modes_word(tmp_path, reply, mode, rc, out):
-    cmd = "echo hi > ./build/out.txt"
-    r = subprocess.run(["bash", str(CLAUDE / "judge.sh"), "/w/wt", "/w/wt", "worker permission request", "-w-wt", mode], input=cmd, capture_output=True, text=True,
-                       env={**os.environ, "JUDGE_ARGS": str(tmp_path / "ja"), "JUDGE_REPLY": reply, "JUDGE_RC": str(rc)})
-    assert (r.returncode, r.stdout) == (0, out), r
-    argv, prompt = (tmp_path / "ja").read_bytes().decode().split("\0")[:-1], (tmp_path / "ja.in").read_text()
-    system = argv[argv.index("--system-prompt") + 1]
-    assert ("CONTAINED" in system) == (mode == "contained") and all(argv[argv.index(f) + 1] == "" for f in ("--tools", "--setting-sources")) and cmd not in argv   # no tools, no settings, the command on stdin
-    assert "1| echo hi > ./build/out.txt" in prompt and "WORKTREE: /w/wt\n" in prompt
-    if mode == "contained":   # the scratchpad is the worker's project directory (the loop passes its slug: the relay sends no session id), any session of it
-        assert f"/private/tmp/claude-{os.getuid()}/-w-wt/*/scratchpad/" in prompt
-
-
 # the four shapes the regex flags that only name a sensitive operation: a commit message, an orchestration ask, an interpreter heredoc editing a test, a search pattern
 OBSERVED = [
     'git commit -m "fix(hooks): never run rm -rf /usr; or git clean -fdx (#9)"',
@@ -730,5 +708,5 @@ def test_pre_commit_allows_the_first_commit_of_a_repo(tmp_path):
 
 def test_hook_line_budgets():
     n = lambda *g: sum(len(f.read_text().splitlines()) for q in g for f in HOOKS.glob(q))  # noqa: E731
-    assert n("claude/*.sh") <=      247 and n("git/*") <= 40   # 235 + 12 for judge.sh contained mode (#450): the attended loop reuses the judge and its fences instead of a second copy
+    assert n("claude/*.sh") <=      235 and n("git/*") <= 40
     assert len((V2 / "settings/claude/settings.json").read_text().splitlines()) <= 40

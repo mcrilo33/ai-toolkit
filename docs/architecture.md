@@ -71,12 +71,12 @@ route leftovers). A Claude session never binds the Run, `check`s or reads the in
 | | auto | attended |
 |---|---|---|
 | PLAN gate | `answer.sh` always answers (`Mode: auto`) | a routine plan is approved by `answer.sh` (`Mode: attended`); any other plan is its third outcome, `human: <reason>` (exit 3): left open on the Run, the worker waits |
-| Permission request | `deny` at once, no model | `allow` when contained (below), else left open (the worker's relay denies itself after 9 minutes) |
+| Permission request | `deny` at once, no model | never answered by the loop: left open for the user, who has the relay's 9 minutes (it denies itself after that) |
 | What reaches the user | blocked issues, each flagged with the bell of the loop's terminal | the **queue**: open questions (oldest first), blocked issues without `hold`, in `--status`; one bell per NEW queued decision on the session's terminal (`--bell-tty`) |
 
 The session in attended mode only presents the queue, one decision at a time, relays each answer with `coordinator.sh --reply`, writes into the issue any answer that changes what it asks, and shows no routine event.
 Its other requests go through the loop too: `coordinator.sh --run R --dispatch <issue> ['<message>']` queues a request (a file in the reply spool's `requests/`, line 1 the message, line 2 the reason it cannot run yet) that the loop runs
-ahead of its own pick with `dispatch.sh` (`--address` with a message, or a default one, for a kept worktree; a fresh worker reads only the issue body, so a message with no worktree is refused), within the cap and the Scope rule; a request that cannot run (on hold, blocked with no message, already running, a Scope overlap, no free slot, an unreadable issue, a failed dispatch: not retried) stays
+ahead of its own pick with `dispatch.sh` (`--address` with a message, or a default one, for a kept worktree; a fresh worker reads only the issue body, so a message with no worktree is refused), within the cap; for a fresh issue `dispatch.sh --next <issue>` decides with its own ready rule (hold, blocked, open blocker, in flight, Scope overlap) and its refusal, with its exit code 3, is the reason; a request that cannot run (on hold, blocked with no message, already running, not ready for `dispatch.sh` (a Scope overlap among others), no free slot, an unreadable issue, a failed dispatch: not retried) stays
 in `--status` with its reason until it runs or `--dispatch <n> --cancel` withdraws it (only a closed issue is dropped); a finished worker is landed by the loop itself.
 The bell is `printf '\a'` appended to a terminal device: Orca has no verb to ring another terminal, so the skill passes its own tty (`--bell-tty`; anything that is not a terminal falls back to the loop's own) and Orca's
 suppress-when-focused keeps it silent while the user works there. The ids last seen live in one shell variable (no file), so a decision rings once; a restart rings again for the blocked issues still waiting, while a question left open before it is in `--status`. A question counts only once this loop has left it open: one that arrived while the loop was busy
@@ -138,9 +138,7 @@ sequenceDiagram
     W->>O: ask "PERMISSION REQUEST ..." (allow, deny)
     O-->>L: check --wait
     L->>L: auto: reply deny (never answer.sh)
-    L->>L: attended: contained? judge.sh contained
-    L->>O: reply allow (contained)
-    L-->>S: not contained: queued, one bell
+    L-->>S: attended: left open, queued, one bell
     S->>U: tool, command or change, reason
     U->>S: decision
     S->>L: coordinator.sh --reply <id> allow | deny
@@ -154,12 +152,8 @@ answer only, never the command or content. The relay is **fail-closed**: exactly
 `deny`. A hook that exceeds its own timeout is killed with no decision and the local dialog stays waiting, so the relay bounds its ask with its own timer (`--timeout-ms` 540000, kill at 570 s) under the hook timeout (600 s).
 While it waits, the dialog is drawn in the worker too; the relay's answer dismisses it. Orca leaves a question pending after its ask times out, so a question the relay already denied stays open in the Run until replied: a late reply changes nothing (the coordinate skill ignores a stale one). Outside a worker (no `.ai-toolkit/spoke-run-id`) the hook prints nothing and the local prompt stays.
 
-**Contained permission requests (#450, attended only).** The user's standing rule: allow a command that only writes inside the worker's own worktree or scratchpad. `coordinator.sh --answer attended` allows a request only when all hold, and any
-failure leaves it open for the user (never a deny, never an allow): the tool is `Bash` and the command is shown whole (no `[truncated`); danger-guard did not flag it (`reason: unknown`: a guard finding is a sensitive operation, never self-approved);
-its text, with quotes and backslashes stripped as the guard does, names no protected path (`.claude/`, `.ai-toolkit/`, `orca.yaml`, `.github`, the reply spool) and has no `..`, `~`, `$`, backtick or brace; its `cwd` resolves (symlinks included) under the worktree
-the loop got from Orca and the dispatch record (never the question's `worktree:` line); and `judge.sh` in its `contained` mode answers exactly `VERDICT: CONTAINED`. That mode is the judge below with its own prompt (everything written, moved, deleted or redirected
-lands in the worktree or the scratchpad `/tmp/claude-<uid>/<the worktree's project slug>/*/scratchpad`, nothing is sent out, no git ref or stash is touched) and all its fences (the command as untrusted numbered lines, a forged `VERDICT:` word never clears, no tools, no settings, a kill timer,
-any failure silent), so a worker cannot argue its way to an allow. It is a classifier over text, **not a sandbox** (same standing as the pattern list above); the independent review at land, the hard denies and the judge's fences are untouched. Issue comments name the tool and the answer only.
+**The loop never approves a permission request (#450).** In attended mode every relayed request stays open and is queued for the user, who answers with `--reply <id> allow|deny` inside the relay's 9 minutes; in auto mode it is denied at once. There is no containment check in the loop and no second judge mode:
+the guard and its judge (below) already allow a recursive delete of a literal path inside the worktree or below the temp root and clear a command that only mentions an operation, so few requests reach the queue.
 
 ## Coordinator runbook
 
@@ -180,7 +174,7 @@ or re-bind after a restart: everything else is re-derived from `worker-list`, `w
   the notification says only "Bell in <worktree>", never the event: the worktree comment, the issue comment and this log carry the text). A `blocked` issue and an auto-answer `WARN:` flag the same way. Run the reply line from ANY terminal (a bare `orca orchestration reply` is refused outside the Run's bound terminal):
   `bash .ai-toolkit/scripts/coordinator.sh --run <run-id> --reply <message-id> approve` or `... 'approve with: <small change>'` or `... 'revise: <what to change>'`; a permission question takes `allow` or `deny` instead.
   It queues one file in `~/.ai-toolkit/coordinator/<run-id>/replies/` (`AITK_STATE_DIR` relocates it); the loop sends it at its next wake (30 s while a question waits).
-- **The queue (`--answer attended`).** Open questions (a plan handed over with its reason, a permission request that is not contained) and open `blocked` issues without `hold`; the loop rings once for each new one. Answer with `--reply`; a blocked issue by a
+- **The queue (`--answer attended`).** Open questions (a plan handed over with its reason, a permission request) and open `blocked` issues without `hold`; the loop rings once for each new one. Answer with `--reply`; a blocked issue by a
   comment and removing the label, `--dispatch <n> '<message>'`, `hold` or closing it.
 - **`blocked` issue.** Read the comment, then fix by hand in the kept worktree (`orca worktree show --worktree issue:<n>`), push, and `land.sh <n>`; or remove the label
   after fixing the cause and `dispatch.sh <n>` again; or `orca worktree rm --worktree issue:<n> --force --run-hooks`.

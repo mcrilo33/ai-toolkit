@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# dispatch.sh [--run R] (<issue> | --next [--dry-run]): one issue -> one supervised worker (06 section 4 steps 2, 3, 5, 6).
+# dispatch.sh [--run R] (<issue> | --next [--dry-run] [<issue>]): one issue -> one supervised worker (06 section 4 steps 2, 3, 5, 6).
 # The Run is explicit (--run or $RUN, never inferred: a coordinator's Run must not be picked up by accident).
 # --retry-of D --task T <issue>: relaunch the issue's worker (a new claude-spoke terminal in its worktree) on the same task; Orca re-seeds the spec.
 # --address "<spec>" <issue>: same fresh terminal, but a NEW task whose spec is the text (a review/CI round: worker-start refuses --task with --spec,
 # and Orca does not accept a new task on an idle two-step terminal: agent_unconfigured). Both first refresh the worktree's installed
 # copies from the main checkout (setup.sh --refresh), keeping its spoke-run-id; a failed refresh starts no agent.
+# --next <issue>: the same pick restricted to that issue, so it starts only if it is ready (exit 3 and a message when it is not).
 # Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; n=""; next=0; dry=0; retry_of=""; task=""; address=""; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
+run="${RUN:-}"; n=""; only=""; next=0; dry=0; retry_of=""; task=""; address=""; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;;
@@ -41,20 +42,21 @@ PICK='def scope: [(.body // "") | split("\n")[] | select(test("^\\s*[Ss]cope:"))
   def names: [.labels.nodes[].name];
   (map(select(.number as $x | ($busy | index($x)) != null) | scope)) as $held
   | [.[] | . as $i | scope as $s
+      | select($only == null or $i.number == $only)
       | select(($busy | index($i.number)) == null)
       | select(names | any(. == "hold" or . == "blocked") | not)
       | select([$i.blockedBy.nodes[] | select(.state != "CLOSED")] | length == 0)
       | select($held | all(clash($s; .) | not))
       | {n: $i.number, p: (if (names | index("priority")) == null then 1 else 0 end)}]
   | sort_by([.p, .n]) | (.[0].n // empty)'
-pick_next() {
+pick_next() {   # $only: restrict the pick to that issue (--next <issue>)
   local nodes busy
   # shellcheck disable=SC2016
   nodes="$(gh api graphql -F owner='{owner}' -F name='{repo}' -F limit=100 --jq '.data.repository.issues.nodes' -f query='
     query($owner:String!, $name:String!, $limit:Int!) { repository(owner:$owner, name:$name) { issues(states: OPEN, first: $limit, orderBy: {field: CREATED_AT, direction: ASC}) {
       nodes { number body labels(first: 20) { nodes { name } } blockedBy(first: 50) { nodes { number state } } } } } }')" || die "gh api graphql failed"
   busy="$(orca_json worktree list --repo "path:$main" | jq -c '[.result.worktrees[].linkedIssue | select(. != null)]')" || die "worktree list failed"
-  printf '%s' "$nodes" | jq -r --argjson busy "$busy" "$PICK"
+  printf '%s' "$nodes" | jq -r --argjson busy "$busy" --argjson only "${only:-null}" "$PICK"
 }
 
 seed() {   # $1 = gate: plan = full cycle; none = light lane (no PLAN gate, no in-worker review)
@@ -119,8 +121,8 @@ dispatch() {
 }
 
 if [ "$next" = 1 ]; then
-  n="$(pick_next)"
-  [ -n "$n" ] || { echo "dispatch: nothing ready" >&2; exit 3; }
+  only="$n"; n="$(pick_next)"
+  [ -n "$n" ] || { if [ -n "$only" ]; then echo "dispatch: #$only is not ready (on hold, blocked, in flight, an open blocker, or a Scope that overlaps an in-flight issue)" >&2; else echo "dispatch: nothing ready" >&2; fi; exit 3; }
   [ "$dry" = 0 ] || { echo "$n"; exit 0; }
 fi
 dispatch "$n"
