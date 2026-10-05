@@ -71,13 +71,19 @@ stale_note() {
 task_md() { jq -r '"# #\(.number) \(.title)\n\n\(.body)"'; }
 task_md_number() { sed -n '1s/^# #\([0-9][0-9]*\)[[:space:]].*/\1/p' "$1" 2> /dev/null || true; }
 
-# issue_of <worktree>: the issue a worktree belongs to, from sources its worker cannot choose by editing files: Orca's link, else the `<n>-<slug>`
-# branch name. Prints nothing when neither names a number. Never task.md's header: that is the worker's to rewrite.
+# issue_of <worktree> [tries]: the issue a worktree belongs to, from Orca's link ONLY. Which issue a worktree is for is set by the coordinator and read
+# back from Orca; the branch name and task.md are the worker's to rewrite, so a gate never reads them. An Orca that cannot answer (error, non-JSON, no
+# worktree object) is retried every AI_TOOLKIT_POLL seconds, ORCA_LINK_TRIES times (default 40, about 2 minutes), never guessed around; an answer of "no
+# link" is final. rc 0 prints the number; 1 Orca has no usable link; 2 Orca never answered. Each failure names the worktree and the cause on stderr.
+_orca_link_once() {   # prints only on success: wait_until's caller captures every attempt's stdout
+  local o
+  o="$(orca_json worktree show --worktree "path:$1" 2> /dev/null | jq -er '.result.worktree | if type == "object" then .linkedIssue // "" else error("no worktree") end' 2> /dev/null)" && printf '%s' "$o"
+}
 issue_of() {
-  local n b
-  n="$(orca_json worktree show --worktree "path:$1" 2> /dev/null | jq -r '.result.worktree.linkedIssue // empty' 2> /dev/null || true)"
-  case "$n" in '' | *[!0-9]*) [ -z "$n" ] || warn "Orca link '$n' is not an issue number; using the branch name"; b="$(git -C "$1" branch --show-current 2> /dev/null || true)"; n="${b%%-*}" ;; esac
-  case "$n" in *[!0-9]*) n="" ;; esac
+  local n
+  n="$(wait_until "${2:-${ORCA_LINK_TRIES:-40}}" "${AI_TOOLKIT_POLL:-3}" _orca_link_once "$1")" || { printf '%s: Orca could not answer for %s: no issue number is guessed\n' "${0##*/}" "$1" >&2; return 2; }
+  [ -n "$n" ] || { printf '%s: no issue linked in Orca for %s\n' "${0##*/}" "$1" >&2; return 1; }
+  case "$n" in *[!0-9]*) printf "%s: Orca's link '%s' for %s is not an issue number\n" "${0##*/}" "$n" "$1" >&2; return 1 ;; esac
   printf '%s' "$n"
 }
 

@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import STUB_TEE, V2
+from conftest import STUB_TEE, V2, git
 
 ANSWER, REVIEW = str(V2 / "scripts/answer.sh"), str(V2 / "scripts/review.sh")
 OK = {"verdict": "APPROVE", "blockers": [], "warnings": ["a.py:1 - nit"], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
@@ -25,10 +25,11 @@ def A(stubs, tmp_path, link_script):
     stdin, wt, rule = tee_stdin(link_script), tmp_path / "wt", tmp_path / "rule.md"
     wt.mkdir()
     rule.write_text("be decisive")
+    stubs.reply("orca.worktree_show", '{"result":{"worktree":{"linkedIssue":9}}}')   # the gate judges the issue Orca links to the worktree
 
     def go(out, rc=0, rule_path=None, input="", **env):
         stubs.reply("claude", out, rc=rc)
-        return sh(["bash", ANSWER, str(wt)], tmp_path, input, ANSWER_RULE=rule_path or rule, **env)
+        return sh(["bash", ANSWER, str(wt)], tmp_path, input, **{"ANSWER_RULE": rule_path or rule, "ORCA_LINK_TRIES": 3, "AI_TOOLKIT_POLL": 0, **env})
 
     return type("A", (), {"go": staticmethod(go), "wt": wt, "rule": rule, "stubs": stubs, "stdin": staticmethod(stdin)})
 
@@ -40,48 +41,55 @@ def test_answer_never_answers_a_permission_question_even_when_claude_would_appro
 
 
 def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_question(A):
-    r = A.go("thinking...\nREVERSIBILITY: reversible\nANSWER:   Approve  \n", input="PLAN: do X. Approve?", ANSWER_MODEL="m-1")
-    assert r.returncode == 0 and r.stdout == "approve\n", r.stderr
-    argv = A.stubs.calls("claude")[0]
-    assert argv[:3] == ["-p", "--model", "m-1"] and ["--append-system-prompt-file", str(A.rule), "--allowedTools", "Read,Grep,Glob"] == argv[3:7]
-    assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and A.stdin().startswith("PLAN: do X. Approve?") and "no issue number" in A.stdin()
-    # the issue changed after dispatch: the gate reads the live text; an unreadable issue keeps the copy, warns and says so in the prompt
-    link = lambda n: A.stubs.reply("orca.worktree_show", f'{{"result":{{"worktree":{{"linkedIssue":{n}}}}}}}')   # the number comes from the Orca link, never from the worktree's own files
-    link(9)
-    task = A.wt / ".ai-toolkit/task.md"
+    A.stubs.reply("orca.worktree_show", '{"result":{"worktree":{"linkedIssue":5}}}', rc=1, n=1)   # Orca fails twice (the first with a payload, which a failed try must not leak), then answers: the gate waits instead of guessing
+    A.stubs.reply("orca.worktree_show", "boom", rc=1, n=2)
+    task = A.wt / ".ai-toolkit/task.md"   # the issue changed after dispatch: the gate reads the live text
     task.parent.mkdir()
     task.write_text("# #9 old\n\nold body\n")
     A.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')
-    assert A.go("ANSWER: approve\n", input="PLAN: do X.").returncode == 0
-    assert A.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and task.read_text() == "# #9 new\n\nnew body\n" and "stale" not in A.stdin()
+    r = A.go("thinking...\nREVERSIBILITY: reversible\nANSWER:   Approve  \n", input="PLAN: do X. Approve?", ANSWER_MODEL="m-1")
+    assert r.returncode == 0 and r.stdout == "approve\n" and r.stderr == "", r.stderr
+    argv = A.stubs.calls("claude")[0]
+    assert argv[:3] == ["-p", "--model", "m-1"] and ["--append-system-prompt-file", str(A.rule), "--allowedTools", "Read,Grep,Glob"] == argv[3:7]
+    assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and A.stdin() == "PLAN: do X. Approve?" and len(A.stubs.calls("orca")) == 3
+    assert A.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and task.read_text() == "# #9 new\n\nnew body\n"
     task.write_text("# #7 edited by the worker\n\nother issue\n")   # a header naming another issue never picks the issue: the link wins, and the disagreement is reported
     r = A.go("ANSWER: approve\n", input="PLAN: do X.")
     assert r.returncode == 0 and [c[2] for c in A.stubs.calls("gh")] == ["9", "9"] and task.read_text() == "# #9 new\n\nnew body\n"
     assert "warning" in r.stderr and "#7" in r.stderr and "#7" in A.stdin() and "#9" in A.stdin() and "stale" not in A.stdin()
     git_in = lambda *a: subprocess.run(["git", "-C", str(A.wt), *a], check=True, capture_output=True)
-    git_in("init", "-q", "-b", "5-x")   # the Orca link outranks the branch; without a link the branch number is used
+    git_in("init", "-q", "-b", "5-x")   # the Orca link outranks the branch name, which the judged worker can rename
+
+    def refused(why):   # Orca's link is the only source: without it the gate judges nothing (no claude, no fetch, no answer) and the loop takes its unanswered path
+        gh, claude, orca = (len(A.stubs.calls(c)) for c in ("gh", "claude", "orca"))
+        r = A.go("ANSWER: approve\n", input="PLAN: do X.")
+        assert r.returncode == 1 and r.stdout == "" and str(A.wt) in r.stderr and why in r.stderr
+        assert len(A.stubs.calls("gh")) == gh and len(A.stubs.calls("claude")) == claude
+        return len(A.stubs.calls("orca")) - orca
+
     assert A.go("ANSWER: approve\n", input="PLAN: do X.").returncode == 0 and A.stubs.calls("gh")[-1][2] == "9"
-    link("null")
-    assert A.go("ANSWER: approve\n", input="PLAN: do X.").returncode == 0 and A.stubs.calls("gh")[-1][2] == "5"
-    link('"x;y"')   # a link that is no number is reported, then the branch is used
-    r = A.go("ANSWER: approve\n", input="PLAN: do X.")
-    assert "not an issue number" in r.stderr and A.stubs.calls("gh")[-1][2] == "5"
-    link("null")
-    git_in("branch", "-m", "wp0")   # neither source: today's note, no fetch, even with a header in the worktree
-    task.write_text("# #7 edited by the worker\n\nother issue\n")
-    n_gh = len(A.stubs.calls("gh"))
-    r = A.go("ANSWER: approve\n", input="PLAN: do X.")
-    assert r.returncode == 0 and len(A.stubs.calls("gh")) == n_gh and "no issue number" in A.stdin() and task.read_text().startswith("# #7")
-    link(9); git_in("branch", "-m", "9-feat")
+    task.write_text("# #7 edited by the worker\n\nother issue\n")   # neither a header nor the branch number 5 picks the issue
+    link = lambda n, rc=0: A.stubs.reply("orca.worktree_show", n, rc=rc)
+    link('{"result":{"worktree":{"linkedIssue":null}}}')
+    assert refused("no issue linked") == 1   # an answer of no link is final: not retried
+    link('{"result":{"worktree":{"linkedIssue":"x;y"}}}')
+    assert refused("not an issue number") == 1
+    link("boom", rc=1)   # Orca never answers: retried up to the bound (ORCA_LINK_TRIES=3), then the cause is named
+    assert refused("could not answer") == 3
+    link("<html>")   # not JSON
+    assert refused("could not answer") == 3
+    link('{"result":{}}')   # no worktree object
+    assert refused("could not answer") == 3 and task.read_text().startswith("# #7")
+    link('{"result":{"worktree":{"linkedIssue":9}}}')
     A.stubs.reply("gh", "boom", rc=1)
     task.write_text("# #9 old\n\nold body\n")
     r = A.go("ANSWER: approve\n", input="PLAN: do X.")
     assert r.returncode == 0 and task.read_text() == "# #9 old\n\nold body\n"
+    assert "warning" in r.stderr and "may be stale" in A.stdin() and A.stdin().startswith("PLAN: do X.")
     task.write_text("# #7 old\n\nold body\n")   # an unrefreshed copy that also disagrees: the prompt must not claim it describes #9
     r = A.go("ANSWER: approve\n", input="PLAN: do X.")
     assert r.returncode == 0 and "may be stale" in A.stdin() and "still holds that edited copy" in A.stdin()
     task.write_text("# #9 old\n\nold body\n")
-    assert "warning" in r.stderr and "may be stale" in A.stdin() and A.stdin().startswith("PLAN: do X.")
     task.chmod(0o444); task.parent.chmod(0o555)   # an unwritable copy is a stale copy too, never a failed gate
     A.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')
     r = A.go("ANSWER: approve\n", input="PLAN: do X.")
@@ -121,9 +129,9 @@ def R(stubs, repo, link_script):
     show = json.dumps({"result": {"worktree": {"path": str(wt), "branch": "refs/heads/9-feat"}}})
     stubs.reply("orca.worktree_show", show)
 
-    def go(verdict, rc=0, **env):
+    def go(verdict, rc=0, sha=None, **env):
         stubs.reply("claude", verdict if isinstance(verdict, str) else json.dumps(verdict), rc=rc)
-        return sh(["bash", REVIEW, "9"], repo.root, **env)
+        return sh(["bash", REVIEW, "9", *([sha] if sha else [])], repo.root, **env)
 
     return type("R", (), {"go": staticmethod(go), "wt": wt, "stubs": stubs, "stdin": staticmethod(stdin), "show": show})
 
@@ -136,6 +144,14 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     tools = argv[argv.index("--allowedTools") + 1]
     assert "Read" in tools and "git diff" in tools and not {"Edit", "Write"} & set(tools.replace("(", ",").split(","))
     assert "origin/trunk...9-feat" in R.stdin() and "JSON" in R.stdin() and f"PWD={R.wt.resolve()}" in R.stubs.env("claude")
+    # a sha pins the review to that commit: the prompt diffs and reads it, never the branch name or the working tree; an unknown sha never reaches claude
+    sha = git(R.wt, "rev-parse", "HEAD")
+    assert R.go(OK, sha=sha, BASE_BRANCH="trunk").returncode == 0
+    p = R.stdin()
+    assert f"origin/trunk...{sha}" in p and f"git show {sha}:" in p and "9-feat" not in p and "working tree" in p and "JSON" in p
+    n = len(R.stubs.calls("claude"))
+    r = R.go(OK, sha="0" * 40)
+    assert r.returncode == 1 and "0" * 40 in r.stderr and len(R.stubs.calls("claude")) == n
     # the issue changed after dispatch: the gate reads the live text; an unreadable issue keeps the copy, warns and says so in the prompt
     task = R.wt / ".ai-toolkit/task.md"
     task.parent.mkdir()

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# review.sh <issue>: the independent pre-land review (06 section 4 step 11, D6). A fresh read-only claude (REVIEW_MODEL, not the
-# worker's) runs the code-review agent in the spoke's worktree on origin/$BASE_BRANCH...<branch>; its final message is the JSON
+# review.sh <issue> [<sha>]: the independent pre-land review (06 section 4 step 11, D6). A fresh read-only claude (REVIEW_MODEL, not the
+# worker's) runs the code-review agent in the spoke's worktree on origin/$BASE_BRANCH...<sha>; its final message is the JSON
 # verdict {verdict, blockers, warnings, tdd_followed, tests_weakened, summary}. stdout: BLOCKER:/WARNING:/SUMMARY: lines.
 # Exit 0 APPROVE; 3 REQUEST_CHANGES (a rejected tdd_followed / tests_weakened or a blocker beats a verdict that says APPROVE);
 # 1 error or an unparseable verdict after one retry (never an approve; land.sh treats it as a rejection).
@@ -9,12 +9,16 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-n="${1:-}"; [ -n "$n" ] || usage_exit "usage: review.sh <issue>"
+n="${1:-}"; sha="${2:-}"; [ -n "$n" ] || usage_exit "usage: review.sh <issue> [<sha>]"
 o="$(orca_json worktree show --worktree "issue:$n")" || die "no Orca worktree is linked to issue $n"
 wt="$(printf '%s' "$o" | jq -r '.result.worktree.path')"
 branch="$(printf '%s' "$o" | jq -r '.result.worktree.branch | sub("^refs/heads/"; "")')"
+if [ -n "$sha" ]; then full="$(git -C "$wt" rev-parse -q --verify "$sha^{commit}")" || die "no commit $sha in the worktree of issue $n"; sha="$full"; fi   # a full sha, never a moving ref
 stale="$(refresh_task "$wt" "$n")"   # the reviewer judges the issue as it is now, not the dispatch-time copy
-prompt="Review the change of branch $branch against origin/$BASE_BRANCH: git diff origin/$BASE_BRANCH...$branch. Intent: .ai-toolkit/task.md.$stale Your final message must be exactly the JSON verdict object of your verdict contract."
+if [ -n "$sha" ]; then   # pinned: the worker keeps committing and editing while this runs, so the ref and the working tree are not the target
+  target="Review commit $sha against origin/$BASE_BRANCH: git diff origin/$BASE_BRANCH...$sha. Read file contents with git show $sha:<path>; the working tree may differ from $sha and is not the review target."
+else target="Review the change of branch $branch against origin/$BASE_BRANCH: git diff origin/$BASE_BRANCH...$branch."; fi
+prompt="$target Intent: .ai-toolkit/task.md.$stale Your final message must be exactly the JSON verdict object of your verdict contract."
 # shellcheck disable=SC2016
 VALID='type == "object" and (.verdict | IN("APPROVE", "REQUEST_CHANGES")) and (.blockers | type == "array" and all(type == "string"))
   and (.warnings | type == "array" and all(type == "string")) and (.tdd_followed | type == "boolean") and (.tests_weakened | type == "boolean") and (.summary | type == "string")'

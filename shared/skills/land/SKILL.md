@@ -7,7 +7,8 @@ argument-hint: "[issue number]"
 
 `.ai-toolkit/scripts/land.sh <n>` runs the whole landing, in order; each step must pass before the next:
 
-1. `review.sh <n>`: independent review on `origin/<base>...<branch>`; REQUEST_CHANGES stops here.
+1. `review.sh <n> <tip>`: independent review on `origin/<base>...<tip sha>`, the exact commit that lands (a branch
+   that moves during the review is refused); REQUEST_CHANGES stops here.
 2. CI green for the exact tip (`gh run list --commit <sha>`); `--local-gate` runs `$CHECK_CMD` instead
    (no CI yet).
 3. Base moved? merge it into the spoke branch and push, then wait for CI again.

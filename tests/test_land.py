@@ -240,6 +240,31 @@ def test_review_runs_first_and_a_non_approval_exits_3(L, tmp_path, link_script):
     n = len(L.trail())
     assert L.go("--review", "9", REVIEW_CMD=rev).returncode == 0
     assert [t[:3] for t in L.trail()[n:n + 3]] == [("orca", "worktree", "show"), ("gh", "review", "9"), ("gh", "run", "list")]
+    # the review judges the exact tip: the sha it gets is the sha gated and the sha fast-forwarded onto main
+    reviewed = L.trail()[n + 1]
+    assert reviewed == ("gh", "review", "9", L.tip) and L.trail()[n + 2][4] == L.tip and main_sha(L) == L.tip
+
+
+@pytest.mark.parametrize("push", ["1", ""])   # the worker pushed a new commit, or only committed locally, while the review ran
+def test_a_branch_moved_during_the_review_is_refused_so_only_the_reviewed_tip_can_land(L, tmp_path, link_script, push):
+    rev = link_script(tmp_path / "mover.sh", f'#!/bin/sh\ngh review "$@"\ncd "$WT" && echo b > b.txt && git add b.txt && git commit -qm b && {{ [ -z "$PUSH" ] || git push -q origin HEAD:{BRANCH}; }}\n')
+    before = main_sha(L)
+    r = L.go("--review", "9", REVIEW_CMD=rev, WT=L.wt, PUSH=push)
+    assert r.returncode == 2 and "moved during the review" in r.stderr and L.tip in r.stderr and git(L.wt, "rev-parse", "HEAD") in r.stderr, r.stderr
+    no_side_effects(L, before)
+    assert not [t for t in L.trail() if t[:3] == ("gh", "run", "list")]
+
+
+def test_a_commit_made_in_the_spoke_while_the_gate_runs_is_not_merged_and_landed_unreviewed(L):
+    L.other_push("seed.txt")   # creates the clone
+    # the first gate runs while main moves again and the worker commits: round 2 would merge main into that unreviewed HEAD
+    cmd = (f"[ -f {L.tmp}/moved ] || {{ touch {L.tmp}/moved; (cd {L.tmp}/other && echo z > z.txt && git add z.txt && git commit -qm z && git push -q origin main) "
+           f"&& cd {L.wt} && echo e > evil.txt && git add evil.txt && git commit -qm evil; }}")
+    r = L.go("--local-gate", "9", CHECK_CMD=cmd)
+    assert r.returncode == 2 and "moved off the reviewed tip" in r.stderr, r.stderr
+    assert "evil.txt" not in git(L.origin, "ls-tree", "--name-only", "-r", "main") and L.tip != main_sha(L)   # only the other clone's push moved main
+    assert not [t for t in L.trail() if t[:3] in (("gh", "issue", "close"), ("orca", "worktree", "rm"))]
+
 
 
 def test_local_main_ahead_of_origin_is_refused_so_nothing_ungated_ships(L):
