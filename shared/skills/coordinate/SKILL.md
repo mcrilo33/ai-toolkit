@@ -65,7 +65,7 @@ the loop would do: `RUN=<run> .ai-toolkit/scripts/dispatch.sh --address "address
 most 2 rounds for a rejected review, 1 for red CI or a conflict; after that propose `blocked`). 6 landed but cleanup incomplete: run
 `.ai-toolkit/scripts/land.sh --cleanup-only <n>`, never land again. After 0 or 6, route the leftovers without asking (`bug-triage.md`): a defect among land.sh's `WARNING:` lines to the
 `bug-scoper` agent, any other warning and anything the worker deferred in `worker_done` to `followup-scoper`; no pre-filtering (they verify
-and dedup), no follow-up issue by hand. Report one line each: filed #n, dropped (ungrounded or duplicate), or on `hold` awaiting the user's go.
+and dedup), say file it, not draft; no follow-up issue by hand. Report one line each: filed #n, dropped (ungrounded or duplicate), or on `hold` awaiting the user's go.
 
 **`worker_done` failed / `escalation`**: read the body and the kept worktree (`orca worktree show --worktree issue:<n>`), explain what
 happened in two sentences, then propose either `blocked` or one retry with `dispatch.sh --address "<what to do differently>" <n>`.

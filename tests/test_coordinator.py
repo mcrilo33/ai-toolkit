@@ -314,8 +314,8 @@ W = "WARNING: a.py:3 - "   # a review warning as land.sh prints it
 
 @pytest.mark.parametrize("land, body, crc, routed", [
     ("", "the body", 0, ""),                                                    # nothing left over: no scoper call
-    (f"{W}x\n{W}y\n", "the body", 0, "xy"), (f"{W}x\n", "the body", 1, "x"),    # the routing succeeds / fails: the land reads the same
-    ("", "done; deferred: cache the lookup", 0, "deferred"),                    # a deferral in the worker's report
+    (f"{W}x\n{W}zeta\n", "the body", 0, "xzeta"), (f"{W}x\n", "the body", 1, "x"),    # the routing succeeds / fails: the land reads the same
+    ("", "done; deferred: cache the lookup", 0, "cache the lookup"),                    # a deferral in the worker's report
     ("".join(f"{W}w{i}\n" for i in range(1, 6)), "the body", 0, "w1w2w3")])    # five warnings: three routed, the other two kept in a comment
 def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_once_after_all_its_messages(C, land, body, crc, routed):
     C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # a failing handler must not stop the rest, nor the ack
@@ -332,7 +332,7 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
         in_order(C.kinds(), "land.sh", "claude")
         p = C.stdin("claude")
         assert "bug-scoper" in p and "followup-scoper" in p
-        assert all(t in p for t in re.findall(r"w\d|deferred|x|y", routed)) and ("w4" not in p)
+        assert all(t in p for t in re.findall(r"w\d|cache the lookup|zeta|x", routed)) and ("w4" not in p)
     if crc:   # a failed routing never reddens the land, and the finding is kept: warned and commented on the landed issue
         assert "a.py:3 - x" in r.stderr and any("a.py:3 - x" in a[-1] for a in C.calls("gh issue comment")[1:])
     if "w1" in routed:

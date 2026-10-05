@@ -191,14 +191,15 @@ on_question() {
 }
 triage() {   # $1 = land output, $2 = the worker's report: after a land, hand what is left over (review warnings, a deferral in the report) to the scoper agents (bug-triage rule)
   local items max="${TRIAGE_CAP:-3}" routed kept out   # in ONE headless session; never fails the land (the caller ignores the status), a failure keeps the text as a warning + an issue comment
-  items="$(sed -n 's/^WARNING: /review warning: /p' <<< "$1")"
-  ! grep -Eiq 'defer|follow-?up|left out|out of scope' <<< "$2" || items="${items:+$items$'\n'}worker report: $(tr '\n' ' ' <<< "$2")"
+  items="$(sed -n 's/^WARNING: /review warning: /p' <<< "$1")"   # the worker's deferral goes first: the cap must not drop it for warnings
+  ! grep -Eiq 'defer|follow-?up|left out|out of scope' <<< "$2" || items="worker report: $(tr '\n' ' ' <<< "$2")${items:+$'\n'$items}"
   [ -n "$items" ] || return 0
   routed="$(head -n "$max" <<< "$items")"; kept="$(tail -n +$((max + 1)) <<< "$items" | tr '\n' ' ')"
   [ -z "$kept" ] || { warn "#$issue: more than $max findings, not routed: $kept"; comment "$issue" "Findings not routed to a scoper (cap $max per land), file by hand: $kept"; }
-  if out="$(printf 'Issue #%s just landed. Findings left over, one per line:\n%s\n\nRoute EACH one with the Agent tool, asking no one (rule: .ai-toolkit/rules/bug-triage.md): a concrete defect -> subagent bug-scoper; a non-defect warning or a deferred item -> subagent followup-scoper (filed with the hold label). Do not judge or filter them: the scoper verifies the evidence and drops ungrounded or duplicate ones. Never edit code. Answer one line per item: filed #n | dropped: why | duplicate of #n | drafted, not filed: why.' "$issue" "$routed" \
-    | claude -p --model "${TRIAGE_MODEL:-$ANSWER_MODEL}" --no-session-persistence --allowedTools 'Agent,Read,Grep,Glob,Bash(gh issue:*),Bash(gh label:*)' 2>&1)" && [ -n "$out" ]; then
+  if out="$(printf 'Issue #%s just landed. Findings left over, one per line:\n%s\n\nRoute EACH one with the Agent tool, asking no one (rule: .ai-toolkit/rules/bug-triage.md): a concrete defect -> subagent bug-scoper; a non-defect warning or a deferred item -> subagent followup-scoper (filed with the hold label). Do not judge or filter them: the scoper verifies the evidence and drops ungrounded or duplicate ones. This run is unattended: tell each scoper to FILE the issue (file it), not to draft it for approval. Never edit code. Answer one line per item: filed #n | dropped: why | duplicate of #n | drafted, not filed: why.' "$issue" "$routed" \
+    | claude -p --model "${TRIAGE_MODEL:-$ANSWER_MODEL}" --no-session-persistence --allowedTools 'Agent,Read,Grep,Glob,Bash(gh issue create:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh label list:*),Bash(gh label create:*)' 2>&1)" && [ -n "$out" ]; then
     log "#$issue leftover findings routed:"; printf '%s\n' "$out" | sed 's/^/  | /'
+    ! grep -qi 'drafted' <<< "$out" || comment "$issue" "A scoper drafted instead of filing, file by hand: ${out//$'\n'/ }"
   else warn "#$issue: routing the leftover findings failed, they are kept in a comment: $routed"; comment "$issue" "Routing to the scopers failed, file by hand: $routed"; fi
 }
 on_done() {
