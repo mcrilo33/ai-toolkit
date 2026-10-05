@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import STUB_TEE, V2
+from conftest import STUB_TEE, V2, git
 
 CO = str(V2 / "scripts/coordinator.sh")
 EMPTY = json.dumps({"result": {"messages": [], "deliveryId": None}})
@@ -58,7 +58,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
             n += 1 if b else 0
         stubs.reply("orca.orchestration_check", EMPTY)
 
-    stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": wt, "linkedIssue": 1}]}}))
+    stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": wt, "linkedIssue": 1, "branch": "refs/heads/1-x"}]}}))
     stubs.reply("orca.orchestration_run_create", '{"result":{"run":{"id":"run_new"}}}')
     def inbox(open_ids=(), answered=(), replies_only=(), pad=0):   # the Run's inbox: unanswered questions wait for the human
         rows = [{**msg("question", i), "run_id": "run_t", "thread_id": i} for i in [*open_ids, *answered]]
@@ -383,16 +383,25 @@ def test_a_land_that_the_worker_cannot_fix_blocks_at_once(C, rc, out):
     assert C.blocked() and not C.stubs.calls("claude")   # nothing landed, nothing to route
 
 
-@pytest.mark.parametrize("cleanup_rc", [0, 6])
-def test_landed_but_cleanup_incomplete_finishes_once_and_parks_a_still_open_issue(C, cleanup_rc):
+@pytest.mark.parametrize("cleanup_rc, mode", [(0, "orca"), (6, "orca"), (6, "switched"), (6, "nobranch")])   # the branch is Orca's, never the worker's HEAD; none from Orca = block, not a guess
+def test_landed_but_cleanup_incomplete_finishes_once_and_parks_a_still_open_issue(C, cleanup_rc, mode):
     C.stubs.reply(key("land.sh", "--review", "1"), f"{W}x\nland.sh: landed abc but cleanup is incomplete\n", rc=6)
     C.stubs.reply("claude", "filed #9\n")
     C.stubs.reply(key("land.sh", "--cleanup-only", "--branch"), "", rc=cleanup_rc)
+    if mode == "switched":
+        git(C.wt, "switch", "-q", "-c", "other")   # the worker moved its own HEAD before worker_done
+    if mode == "nobranch":
+        C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 1}]}}))
     C.mail([msg("worker_done", outcome="succeeded")])
     C.go()
-    co = C.stubs.calls("land.sh")[1]
-    assert co[:3] == ["--cleanup-only", "--branch", "1-x"] and arg(co, "--tip") and co[-1] == "1" and len(C.stubs.calls("land.sh")) == 2
-    assert bool(C.calls("gh issue edit")) == (cleanup_rc == 6)   # else `--next` would pick the open issue again
+    if mode == "nobranch":
+        said = " ".join(" ".join(a) for a in C.calls("gh issue comment"))
+        assert len(C.stubs.calls("land.sh")) == 1 and C.blocked()   # no cleanup call at all, the issue stays parked
+        assert C.wt in said and "no branch" in said
+    else:
+        co = C.stubs.calls("land.sh")[1]
+        assert co[:3] == ["--cleanup-only", "--branch", "1-x"] and arg(co, "--tip") and co[-1] == "1" and len(C.stubs.calls("land.sh")) == 2
+        assert bool(C.calls("gh issue edit")) == (cleanup_rc == 6)   # else `--next` would pick the open issue again
     assert len(C.stubs.calls("claude")) == 1   # landed either way: the review's warning is routed after the cleanup, whatever its result
 
 

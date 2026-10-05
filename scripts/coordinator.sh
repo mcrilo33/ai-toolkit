@@ -118,7 +118,7 @@ mode="$answer${until:+ until $until}"; [ "$drain" = 0 ] || mode="$mode drain"
 sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'rm -f "$errf" "$hf"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
 log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
 
-# ctx <dispatch>: sets disp task term wtp issue wtc (the worktree's Orca comment) from the worker's Orca row and the issue linked to its worktree.
+# ctx <dispatch>: sets disp task term wtp issue wtc (the worktree's Orca comment) br (its Orca branch) from the worker's Orca row and the issue linked to its worktree.
 ctx() {
   local r; disp="$1"
   r="$(wl | jq -c --arg d "$1" '[.result.workers[] | select(.dispatchId == $d)][0] // empty')"
@@ -127,6 +127,7 @@ ctx() {
   wtp="$(jq -r '.resource.worktreeId | sub("^.*::"; "")' <<< "$r")"
   r="$(orca_json worktree list | jq -c --arg p "$wtp" '[.result.worktrees[] | select(.path == $p)][0] // {}')"
   issue="$(jq -r '.linkedIssue // empty' <<< "$r")"; wtc="$(jq -r '.comment // empty' <<< "$r")"
+  br="$(jq -r '(.branch // "") | sub("^refs/heads/"; "")' <<< "$r")"   # Orca's branch for the worktree, never the worker's own HEAD (it can switch or rename it)
   [ -n "$issue" ] || { warn "no issue is linked to $wtp"; return 1; }
 }
 rounds() { wl | jq --arg p "::$wtp" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] | length - 1'; }   # dispatches so far - 1
@@ -217,11 +218,10 @@ triage() {   # $1 = land output, $2 = the worker's report: after a land, hand wh
   else warn "#$issue: routing the leftover findings failed (exit $rc, after at most ${t}s), they are kept in a comment: $routed"; comment "$issue" "Routing to the scopers failed, file by hand: $routed"; fi
 }
 on_done() {
-  local out rc=0 branch bl last
+  local out rc=0 bl last
   ctx "$(pj "$1" dispatchId)" || return 1
   [ "$(pj "$1" outcome)" = succeeded ] || { block "worker_done failed: $(jq -r '.body // ""' <<< "$1")"; return 0; }
   [ "$(gh issue view "$issue" --json state --jq .state 2> /dev/null)" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; return 0; }
-  branch="$(git -C "$wtp" branch --show-current)"
   # No --dispatch: land finds and releases EVERY dispatch of the worktree, earlier address rounds included.
   out="$(RUN="$run" "$LAND_CMD" --review "$issue" 2>&1)" || rc=$?
   printf '%s\n' "$out"; last="$(tail -n 1 <<< "$out")"
@@ -234,8 +234,9 @@ on_done() {
         *"timed out"* | *"keeps moving"*) block "$last" ;;
         *) redispatch 1 "address: the land was refused ($last). Fix it on your branch (merge origin/$BASE_BRANCH and resolve conflicts, or fix the failing checks), push, then send worker_done again." "$last" ;;
       esac ;;
-    6) RUN="$run" "$LAND_CMD" --cleanup-only --branch "$branch" --tip "$(git rev-parse HEAD)" --dispatch "$disp" "$issue" \
-         || block "landed, but cleanup is incomplete (finish with land.sh --cleanup-only $issue); blocked so the still-open issue is not dispatched again" ;;
+    6) if [ -z "$br" ]; then block "landed, but Orca gives no branch for worktree $wtp, so cleanup cannot name it (finish with land.sh --cleanup-only --branch <name> $issue); blocked so the still-open issue is not dispatched again"
+       else RUN="$run" "$LAND_CMD" --cleanup-only --branch "$br" --tip "$(git rev-parse HEAD)" --dispatch "$disp" "$issue" \
+         || block "landed, but cleanup is incomplete (finish with land.sh --cleanup-only $issue); blocked so the still-open issue is not dispatched again"; fi ;;
     *) block "land.sh exited $rc: $last" ;;
   esac
   case $rc in 0 | 6) triage "$out" "$(jq -r '.body // ""' <<< "$1")" || true ;; esac   # landed: what is left over goes to the scopers, after the land's own work
