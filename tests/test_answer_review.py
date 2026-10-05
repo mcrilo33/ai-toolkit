@@ -44,7 +44,7 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     assert r.returncode == 0 and r.stdout == "approve\n", r.stderr
     argv = A.stubs.calls("claude")[0]
     assert argv[:3] == ["-p", "--model", "m-1"] and ["--append-system-prompt-file", str(A.rule), "--allowedTools", "Read,Grep,Glob"] == argv[3:7]
-    assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and A.stdin() == "PLAN: do X. Approve?"
+    assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and A.stdin().startswith("PLAN: do X. Approve?") and "no issue number" in A.stdin()
     # the issue changed after dispatch: the gate reads the live text; an unreadable issue keeps the copy, warns and says so in the prompt
     task = A.wt / ".ai-toolkit/task.md"
     task.parent.mkdir()
@@ -57,6 +57,11 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     r = A.go("ANSWER: approve\n", input="PLAN: do X.")
     assert r.returncode == 0 and task.read_text() == "# #9 old\n\nold body\n"
     assert "warning" in r.stderr and "may be stale" in A.stdin() and A.stdin().startswith("PLAN: do X.")
+    task.chmod(0o444); task.parent.chmod(0o555)   # an unwritable copy is a stale copy too, never a failed gate
+    A.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')
+    r = A.go("ANSWER: approve\n", input="PLAN: do X.")
+    task.parent.chmod(0o755)
+    assert r.returncode == 0 and "may be stale" in A.stdin() and task.read_text() == "# #9 old\n\nold body\n"
 
 
 @pytest.mark.parametrize("line, body", [

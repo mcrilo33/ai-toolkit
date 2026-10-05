@@ -21,7 +21,7 @@ q="$(cat)"; t="${q#"${q%%[![:space:]]*}"}"   # a worker's permission prompt (per
 # The answerer judges the issue as it is now: its number is task.md's header, else the `<n>-<slug>` branch.
 n="$(sed -n '1s/^# #\([0-9][0-9]*\)[[:space:]].*/\1/p' "$wt/.ai-toolkit/task.md" 2> /dev/null)" || n=""
 if [ -z "$n" ]; then n="$(git -C "$wt" branch --show-current 2> /dev/null)" || n=""; n="${n%%-*}"; fi
-case "$n" in '' | *[!0-9]*) ;; *) q="$q$(refresh_task "$wt" "$n")" ;; esac
+case "$n" in '' | *[!0-9]*) q="$q$(stale_note "no issue number found for this worktree")" ;; *) q="$q$(refresh_task "$wt" "$n")" ;; esac
 out="$(cd "$wt" && printf '%s' "$q" | claude -p --model "$ANSWER_MODEL" --append-system-prompt-file "$rule" --allowedTools Read,Grep,Glob --no-session-persistence)" || die "claude failed"
 last="$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 1)"
 body="$(printf '%s' "$last" | sed -n 's/^ANSWER:[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p')"
