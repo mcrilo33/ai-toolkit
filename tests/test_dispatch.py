@@ -77,7 +77,7 @@ def test_seed_for_a_plan_gate_asks_before_coding_and_never_touches_the_base(d):
     for part in (".ai-toolkit/task.md", "approve,revise", "do not edit code before approve", "RED", "git push -u origin HEAD",
                  "worker_done --outcome succeeded", "Never merge or push the base branch", "in-spoke code-review",
                  "approve with: <change>", "do NOT ask again", "revise: <change>, amend the plan and ask again",
-                 ".ai-toolkit/rules/bug-triage.md", "DEFERRED: <item>", "Send no heartbeat messages"):
+                 ".ai-toolkit/rules/bug-triage.md", "DEFERRED: <item>", "Send no heartbeat messages: report only with worker_done, a question, or an escalation."):
         assert part in seed, part
 
 
