@@ -60,6 +60,18 @@ gh() { command "${AI_TOOLKIT_GH:-gh}" "$@"; }
 # gh_issue <n>: {number,title,body} of one issue.
 gh_issue() { gh issue view "$1" --json number,title,body; }
 
+# refresh_task <worktree> <issue>: rewrite the worktree's .ai-toolkit/task.md from the live issue, so a gate judges the issue as it is now.
+# An unreadable issue keeps the old copy, warns, and prints a note for the gate's prompt (the intent may be stale); never a failure.
+refresh_task() {
+  local t
+  if t="$(gh_issue "$2" | jq -r '"# #\(.number) \(.title)\n\n\(.body)"')" && [ -n "$t" ] && mkdir -p "$1/.ai-toolkit"; then
+    printf '%s\n' "$t" > "$1/.ai-toolkit/task.md"
+  else
+    warn "cannot read issue $2; keeping the existing .ai-toolkit/task.md"
+    printf ' NOTE: issue %s could not be re-read, so .ai-toolkit/task.md may be stale: the issue may have changed since dispatch.' "$2"
+  fi
+}
+
 # status_label <add|remove> <issue>: the one `status:in-progress` marker follows the worker. A failure only warns: the work it marks is already done.
 status_label() {
   local l="status:in-progress"
