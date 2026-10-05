@@ -50,8 +50,10 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         fs = ".123" if frac else ""
         reply = {"terminal": {"lastOutputAt": ago(silent) * 1000}, "observation": {"agentWait": {"source": "hook"} if wait else None},
                  "dispatch": {"dispatchedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ago(born))) + fs if born is not None else "2020-01-01 00:00:00", "lastHeartbeatAt": None if beat is None else time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ago(beat))) + fs + "Z"}}
-        if obs:
-            reply.pop("observation") if obs == "missing" else reply.update(observation=None)
+        if obs == "missing":
+            del reply["observation"]
+        elif obs:
+            reply["observation"] = None
         stubs.reply("orca.orchestration_worker_show", raw if raw is not None else json.dumps({"result": reply}))
 
     def workers(*rows):
@@ -474,6 +476,7 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     ([dict(d="ctx_1", st="failed", lv="exited"), dict(d="ctx_2", lv="live")], {}, False),   # the relaunched worker is alive: left alone
     ([dict()], dict(silent=0, beat=93), False),   # an old heartbeat, the agent working: #415 and #418 at 09:39 UTC
     ([dict()], dict(silent=40, beat=1), False),   # a worker that heartbeats
+    ([dict()], dict(silent=40, beat=1, frac=True), False),   # ... the heartbeat carrying fractional seconds: read, not dropped
     ([dict()], dict(silent=40, born=1), False),   # just (re)dispatched: the old terminal output is not the new worker's silence
     ([dict()], dict(silent=14), False),   # silent, but under the bound
     ([dict()], dict(silent=40, wait=True), False),   # parked on a prompt only a human can answer: flagged, never relaunched
