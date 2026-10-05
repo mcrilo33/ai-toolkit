@@ -70,8 +70,8 @@ pending() {   # {open: questions nobody has replied to (waiting for the human), 
 }
 silent() {   # $1 dispatch: "<minutes> <run|wait>": minutes since the newest sign of life (terminal output, liveness observation, heartbeat, never before dispatchedAt);
   orca_json orchestration worker-show --dispatch "$1" < /dev/null | jq -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer, or Orca could not prove the worker (never "not waiting")
-    | ([($r.terminal.lastOutputAt, $r.projection.liveness.observedAt | select(. != null) / 1000), ($r.dispatch.lastHeartbeatAt, $r.dispatch.dispatchedAt | select(. != null) | sub(" "; "T") | sub("Z?$"; "Z") | fromdateiso8601)] | max) as $t
-    | "\(([(($now - $t) / 60) | floor, 0] | max)) \(if ($r.terminal == null or ($r.observation | has("agentWait") | not) or $r.observation.agentWait) then "wait" else "run" end)"'
+    | ([($r.terminal.lastOutputAt, $r.projection.liveness.observedAt | select(. != null) / 1000), ($r.dispatch.lastHeartbeatAt, $r.dispatch.dispatchedAt | select(. != null) | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)] | max) as $t
+    | "\(([(($now - $t) / 60) | floor, 0] | max)) \(if ($r.terminal == null or (($r.observation // {}) | has("agentWait") | not) or $r.observation.agentWait) then "wait" else "run" end)"'
 }
 holder() { orca_json orchestration run-show --id "$run" 2> /dev/null | jq -r '.result.run.coordinator_handle // empty'; }   # the terminal that holds the Run
 live_hold() {   # $1 eq|ne, $2 a handle: if a live coordinator.sh (holder.<pid> = "<handle> <mode>", the pid's command must still be coordinator.sh) is bound as
@@ -282,7 +282,7 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
   open="$(pending | jq -c '[.open[] | (.payload // "{}" | if type == "string" then fromjson else . end).dispatchId]')" || return 0   # a worker waiting on a gate or permission question is never idle
   for d in $(wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited") | .dispatchId'); do
     ! jq -e --arg d "$d" 'index($d)' <<< "$open" > /dev/null || continue
-    read -r age how <<< "$(silent "$d")" || true; [ "${age:-0}" -ge "${COORD_IDLE_MIN:-15}" ] || continue
+    how="$(silent "$d")" || true; [ -n "$how" ] || { warn "worker $d: cannot tell how long it has been silent (worker-show or its jq failed), left alone"; continue; }; read -r age how <<< "$how"; [ "$age" -ge "${COORD_IDLE_MIN:-15}" ] || continue   # never an age of 0: an unknown age is not an idle check that passed
     ctx "$d" || continue
     if [ "$how" = wait ]; then log "#$issue: worker $d waits on a prompt only a human can answer (silent ${age}m)"
       case "$wtc" in "IDLE #$issue"*) ;; *) comment "$issue" "worker $d is silent for ${age}m and may wait on a prompt only a human can answer: check its terminal" ;; esac   # once: the IDLE flag on the worktree is the durable mark, an age window misses a late first sweep and repeats on a fast one
