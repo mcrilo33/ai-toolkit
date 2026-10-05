@@ -13,7 +13,8 @@ n="${1:-}"; [ -n "$n" ] || usage_exit "usage: review.sh <issue>"
 o="$(orca_json worktree show --worktree "issue:$n")" || die "no Orca worktree is linked to issue $n"
 wt="$(printf '%s' "$o" | jq -r '.result.worktree.path')"
 branch="$(printf '%s' "$o" | jq -r '.result.worktree.branch | sub("^refs/heads/"; "")')"
-prompt="Review the change of branch $branch against origin/$BASE_BRANCH: git diff origin/$BASE_BRANCH...$branch. Intent: .ai-toolkit/task.md. Your final message must be exactly the JSON verdict object of your verdict contract."
+stale="$(refresh_task "$wt" "$n")"   # the reviewer judges the issue as it is now, not the dispatch-time copy
+prompt="Review the change of branch $branch against origin/$BASE_BRANCH: git diff origin/$BASE_BRANCH...$branch. Intent: .ai-toolkit/task.md.$stale Your final message must be exactly the JSON verdict object of your verdict contract."
 # shellcheck disable=SC2016
 VALID='type == "object" and (.verdict | IN("APPROVE", "REQUEST_CHANGES")) and (.blockers | type == "array" and all(type == "string"))
   and (.warnings | type == "array" and all(type == "string")) and (.tdd_followed | type == "boolean") and (.tests_weakened | type == "boolean") and (.summary | type == "string")'

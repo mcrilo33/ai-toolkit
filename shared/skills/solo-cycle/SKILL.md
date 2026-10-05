@@ -52,7 +52,7 @@ Then the next subtask, from step 2.
 
 Extend the test that covers the area, or write a new failing test, first, and run it. Delegating to `tdd-red` / `tdd-green` / `tdd-refactor` is optional
 (clean context for larger work; each runs on the model in its own frontmatter). Commit RED and GREEN
-separately. Never weaken a test to get green: no deleted or loosened assertions (deleting a test with the code it covered, or a flaky or never-red one per Test economy, is not weakening; say why in the commit), no `skip`/`xfail`, no
+separately. Never weaken a test to get green: no deleted or loosened assertions (removing a test is weakening unless `code-review` Tests and TDD allows it; say why in the commit), no `skip`/`xfail`, no
 `sys.exit(0)`. The independent reviewer reports `tdd_followed` and `tests_weakened`, and either one blocks
 the land.
 

@@ -21,6 +21,7 @@ own branch, driven by its own agent. The hub thinks, decides, decomposes, dispat
   the spoke starts with clean context and no planning noise.
 - **Dispatch**: `start-task` files the issue and runs `dispatch.sh`; `/afk` hands the whole backlog to `coordinator.sh`.
 - **Answer**: a PLAN gate arrives as an Orca question; reply `approve`, `approve with: <change>` or `revise: …` (which one: `afk-answering`, Choosing the reply; or let `answer.sh` do it).
+- **Revise in place**: to change the design of an in-flight issue, edit the issue and send the worker the change (a `revise:` reply to its gate, or `dispatch.sh --address`); never open a new issue for the same work. A new issue is for different work.
 - **Permission prompts**: a worker's tool-permission prompt is relayed to the Run (`permission-relay` hook) as a `PERMISSION REQUEST` question: the coordinate skill shows it to the user and replies `allow` or `deny` on their word only; the auto loop denies it.
 - **Review and land**: `land.sh <n>` after the independent review and green CI. The hub never merges by hand
   past a red review or red CI.
