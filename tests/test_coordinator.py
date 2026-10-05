@@ -33,7 +33,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     monkeypatch.setenv("STUB_NOENV", "1")   # no test here reads a stub's env: one process fewer per stub call
     cmds, wt = tmp_path / "cmds", str(repo.wt("1-x"))
     cmds.mkdir()
-    for n in ("dispatch.sh", "land.sh", "answer.sh"):   # sub-commands are stubs that also record their stdin
+    for n in ("dispatch.sh", "land.sh", "answer.sh", "judge.sh"):   # sub-commands are stubs that also record their stdin
         link_script(cmds / n, STUB_TEE)
     link_script(tmp_path / "stubs/bin/claude", STUB_TEE)   # the post-land triage prompt goes on its stdin
 
@@ -89,7 +89,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     mail()
 
     def go(*args, run_id="run_t", **env):
-        cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh")}
+        cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh", "judge.sh")}
         return run(["bash", CO, *(["--run", run_id] if run_id else []), *args], cwd=repo.root,
                    **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", "COORD_BELL_TTY": tmp_path / "bell", **cmd_env, **env})
 
@@ -185,6 +185,43 @@ def test_auto_denies_a_permission_question_and_never_hands_it_to_the_answerer(C,
     assert "Bash" in c and "denied" in c and "curl" not in c and "secret" not in c   # the issue comment names the tool and the answer only, never the command
     in_order(C.kinds(), "orca orchestration reply", "orca orchestration check ack")
     assert not C.calls("orca worktree set") and not (tmp_path / "bell").exists()   # nothing for the human to do: log and issue comment only
+
+
+def perm(cmd, tool="Bash", cwd=None, cut=False, wt=None):   # a relayed permission request as permission-relay.sh words it
+    body = "\n".join("  " + ln for ln in cmd.splitlines()) + ("\n  [truncated: 9000 chars in all]" if cut else "")
+    return f"PERMISSION REQUEST (not a plan gate: reply allow or deny)\nissue: #1 feat\nworktree: {wt}\ntool: {tool}\ncwd: {cwd or wt}\nmode: bypassPermissions\nreason: unknown\ncommand:\n{body}\n"
+
+
+@pytest.mark.parametrize("cmd, kw, judged, verdict", [
+    ("echo hi > build/out.txt", {}, True, "only writes build/"),   # the judge cleared it: allowed
+    ("echo hi > build/out.txt", {}, True, ""),   # not cleared: left open
+    ("echo '# stays inside the worktree' > ../../outside.txt", {}, True, ""),   # claims to stay inside, writes outside: the judge's call, and it never clears it
+    ("echo x > .claude/settings.json", {}, False, "x"), ("cat .AI-TOOLKIT/spoke-run-id > a", {}, False, "x"), ("sed -i s/a/b/ orca.yaml", {}, False, "x"),   # a protected name: never judged, whatever the judge would say
+    ("ls", {"cwd": "/etc"}, False, "x"), ("ls", {"cwd": "{wt}/../elsewhere"}, False, "x"), ("ls", {"cwd": "{wt}x"}, False, "x"),   # the cwd must be under the worktree
+    ("ls", {"tool": "Write"}, False, "x"), ("ls", {"cut": True}, False, "x"),   # only a Bash command shown whole
+])
+def test_attended_allows_only_a_contained_permission_request_and_leaves_every_other_one_open_for_the_human(C, cmd, kw, judged, verdict):
+    kw = {k: v.replace("{wt}", C.wt) if isinstance(v, str) else v for k, v in kw.items()}
+    C.stubs.reply("judge.sh", verdict + "\n" if verdict else "")
+    C.mail([msg("question", "msg_p", question=perm(cmd, wt=C.wt, **kw))])
+    assert C.go("--answer", "attended").returncode == 0 and not C.stubs.calls("answer.sh") and C.calls("orca orchestration check ack")
+    assert len(C.stubs.calls("judge.sh")) == int(judged)
+    allowed = bool(judged and verdict)
+    assert [arg(a, "--body") for a in C.calls("orca orchestration reply")] == (["allow"] if allowed else [])
+    c = C.calls("gh issue comment")[0][-1]
+    assert "Bash" in c or kw.get("tool") and cmd.split()[0] not in c   # the issue comment names the tool and the answer only, never the command
+    assert (c == "Permission allowed (tool: Bash): it writes only inside the worker's worktree or scratchpad.") == allowed and (allowed or REPLY_P in c)
+    if judged:
+        args, slug = C.stubs.calls("judge.sh")[0], re.sub(r"[^A-Za-z0-9]", "-", C.wt)
+        assert args == [kw.get("cwd", C.wt), C.wt, "worker permission request", slug, "contained"] and C.stdin("judge.sh") == cmd
+
+
+@pytest.mark.parametrize("mode", ["auto", "human"])
+def test_only_attended_ever_asks_the_judge_for_a_permission_request(C, mode):
+    C.stubs.reply("judge.sh", "contained\n")
+    C.mail([msg("question", "msg_p", question=perm("echo hi > build/out.txt", wt=C.wt))])
+    assert C.go("--answer", mode).returncode == 0 and not C.stubs.calls("judge.sh") and not C.stubs.calls("answer.sh")
+    assert [arg(a, "--body") for a in C.calls("orca orchestration reply")] == (["deny"] if mode == "auto" else [])   # auto denies at once, human leaves it open: as before
 
 
 def test_auto_whose_deny_cannot_be_sent_falls_back_to_the_human_never_to_an_allow(C):

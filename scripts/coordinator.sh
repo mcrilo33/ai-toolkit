@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop: the Run loop (06 section 4,
+# coordinator.sh [--run R] [--answer auto|attended|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop: the Run loop (06 section 4,
 # "The coordinator"). One foreground process in an Orca terminal on the main checkout, the single consumer of ONE Run
 # (--run re-binds it with run-use; none creates one). Loop: fill slots to --cap (dispatch.sh) -> check --wait -> route each message
 # -> ack the delivery. question: answer.sh (auto) or the human, who types the answer on this terminal; worker_done succeeded: land.sh
@@ -24,15 +24,16 @@ while [ $# -gt 0 ]; do
     --cap) cap="${2:-}"; shift ;; --until) until="${2:-}"; shift ;;
     --drain) drain=1 ;; --status) status=1 ;; --stop) stop=1 ;;
     --reply) reply=1; reply_id="${2:-}"; reply_body="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
-    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny" ;;
+    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|attended|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny" ;;
   esac; shift
 done
-case "$answer" in auto | human) ;; *) usage_exit "--answer takes auto or human" ;; esac
+case "$answer" in auto | attended | human) ;; *) usage_exit "--answer takes auto, attended or human" ;; esac
 [ "$stop" = 0 ] || [ -n "$run" ] || usage_exit "--stop needs --run <run-id>"
 [ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
 [ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid>)
 DISPATCH_CMD="${DISPATCH_CMD:-$here/dispatch.sh}"; LAND_CMD="${LAND_CMD:-$here/land.sh}"; ANSWER_CMD="${ANSWER_CMD:-$here/answer.sh}"
+case "$here" in */.ai-toolkit/scripts) JUDGE_CMD="${JUDGE_CMD:-$here/../../.claude/hooks/judge.sh}" ;; *) JUDGE_CMD="${JUDGE_CMD:-$here/../hooks/claude/judge.sh}" ;; esac
 cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
 log() { printf '%s coordinator: %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -180,10 +181,22 @@ drain_replies() {   # send the queued human replies as the bound consumer. Dropp
     rm -f "$f"
   done
 }
-on_permission() {   # $1 message id, $2 question, $3 dispatch id: a worker's tool-permission prompt. Never answer.sh and never an allow: auto denies it, a human answers allow|deny.
+contained() {   # $1 a permission request: succeeds only for a Bash command shown whole, naming no protected path, run under the worker's worktree, that judge.sh contained clears (it writes only inside the worktree or its scratchpad)
+  local cwd cmd slug   # wtp is the loop's own path (Orca + the dispatch record), never the question's worktree: line; any failure = not contained (the human decides)
+  [ "$(tool_of "$1")" = Bash ] && [ -n "$wtp" ] && [[ $1 != *"[truncated"* ]] || return 1
+  cwd="$(sed -n 's/^cwd: //p' <<< "$1" | head -n 1)"; case "$cwd" in *..*) return 1 ;; esac; case "$cwd/" in "$wtp"/*) ;; *) return 1 ;; esac
+  cmd="$(awk '/^command:$/ { f = 1; next } /^[^ ]/ { f = 0 } f { sub(/^  /, ""); print }' <<< "$1")"; [ -n "$cmd" ] || return 1
+  ! grep -Eiq '\.claude|\.ai-toolkit|orca\.yaml|\.github/workflows' <<< "$cmd" || return 1   # the guard's protected set: a worker never self-approves a write to its own hooks, settings, marker or CI
+  slug="$(printf '%s' "$wtp" | LC_ALL=C tr -c 'A-Za-z0-9' '-')"   # the scratchpad is /tmp/claude-<uid>/<this slug>/*/scratchpad: the relay sends no session id
+  [ -n "$(printf '%s' "$cmd" | bash "$JUDGE_CMD" "$cwd" "$wtp" "worker permission request" "$slug" contained 2> /dev/null)" ]
+}
+on_permission() {   # $1 message id, $2 question, $3 dispatch id: a worker's tool-permission prompt. Never answer.sh. auto denies it at once; attended allows a contained one and leaves the rest to the human; human leaves it to the human (allow|deny).
   local tool known=1; tool="$(tool_of "$2")"   # Issue comments name the tool and the answer only, never the command or content (it can hold secrets).
   ctx "$3" || { known=0; wtp=""; }   # the deny needs no issue: a worker the loop cannot resolve is still denied at once, not left to the relay's timeout
-  if [ "$answer" = auto ] && orca_mutate orchestration reply --run "$run" --from "$H" --id "$1" --body deny > /dev/null; then
+  if [ "$answer" = attended ] && contained "$2" && orca_mutate orchestration reply --run "$run" --from "$H" --id "$1" --body allow > /dev/null; then
+    log "permission allowed (tool: $tool, message $1): contained in the worker's worktree or scratchpad"
+    comment "$issue" "Permission allowed (tool: $tool): it writes only inside the worker's worktree or scratchpad."
+  elif [ "$answer" = auto ] && orca_mutate orchestration reply --run "$run" --from "$H" --id "$1" --body deny > /dev/null; then
     log "permission denied (tool: $tool, message $1): an unattended run never approves one"
     [ "$known" = 0 ] || comment "$issue" "Permission denied (tool: $tool): an unattended run never approves a permission prompt; the worker reports it in worker_done."
   else   # human mode, or the deny could not be sent (the worker's relay denies on its own timeout): the human decides, nothing waits
