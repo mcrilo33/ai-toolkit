@@ -60,6 +60,21 @@ gh() { command "${AI_TOOLKIT_GH:-gh}" "$@"; }
 # gh_issue <n>: {number,title,body} of one issue.
 gh_issue() { gh issue view "$1" --json number,title,body; }
 
+# stale_note <why>: warn on stderr and print the note a gate adds to its prompt when it cannot read the live issue (the intent may be stale).
+stale_note() {
+  warn "$1; keeping the existing .ai-toolkit/task.md"
+  printf ' NOTE: %s, so .ai-toolkit/task.md may be stale: the issue may have changed since dispatch.' "$1"
+}
+
+# refresh_task <worktree> <issue>: rewrite the worktree's .ai-toolkit/task.md from the live issue, so a gate judges the issue as it is now.
+# An issue that cannot be read or written keeps the old copy and prints the stale note for the gate's prompt; never a failure.
+refresh_task() {
+  local t f="$1/.ai-toolkit/task.md"
+  if t="$(gh_issue "$2" | jq -r '"# #\(.number) \(.title)\n\n\(.body)"')" && [ -n "$t" ] && mkdir -p "$1/.ai-toolkit" \
+    && printf '%s\n' "$t" > "$f.new" && mv "$f.new" "$f"; then :
+  else stale_note "issue $2 could not be refreshed"; fi
+}
+
 # status_label <add|remove> <issue>: the one `status:in-progress` marker follows the worker. A failure only warns: the work it marks is already done.
 status_label() {
   local l="status:in-progress"

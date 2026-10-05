@@ -27,9 +27,11 @@ def test_spoke_is_a_plain_claude_without_a_run_id_or_when_opted_out(run, stubs, 
 
 
 def test_install_checks_prerequisites_then_prints_the_orca_override_without_a_path_shim(run, stubs, tmp_path):
-    r = run(["bash", f"{V2}/scripts/install.sh"], PATH=f"{tmp_path}:/usr/bin:/bin")
+    # spawns are the cost on macOS: a set ORCA_ROOT_PATH spares load_env its `git rev-parse` (the /usr/bin git there is an xcrun shim), STUB_NOENV the stub its `env`
+    quick = dict(ORCA_ROOT_PATH=tmp_path, STUB_NOENV=1)
+    r = run(["bash", f"{V2}/scripts/install.sh"], PATH=f"{tmp_path}:/usr/bin:/bin", **quick)
     assert r.returncode != 0 and "missing prerequisite" in r.stderr and "orca" in r.stderr
     stubs.reply("orca", "1.4.219")
-    r = run(["bash", f"{V2}/scripts/install.sh"])
+    r = run(["bash", f"{V2}/scripts/install.sh"], **quick)
     assert r.returncode == 0, r.stderr
     assert f"{V2}/bin/claude-spoke" in r.stdout and not any((tmp_path / "home").rglob("claude"))

@@ -44,7 +44,24 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     assert r.returncode == 0 and r.stdout == "approve\n", r.stderr
     argv = A.stubs.calls("claude")[0]
     assert argv[:3] == ["-p", "--model", "m-1"] and ["--append-system-prompt-file", str(A.rule), "--allowedTools", "Read,Grep,Glob"] == argv[3:7]
-    assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and A.stdin() == "PLAN: do X. Approve?"
+    assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and A.stdin().startswith("PLAN: do X. Approve?") and "no issue number" in A.stdin()
+    # the issue changed after dispatch: the gate reads the live text; an unreadable issue keeps the copy, warns and says so in the prompt
+    task = A.wt / ".ai-toolkit/task.md"
+    task.parent.mkdir()
+    task.write_text("# #9 old\n\nold body\n")
+    A.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')
+    assert A.go("ANSWER: approve\n", input="PLAN: do X.").returncode == 0
+    assert A.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and task.read_text() == "# #9 new\n\nnew body\n" and "stale" not in A.stdin()
+    A.stubs.reply("gh", "boom", rc=1)
+    task.write_text("# #9 old\n\nold body\n")
+    r = A.go("ANSWER: approve\n", input="PLAN: do X.")
+    assert r.returncode == 0 and task.read_text() == "# #9 old\n\nold body\n"
+    assert "warning" in r.stderr and "may be stale" in A.stdin() and A.stdin().startswith("PLAN: do X.")
+    task.chmod(0o444); task.parent.chmod(0o555)   # an unwritable copy is a stale copy too, never a failed gate
+    A.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')
+    r = A.go("ANSWER: approve\n", input="PLAN: do X.")
+    task.parent.chmod(0o755)
+    assert r.returncode == 0 and "may be stale" in A.stdin() and task.read_text() == "# #9 old\n\nold body\n"
 
 
 @pytest.mark.parametrize("line, body", [
@@ -94,6 +111,18 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     tools = argv[argv.index("--allowedTools") + 1]
     assert "Read" in tools and "git diff" in tools and not {"Edit", "Write"} & set(tools.replace("(", ",").split(","))
     assert "origin/trunk...9-feat" in R.stdin() and "JSON" in R.stdin() and f"PWD={R.wt.resolve()}" in R.stubs.env("claude")
+    # the issue changed after dispatch: the gate reads the live text; an unreadable issue keeps the copy, warns and says so in the prompt
+    task = R.wt / ".ai-toolkit/task.md"
+    task.parent.mkdir()
+    task.write_text("# #9 old\n\nold body\n")
+    R.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')
+    assert R.go(OK).returncode == 0
+    assert R.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and task.read_text() == "# #9 new\n\nnew body\n" and "stale" not in R.stdin()
+    R.stubs.reply("gh", "boom", rc=1)
+    task.write_text("# #9 old\n\nold body\n")
+    r = R.go(OK)
+    assert r.returncode == 0 and task.read_text() == "# #9 old\n\nold body\n"
+    assert "warning" in r.stderr and "may be stale" in R.stdin() and "JSON" in R.stdin()
 
 
 @pytest.mark.parametrize("patch, word", [({"verdict": "REQUEST_CHANGES", "blockers": ["a.py:3 - off by one"]}, "off by one"), ({"tests_weakened": True}, "tests_weakened"),

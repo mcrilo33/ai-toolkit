@@ -321,9 +321,8 @@ def install_relay(spoke, how):
 # every lane is proven once, on the ask path (a worker with the relay installed); each other scenario is proven on one file lane and one Bash lane
 RELAYED = "worker-with-the-relay-installed"
 FILE_LANE, BASH_LANE = WF_LANES[0], next(lane for lane in WF_LANES if lane[0] == "Bash")
-WF_CASES = [(RELAYED, *lane) for lane in WF_LANES] + [("no-run-plain-worktree", *FILE_LANE), ("no-run-main-checkout", *BASH_LANE)] + [
-    (scenario, *lane) for scenario in ("worker-whose-settings-lack-the-relay", "worker-without-the-relay-file", "worker-without-any-claude-dir")
-    for lane in (FILE_LANE, BASH_LANE)]
+WF_CASES = [(RELAYED, *lane) for lane in WF_LANES] + [
+    (scenario, *lane) for scenario in WF_SCENARIOS if scenario != RELAYED for lane in (FILE_LANE, BASH_LANE)]
 
 
 @pytest.mark.parametrize("scenario,tool,ti,named", WF_CASES)

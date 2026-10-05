@@ -359,9 +359,10 @@ def relaunches(C):
 
 
 def test_a_worker_that_exited_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C):
+    assert re.search(r"COORD_SWEEP_EVERY:-10\}", (V2 / "scripts/coordinator.sh").read_text())   # the default period, read rather than waited for: ten empty ticks
     C.workers(C.row(lv="exited"))
     C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
-    assert not relaunches(C)
+    assert not C.stubs.calls("dispatch.sh")
     C.go("--cap", "1", **SWEEP)
     assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]]
 
@@ -373,13 +374,13 @@ def test_a_worker_that_exited_without_worker_done_is_relaunched_once_on_the_nth_
 def test_a_sweep_leaves_a_settled_worker_and_a_live_relaunch_alone(C, rows):
     C.workers(*[C.row(**r) for r in rows])
     C.go("--cap", "0", **SWEEP)
-    assert not relaunches(C) and not C.calls("gh issue edit")
+    assert not C.stubs.calls("dispatch.sh") and not C.calls("gh issue edit")
 
 
 def test_a_worker_that_died_again_after_its_relaunch_blocks_the_issue(C):
     C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2", lv="exited"))
     C.go("--cap", "1", **SWEEP)
-    assert C.blocked() and not relaunches(C)
+    assert C.blocked() and not C.stubs.calls("dispatch.sh")
 
 
 def test_slots_are_filled_up_to_the_cap_and_a_failed_dispatch_is_cleaned_up_and_blocks_the_issue(C, tmp_path):
