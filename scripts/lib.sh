@@ -107,8 +107,15 @@ issue_footer() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | tail -n 1
 
 valid_run() { [[ "$1" =~ ^run_[a-z0-9]+$ ]]; }   # an Orca Run id: it names a directory, so nothing else gets near the spool path
 # spool_dir <run-id>: the coordinator's only state, outside every worktree (AITK_STATE_DIR relocates it): replies/ queued human answers,
-# holder.<pid> = "<handle> <mode>" of a live coordinator.sh (the --stop wait signal, and --status's mode).
+# holder.<pid> = "<handle> <mode>" of a live coordinator.sh (the --stop wait signal, and --status's mode),
+# dispatch/<id> = the issue number dispatch.sh gave that dispatch (ctx() checks Orca's worker-writable link against it).
 spool_dir() { valid_run "$1" || die "bad run id '$1'"; echo "${AITK_STATE_DIR:-$HOME/.ai-toolkit/coordinator}/$1"; }
+_dispatch_id_ok() { [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]; }   # the id names a file
+record_dispatch() {   # <run> <dispatch> <issue>
+  _dispatch_id_ok "$2" || die "bad dispatch id '$2'"
+  local d; d="$(spool_dir "$1")/dispatch"; (umask 077; mkdir -p "$d"; printf '%s\n' "$3" > "$d/$2")
+}
+recorded_issue() { local n; _dispatch_id_ok "$2" && n="$(head -n 1 "$(spool_dir "$1")/dispatch/$2" 2> /dev/null)" && [[ $n =~ ^[0-9]+$ ]] && printf '%s' "$n"; }   # <run> <dispatch>: rc 1 = none
 
 # usage_exit <msg>: caller misuse, exit 2 (die is exit 1: a failed operation).
 usage_exit() { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 2; }

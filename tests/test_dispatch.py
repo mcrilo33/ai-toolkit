@@ -23,7 +23,7 @@ def strip(argv):
 
 
 @pytest.fixture
-def d(stubs, repo, run):
+def d(stubs, repo, run, tmp_path):
     wt = repo.wt(NAME)
     (wt / ".ai-toolkit").mkdir()
     (wt / ".ai-toolkit/setup-done").write_text("")
@@ -35,14 +35,14 @@ def d(stubs, repo, run):
     stubs.reply("orca.orchestration_worker_start", '{"result":{"dispatchId":"ctx_1","state":"ready"}}')
 
     def go(*args, **env):
-        e = {"RUN": "run_t", "ORCA_TERMINAL_HANDLE": "term_coord", "AI_TOOLKIT_POLL": 0, **env}
+        e = {"RUN": "run_t", "ORCA_TERMINAL_HANDLE": "term_coord", "AI_TOOLKIT_POLL": 0, "AITK_STATE_DIR": tmp_path / "state", **env}   # never the real ~/.ai-toolkit
         return run(["bash", DISPATCH, *args], cwd=repo.root, **e)
 
     def orca():
         return [strip(c) for c in stubs.calls("orca")]
 
     return type("D", (), {"go": staticmethod(go), "orca": staticmethod(orca), "wt": wt, "root": root, "stubs": stubs, "repo": repo,
-                          "stubs_dir": wt.parent / "stubs"})
+                          "stubs_dir": wt.parent / "stubs", "record": tmp_path / "state/run_t/dispatch"})
 
 
 def worker_start(d):
@@ -66,6 +66,7 @@ def test_two_step_launch_runs_the_exact_orca_calls_in_order(d):
                   "--terminal", "term_agent", "--task-title", "#7 Add Hello, World!", "--spec", seed, "--timeout-ms", "120000"]
     assert calls[-1] == ["worktree", "set", "--worktree", f"path:{d.wt}", "--issue", "7", "--workspace-status", "in-progress"]
     assert json.loads(r.stdout) == {"issue": 7, "dispatch": "ctx_1", "worktree": str(d.wt), "terminal": "term_agent"}
+    assert (d.record / "ctx_1").read_text() == "7\n" and oct((d.record / "ctx_1").stat().st_mode & 0o777) == "0o600" and oct(d.record.stat().st_mode & 0o777) == "0o700"   # which issue this dispatch was given, outside every worktree
     assert d.stubs.calls("gh") == [["issue", "view", "7", "--json", "number,title,body"], ["issue", "edit", "7", "--add-label", "status:in-progress"]]
 
 
@@ -140,11 +141,12 @@ def test_agent_that_never_comes_up_is_not_handed_a_task(d):
     assert not any(c[:2] in (["orchestration", "worker-start"], ["worktree", "set"]) for c in d.orca())
 
 
-def test_failed_worker_start_exits_non_zero_without_linking_the_issue(d):
-    d.stubs.reply("orca.orchestration_worker_start", '{"result":{"state":"failed","failedStage":"setup"}}', rc=1)
+@pytest.mark.parametrize("out, rc", [('{"result":{"state":"failed","failedStage":"setup"}}', 1), ('{"result":{"state":"ready"}}', 0)])   # failed / no dispatch id to record: nothing could verify the worker
+def test_failed_worker_start_exits_non_zero_without_linking_the_issue(d, out, rc):
+    d.stubs.reply("orca.orchestration_worker_start", out, rc=rc)
     r = d.go("7")
     assert r.returncode == 1 and "worker-start" in r.stderr
-    assert not any(c[:2] == ["worktree", "set"] for c in d.orca())
+    assert not any(c[:2] == ["worktree", "set"] for c in d.orca()) and not d.record.exists()
 
 
 def test_a_run_is_required_and_never_inferred(d):
@@ -245,6 +247,7 @@ def assert_refreshed_before_the_agent_starts(d, r):
 
 def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d):
     stale_worktree(d)
+    d.stubs.reply("orca.orchestration_worker_start", '{"result":{"dispatchId":"ctx_2","state":"ready"}}')
     r = d.go("--retry-of", "ctx_old", "--task", "task_7", "7", AI_TOOLKIT_POLL=0)
     assert r.returncode == 0, r.stderr
     assert_refreshed_before_the_agent_starts(d, r)
@@ -255,6 +258,7 @@ def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d)
     assert calls[4] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}",
                         "--terminal", "term_agent", "--task", "task_7", "--retry-of", "ctx_old", "--timeout-ms", "120000"]
     assert json.loads(r.stdout)["terminal"] == "term_agent" and ["issue", "edit", "7", "--add-label", "status:in-progress"] in d.stubs.calls("gh")
+    assert (d.record / "ctx_2").read_text() == "7\n"   # the retry's own dispatch id, not the one it replaces
 
 
 @pytest.mark.parametrize("args", [("--retry-of", "ctx_old", "--task", "task_7"), ("--address", "fix it")], ids=["retry", "address"])
@@ -277,6 +281,7 @@ def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_th
     stale_worktree(d)
     d.stubs.reply("gh.issue_edit", "boom", rc=1)
     d.stubs.reply("gh.label_create", "boom", rc=1)
+    d.stubs.reply("orca.orchestration_worker_start", '{"result":{"dispatchId":"ctx_3","state":"ready"}}')
     r = d.go("--address", "address: fix the blocker", "7")
     assert r.returncode == 0, r.stderr   # a label that cannot be set warns and changes nothing else
     assert "warning" in r.stderr and ["issue", "edit", "7", "--add-label", "status:in-progress"] in d.stubs.calls("gh") and ["label", "create", "status:in-progress", "--color", "FBCA04"] in d.stubs.calls("gh")
@@ -286,3 +291,4 @@ def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_th
     assert calls[2][7].endswith("/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")
     assert calls[4] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}", "--terminal", "term_agent",
                         "--task-title", "#7 address", "--spec", "address: fix the blocker", "--timeout-ms", "120000"]
+    assert (d.record / "ctx_3").read_text() == "7\n"

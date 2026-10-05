@@ -37,7 +37,11 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         link_script(cmds / n, STUB_TEE)
     link_script(tmp_path / "stubs/bin/claude", STUB_TEE)   # the post-land triage prompt goes on its stdin
 
-    def row(d="ctx_1", st="dispatched", lv="live"):
+    def row(d="ctx_1", st="dispatched", lv="live", rec=1):   # the dispatch record dispatch.sh keeps for every id a row uses: the issue it was given (None = none was written)
+        (tmp_path / "state/run_t/dispatch").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "state/run_t/dispatch" / d).unlink(missing_ok=True)
+        if rec is not None:
+            (tmp_path / "state/run_t/dispatch" / d).write_text(f"{rec}\n")
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",
                 "resource": {"worktreeId": f"r::{wt}"}, "projection": {"liveness": {"verdict": lv}, "stage": {"activity": "working"}}}
 
@@ -110,10 +114,31 @@ def test_a_given_run_is_rebound_without_one_a_run_is_created_and_every_wait_name
     assert arg(C.calls("orca orchestration check")[-1], "--run") == "run_new"
 
 
-def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_acks(C, tmp_path):
+def relink(C, link):   # the worker's Orca link as the coordinator reads it: as dispatched (1), moved to issue 2, or with no dispatch record at all
+    if link == "norecord":
+        C.workers(C.row(rec=None))
+    if link == "dup":   # another worktree links issue 1 too: review.sh and land.sh pick the worktree by that link
+        C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 1, "branch": "refs/heads/1-x"}, {"path": "/other", "linkedIssue": 1}]}}))
+    if link == "relinked":
+        C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 2, "branch": "refs/heads/1-x"}]}}))
+
+
+def moved(C, link="relinked"):   # a link that no longer matches its record: issue 1 (the recorded one) is blocked with both numbers named; nothing else happens to issue 2
+    c = C.calls("gh issue comment")
+    assert C.blocked() and len(c) == 1 and (("#2" in c[0][-1] and "#1" in c[0][-1]) or link == "dup") and C.calls("gh issue edit")[0][2] == "1"
+    return True
+
+
+@pytest.mark.parametrize("link", ["ok", "relinked", "dup", "norecord"])   # no record fails closed: unresolvable, so the human answers by hand and nothing is blocked
+def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_acks(C, tmp_path, link):
+    relink(C, link)
     C.stubs.reply("answer.sh", "revise: drop the extra file\nWARN: touches CI\n")
     C.mail([msg("question", "msg_q", question="PLAN: do X?")])
     assert C.go("--answer", "auto").returncode == 0
+    if link != "ok":
+        assert not C.stubs.calls("answer.sh") and not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack")
+        assert (tmp_path / "bell").exists() and (not C.calls("gh issue edit") if link == "norecord" else moved(C, link))
+        return
     assert C.stubs.calls("answer.sh") == [[C.wt]] and C.stdin("answer.sh") == "PLAN: do X?"
     rep = C.calls("orca orchestration reply")[0]
     assert (arg(rep, "--id"), arg(rep, "--body"), arg(rep, "--run")) == ("msg_q", "revise: drop the extra file", "run_t")
@@ -307,11 +332,18 @@ def test_a_pending_human_question_does_not_stop_dispatch_or_land(C):
     assert ["5"] in C.stubs.calls("dispatch.sh") and C.stubs.calls("land.sh") == [["--review", "1"]]
 
 
-@pytest.mark.parametrize("kind, extra", [("worker_done", {"outcome": "failed"}), ("escalation", {})])
-def test_a_failed_or_escalating_worker_blocks_the_issue(C, kind, extra):
+@pytest.mark.parametrize("kind, extra, link", [("worker_done", {"outcome": "failed"}, "ok"), ("escalation", {}, "ok"),
+                                              ("worker_done", {"outcome": "succeeded"}, "relinked"), ("worker_done", {"outcome": "succeeded"}, "dup"),
+                                              ("worker_done", {"outcome": "succeeded"}, "norecord")])   # a done worker is never landed under a moved link or none recorded
+def test_a_failed_or_escalating_worker_blocks_the_issue(C, kind, extra, link):
+    relink(C, link)
     C.stubs.reply("gh.issue_edit", "boom", rc=1, n=2)   # the in-progress label cannot be removed: a warning, the issue is still blocked
     C.mail([msg(kind, **extra)])
     C.go()
+    if link != "ok":
+        assert not C.stubs.calls("land.sh") and not C.stubs.calls("claude") and C.calls("orca orchestration check ack")
+        assert (not C.calls("gh issue edit") and not C.calls("gh issue comment")) if link == "norecord" else moved(C, link)
+        return
     assert C.blocked() and not C.stubs.calls("land.sh") and C.calls("orca orchestration check ack")
 
 
