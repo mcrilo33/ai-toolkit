@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import STUB_TEE, V2
+from conftest import STUB_TEE, V2, git
 
 ANSWER, REVIEW = str(V2 / "scripts/answer.sh"), str(V2 / "scripts/review.sh")
 OK = {"verdict": "APPROVE", "blockers": [], "warnings": ["a.py:1 - nit"], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
@@ -129,9 +129,9 @@ def R(stubs, repo, link_script):
     show = json.dumps({"result": {"worktree": {"path": str(wt), "branch": "refs/heads/9-feat"}}})
     stubs.reply("orca.worktree_show", show)
 
-    def go(verdict, rc=0, **env):
+    def go(verdict, rc=0, sha=None, **env):
         stubs.reply("claude", verdict if isinstance(verdict, str) else json.dumps(verdict), rc=rc)
-        return sh(["bash", REVIEW, "9"], repo.root, **env)
+        return sh(["bash", REVIEW, "9", *([sha] if sha else [])], repo.root, **env)
 
     return type("R", (), {"go": staticmethod(go), "wt": wt, "stubs": stubs, "stdin": staticmethod(stdin), "show": show})
 
@@ -144,6 +144,14 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     tools = argv[argv.index("--allowedTools") + 1]
     assert "Read" in tools and "git diff" in tools and not {"Edit", "Write"} & set(tools.replace("(", ",").split(","))
     assert "origin/trunk...9-feat" in R.stdin() and "JSON" in R.stdin() and f"PWD={R.wt.resolve()}" in R.stubs.env("claude")
+    # a sha pins the review to that commit: the prompt diffs and reads it, never the branch name or the working tree; an unknown sha never reaches claude
+    sha = git(R.wt, "rev-parse", "HEAD")
+    assert R.go(OK, sha=sha, BASE_BRANCH="trunk").returncode == 0
+    p = R.stdin()
+    assert f"origin/trunk...{sha}" in p and f"git show {sha}:" in p and "9-feat" not in p and "working tree" in p and "JSON" in p
+    n = len(R.stubs.calls("claude"))
+    r = R.go(OK, sha="0" * 40)
+    assert r.returncode == 1 and "0" * 40 in r.stderr and len(R.stubs.calls("claude")) == n
     # the issue changed after dispatch: the gate reads the live text; an unreadable issue keeps the copy, warns and says so in the prompt
     task = R.wt / ".ai-toolkit/task.md"
     task.parent.mkdir()

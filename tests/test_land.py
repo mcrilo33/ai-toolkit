@@ -240,6 +240,22 @@ def test_review_runs_first_and_a_non_approval_exits_3(L, tmp_path, link_script):
     n = len(L.trail())
     assert L.go("--review", "9", REVIEW_CMD=rev).returncode == 0
     assert [t[:3] for t in L.trail()[n:n + 3]] == [("orca", "worktree", "show"), ("gh", "review", "9"), ("gh", "run", "list")]
+    # the review judges the exact tip: the sha it gets is the sha gated and the sha fast-forwarded onto main
+    reviewed = L.trail()[n + 1]
+    assert reviewed == ("gh", "review", "9", L.tip) and L.trail()[n + 2][4] == L.tip and main_sha(L) == L.tip
+
+
+def test_a_branch_moved_during_the_review_is_refused_so_only_the_reviewed_tip_can_land(L, tmp_path, link_script):
+    rev = link_script(tmp_path / "mover.sh", f'#!/bin/sh\ngh review "$@"\ncd "$WT" && echo b > b.txt && git add b.txt && git commit -qm b && {{ [ -z "$PUSH" ] || git push -q origin HEAD:{BRANCH}; }}\n')
+    before = main_sha(L)
+    for push in ("1", ""):   # the worker pushed a new commit, or only committed locally, while the review ran
+        r = L.go("--review", "9", REVIEW_CMD=rev, WT=L.wt, PUSH=push)
+        moved = git(L.wt, "rev-parse", "HEAD")
+        assert r.returncode == 2 and "moved during the review" in r.stderr and L.tip in r.stderr and moved in r.stderr, r.stderr
+        no_side_effects(L, before)
+        assert not [t for t in L.trail() if t[:3] == ("gh", "run", "list")]
+        git(L.wt, "reset", "-q", "--hard", L.tip)
+        git(L.wt, "push", "-q", "-f", "origin", f"HEAD:{BRANCH}")
 
 
 def test_local_main_ahead_of_origin_is_refused_so_nothing_ungated_ships(L):
