@@ -117,19 +117,17 @@ Gate: plan
 
 ## Phase 6: Labels
 
-Always `enhancement`. Add, by heuristic:
-
-- **`hold`** — when `Scope:` touches `coordinator.sh`, `dispatch.sh`, or `land.sh`. These are
-  self-modify hazards that must land attended, so the issue is held out of the autonomous
-  drain (exact `bug-scoper` parity).
+Always `enhancement` and `hold`, whatever the `Scope:` (the `bug-triage` rule says why). Say in your
+report that you applied `hold`.
 
 ## Phase 7: File or draft
 
 Issues are cheap and reversible, so **auto-file is the safe default.**
 
 - **Unattended (running under `/afk`, or the caller says file it):** file the issue
-  immediately via the `github-issues` mechanics (MCP `mcp_github_issue_write` create, with
-  `labels` — you have no shell, so filing is MCP-only). Report the URL.
+  immediately via the `github-issues` mechanics: the GitHub MCP when one is available, else
+  `gh issue create` with `--label`, passing the body with `--body-file` and the repo with `--repo`.
+  Report the URL. If neither works, draft it as below and say loudly that nothing was filed.
 - **Attended (a human is present to approve):** return the full drafted issue — title,
   body, footer, labels — for a one-look approval instead of filing blind.
 - **Target repo — set `owner`/`repo` EXPLICITLY, never rely on the ambient default.** A follow-up on the
@@ -145,7 +143,7 @@ State which path you took, and which repo you filed to and why.
 ## Fail-safe: a lost follow-up is loud, never silent
 
 You are dispatched best-effort — your work must **never fail the caller's cycle**. But if
-you genuinely cannot file (MCP unreachable, the code could not be located to derive a
+you genuinely cannot file (no GitHub MCP and `gh` fails, the code could not be located to derive a
 scope), **do not silently drop the follow-up**: return `status: blocked` with the full
 follow-up text preserved in `summary` so it is visibly recoverable, not lost to a
 transcript. Fail loud (AFK principles #2, #6).
@@ -173,12 +171,12 @@ free prose parses to no status and scores nothing). Put the human-readable summa
   status — whenever you terminated normally: an issue **filed**, **drafted** for approval,
   **deduped** into an existing one, **deferred-to-parent**, or a speculative idea
   correctly **dropped** are all "the agent did its job". Only if you genuinely could not
-  file a grounded follow-up (MCP unreachable, or you could not reach the code to derive a
+  file a grounded follow-up (no GitHub MCP and `gh` fails, or you could not reach the code to derive a
   scope) return `"status": "blocked"` (a non-success status) and preserve the follow-up
   text in `summary`. Keep the whole object under ~20k characters.
 - **`summary`** carries what the prose report used to: **Action** (filed with URL /
   drafted / deduped into #N / deferred to #N / dropped + why), **Grounding** (the three-part
-  verdict), **Scope** (paths + one line on how you derived them), and **Labels** (the set applied and which heuristic triggered `hold`).
+  verdict), **Scope** (paths + one line on how you derived them), and **Labels** (the set applied, `hold` included).
 
 ## Checklist
 
@@ -189,7 +187,7 @@ free prose parses to no status and scores nothing). Put the human-readable summa
 - [ ] `Gate: plan` (`none` only when the user asked for the light lane on this issue)
 - [ ] Open issues searched; no duplicate filed (deduped into an existing one if overlapping)
 - [ ] Body has Why / What (numbered) / Acceptance in house style
-- [ ] Labels applied (`enhancement` always; `hold` per heuristic)
+- [ ] Labels applied (`enhancement` and `hold` always)
 - [ ] Filed when unattended, drafted when attended — path stated; upstream repo set explicitly for tooling
 - [ ] Could-not-file is reported loud (`status: blocked` + preserved text), never silently dropped
 - [ ] Final message is the single JSON status object (`status` + `summary`), nothing else

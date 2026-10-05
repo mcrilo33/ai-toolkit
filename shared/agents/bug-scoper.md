@@ -93,8 +93,9 @@ Always `bug`. Add, by heuristic:
 Issues are cheap and reversible, so **auto-file is the safe default.**
 
 - **Unattended (running under `/afk`, or the caller says file it):** file the
-  issue immediately via the `github-issues` mechanics (MCP `mcp_github_issue_write`
-  create, with `labels` — you have no shell, so filing is MCP-only). Report the URL.
+  issue immediately via the `github-issues` mechanics: the GitHub MCP when one is available, else
+  `gh issue create` with `--label`, passing the body with `--body-file` and the repo with `--repo`.
+  Report the URL. If neither works, draft it as below and say loudly that nothing was filed.
 - **Attended (a human is present to approve):** return the full drafted issue —
   title, body, footer, labels — for a one-look approval instead of filing blind.
 - **Target repo — set `owner`/`repo` EXPLICITLY, never rely on the ambient default.** A defect whose

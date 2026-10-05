@@ -79,6 +79,17 @@ deferred scope is surfaced as a comment / `UPGRADE` marker, **not** a new issue.
 file is reported **loudly**, with the follow-up text preserved, never silently dropped: a
 lost follow-up is a visible failure, not a no-op.
 
+## What happens to the filed issue
+
+The filing agent decides the issue's dispatch outcome, and this is the only place it is stated:
+
+- **`bug-scoper`** files an ordinary dispatchable issue. A confirmed bug may be dispatched automatically.
+- **`followup-scoper`** files the issue with the `hold` label, which keeps it out of dispatch until
+  the human removes the label. A follow-up waits for the human's go.
+
+Both agents file with the `gh` CLI when no GitHub MCP is available. When neither works they
+draft instead, and report it loudly with the finding text preserved.
+
 ## What this does not cover
 
 - **Speculative ideas and design musings** — a preference with no measured cost, an
