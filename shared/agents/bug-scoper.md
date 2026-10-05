@@ -84,7 +84,7 @@ Always `bug`. Add, by heuristic:
 - **`priority`** — when the defect is a correctness bug, risks data loss, or is a
   fail-open (a gate or guard that silently passes when it should block). These jump
   the queue.
-- **`hold`** — when `Scope:` touches `coordinator.sh`, `dispatch.sh`, or `land.sh`. These are
+- **`hold`** — (dispatch outcome: `bug-triage` rule) when `Scope:` touches `coordinator.sh`, `dispatch.sh`, or `land.sh`. These are
   self-modify hazards that must land attended, so the issue is held out of the
   autonomous drain.
 
@@ -94,7 +94,7 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
 
 - **Unattended (running under `/afk`, or the caller says file it):** file the
   issue immediately via the `github-issues` mechanics: the GitHub MCP when one is available, else
-  `gh issue create` with `--label`, passing the body with `--body-file` and the repo with `--repo`.
+  `gh issue create` with `--title`, `--label`, `--repo`, and the body on stdin via `--body-file -`.
   Report the URL. If neither works, draft it as below and say loudly that nothing was filed.
 - **Attended (a human is present to approve):** return the full drafted issue —
   title, body, footer, labels — for a one-look approval instead of filing blind.

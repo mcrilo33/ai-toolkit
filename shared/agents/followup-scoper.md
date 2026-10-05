@@ -117,8 +117,8 @@ Gate: plan
 
 ## Phase 6: Labels
 
-Always `enhancement` and `hold`, whatever the `Scope:` (the `bug-triage` rule says why). Say in your
-report that you applied `hold`.
+Always `enhancement` and `hold`, whatever the `Scope:` (the `bug-triage` rule says why; create the
+label if the repo lacks it, and never file without it). Say in your report that you applied `hold`.
 
 ## Phase 7: File or draft
 
@@ -126,7 +126,7 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
 
 - **Unattended (running under `/afk`, or the caller says file it):** file the issue
   immediately via the `github-issues` mechanics: the GitHub MCP when one is available, else
-  `gh issue create` with `--label`, passing the body with `--body-file` and the repo with `--repo`.
+  `gh issue create` with `--title`, `--label`, `--repo`, and the body on stdin via `--body-file -`.
   Report the URL. If neither works, draft it as below and say loudly that nothing was filed.
 - **Attended (a human is present to approve):** return the full drafted issue — title,
   body, footer, labels — for a one-look approval instead of filing blind.

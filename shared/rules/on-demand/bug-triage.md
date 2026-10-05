@@ -83,12 +83,14 @@ lost follow-up is a visible failure, not a no-op.
 
 The filing agent decides the issue's dispatch outcome, and this is the only place it is stated:
 
-- **`bug-scoper`** files an ordinary dispatchable issue. A confirmed bug may be dispatched automatically.
+- **`bug-scoper`** files an ordinary dispatchable issue. A confirmed bug may be dispatched automatically,
+  except one whose fix touches the coordinator's own scripts: those carry `hold` and land attended.
 - **`followup-scoper`** files the issue with the `hold` label, which keeps it out of dispatch until
   the human removes the label. A follow-up waits for the human's go.
 
 Both agents file with the `gh` CLI when no GitHub MCP is available. When neither works they
-draft instead, and report it loudly with the finding text preserved.
+draft instead, and report it loudly with the finding text preserved. A follow-up is never filed
+without `hold`: if the label is missing from the repo, create it first.
 
 ## What this does not cover
 
