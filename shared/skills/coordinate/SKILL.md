@@ -5,11 +5,8 @@ argument-hint: "[auto [--until HH:MM] [--drain] | attended | status]"
 ---
 # Coordinate
 
-One Run, one holder at a time (Orca fences the other). **Attended**: this session holds the Run; Orca pushes
-`You have N orchestration message(s). Run orca orchestration check --run <run>` into it. **Auto**: `coordinator.sh --answer auto`
-holds it (answers gates itself, lands, labels `blocked`). The switch is always an explicit user instruction, never inferred from presence.
-The session converses, decides and calls the scripts in `.ai-toolkit/scripts/` (`dispatch.sh`, `land.sh`, `review.sh`, `answer.sh`,
-`coordinator.sh`); it never writes task code (see `.ai-toolkit/rules/planning-hub.md`) and keeps no state: ids live in the conversation.
+One Run, one holder at a time (Orca fences the other). **Attended**: this session holds the Run; Orca pushes `You have N orchestration message(s). Run orca orchestration check --run <run>` into it. **Auto**: `coordinator.sh --answer auto` holds it (answers gates itself, lands, labels `blocked`). The switch is always an explicit user instruction, never inferred from presence.
+The session converses, decides and calls the scripts in `.ai-toolkit/scripts/` (`dispatch.sh`, `land.sh`, `review.sh`, `answer.sh`, `coordinator.sh`); it never writes task code (see `.ai-toolkit/rules/planning-hub.md`) and keeps no state: ids live in the conversation.
 
 ## Preconditions
 
@@ -24,7 +21,7 @@ orca orchestration run-use --id <run> --from $H --json          # take an existi
 orca orchestration run-create --objective "<goal>" --from $H --json   # or a new one
 ```
 
-Find the id with `orca orchestration run-list --json` or `coordinator.sh --status --run <run>` (it names the holder). Say the id back to the user.
+Find the id with `orca orchestration run-list --json` or `coordinator.sh --status --run <run>` (names the holder); say it back to the user.
 
 ## On each message
 
@@ -128,3 +125,6 @@ Present blocked issues and pending questions first, then lands, then running wor
 - A bare `orca orchestration reply` only works from the bound terminal: when the loop holds the Run, a human answers with
   `coordinator.sh --run <run> --reply <message-id> approve` (`allow` or `deny` for a permission question); the loop sends it at its next wake.
 - Surface what the user must decide (gates, blocked issues, rejected reviews) before what runs fine; one recommendation, not a menu.
+- **Bell**: end a turn in which the user must act (a PLAN gate or permission request no standing rule answers, a blocked issue, a rejected review needing a decision,
+  any question you ask) by ringing the terminal bell: `printf '\a' > "/dev/$(ps -o tty= -p $PPID | tr -d ' ')"` (the agent has no `/dev/tty`). Never ring for a turn that
+  only reports (heartbeat acked, land done, approval under a standing rule). The user sets Orca once: notifications "agent task complete" off, "terminal bell" on.

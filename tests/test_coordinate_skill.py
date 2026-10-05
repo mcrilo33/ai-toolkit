@@ -29,7 +29,8 @@ def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
     '"approve"', '"approve with: ', '"revise: ', "land.sh --review", "dispatch.sh --address", "dispatch.sh --next", "coordinator.sh --status",
     "/coordinate auto", "--answer auto", "--until HH:MM", "--drain", "/coordinate attended", "coordinator.sh --stop --run", "You have", "heartbeat",
     "land.sh --cleanup-only", "worker-release", "blocked", "thread_id", "a land is in flight", "PERMISSION REQUEST", '--body "allow"', '--body "deny"',
-    "Permission answered by the user", "bug-scoper", "followup-scoper", "hold", "COORD_IDLE_MIN", "orca orchestration worker-show --dispatch", "observation.agentWait", "orca terminal read"])
+    "Permission answered by the user", "bug-scoper", "followup-scoper", "hold", "COORD_IDLE_MIN", "orca orchestration worker-show --dispatch", "observation.agentWait", "orca terminal read",
+    "printf '\\a' > \"/dev/$(ps -o tty= -p $PPID", "terminal bell", "agent task complete"])
 def test_the_skill_covers_each_mechanic_of_the_brief(needle):
     assert needle in SKILL
 
