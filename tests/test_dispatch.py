@@ -247,10 +247,10 @@ def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d)
     assert r.returncode == 0, r.stderr
     assert_refreshed_before_the_agent_starts(d, r)
     calls = d.orca()
-    assert [c[:2] for c in calls] == [["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
-    assert calls[1][2:6] == ["--worktree", f"path:{d.wt}", "--title", f"{NAME}-agent"] and calls[1][7].endswith(
+    assert [c[:2] for c in calls] == [["worktree", "show"], ["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
+    assert calls[2][2:6] == ["--worktree", f"path:{d.wt}", "--title", f"{NAME}-agent"] and calls[2][7].endswith(
         "/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")   # keeps the shim's OTel env
-    assert calls[3] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}",
+    assert calls[4] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}",
                         "--terminal", "term_agent", "--task", "task_7", "--retry-of", "ctx_old", "--timeout-ms", "120000"]
     assert json.loads(r.stdout)["terminal"] == "term_agent" and ["issue", "edit", "7", "--add-label", "status:in-progress"] in d.stubs.calls("gh")
 
@@ -280,7 +280,7 @@ def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_th
     assert "warning" in r.stderr and ["issue", "edit", "7", "--add-label", "status:in-progress"] in d.stubs.calls("gh") and ["label", "create", "status:in-progress", "--color", "FBCA04"] in d.stubs.calls("gh")
     assert_refreshed_before_the_agent_starts(d, r)
     calls = d.orca()
-    assert [c[:2] for c in calls] == [["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
-    assert calls[1][7].endswith("/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")
-    assert calls[3] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}", "--terminal", "term_agent",
+    assert [c[:2] for c in calls] == [["worktree", "show"], ["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
+    assert calls[2][7].endswith("/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")
+    assert calls[4] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}", "--terminal", "term_agent",
                         "--task-title", "#7 address", "--spec", "address: fix the blocker", "--timeout-ms", "120000"]

@@ -52,7 +52,7 @@ def test_runs_the_hosts_setup_local_hook(run, repo, stubs, mode):
     assert (setup(run, repo, mode=mode)[0] / "hook-ran").exists()
 
 
-def test_refresh_recopies_claude_but_keeps_run_id_and_task_md_and_asks_nobody(run, repo, stubs):
+def test_refresh_recopies_claude_and_task_md_but_keeps_run_id_and_a_failed_fetch_keeps_the_old_task_md(run, repo, stubs):
     stubs.reply("gh", '{"number":12,"title":"Add hello","body":"Do it."}')
     (repo.root / ".ai-toolkit").mkdir()
     manifest = repo.root / ".ai-toolkit/sync-manifest"
@@ -63,20 +63,26 @@ def test_refresh_recopies_claude_but_keeps_run_id_and_task_md_and_asks_nobody(ru
     rid, task = (wt / ".ai-toolkit/spoke-run-id").read_text(), (wt / ".ai-toolkit/task.md").read_text()
     (repo.root / ".claude/hooks/guard.sh").write_text("#!/bin/sh\nnewer\n")   # main moved on while this worktree was kept
     (wt / ".ai-toolkit/task.md").write_text("edited by the worker")
+    stubs.reply("gh", '{"number":12,"title":"Add hello","body":"Do it differently."}')   # the issue was rewritten after the first dispatch
     (wt / ".ai-toolkit/setup-done").unlink()
     (wt / ".claude/settings.local.json").write_text("worker grants\n")   # outside the synced set: neither copied over nor deleted
     (wt / ".claude/worker-note").write_text("mine\n")
     (repo.root / ".claude/settings.local.json").write_text("main local moved\n")
     (repo.root / ".claude/hooks/old.sh").unlink()   # a land's sync dropped old.sh from main
     manifest.write_text(".claude/hooks/guard.sh\n")
-    calls = len(stubs.calls("gh")) + len(stubs.calls("orca"))
+    calls = len(stubs.calls("gh"))
     r = setup(run, repo, wt=wt, mode=("--refresh",))[1]
     assert r.returncode == 0, r.stderr
     assert not (wt / ".claude/hooks/old.sh").exists() and (wt / ".claude/worker-note").read_text() == "mine\n"
     assert (wt / ".claude/settings.local.json").read_text() == "worker grants\n"
     assert (wt / ".claude/hooks/guard.sh").read_text() == "#!/bin/sh\nnewer\n" and (wt / ".ai-toolkit/setup-done").exists()
-    assert (wt / ".ai-toolkit/spoke-run-id").read_text() == rid and (wt / ".ai-toolkit/task.md").read_text() == "edited by the worker" != task
-    assert len(stubs.calls("gh")) + len(stubs.calls("orca")) == calls   # no issue fetch, no orca lookup
+    assert (wt / ".ai-toolkit/spoke-run-id").read_text() == rid and "Do it differently." in (wt / ".ai-toolkit/task.md").read_text() != task
+    assert len(stubs.calls("gh")) == calls + 1   # the refresh reads the issue once
+    stubs.reply("gh", "boom", rc=1)   # an outage must not block a re-dispatch: the old text stays and the warning names the issue
+    kept = (wt / ".ai-toolkit/task.md").read_text()
+    r = setup(run, repo, wt=wt, mode=("--refresh",))[1]
+    assert r.returncode == 0 and "issue 12" in r.stderr and (wt / ".ai-toolkit/task.md").read_text() == kept and (wt / ".ai-toolkit/setup-done").exists()
+    stubs.reply("gh", '{"number":12,"title":"Add hello","body":"Do it differently."}')
     git(repo.root, "add", "-f", ".claude/hooks/guard.sh")   # the repo tracks part of .claude: a refresh must not dirty or clobber it
     git(repo.root, "commit", "-qm", "track guard")
     (wt / ".claude/hooks/guard.sh").unlink()
