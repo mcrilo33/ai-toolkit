@@ -25,6 +25,9 @@ own branch, driven by its own agent. The hub thinks, decides, decomposes, dispat
 - **Permission prompts**: a worker's tool-permission prompt is relayed to the Run (`permission-relay` hook) as a `PERMISSION REQUEST` question: the coordinate skill shows it to the user and replies `allow` or `deny` on their word only; the auto loop denies it.
 - **Review and land**: `land.sh <n>` after the independent review and green CI. The hub never merges by hand
   past a red review or red CI.
+- **Watch suite time**: when reporting a land, also report each CI leg's job duration and the slowest test's duration (the CI log lists the slowest tests per leg).
+  If the slowest leg passes 3 minutes (unless the project says otherwise), raise a review of the suite's slowest tests with the user.
+  The review is one ordinary issue worked under `pytest-conventions`, Test economy (a slow test is made fast or deleted), filed only past that threshold or when a test is repeatedly listed as slow (`bug-triage` bar).
 
 ## Hub must not
 
