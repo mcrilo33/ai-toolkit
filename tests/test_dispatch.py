@@ -77,7 +77,8 @@ def test_seed_for_a_plan_gate_asks_before_coding_and_never_touches_the_base(d):
     for part in (".ai-toolkit/task.md", "approve,revise", "do not edit code before approve", "RED", "git push -u origin HEAD",
                  "worker_done --outcome succeeded", "Never merge or push the base branch", "in-spoke code-review",
                  "approve with: <change>", "do NOT ask again", "revise: <change>, amend the plan and ask again",
-                 ".ai-toolkit/rules/bug-triage.md", "DEFERRED: <item>", "Send no heartbeat messages: report only with worker_done, a question, or an escalation."):
+                 ".ai-toolkit/rules/bug-triage.md", "DEFERRED: <item>", "Send no heartbeat messages: report only with worker_done, a question, or an escalation.",
+                 "In a recursive delete, write the target as a literal path inside the worktree or the scratch directory, never a variable or a command substitution: the guard allows the first and asks for the second."):
         assert part in seed, part
 
 
@@ -92,6 +93,7 @@ def test_gate_none_and_model_footer_override_the_defaults(d):
     assert "RED" in seed and "git push -u origin HEAD" in seed and "worker_done" in seed
     assert ".ai-toolkit/rules/bug-triage.md" in seed and "DEFERRED: <item>" in seed  # both lanes route discovered bugs and follow-ups to the scopers, and mark what stays unfiled
     assert "Send no heartbeat messages: report only with worker_done, a question, or an escalation." in seed  # nothing consumes heartbeats (#451): both lanes tell the worker to send none
+    assert "In a recursive delete, write the target as a literal path inside the worktree or the scratch directory, never a variable or a command substitution: the guard allows the first and asks for the second." in seed  # the guard allows a literal-path recursive delete and asks for a variable one (#452): both lanes tell the worker which form passes
 
 
 def test_missing_gate_footer_falls_back_to_the_env_default(d):
