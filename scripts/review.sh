@@ -7,6 +7,7 @@
 # The reviewer's instructions are the coordinator's own code-review definition (REVIEW_AGENT, else the one place of this install layout: the checkout's shared/agents, or the synced
 # .claude/agents of the repo this script is installed in, never a path above that root), passed with --agents and run with no setting source at all (so the user-level allow rules
 # cannot widen the read-only tools), no MCP config and no auto-memory, so a worker's .claude/agents, CLAUDE.md, rules or ~/.claude/projects/*/memory never reach it; a missing definition is exit 1, never a fallback.
+# The rules that definition cites (guidelines, security, code-quality, python-style, pytest-conventions) are appended to its prompt from the same coordinator-side place (REVIEW_RULES_DIR overrides it: a flat dir of <name>.md): a missing or blank one is exit 1.
 # Its effort and read-only block (disallowedTools) come from the definition's frontmatter, a missing one is exit 1. model: is dropped on purpose (REVIEW_MODEL decides) and so is skills:
 # (they resolve from a skills dir, which --setting-sources "" does not load; naming them would load a worker-controlled one or do nothing).
 # Auto-memory is switched off twice, independently: --settings autoMemoryEnabled=false (the documented setting) and CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 in the environment, on every claude call. An unknown settings key
@@ -19,17 +20,26 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 load_env
 n="${1:-}"; sha="${2:-}"; [ -n "$n" ] || usage_exit "usage: review.sh <issue> [<sha>]"
 o="$(orca_json worktree show --worktree "issue:$n")" || die "no Orca worktree is linked to issue $n"
-agent="${REVIEW_AGENT:-}"
-if [ -z "$agent" ]; then
-  case "$here" in */.ai-toolkit/scripts) agent="$here/../../.claude/agents/code-review.md" ;; *) agent="$here/../shared/agents/code-review.md" ;; esac
-fi
+case "$here" in   # the one place of this install layout: the checkout's shared/, or the synced repo's .claude/ and CLAUDE.md
+  */.ai-toolkit/scripts) agents_d="$here/../../.claude/agents"; rules_d="$here/../../.claude/rules"; goal="$here/../../CLAUDE.md" ;;
+  *) agents_d="$here/../shared/agents"; rules_d="$here/../shared/rules"; goal="$rules_d/guidelines.md" ;;
+esac
+agent="${REVIEW_AGENT:-$agents_d/code-review.md}"
+if [ -n "${REVIEW_RULES_DIR:-}" ]; then rules_d="$REVIEW_RULES_DIR"; goal="$rules_d/guidelines.md"; fi
 [ -f "$agent" ] || die "code-review agent definition not found"
 front() { awk -v k="$1" 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } index($0, k ": ") == 1 { sub("^[^:]*: *", ""); gsub(" *, *", ","); sub("[ \t]+$", ""); print; exit }' "$agent"; }   # one flat frontmatter value
 effort="$(front effort)"; blocked="$(front disallowedTools)"
 case "$effort$blocked" in *[\"\'\[\]#]*) die "code-review agent definition: effort and disallowedTools must be plain unquoted values without an inline comment in its frontmatter: $agent" ;; esac
 [ -n "$effort" ] && [ -n "$blocked" ] || die "code-review agent definition lacks effort or disallowedTools in its frontmatter: $agent"
-prose="$(awk 'NR == 1 && $0 != "---" { f = 2 } f < 2 { if ($0 == "---") f++; next } { print }' "$agent")"   # the body after the frontmatter
+body() { awk 'NR == 1 && $0 != "---" { f = 2 } f < 2 { if ($0 == "---") f++; next } { print }' "$1"; }   # the body after the frontmatter
+prose="$(body "$agent")"
 printf '%s' "$prose" | grep -q '[^[:space:]]' || die "code-review agent definition is empty: $agent"
+for r in guidelines security code-quality python-style pytest-conventions; do   # the rules the agent cites, from the coordinator's copies; a missing or blank one is exit 1
+  f="$rules_d/$r.md"; [ "$r" != guidelines ] || f="$goal"
+  [ -f "$f" ] || die "coordinator-side rule not found: $f"
+  text="$(body "$f")"; printf '%s' "$text" | grep -q '[^[:space:]]' || die "coordinator-side rule is empty: $f"
+  prose="$prose"$'\n\n'"--- project rule: $r ---"$'\n\n'"$text"
+done
 agents="$(jq -nc --arg p "$prose" '{"code-review": {description: "independent pre-land code review", prompt: $p}}')"
 wt="$(printf '%s' "$o" | jq -r '.result.worktree.path')"
 branch="$(printf '%s' "$o" | jq -r '.result.worktree.branch | sub("^refs/heads/"; "")')"
