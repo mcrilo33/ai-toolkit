@@ -83,9 +83,14 @@ issue_of() {
 # issue_text <n>: the live issue text for a gate's prompt, from GitHub only. The worker's worktree copy is its own to rewrite, so no gate judges it
 # and none falls back to it. A gh that fails (or returns nothing) is retried every AI_TOOLKIT_POLL seconds, ORCA_LINK_TRIES times (the same bound as
 # issue_of: about 2 minutes), then rc 1 names the issue on stderr: the gate declines rather than judging a weaker source.
-_issue_text_once() { local t; t="$({ gh_issue "$1" | task_md; } 2> /dev/null)" && [ -n "$t" ] && printf '%s' "$t"; }   # prints only on success: a failed try leaks nothing
+_issue_text_once() {   # prints only on success (a failed try leaks nothing); a failure leaves gh's first stderr line in _ISSUE_ERR for the decline message
+  local t e; e="$(mktemp)"
+  if t="$({ gh_issue "$1" | task_md; } 2> "$e")" && [ -n "$t" ]; then rm -f "$e"; printf '%s' "$t"; return 0; fi
+  _ISSUE_ERR="$(head -n 1 "$e")"; rm -f "$e"; return 1
+}
 issue_text() {
-  wait_until "${ORCA_LINK_TRIES:-40}" "${AI_TOOLKIT_POLL:-3}" _issue_text_once "$1" || { printf '%s: cannot read issue %s from GitHub (gh failed or returned nothing); nothing is judged\n' "${0##*/}" "$1" >&2; return 1; }
+  local _ISSUE_ERR=""
+  wait_until "${ORCA_LINK_TRIES:-40}" "${AI_TOOLKIT_POLL:-3}" _issue_text_once "$1" || { printf '%s: cannot read issue %s from GitHub (%s); nothing is judged\n' "${0##*/}" "$1" "${_ISSUE_ERR:-gh failed or returned nothing}" >&2; return 1; }
 }
 
 # status_label <add|remove> <issue>: the one `status:in-progress` marker follows the worker. A failure only warns: the work it marks is already done.
