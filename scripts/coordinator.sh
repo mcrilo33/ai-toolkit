@@ -350,7 +350,7 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
 }
 
 notify_queue() {   # attended: one bell for each decision that was not queued at the last look; the ids last seen live in $seen (no file); a failed read changes nothing.
-  [ "$answer" = attended ] || return 0   # A question counts once THIS loop left it open ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event
+  [ "$answer" = attended ] || return 0   # A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event
   local now i all; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
   all="$(queue_ids | tr '\n' ' ')" || return 0; now=""
   for i in $all; do case "$i" in q:*) case " $held " in *" ${i#q:} "*) ;; *) continue ;; esac ;; esac; now="$now$i "; case " $seen " in *" $i "*) ;; *) bell ;; esac; done; seen="$now"
