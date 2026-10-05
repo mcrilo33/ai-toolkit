@@ -98,11 +98,11 @@ def test_refresh_recopies_claude_and_task_md_but_keeps_run_id_and_a_failed_fetch
     git(wt, "merge", "-q", "main")   # the branch now tracks it too
     (repo.root / ".claude/hooks/guard.sh").write_text("main moved again\n")
     (repo.root / ".claude/hooks/extra.sh").write_text("untracked\n")
-    manifest.write_text(".claude/hooks/guard.sh\n.claude/hooks/extra.sh\n")
+    manifest.write_text(".claude/hooks/guard.sh\n.claude/hooks/extra.sh\n.ai-toolkit/rules/bug-triage.md\n")
     (wt / ".claude/hooks/guard.sh").write_text("worker edit\n")
     assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0
     assert (wt / ".claude/hooks/extra.sh").read_text() == "untracked\n" and (wt / ".claude/hooks/guard.sh").read_text() == "worker edit\n"
-    manifest.write_text(".claude/hooks/extra.sh\n")   # the branch tracks guard.sh, so main dropping it from the synced set does not delete it
+    manifest.write_text(".claude/hooks/extra.sh\n.ai-toolkit/rules/bug-triage.md\n")   # the branch tracks guard.sh, so main dropping it from the synced set does not delete it
     assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0 and (wt / ".claude/hooks/guard.sh").read_text() == "worker edit\n"
     (repo.root / ".git/info/exclude").write_text("")   # a repo that tracks .claude does not ignore it (an ignored file would be merged over silently)
     (repo.root / ".claude/rules").mkdir()

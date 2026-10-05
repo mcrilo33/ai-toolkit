@@ -66,7 +66,7 @@ put_md "$SHARED/agents" .claude/agents
 put_md "$SHARED/prompts" .claude/commands
 put_tree "$V2/scripts" .ai-toolkit/scripts otel.sh   # the collector is per-machine: it runs from the toolkit checkout
 put_tree "$V2/bin" .ai-toolkit/bin
-put_tree "$V2/hooks/claude" .claude/hooks   # setup.sh copies only .claude/ into a new worktree
+put_tree "$V2/hooks/claude" .claude/hooks   # setup.sh copies .claude/ and .ai-toolkit/rules/ into a new worktree
 put_tree "$V2/hooks/git" .ai-toolkit/hooks/git
 put "$V2/settings/ai-toolkit.env" .ai-toolkit/ai-toolkit.env
 if [ -f "$V2/settings/claude/settings.json" ]; then put "$V2/settings/claude/settings.json" .claude/settings.json bak
