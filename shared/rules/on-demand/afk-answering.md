@@ -15,8 +15,9 @@ the quality of the answer, so reason with a real thinking budget.
 ## What you are given
 
 - **The question**: for a PLAN gate, the spoke's complete plan (files, approach, test strategy, open questions).
-- **The issue contract**: `.ai-toolkit/task.md` in your cwd: goal, `Scope:`, `Gate:`, acceptance criteria.
-  This is the source of truth for intent.
+- **The issue contract**: the issue text in your prompt, fetched live: goal, `Scope:`, `Gate:`, acceptance criteria.
+  This is the source of truth for intent. A `.ai-toolkit/task.md` in the worktree is the worker's own copy and
+  never the contract: do not read it for intent.
 - **Repo conventions**: the rules and patterns already in the codebase.
 - **The worktree, read-only** (Read, Grep, Glob). Use it to check the plan against the code as it *is*. You must
   not edit, stage, commit, or push; any write voids your answer.

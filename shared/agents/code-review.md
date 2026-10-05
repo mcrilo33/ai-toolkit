@@ -26,7 +26,9 @@ apply them. You run in two places: inside a spoke as an advisory pre-push check,
 ## Workflow
 
 1. **Get the diff**: `git diff origin/<base>...HEAD` (or the range you were given), then read the changed files.
-2. **Understand intent**: the issue (`.ai-toolkit/task.md`), commit messages, the stated acceptance criteria.
+2. **Understand intent**: the issue text in your prompt when one is given (the contract of an independent gate; a
+   worktree `.ai-toolkit/task.md` is never the contract there), else, for an in-spoke review, `.ai-toolkit/task.md`;
+   plus commit messages and the stated acceptance criteria.
 3. **Stage 1, spec compliance** (stop here if it fails): the diff does what was asked, no more, no less.
    - Every acceptance criterion is addressed; no TODOs, stubs, or "handle later" gaps in the requested behavior.
    - No scope creep: nothing beyond the issue's `Scope:` and intent. The right problem is solved, not a similar one.

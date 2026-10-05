@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # answer.sh <worktree> < question: the auto-answerer for a spoke's gate (06 section 4 step 7, D5). Headless, read-only claude
 # in the spoke's worktree, driven by the afk-answering rule. stdout = the reply body (`approve` | `approve with: <change>` | `revise: <change>`), then any
-# `WARN:` lines for the human. Exit 0 answered; 1 no usable answer (garbage, claude failed, rule missing, no issue in Orca's link): the caller escalates
+# `WARN:` lines for the human. Exit 0 answered; 1 no usable answer (garbage, claude failed, rule missing, no issue in Orca's link, issue unreadable): the caller escalates
 # to the human, never a blind approve.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -18,14 +18,15 @@ fi
 [ -f "$rule" ] || die "answer rule (afk-answering.md) not found"
 q="$(cat)"; t="${q#"${q%%[![:space:]]*}"}"   # a worker's permission prompt (permission-relay.sh) is never answered here: the loop denies it, only the user allows it
 [[ $t != "PERMISSION REQUEST"* ]] || die "a permission question is never auto-answered (the coordinator denies it; only the user can allow it)"
-# The answerer judges the issue as it is now. Its number comes from Orca's link only (the worker can rewrite task.md and its branch name): when Orca
-# cannot give it, issue_of has waited and said why on stderr, and nothing is judged (exit 1: the caller's unanswered path).
-h="$(task_md_number "$wt/.ai-toolkit/task.md")"; n="$(issue_of "$wt")" || exit 1   # h before the refresh, which rewrites the header
-s="$(refresh_task "$wt" "$n")"; q="$q$s"   # s = the stale note when the copy could not be refreshed
-if [ -n "$h" ] && [ "$h" != "$n" ]; then
-  warn "task.md header names #$h but this worktree is issue #$n; judging #$n"
-  q="$q NOTE: the worker's .ai-toolkit/task.md header named #$h, but this worktree is issue #$n (Orca link); the worker may have edited that header.${s:+ task.md was not refreshed and still holds that edited copy, not issue #$n.}"
-fi
+# The answerer judges the issue as it is now, from GitHub, and puts its text in the prompt. The number comes from Orca's link only (the worker can rewrite
+# task.md and its branch name) and the text never from the worktree: when either cannot be had (issue_of / issue_text waited and said why on stderr),
+# nothing is judged (exit 1: the caller's unanswered path).
+n="$(issue_of "$wt")" || exit 1
+issue="$(issue_text "$n")" || exit 1
+q="$q
+
+Issue #$n (the only contract, as fetched now; never a task.md in the worktree):
+$issue"
 out="$(cd "$wt" && printf '%s' "$q" | claude -p --model "$ANSWER_MODEL" --append-system-prompt-file "$rule" --allowedTools Read,Grep,Glob --no-session-persistence)" || die "claude failed"
 last="$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 1)"
 body="$(printf '%s' "$last" | sed -n 's/^ANSWER:[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p')"
