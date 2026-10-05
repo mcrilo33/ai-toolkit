@@ -375,7 +375,7 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
     C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # a failing handler must not stop the rest, nor the ack
     C.stubs.reply("land.sh", f"{land}landed #1 in abc\n")
     if crc == HANG:
-        link_script(tmp_path / "stubs/bin/claude", STUB_TEE.replace('k="$1_$2"', 'exec sleep 30; k="$1_$2"', 1))   # logs the call and its stdin, then waits
+        link_script(tmp_path / "stubs/bin/claude", STUB_TEE.replace('k="$1_$2"', 'trap "" TERM; sleep 30 & echo $! > "$STUB_DIR/child.pid"; sleep 30; k="$1_$2"', 1))   # logs the call and its stdin, ignores SIGTERM, starts a child, then waits
     else:
         C.stubs.reply("claude", "filed #9\n", rc=crc)
     C.mail([msg("question", "msg_q", question="q"), {**msg("worker_done", "msg_d", outcome="succeeded"), "body": body}])
@@ -394,7 +394,10 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
         head, _, data = p.partition("<findings>\n")   # the findings come last, as data the session is told never to obey
         assert "UNTRUSTED DATA" in head and "followup-scoper" in head and data.rstrip().endswith("</findings>") and data.count("</findings>") == 1
     if crc:   # a failed or expired routing never reddens the land, and the finding is kept: warned and commented on the landed issue
-        assert ("exit 143" in r.stderr) == (crc == HANG)   # an expiry is a SIGTERM kill, not a natural end
+        assert ("exit 137" in r.stderr) == (crc == HANG)   # an expiry is a SIGKILL, not a natural end
+        if crc == HANG:   # the kill reaches the session's child too
+            with pytest.raises(ProcessLookupError):
+                os.kill(int((Path(os.environ["STUB_DIR"]) / "child.pid").read_text()), 0)
         assert "a.py:3 - x" in r.stderr and any("a.py:3 - x" in a[-1] for a in C.calls("gh issue comment")[1:])
     if "w1" in routed:
         assert any("w4" in a[-1] and "w5" in a[-1] for a in C.calls("gh issue comment")[1:])
