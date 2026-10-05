@@ -2,7 +2,9 @@
 # answer.sh <worktree> < question: the auto-answerer for a spoke's gate (06 section 4 step 7, D5). Headless, read-only claude
 # in the spoke's worktree, driven by the afk-answering rule. stdout = the reply body (`approve` | `approve with: <change>` | `revise: <change>`), then any
 # `WARN:` lines for the human. Exit 0 answered; 1 no usable answer (garbage, claude failed, rule missing, no issue in Orca's link, issue unreadable): the caller escalates
-# to the human, never a blind approve.
+# to the human, never a blind approve. Runs with no setting source, no MCP config and no auto-memory, so nothing a worker can write (its CLAUDE.md, rules, ~/.claude/projects/*/memory) reaches the model
+# that approves its plan. Auto-memory is switched off twice, independently: --settings autoMemoryEnabled=false and CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 in the environment (an unknown settings key is
+# ignored silently, so a CLI rename would fail open; see review.sh).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
@@ -10,10 +12,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 load_env
 wt="${1:-}"; [ -d "$wt" ] || usage_exit "usage: answer.sh <worktree> < question"
 rule="${ANSWER_RULE:-}"
-if [ -z "$rule" ]; then
-  for f in "$here/../rules/afk-answering.md" "$here/../shared/rules/on-demand/afk-answering.md" "$here/../../shared/rules/on-demand/afk-answering.md"; do
-    if [ -f "$f" ]; then rule="$f"; break; fi
-  done
+if [ -z "$rule" ]; then   # the one place of this install layout, never a path above its root
+  case "$here" in */.ai-toolkit/scripts) rule="$here/../rules/afk-answering.md" ;; *) rule="$here/../shared/rules/on-demand/afk-answering.md" ;; esac
 fi
 [ -f "$rule" ] || die "answer rule (afk-answering.md) not found"
 q="$(cat)"; t="${q#"${q%%[![:space:]]*}"}"   # a worker's permission prompt (permission-relay.sh) is never answered here: the loop denies it, only the user allows it
@@ -27,8 +27,8 @@ q="$q
 
 Issue #$n (the only contract, as fetched now; never a task.md in the worktree):
 $issue"
-out="$(cd "$wt" && printf '%s' "$q" | claude -p --model "$ANSWER_MODEL" --append-system-prompt-file "$rule" --allowedTools Read,Grep,Glob \
-  --setting-sources "" --strict-mcp-config --no-session-persistence)" || die "claude failed"
+out="$(cd "$wt" && printf '%s' "$q" | CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 claude -p --model "$ANSWER_MODEL" --append-system-prompt-file "$rule" --allowedTools Read,Grep,Glob \
+  --setting-sources "" --strict-mcp-config --settings '{"autoMemoryEnabled":false}' --no-session-persistence)" || die "claude failed"
 last="$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 1)"
 body="$(printf '%s' "$last" | sed -n 's/^ANSWER:[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p')"
 case "$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]')" in
