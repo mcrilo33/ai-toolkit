@@ -4,7 +4,9 @@
 # (--run re-binds it with run-use; none creates one). Loop: fill slots to --cap (dispatch.sh) -> check --wait -> route each message
 # -> ack the delivery. question: answer.sh (auto) or the human, who types the answer on this terminal; worker_done succeeded: land.sh
 # --review inline (lands are serialized by construction); a rejected review, red CI or a conflict goes back to the SAME worker for a
-# bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked. Every 10th empty wait: a sweep.
+# bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked. Every 2nd empty wait (COORD_SWEEP_EVERY,
+# ~10 min): a sweep of the workers that died or went idle without worker_done: one relaunch, then blocked. Idle = silent (no terminal output, heartbeat or
+# liveness change) for COORD_IDLE_MIN minutes (15) with no open question and no human-only prompt: worst-case detection = that bound + the sweep period (~25 min). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
 # back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
@@ -66,6 +68,11 @@ pending() {   # {open: questions nobody has replied to (waiting for the human), 
     | {open: [$m[] | select(.type == "question") | select(. as $q | $m | any(.id != $q.id and .thread_id == $q.id) | not)],
        answered: [$m[] | select(.thread_id != null and .thread_id != .id) | .thread_id], truncated: ($all | length >= 200)}'
 }
+silent() {   # $1 dispatch: "<minutes> <run|wait>": minutes since the newest sign of life (terminal output, liveness observation, heartbeat, never before dispatchedAt);
+  orca_json orchestration worker-show --dispatch "$1" < /dev/null | jq -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer, or Orca could not prove the worker (never "not waiting")
+    | ([($r.terminal.lastOutputAt, $r.projection.liveness.observedAt | select(. != null) / 1000), ($r.dispatch.lastHeartbeatAt, $r.dispatch.dispatchedAt | select(. != null) | sub(" "; "T") | sub("Z?$"; "Z") | fromdateiso8601)] | max) as $t
+    | "\(([(($now - $t) / 60) | floor, 0] | max)) \(if ($r.terminal == null or ($r.observation | has("agentWait") | not) or $r.observation.agentWait) then "wait" else "run" end)"'
+}
 holder() { orca_json orchestration run-show --id "$run" 2> /dev/null | jq -r '.result.run.coordinator_handle // empty'; }   # the terminal that holds the Run
 live_hold() {   # $1 eq|ne, $2 a handle: if a live coordinator.sh (holder.<pid> = "<handle> <mode>", the pid's command must still be coordinator.sh) is bound as
   local f h  # (eq) / as anything but (ne) that handle, print its mode and succeed
@@ -83,8 +90,9 @@ replycmd() { printf 'bash %s --run %s --reply %s %s' "$here/coordinator.sh" "$ru
 if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to
   [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"
   log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold eq "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
-  echo "live workers:"
-  wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "  \(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict)"'
+  echo "live workers:"   # verdict, the agent's activity and the silence: `unverifiable` for a long run tells a stuck worker from a working one
+  wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "\(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict) \(.projection.stage.activity // "-")"' | while read -r d w v a; do
+    read -r age how <<< "$(silent "$d")" || true; echo "  $d $w $v $a, silent ${age:-?}m$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done
   echo "pending questions:"
   pending | jq -c '.open[]' | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"
     if is_perm "$(question_of "$m")"; then echo "    reply: $(replycmd "$id" allow)   (or deny)"; else echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; fi; done
@@ -110,14 +118,15 @@ mode="$answer${until:+ until $until}"; [ "$drain" = 0 ] || mode="$mode drain"
 sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'rm -f "$errf" "$hf"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
 log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
 
-# ctx <dispatch>: sets disp task term wtp issue from the worker's Orca row and the issue linked to its worktree.
+# ctx <dispatch>: sets disp task term wtp issue wtc (the worktree's Orca comment) from the worker's Orca row and the issue linked to its worktree.
 ctx() {
   local r; disp="$1"
   r="$(wl | jq -c --arg d "$1" '[.result.workers[] | select(.dispatchId == $d)][0] // empty')"
   [ -n "$r" ] || { warn "unknown dispatch '$1'"; return 1; }
   task="$(jq -r '.taskId // empty' <<< "$r")"; term="$(jq -r '.agentTerminalHandle // empty' <<< "$r")"
   wtp="$(jq -r '.resource.worktreeId | sub("^.*::"; "")' <<< "$r")"
-  issue="$(orca_json worktree list | jq -r --arg p "$wtp" '[.result.worktrees[] | select(.path == $p) | .linkedIssue // empty][0] // empty')"
+  r="$(orca_json worktree list | jq -c --arg p "$wtp" '[.result.worktrees[] | select(.path == $p)][0] // {}')"
+  issue="$(jq -r '.linkedIssue // empty' <<< "$r")"; wtc="$(jq -r '.comment // empty' <<< "$r")"
   [ -n "$issue" ] || { warn "no issue is linked to $wtp"; return 1; }
 }
 rounds() { wl | jq --arg p "::$wtp" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] | length - 1'; }   # dispatches so far - 1
@@ -247,14 +256,25 @@ fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --n
     fi
   done
 }
-sweep() {   # a worker whose process exited without worker_done (and was not relaunched): one relaunch, then blocked
-  local d
+sweep() {   # a worker without worker_done whose process exited (and was not relaunched), or that is alive but silent for COORD_IDLE_MIN minutes: one relaunch, then blocked
+  local d age how open
   for d in $(wl | jq -r '.result.workers as $w | $w[] | select(.dispatchStatus == "dispatched" and .projection.liveness.verdict == "exited")
       | .resource.worktreeId as $p | select([$w[] | select(.resource.worktreeId == $p and .dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited")] | length == 0) | .dispatchId'); do
     ctx "$d" || continue
     if [ "$(rounds)" -lt 1 ]; then
       log "#$issue: worker $d exited without worker_done, relaunching"; RUN="$run" "$DISPATCH_CMD" --retry-of "$d" --task "$task" "$issue" > /dev/null || block "relaunch failed"
     else block "worker exited again without worker_done"; fi
+  done
+  open="$(pending | jq -c '[.open[] | (.payload // "{}" | if type == "string" then fromjson else . end).dispatchId]')" || return 0   # a worker waiting on a gate or permission question is never idle
+  for d in $(wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited") | .dispatchId'); do
+    ! jq -e --arg d "$d" 'index($d)' <<< "$open" > /dev/null || continue
+    read -r age how <<< "$(silent "$d")" || true; [ "${age:-0}" -ge "${COORD_IDLE_MIN:-15}" ] || continue
+    ctx "$d" || continue
+    if [ "$how" = wait ]; then log "#$issue: worker $d waits on a prompt only a human can answer (silent ${age}m)"
+      case "$wtc" in "IDLE #$issue"*) ;; *) comment "$issue" "worker $d is silent for ${age}m and may wait on a prompt only a human can answer: check its terminal" ;; esac   # once: the IDLE flag on the worktree is the durable mark, an age window misses a late first sweep and repeats on a fast one
+      flag "$wtp" "IDLE #$issue: a prompt waits for the human in its terminal (${age}m)"; continue; fi
+    log "#$issue: worker $d silent for ${age}m, relaunching"; release "$d"   # its dispatch is still live: stop it first or the worktree counts twice
+    redispatch 1 "address: your agent went idle after an error without worker_done. Continue from the pushed branch (git log), push, then send worker_done." "worker idle again without worker_done"
   done
 }
 
@@ -274,7 +294,7 @@ while :; do
   msgs="$(jq -c '.result.messages[]?' <<< "$out" 2> /dev/null)" || msgs=""
   if [ -z "$msgs" ]; then
     empties=$((empties + 1)); [ "$rc" = 0 ] || sleep "${AI_TOOLKIT_POLL:-3}"
-    [ $((empties % ${COORD_SWEEP_EVERY:-10})) -ne 0 ] || sweep
+    [ $((empties % ${COORD_SWEEP_EVERY:-2})) -ne 0 ] || sweep
     continue
   fi
   # fd 3, not stdin: a handler that reads stdin (claude -p, ssh) must not swallow the rest of the batch.
