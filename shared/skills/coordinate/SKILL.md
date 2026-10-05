@@ -76,11 +76,12 @@ gh issue edit <n> --add-label blocked --remove-label status:in-progress && gh is
 orca orchestration worker-release --dispatch <dispatch-id> --json
 ```
 
+**A worker that says nothing**: an agent idle after an error (API outage) sends no message, so check each live worker on every status or switch and whenever the Run is quiet. Silent past 15 minutes (`COORD_IDLE_MIN`, no terminal output or heartbeat, no open question): `orca orchestration worker-show --dispatch <dispatch-id> --json` (`terminal.lastOutputAt`; `observation.agentWait` set = a prompt only the user can answer: tell them) then `orca terminal read --terminal <handle>`. If idle, propose once: `worker-release`, then `dispatch.sh --address "your agent went idle after an error: continue from the pushed branch, push, send worker_done" <n>`; idle again: `blocked`.
+
 ## On request
 
-- **Dispatch**: `RUN=<run> .ai-toolkit/scripts/dispatch.sh --next --dry-run` prints the next ready issue (exit 3 = nothing ready); confirm
-  it with the user, then `RUN=<run> .ai-toolkit/scripts/dispatch.sh <n>`. To fill up to the cap repeat until exit 3 or
-  `orca orchestration worker-list --run <run> --terminal-state active --json` shows `CONCURRENCY_CAP` live workers (default 3).
+- **Dispatch**: `RUN=<run> .ai-toolkit/scripts/dispatch.sh --next --dry-run` prints the next ready issue (exit 3 = nothing ready); confirm it with the user, then
+  `RUN=<run> .ai-toolkit/scripts/dispatch.sh <n>`. Repeat until exit 3 or `orca orchestration worker-list --run <run> --terminal-state active --json` shows `CONCURRENCY_CAP` live workers (3).
 - **Status**: `.ai-toolkit/scripts/coordinator.sh --status --run <run>` (who holds the Run, live workers, unanswered questions), plus
   `orca worktree ps --json` and `gh issue list --state open --json number,title,labels`. One table: `#n title · state · next step`.
 

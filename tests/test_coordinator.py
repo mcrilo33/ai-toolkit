@@ -2,6 +2,7 @@ import json
 import os
 import re
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,12 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
 
     def row(d="ctx_1", st="dispatched", lv="live"):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",
-                "resource": {"worktreeId": f"r::{wt}"}, "projection": {"liveness": {"verdict": lv}}}
+                "resource": {"worktreeId": f"r::{wt}"}, "projection": {"liveness": {"verdict": lv}, "stage": {"activity": "working"}}}
+
+    def show(silent=0, wait=False, beat=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt
+        ago = lambda m: time.time() - m * 60
+        stubs.reply("orca.orchestration_worker_show", json.dumps({"result": {"terminal": {"lastOutputAt": ago(silent) * 1000}, "observation": {"agentWait": {"source": "hook"} if wait else None},
+            "dispatch": {"dispatchedAt": "2020-01-01 00:00:00", "lastHeartbeatAt": None if beat is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ago(beat)))}}}))
 
     def workers(*rows):
         stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": list(rows)}}))
@@ -90,7 +96,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
                 and any(arg(a, "--comment").startswith("BLOCKED #1") and arg(a, "--worktree") == f"path:{wt}" for a in calls("orca worktree set"))
                 and "orca orchestration worker-release" in ks and "--address" not in sum(stubs.calls("dispatch.sh"), []) and "orca worktree rm" not in ks)
 
-    return type("C", (), dict(go=staticmethod(go), mail=staticmethod(mail), inbox=staticmethod(inbox), spool=staticmethod(spool), spooled=lambda m: (tmp_path / "state/run_t/replies" / m).exists(), workers=staticmethod(workers), row=staticmethod(row), wt=wt,
+    return type("C", (), dict(go=staticmethod(go), mail=staticmethod(mail), inbox=staticmethod(inbox), spool=staticmethod(spool), spooled=lambda m: (tmp_path / "state/run_t/replies" / m).exists(), workers=staticmethod(workers), row=staticmethod(row), show=staticmethod(show), wt=wt,
                               calls=staticmethod(calls), blocked=staticmethod(blocked), stubs=stubs, kinds=staticmethod(lambda: [k for k, _ in trail()]),
                               stdin=staticmethod(lambda n: (tmp_path / f"stubs/{n}.stdin").read_text())))
 
@@ -380,27 +386,46 @@ def relaunches(C):
     return [a for a in C.stubs.calls("dispatch.sh") if a[0] == "--retry-of"]
 
 
-def test_a_worker_that_exited_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C):
-    assert re.search(r"COORD_SWEEP_EVERY:-10\}", (V2 / "scripts/coordinator.sh").read_text())   # the default period, read rather than waited for: ten empty ticks
-    C.workers(C.row(lv="exited"))
+@pytest.mark.parametrize("idle", [False, True])   # the process exited / the agent is alive but silent past the 15-minute bound after a failed turn
+def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C, idle):
+    assert re.search(r"COORD_SWEEP_EVERY:-2\}", (V2 / "scripts/coordinator.sh").read_text())   # the defaults, read rather than waited for: a sweep every 2nd empty wait (~10 min), the idle bound 15 minutes
+    assert "COORD_IDLE_MIN:-15}" in (V2 / "scripts/coordinator.sh").read_text()
+    C.workers(C.row(lv="live" if idle else "exited")); C.show(silent=25)
     C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
     assert not C.stubs.calls("dispatch.sh")
-    C.go("--cap", "1", **SWEEP)
-    assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]]
+    r = C.go("--cap", "1", **SWEEP)
+    if not idle:
+        assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]]
+        return
+    assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and C.stubs.calls("dispatch.sh")[0][-1] == "1" and "continue from the pushed branch" in C.stubs.calls("dispatch.sh")[0][1].replace("Continue", "continue")
+    in_order(C.kinds(), "orca orchestration worker-release", "dispatch.sh", "orca terminal close")   # the live dispatch is stopped before its replacement starts
+    assert re.search(r"silent for 2[45]m, relaunching", r.stdout) and "round 1" in C.calls("gh issue comment")[0][-1]
 
 
-@pytest.mark.parametrize("rows", [
-    [dict(st="completed", lv="exited")],   # a settled worker's process is expected to be gone
-    [dict(d="ctx_1", st="failed", lv="exited"), dict(d="ctx_2", lv="live")],   # the relaunched worker is alive: left alone
+@pytest.mark.parametrize("rows, shown, gate", [
+    ([dict(st="completed", lv="exited")], {}, False),   # a settled worker's process is expected to be gone
+    ([dict(d="ctx_1", st="failed", lv="exited"), dict(d="ctx_2", lv="live")], {}, False),   # the relaunched worker is alive: left alone
+    ([dict()], dict(silent=0, beat=93), False),   # an old heartbeat, the agent working: #415 and #418 at 09:39 UTC
+    ([dict()], dict(silent=40, beat=1), False),   # a worker that heartbeats
+    ([dict()], dict(silent=14), False),   # silent, but under the bound
+    ([dict()], dict(silent=40, wait=True), False),   # parked on a prompt only a human can answer: flagged, never relaunched
+    ([dict()], dict(silent=40), True),   # waiting on an open gate or permission question
 ])
-def test_a_sweep_leaves_a_settled_worker_and_a_live_relaunch_alone(C, rows):
-    C.workers(*[C.row(**r) for r in rows])
+def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worker_alone(C, rows, shown, gate):
+    C.workers(*[C.row(**r) for r in rows]); C.show(**shown)
+    if gate:
+        C.inbox(["msg_q"])
     C.go("--cap", "0", **SWEEP)
-    assert not C.stubs.calls("dispatch.sh") and not C.calls("gh issue edit")
+    assert not C.stubs.calls("dispatch.sh") and not C.calls("gh issue edit") and not C.calls("orca orchestration worker-release")
+    assert bool(C.calls("orca worktree set")) == bool(shown.get("wait"))   # a human-only prompt is flagged (worktree comment + bell), nothing else is
 
 
-def test_a_worker_that_died_again_after_its_relaunch_blocks_the_issue(C):
-    C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2", lv="exited"))
+@pytest.mark.parametrize("rows, shown", [
+    ([("ctx_1", "failed", "exited"), ("ctx_2", "dispatched", "exited")], {}),   # died again
+    ([("ctx_1", "failed", "exited"), ("ctx_2", "dispatched", "live")], dict(silent=20)),   # idle again after a relaunch
+])
+def test_a_worker_that_died_or_went_idle_again_after_its_relaunch_blocks_the_issue(C, rows, shown):
+    C.workers(*[C.row(d, st=st, lv=lv) for d, st, lv in rows]); C.show(**shown)
     C.go("--cap", "1", **SWEEP)
     assert C.blocked() and not C.stubs.calls("dispatch.sh")
 
@@ -432,10 +457,11 @@ def test_until_stops_the_loop_at_the_clock_time_and_wraps_past_midnight(C, now, 
 
 
 def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply_command_and_changes_nothing(C):
-    C.inbox(["msg_q"], answered=["msg_a"])
+    C.inbox(["msg_q"], answered=["msg_a"]); C.show(silent=30, wait=True)
     r = C.go("--status", ORCA_TERMINAL_HANDLE="")   # read-only: no coordinator terminal needed
     assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and REPLY in r.stdout and "msg_a" not in r.stdout
-    assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in ("worker-list", "inbox", "run-show")] == []
+    assert re.search(r"ctx_1 \S+ live working, silent (29|30)m, waits on a prompt", r.stdout)   # verdict, activity and silence: a stuck worker is told from a working one
+    assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in ("worker-list", "worker-show", "inbox", "run-show")] == []
 
 
 LONG_Q = "\n".join(f"plan line {i}: " + "word " * 30 for i in range(40))   # long lines AND too many of them
