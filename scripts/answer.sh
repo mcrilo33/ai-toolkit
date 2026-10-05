@@ -27,7 +27,8 @@ q="$q
 
 Issue #$n (the only contract, as fetched now; never a task.md in the worktree):
 $issue"
-out="$(cd "$wt" && printf '%s' "$q" | claude -p --model "$ANSWER_MODEL" --append-system-prompt-file "$rule" --allowedTools Read,Grep,Glob --no-session-persistence)" || die "claude failed"
+out="$(cd "$wt" && printf '%s' "$q" | claude -p --model "$ANSWER_MODEL" --append-system-prompt-file "$rule" --allowedTools Read,Grep,Glob \
+  --setting-sources user --strict-mcp-config --no-session-persistence)" || die "claude failed"
 last="$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 1)"
 body="$(printf '%s' "$last" | sed -n 's/^ANSWER:[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p')"
 case "$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]')" in
