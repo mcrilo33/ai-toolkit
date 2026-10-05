@@ -207,14 +207,17 @@ drain_replies() {   # send the queued human replies as the bound consumer. Dropp
     rm -f "$f"
   done
 }
-contained() {   # $1 a permission request: succeeds only for a Bash command shown whole that danger-guard did not flag (reason: unknown), names no protected path, expands no path (.. ~ $ `), runs under the worker's worktree, and judge.sh contained clears
-  local cwd cmd slug w   # wtp is the loop's own path (Orca + the dispatch record), never the question's worktree: line; any failure = not contained (the human decides)
-  [ "$(tool_of "$1")" = Bash ] && [ -n "$wtp" ] && [[ $1 != *"[truncated"* ]] && [ "$(sed -n 's/^reason: //p' <<< "$1" | head -n 1)" = unknown ] || return 1   # a guard finding is a sensitive operation: never self-approved, whatever the judge says
+contained() {   # $1 a permission request: succeeds only for a Bash command shown whole, with no guard finding but a recursive delete (reason unknown or rm -r), no protected path, git clean/stash/reset, .. ~ or brace expansion, run under the worker's worktree, that judge.sh contained clears
+  local cwd cmd slug w plain reason   # wtp is the loop's own path (Orca + the dispatch record), never the question's worktree: line; any failure = not contained (the human decides)
+  [ "$(tool_of "$1")" = Bash ] && [ -n "$wtp" ] && [[ $1 != *"[truncated"* ]] || return 1
+  reason="$(sed -n 's/^reason: //p' <<< "$1" | head -n 1)"   # unverified (a file in the worktree), so the command text below is checked too. A guard finding other than a recursive delete (git clean -x, stash -a, reset --hard, a protected path) is never self-approved; a recursive delete is the judge's call
+  [ "$reason" = unknown ] || { [[ $reason == "danger-guard: needs your approval: rm -r"* ]] && ! tr ';' '\n' <<< "${reason#*approval: }" | sed 's/^ *//' | grep -vq '^rm -r'; } || return 1
   cwd="$(sed -n 's/^cwd: //p' <<< "$1" | head -n 1)"; case "$cwd" in *..*) return 1 ;; esac
   cwd="$(cd "$cwd" 2> /dev/null && pwd -P)" && w="$(cd "$wtp" 2> /dev/null && pwd -P)" && case "$cwd/" in "$w"/*) ;; *) false ;; esac || return 1   # symlinks resolved on both sides
   cmd="$(awk '/^command:$/ { f = 1; next } /^[^ ]/ { f = 0 } f { sub(/^  /, ""); print }' <<< "$1")"; [ -n "$cmd" ] || return 1
-  case "$cmd" in *'..'* | *'~'* | *'$'* | *'`'* | *'{'*) return 1 ;; esac   # a path the shell would resolve later (a variable, a brace expansion): the judge's rule, kept out of the model
-  ! tr -d "\"'\\\\" <<< "$cmd" | grep -Eiq '\.claude|\.ai-toolkit|orca\.yaml|\.github' || return 1   # the guard's protected set, quotes and backslashes stripped as it does: a worker never self-approves a write to its own hooks, settings, marker or CI
+  plain="$(tr -d "\"'\\\\" <<< "$cmd")"   # quotes and backslashes stripped, as the guard does
+  case "$plain" in *'..'* | *'~'* | *'{'*','*'}'* | *git*clean* | *git*stash* | *git*reset* | *--git-dir* | *--work-tree*) return 1 ;; esac   # a dot-dot, a tilde or a brace expansion is never judged; a variable or mktemp path is the judge's call (it must be assigned a literal path under the worktree or scratchpad in the same command)
+  ! grep -Eiq '\.claude|\.ai-toolkit|orca\.yaml|\.github' <<< "$plain" || return 1   # the guard's protected set: a worker never self-approves a write to its own hooks, settings, marker or CI
   slug="$(printf '%s' "$wtp" | LC_ALL=C tr -c 'A-Za-z0-9' '-')"   # the scratchpad is /tmp/claude-<uid>/<this slug>/*/scratchpad: the relay sends no session id
   [ -n "$(printf '%s' "$cmd" | bash "$JUDGE_CMD" "$cwd" "$w" "worker permission request" "$slug" contained 2> /dev/null)" ]
 }
