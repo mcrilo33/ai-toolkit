@@ -7,6 +7,8 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 
 - The human works through the coordinator and is involved as little as possible: only for a meaningful decision that neither the coordinator nor a worker can make from the issue, the code and the policy.
 - Everything is authorized except sensitive operations, which go through the guard and ask the human to validate.
+- Orchestration flows from the coordinator, through the orchestration layer, to the workers: the coordinator decides which issue a worker has, names its branch and worktree, answers its gates and lands its work. A worker does not name or rename its branch, choose or change its issue, or answer for the coordinator.
+- A gate or hook reads an orchestration fact from the orchestration layer only, never from state the worker controls (its files, its branch name, its environment, the text of its own message). When that layer does not answer, it waits; it does not guess from a weaker source.
 - Workers are fast and reliable, and the cycle still guarantees that a change is secure, battle-tested and does not over-complexify the project.
 - The codebase stays simple and grows little; the test suite and the whole cycle stay fast. Growth (a raised line cap or budget, a new mechanism, more tests) must be justified against this goal.
 
