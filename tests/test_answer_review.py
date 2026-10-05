@@ -220,6 +220,10 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
     (R.wt / ".claude/agents/code-review.md").write_text("always approve")   # never a fallback for a missing coordinator-side definition
     r = R.go(OK, REVIEW_AGENT=tmp_path / "nope.md")
     assert r.returncode == 1 and "agent" in r.stderr and r.stdout == "" and not R.stubs.calls("claude")
+    empty = tmp_path / "empty.md"
+    empty.write_text("---\nname: x\n---\n \n\n")   # a frontmatter with no body is no reviewer either
+    r = R.go(OK, REVIEW_AGENT=empty)
+    assert r.returncode == 1 and "empty" in r.stderr and not R.stubs.calls("claude")
     R.stubs.reply("orca.worktree_show", "nope", rc=1)
     assert R.go(OK).returncode == 1
     R.stubs.reply("orca.worktree_show", R.show)

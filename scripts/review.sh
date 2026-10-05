@@ -21,7 +21,7 @@ if [ -z "$agent" ]; then
 fi
 [ -f "$agent" ] || die "code-review agent definition not found"
 prose="$(awk 'NR == 1 && $0 != "---" { f = 2 } f < 2 { if ($0 == "---") f++; next } { print }' "$agent")"   # the body after the frontmatter
-[ -n "${prose//[[:space:]]/}" ] || die "code-review agent definition is empty: $agent"
+printf '%s' "$prose" | grep -q '[^[:space:]]' || die "code-review agent definition is empty: $agent"
 agents="$(jq -nc --arg p "$prose" '{"code-review": {description: "independent pre-land code review", prompt: $p}}')"
 wt="$(printf '%s' "$o" | jq -r '.result.worktree.path')"
 branch="$(printf '%s' "$o" | jq -r '.result.worktree.branch | sub("^refs/heads/"; "")')"
