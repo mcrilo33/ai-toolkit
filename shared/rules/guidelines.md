@@ -11,6 +11,7 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 - A gate or hook reads an orchestration fact from the orchestration layer only, never from state the worker controls (its files, its branch name, its environment, the text of its own message). When that layer does not answer, it waits; it does not guess from a weaker source.
 - Workers are fast and reliable, and the cycle still guarantees that a change is secure, battle-tested and does not over-complexify the project.
 - The codebase stays simple and grows little; the test suite and the whole cycle stay fast. Growth (a raised line cap or budget, a new mechanism, more tests) must be justified against this goal.
+- The number of open issues stays small. An issue is opened only for a defect whose fix saves time (it has happened, or will often enough to cost more than the fix) or a change that really improves productivity; a rare or theoretical problem and a tidy-up are dropped, not filed.
 
 ## Agent Behavior
 
