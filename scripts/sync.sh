@@ -79,9 +79,7 @@ put_tree "$V2/hooks/git" .ai-toolkit/hooks/git
 # A host project files the toolkit's own defects to the toolkit's repo (UPSTREAM_REPO = its origin as owner/repo); the toolkit itself keeps it empty.
 up=""
 if [ "$TARGET" != "$V2" ]; then
-  up="$(owner_repo "$(git -C "$V2" remote get-url origin 2> /dev/null)")" || {
-    up=""; warn "the toolkit checkout has no usable origin: UPSTREAM_REPO left empty in $TARGET, so the scopers will draft, not file, a toolkit defect"
-  }
+  up="$(owner_repo "$(git -C "$V2" remote get-url origin 2> /dev/null)")" || { up=""; warn "the toolkit checkout has no usable origin: UPSTREAM_REPO left empty in $TARGET, so the scopers will draft, not file, a toolkit defect"; }
 fi
 sed "s|^UPSTREAM_REPO=.*|UPSTREAM_REPO=$up|" "$V2/settings/ai-toolkit.env" > "$TMP"
 put "$TMP" .ai-toolkit/ai-toolkit.env
