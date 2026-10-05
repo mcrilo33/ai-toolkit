@@ -41,7 +41,7 @@ def test_answer_never_answers_a_permission_question_even_when_claude_would_appro
 
 
 def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_question(A):
-    A.stubs.reply("orca.worktree_show", "boom", rc=1, n=1)   # Orca fails twice, then answers: the gate waits for Orca instead of guessing
+    A.stubs.reply("orca.worktree_show", '{"result":{"worktree":{"linkedIssue":5}}}', rc=1, n=1)   # Orca fails twice (the first with a payload, which a failed try must not leak), then answers: the gate waits instead of guessing
     A.stubs.reply("orca.worktree_show", "boom", rc=1, n=2)
     task = A.wt / ".ai-toolkit/task.md"   # the issue changed after dispatch: the gate reads the live text
     task.parent.mkdir()
@@ -73,10 +73,12 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     link('{"result":{"worktree":{"linkedIssue":null}}}')
     assert refused("no issue linked") == 1   # an answer of no link is final: not retried
     link('{"result":{"worktree":{"linkedIssue":"x;y"}}}')
-    assert refused("no issue linked") == 1
+    assert refused("not an issue number") == 1
     link("boom", rc=1)   # Orca never answers: retried up to the bound (ORCA_LINK_TRIES=3), then the cause is named
     assert refused("could not answer") == 3
     link("<html>")   # not JSON
+    assert refused("could not answer") == 3
+    link('{"result":{}}')   # no worktree object
     assert refused("could not answer") == 3 and task.read_text().startswith("# #7")
     link('{"result":{"worktree":{"linkedIssue":9}}}')
     A.stubs.reply("gh", "boom", rc=1)

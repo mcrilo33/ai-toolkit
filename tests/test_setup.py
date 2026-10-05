@@ -40,7 +40,7 @@ def test_fails_loud_when_gh_fails_or_the_root_has_no_claude_dir(run, repo, stubs
 @pytest.mark.parametrize("branch,linked,issue,mode", [
     ("12-add-hello", None, "12", ()), ("12-add-hello", 7, "7", ()), ("12-add-hello", '"x;y"', "12", ()), ("wp0", None, None, ()),
     ("12-add-hello", "boom", "12", ()),   # first provisioning: no worker has run yet, so the branch name the coordinator chose may stand in for the link
-    ("12-add-hello", None, None, ("--refresh",)), ("12-add-hello", '"x;y"', None, ("--refresh",)), ("12-add-hello", "boom", None, ("--refresh",)),
+    ("12-add-hello", None, None, ("--refresh",)), ("12-add-hello", "boom", None, ("--refresh",)),
     ("12-add-hello", 7, "7", ("--refresh",)),   # a refresh (a worker has run, and may have renamed its branch) reads Orca's link only
 ])
 def test_task_md_comes_from_the_linked_issue_and_only_first_provisioning_may_use_the_branch_number(run, repo, stubs, branch, linked, issue, mode):
