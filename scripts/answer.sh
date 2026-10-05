@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # answer.sh <worktree> < question: the auto-answerer for a spoke's gate (06 section 4 step 7, D5). Headless, read-only claude
-# in the spoke's worktree, driven by the afk-answering rule. stdout = the reply body (`approve` | `approve with: <change>` | `revise: <change>`), then any
+# in the spoke's worktree, driven by the afk-answering rule. stdout = the reply body (`approve` | `approve with: <change>` | `revise: <change>`; attended also `human: <reason>`), then any
 # `WARN:` lines for the human. Exit 0 answered; 3 (ANSWER_MODE=attended only) `human: <reason>`, a plan for the human: the loop leaves it open and queues it; 1 no usable answer (garbage, claude failed, rule missing, no issue in Orca's link, issue unreadable): the caller escalates
 # to the human, never a blind approve. Runs with no setting source, no MCP config and no auto-memory, so nothing a worker can write (its CLAUDE.md, rules, ~/.claude/projects/*/memory) reaches the model
 # that approves its plan. Auto-memory is switched off twice, independently: --settings autoMemoryEnabled=false and CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 in the environment (an unknown settings key is
@@ -16,7 +16,7 @@ if [ -z "$rule" ]; then   # the one place of this install layout, never a path a
   case "$here" in */.ai-toolkit/scripts) rule="$here/../rules/afk-answering.md" ;; *) rule="$here/../shared/rules/on-demand/afk-answering.md" ;; esac
 fi
 [ -f "$rule" ] || die "answer rule (afk-answering.md) not found"
-mode=auto; [ "${ANSWER_MODE:-}" != attended ] || mode=attended
+case "${ANSWER_MODE:-auto}" in auto | attended) mode="${ANSWER_MODE:-auto}" ;; *) die "ANSWER_MODE takes auto or attended" ;; esac   # a typo must not turn into the mode that always answers
 q="$(cat)"; t="${q#"${q%%[![:space:]]*}"}"   # a worker's permission prompt (permission-relay.sh) is never answered here: the loop denies it, only the user allows it
 [[ $t != "PERMISSION REQUEST"* ]] || die "a permission question is never auto-answered (the coordinator denies it; only the user can allow it)"
 # The answerer judges the issue as it is now, from GitHub, and puts its text in the prompt. The number comes from Orca's link only (the worker can rewrite
