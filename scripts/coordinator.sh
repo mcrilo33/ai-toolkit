@@ -6,7 +6,7 @@
 # --review inline (lands are serialized by construction); a rejected review, red CI or a conflict goes back to the SAME worker for a
 # bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked. Every 2nd empty wait (COORD_SWEEP_EVERY,
 # ~10 min): a sweep of the workers that died or went idle without worker_done: one relaunch, then blocked. Idle = silent (no terminal output, heartbeat or
-# liveness change) for COORD_IDLE_MIN minutes (15) with no open question and no human-only prompt: worst-case detection = that bound + the sweep period (~25 min). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
+# liveness change) for COORD_IDLE_MIN minutes (15) with no open question: worst-case detection = that bound + the sweep period (~25 min). A silent worker Orca shows parked on a human-only prompt, or cannot prove (absent agentWait, null terminal), is blocked at once, never relaunched: nobody answers it unattended, and its slot and Scope must not be held without bound (the block comment is the notice). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
 # back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
@@ -118,7 +118,7 @@ mode="$answer${until:+ until $until}"; [ "$drain" = 0 ] || mode="$mode drain"
 sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'rm -f "$errf" "$hf"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
 log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
 
-# ctx <dispatch>: sets disp task term wtp issue wtc (the worktree's Orca comment) br (its Orca branch) from the worker's Orca row and the issue linked to its worktree.
+# ctx <dispatch>: sets disp task term wtp issue br (its Orca branch) from the worker's Orca row and the issue linked to its worktree.
 ctx() {
   local r rec rows; disp="$1"
   r="$(wl | jq -c --arg d "$1" '[.result.workers[] | select(.dispatchId == $d)][0] // empty')"
@@ -127,7 +127,7 @@ ctx() {
   wtp="$(jq -r '.resource.worktreeId | sub("^.*::"; "")' <<< "$r")"
   r="$(orca_json worktree list)"
   rows="$(jq -c '.result.worktrees' <<< "$r")"; r="$(jq -c --arg p "$wtp" '[.result.worktrees[] | select(.path == $p)][0] // {}' <<< "$r")"
-  issue="$(jq -r '.linkedIssue // empty' <<< "$r")"; wtc="$(jq -r '.comment // empty' <<< "$r")"
+  issue="$(jq -r '.linkedIssue // empty' <<< "$r")"
   br="$(jq -r '(.branch // "") | sub("^refs/heads/"; "")' <<< "$r")"   # Orca's branch for the worktree, never the worker's own HEAD (it can switch or rename it)
   [ -n "$issue" ] || { warn "no issue is linked to $wtp"; return 1; }
   # The link is the worker's to rewrite: it must match what dispatch.sh recorded, or nothing is answered or landed. No record fails closed (a dispatch from before this check:
@@ -284,9 +284,7 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
     ! jq -e --arg d "$d" 'index($d)' <<< "$open" > /dev/null || continue
     how="$(silent "$d")" || true; [ -n "$how" ] || { warn "worker $d: cannot tell how long it has been silent (worker-show or its jq failed), left alone"; continue; }; read -r age how <<< "$how"; [ "$age" -ge "${COORD_IDLE_MIN:-15}" ] || continue   # never an age of 0: an unknown age is not an idle check that passed
     ctx "$d" || continue
-    if [ "$how" = wait ]; then log "#$issue: worker $d waits on a prompt only a human can answer (silent ${age}m)"
-      case "$wtc" in "IDLE #$issue"*) ;; *) comment "$issue" "worker $d is silent for ${age}m and may wait on a prompt only a human can answer: check its terminal" ;; esac   # once: the IDLE flag on the worktree is the durable mark, an age window misses a late first sweep and repeats on a fast one
-      flag "$wtp" "IDLE #$issue: a prompt waits for the human in its terminal (${age}m)"; continue; fi
+    if [ "$how" = wait ]; then block "worker $d is silent for ${age}m and waits on a prompt only a human can answer, or Orca cannot prove it works: slot freed, worktree kept, check its terminal"; continue; fi   # never a relaunch: it may be healthy
     log "#$issue: worker $d silent for ${age}m, relaunching"; release "$d"   # its dispatch is still live: stop it first or the worktree counts twice
     redispatch 1 "address: your agent went idle after an error without worker_done. Continue from the pushed branch (git log), push, then send worker_done." "worker idle again without worker_done"
   done

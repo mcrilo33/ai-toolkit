@@ -45,7 +45,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",
                 "resource": {"worktreeId": f"r::{wt}"}, "projection": {"liveness": {"verdict": lv}, "stage": {"activity": "working"}}}
 
-    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, raw=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, raw = the reply verbatim
+    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim
         ago = lambda m: time.time() - m * 60
         fs = ".123" if frac else ""
         reply = {"terminal": {"lastOutputAt": ago(silent) * 1000}, "observation": {"agentWait": {"source": "hook"} if wait else None},
@@ -54,6 +54,8 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
             del reply["observation"]
         elif obs:
             reply["observation"] = None
+        if noterm:
+            reply["terminal"] = None
         stubs.reply("orca.orchestration_worker_show", raw if raw is not None else json.dumps({"result": reply}))
 
     def workers(*rows):
@@ -479,10 +481,8 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     ([dict()], dict(silent=40, beat=1, frac=True), False),   # ... the heartbeat carrying fractional seconds: read, not dropped
     ([dict()], dict(silent=40, born=1), False),   # just (re)dispatched: the old terminal output is not the new worker's silence
     ([dict()], dict(silent=14), False),   # silent, but under the bound
-    ([dict()], dict(silent=40, wait=True), False),   # parked on a prompt only a human can answer: flagged, never relaunched
+    ([dict()], dict(silent=14, wait=True), False),   # ... also with a proved human-only prompt
     ([dict()], dict(silent=40), True),   # waiting on an open gate or permission question
-    ([dict()], dict(silent=40, wait=True, obs="null"), False),   # a present terminal with no observation: not provable, so flagged for the human
-    ([dict()], dict(silent=40, wait=True, obs="missing"), False),   # ... also when the key is absent
     ([dict()], dict(silent=40, raw="not json"), False),   # worker-show unreadable: the age is unknown, so the worker is neither relaunched nor flagged idle
 ])
 def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worker_alone(C, rows, shown, gate):
@@ -491,22 +491,22 @@ def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worke
         C.inbox(["msg_q"])
     r = C.go("--cap", "0", **SWEEP)
     assert not C.stubs.calls("dispatch.sh") and not C.calls("gh issue edit") and not C.calls("orca orchestration worker-release")
-    assert bool(C.calls("orca worktree set")) == bool(shown.get("wait"))   # a human-only prompt is flagged (worktree comment + bell), nothing else is
+    assert not C.calls("orca worktree set") and not C.calls("gh issue comment")
     assert "jq: error" not in r.stderr and ("ctx_1" in r.stderr and "silent" in r.stderr) == ("raw" in shown)   # an unknown age is warned about, naming the dispatch
 
 
-@pytest.mark.parametrize("silent, flagged, comments", [
-    (16, False, True),   # first seen just past the bound
-    (40, False, True),   # first seen long after it (the auto loop started ~40 min after the stall, or after a hand-over / restart): still commented
-    (40, True, False),   # a later sweep: the worktree already carries the IDLE flag, the issue is not commented again
-    (17, True, False),   # ... however soon it comes (a failing `check --wait` sweeps every few seconds)
+@pytest.mark.parametrize("shown", [
+    dict(silent=16, wait=True),   # a proved human-only prompt, just past the bound: nobody answers it in an unattended run, so it blocks like any silent worker
+    dict(silent=40, wait=True),   # ... however late the loop first sees it
+    dict(silent=40, obs="missing"),   # no agentWait key: Orca never looked, the incident's `unverifiable` shape
+    dict(silent=40, obs="null"),   # no observation at all
+    dict(silent=40, noterm=True),   # a null terminal
 ])
-def test_a_human_only_prompt_gets_one_issue_comment_however_late_it_is_first_seen_and_never_a_second(C, silent, flagged, comments):
-    C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 1, "comment": f"IDLE #1: a prompt waits for the human in its terminal ({silent}m)" if flagged else ""}]}}))
-    C.show(silent=silent, wait=True)
+def test_a_silent_worker_with_no_open_question_is_blocked_at_the_first_sweep_past_the_bound_whether_or_not_its_prompt_is_proved(C, shown):
+    C.workers(C.row()); C.show(**shown)
     C.go("--cap", "0", **SWEEP)
-    assert bool(C.calls("gh issue comment")) == comments and not C.stubs.calls("dispatch.sh") and not C.calls("gh issue edit")
-    assert C.calls("orca worktree set") and (not comments or "human can answer" in C.calls("gh issue comment")[0][-1])   # the worktree flag is refreshed every sweep
+    assert C.blocked() and not C.stubs.calls("dispatch.sh")   # label, comment, flag, slot released; never a relaunch
+    assert re.search(r"silent for [0-9]+m", C.calls("gh issue comment")[0][-1])   # the block comment is the notice: it names the silence
 
 
 @pytest.mark.parametrize("rows, shown", [
