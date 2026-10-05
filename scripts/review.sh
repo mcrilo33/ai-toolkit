@@ -4,8 +4,8 @@
 # verdict {verdict, blockers, warnings, tdd_followed, tests_weakened, summary}. stdout: BLOCKER:/WARNING:/SUMMARY: lines.
 # Exit 0 APPROVE; 3 REQUEST_CHANGES (a rejected tdd_followed / tests_weakened or a blocker beats a verdict that says APPROVE);
 # 1 error (incl. a missing coordinator-side agent definition) or an unparseable verdict after one retry (never an approve; land.sh treats it as a rejection).
-# The reviewer's instructions are the coordinator's own code-review definition (REVIEW_AGENT, else the synced shared/agents copy), passed with --agents and run
-# with no project/local setting source, so a worker's .claude/agents, CLAUDE.md or rules never reach it; a missing definition is exit 1, never a fallback.
+# The reviewer's instructions are the coordinator's own code-review definition (REVIEW_AGENT, else the checkout's shared/agents, or the synced .claude/agents of the repo this script is installed in), passed with --agents and run
+# with no setting source at all (so the user-level allow rules cannot widen the read-only tools) and no MCP config, so a worker's .claude/agents, CLAUDE.md or rules never reach it; a missing definition is exit 1, never a fallback.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
@@ -15,7 +15,7 @@ n="${1:-}"; sha="${2:-}"; [ -n "$n" ] || usage_exit "usage: review.sh <issue> [<
 o="$(orca_json worktree show --worktree "issue:$n")" || die "no Orca worktree is linked to issue $n"
 agent="${REVIEW_AGENT:-}"
 if [ -z "$agent" ]; then
-  for f in "$here/../agents/code-review.md" "$here/../shared/agents/code-review.md" "$here/../../shared/agents/code-review.md"; do
+  for f in "$here/../shared/agents/code-review.md" "$here/../../.claude/agents/code-review.md" "$here/../../shared/agents/code-review.md"; do
     if [ -f "$f" ]; then agent="$f"; break; fi
   done
 fi
@@ -41,7 +41,7 @@ v=""
 for _ in 1 2; do
   # The prompt goes on stdin: --allowedTools is variadic and would swallow a trailing positional argument.
   out="$(cd "$wt" && printf '%s' "$prompt" | claude -p --model "$REVIEW_MODEL" --agents "$agents" --agent code-review \
-    --setting-sources user --strict-mcp-config --no-session-persistence \
+    --setting-sources "" --strict-mcp-config --effort high --disallowedTools "Edit,Write,NotebookEdit" --no-session-persistence \
     --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)")" || out=""
   v="$(printf '%s\n' "$out" | sed '/^```/d' | jq -c "select($VALID)" 2> /dev/null)" || v=""
   [ -z "$v" ] || break

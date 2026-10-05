@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -53,7 +54,7 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     assert r.returncode == 0 and r.stdout == "approve\n" and r.stderr == "", r.stderr
     argv = A.stubs.calls("claude")[0]
     assert argv[:3] == ["-p", "--model", "m-1"] and ["--append-system-prompt-file", str(A.rule), "--allowedTools", "Read,Grep,Glob"] == argv[3:7]
-    assert argv[argv.index("--setting-sources") + 1] == "user" and "--strict-mcp-config" in argv and "TAMPERED" not in " ".join(argv)
+    assert argv[argv.index("--setting-sources") + 1] == "" and "--strict-mcp-config" in argv and "TAMPERED" not in " ".join(argv)
     p = A.stdin()   # the live issue text rides in the prompt: the question first, then issue 9 as fetched now
     assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and p.startswith("PLAN: do X. Approve?") and "# #9 new\n\nnew body" in p and len(A.stubs.calls("orca")) == 3
     assert "forged" not in p and "#7" not in p and "stale" not in p and task.read_text() == "# #7 forged by the worker\n\nthe worker's own contract\n"
@@ -135,7 +136,7 @@ def R(stubs, repo, link_script):
         stubs.reply("claude", verdict if isinstance(verdict, str) else json.dumps(verdict), rc=rc)
         return sh(["bash", REVIEW, "9", *([sha] if sha else [])], repo.root, **{"ORCA_LINK_TRIES": 3, "AI_TOOLKIT_POLL": 0, **env})
 
-    return type("R", (), {"go": staticmethod(go), "wt": wt, "stubs": stubs, "stdin": staticmethod(stdin), "show": show})
+    return type("R", (), {"go": staticmethod(go), "wt": wt, "stubs": stubs, "stdin": staticmethod(stdin), "show": show, "root": repo.root})
 
 
 def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktree(R, tmp_path):
@@ -149,7 +150,8 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     argv = R.stubs.calls("claude")[0]
     assert argv[:3] == ["-p", "--model", "fable-x"] and argv[argv.index("--agent") + 1] == "code-review"
     spec = json.loads(argv[argv.index("--agents") + 1])["code-review"]   # the coordinator's body, frontmatter stripped; never resolved from the cwd
-    assert spec["prompt"].strip() == "# Reviewer\nthe coordinator body" and argv[argv.index("--setting-sources") + 1] == "user" and "--strict-mcp-config" in argv
+    assert spec["prompt"].strip() == "# Reviewer\nthe coordinator body" and argv[argv.index("--setting-sources") + 1] == "" and "--strict-mcp-config" in argv
+    assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit" and argv[argv.index("--effort") + 1] == "high"   # the agent's read-only block and effort, not the dropped frontmatter's
     assert "PROJECTCOPY" not in " ".join(argv) + R.stdin() and "TAMPERED" not in " ".join(argv) + R.stdin()
     tools = argv[argv.index("--allowedTools") + 1]
     assert "Read" in tools and "git diff" in tools and not {"Edit", "Write"} & set(tools.replace("(", ",").split(","))
@@ -159,6 +161,16 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     assert R.go(OK, sha=sha, BASE_BRANCH="trunk", REVIEW_AGENT=agent).returncode == 0
     p = R.stdin()
     assert f"origin/trunk...{sha}" in p and f"git show {sha}:" in p and "9-feat" not in p and "working tree" in p and "JSON" in p
+    inst = tmp_path / "repo/.ai-toolkit/scripts"   # a synced repo: the agent is <root>/.claude/agents, not shared/agents
+    inst.mkdir(parents=True)
+    for f in ("review.sh", "lib.sh"):
+        shutil.copy(V2 / "scripts" / f, inst / f)
+    shutil.copy(V2 / "settings/ai-toolkit.env", inst.parent / "ai-toolkit.env")
+    (inst.parent.parent / ".claude/agents").mkdir(parents=True)
+    (inst.parent.parent / ".claude/agents/code-review.md").write_text("---\nname: x\n---\nsynced body\n")
+    R.stubs.reply("claude", json.dumps(OK))
+    assert sh(["bash", str(inst / "review.sh"), "9"], R.root, ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0).returncode == 0
+    assert json.loads(R.stubs.calls("claude")[-1][R.stubs.calls("claude")[-1].index("--agents") + 1])["code-review"]["prompt"].strip() == "synced body"
     n = len(R.stubs.calls("claude"))
     r = R.go(OK, sha="0" * 40)
     assert r.returncode == 1 and "0" * 40 in r.stderr and len(R.stubs.calls("claude")) == n
