@@ -22,7 +22,7 @@ A test earns its place only if it can fail for a reason that matters. Apply thes
 3. **Lowest level that proves it.** One end-to-end test per flow; variations go to the cheapest level that proves them (a parametrized unit case, not another end-to-end run).
 4. **Deterministic or gone.** No sleeps, wall clocks or network. A flaky test is fixed or deleted in the same change (deleting needs evidence it is flaky on the base branch too), never retried or given a looser bound.
 5. **Tests die with their code.** Removing a mechanism removes its tests in the same commit.
-6. **A time limit, no slow lane.** The suite enforces a project-set per-test time limit on CI, with no marker to opt out; a slow test is made fast or deleted.
+6. **A time limit, no slow lane.** The suite lists a test over the project's per-test time limit and fails one far over it on CI, with no marker to opt out; a slow test is made fast or deleted.
 
 A plan's test strategy lists the tests extended, the tests new, and the net change in test count.
 

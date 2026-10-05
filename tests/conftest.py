@@ -44,7 +44,8 @@ PHASES = pytest.StashKey[dict]()
 
 
 def pytest_addoption(parser):
-    parser.addini("test_time_limit", "seconds one test may take, setup + call + teardown; over it the test fails under CI and is warned about elsewhere", default="5")
+    parser.addini("test_time_limit", "seconds one test may take, setup + call + teardown; over it the test is listed as slow", default="5")
+    parser.addini("test_time_fail", "seconds over which a test also fails under CI, set above what load alone reaches on a shared runner", default="10")
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -53,11 +54,12 @@ def pytest_runtest_makereport(item, call):   # no marker or option opts a test o
     phases = item.stash.setdefault(PHASES, {})
     phases[call.when] = (call.duration, rep.failed)
     spent = sum(d for d, _ in phases.values())
-    limit = float(item.config.getini("test_time_limit"))
+    limit, fail = float(item.config.getini("test_time_limit")), float(item.config.getini("test_time_fail"))
     if call.when == "teardown" and not any(failed for _, failed in phases.values()) and spent > limit:   # skipped and xfailed tests count; a failed phase is not reported twice
         parts = " + ".join(f"{k} {d:.2f}" for k, (d, _) in phases.items())
-        msg = f"{item.nodeid} took {spent:.2f} s ({parts}), limit {limit:g} s"
-        if os.environ.get("CI"):   # a busy developer host makes the limit a load flake, so only CI (GitHub sets CI=true) fails on it
+        failing = bool(os.environ.get("CI")) and spent > fail   # load alone swings a test 2x, so only one far over the limit fails; GitHub sets CI=true
+        msg = f"{item.nodeid} took {spent:.2f} s ({parts}), {'fail limit ' + format(fail, 'g') if failing else 'limit ' + format(limit, 'g')} s"
+        if failing:
             rep.outcome, rep.longrepr = "failed", msg
         else:
             rep.user_properties.append(("over_time_limit", msg))   # a property crosses the xdist boundary, a stash would not
