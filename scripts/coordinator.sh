@@ -39,6 +39,7 @@ case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --unti
 if [ "$dreq" = 1 ]; then   # a dispatch request: <issue> = its one-line message (empty = a plain dispatch), queued in the reply spool's shape for the loop's next wake
   [ -n "$run" ] || usage_exit "--dispatch needs --run <run-id>"; [[ $dreq_n =~ ^[0-9]+$ ]] || usage_exit "--dispatch takes an issue number and an optional one-line message"
   d="$(spool_dir "$run")/requests"; (umask 077; mkdir -p "$d"); chmod 700 "$d"
+  [ "$dreq_text" != --cancel ] || { rm -f "$d/$dreq_n"; echo "dispatch request for #$dreq_n cancelled"; exit 0; }
   printf '%s\n' "$(printf '%s' "$dreq_text" | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-1000)" > "$d/.$dreq_n.tmp" && mv "$d/.$dreq_n.tmp" "$d/$dreq_n"
   echo "dispatch request for #$dreq_n queued: the loop starts it at its next wake, or --status says why not"; exit 0
 fi
@@ -115,8 +116,10 @@ if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the que
   echo "queue (the order to present it):"
   open_q | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"
     if is_perm "$(question_of "$m")"; then echo "    reply: $(replycmd "$id" allow)   (or deny)"; else echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; fi; done
-  { blocked_q || true; } | while IFS=$'\t' read -r n t; do   # the reason is the last "blocked:" comment
-    w="$(gh issue view "$n" --json comments 2> /dev/null | jq -r '[.comments[].body | select(startswith("blocked: "))] | last // "" | .[9:]' 2> /dev/null)" || w=""; echo "  blocked #$n $t${w:+: $w}"
+  me="$(gh api user --jq .login 2> /dev/null)" || me=""   # the reason is the loop's own last "blocked:" comment (this gh login): the repo may be public, any other author's text is not shown
+  { blocked_q || true; } | while IFS=$'\t' read -r n t; do   # one line each, no control byte, capped: the text is somebody else's, it must not forge a queue item or move the cursor
+    w="$(gh issue view "$n" --json comments 2> /dev/null | jq -r --arg me "$me" '[.comments[] | select(.author.login == $me and (.body | startswith("blocked: "))) | .body] | last // "" | .[9:]' 2> /dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-160)" || w=""
+    echo "  blocked #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)${w:+: $w}"
     echo "    decide: re-dispatch (comment the guidance, then remove the blocked label, or --dispatch $n '<message>'), park it with the hold label, or close it"; done
   echo "dispatch requests:"
   for f in "$(spool_dir "$run")/requests"/*; do [ -f "$f" ] && echo "  #${f##*/} $(head -n 1 "$f"): $(sed -n 2p "$f" | grep . || echo queued)"; done
@@ -210,8 +213,8 @@ contained() {   # $1 a permission request: succeeds only for a Bash command show
   cwd="$(sed -n 's/^cwd: //p' <<< "$1" | head -n 1)"; case "$cwd" in *..*) return 1 ;; esac
   cwd="$(cd "$cwd" 2> /dev/null && pwd -P)" && w="$(cd "$wtp" 2> /dev/null && pwd -P)" && case "$cwd/" in "$w"/*) ;; *) false ;; esac || return 1   # symlinks resolved on both sides
   cmd="$(awk '/^command:$/ { f = 1; next } /^[^ ]/ { f = 0 } f { sub(/^  /, ""); print }' <<< "$1")"; [ -n "$cmd" ] || return 1
-  case "$cmd" in *'..'* | *'~'* | *'$'* | *'`'*) return 1 ;; esac   # a path the shell would resolve later: the judge's rule, kept out of the model
-  ! tr -d "\"'\\\\" <<< "$cmd" | grep -Eiq '\.claude|\.ai-toolkit|orca\.yaml|\.github/workflows' || return 1   # the guard's protected set, quotes and backslashes stripped as it does: a worker never self-approves a write to its own hooks, settings, marker or CI
+  case "$cmd" in *'..'* | *'~'* | *'$'* | *'`'* | *'{'*) return 1 ;; esac   # a path the shell would resolve later (a variable, a brace expansion): the judge's rule, kept out of the model
+  ! tr -d "\"'\\\\" <<< "$cmd" | grep -Eiq '\.claude|\.ai-toolkit|orca\.yaml|\.github' || return 1   # the guard's protected set, quotes and backslashes stripped as it does: a worker never self-approves a write to its own hooks, settings, marker or CI
   slug="$(printf '%s' "$wtp" | LC_ALL=C tr -c 'A-Za-z0-9' '-')"   # the scratchpad is /tmp/claude-<uid>/<this slug>/*/scratchpad: the relay sends no session id
   [ -n "$(printf '%s' "$cmd" | bash "$JUDGE_CMD" "$cwd" "$w" "worker permission request" "$slug" contained 2> /dev/null)" ]
 }
@@ -225,7 +228,7 @@ on_permission() {   # $1 message id, $2 question, $3 dispatch id: a worker's too
     log "permission denied (tool: $tool, message $1): an unattended run never approves one"
     [ "$known" = 0 ] || comment "$issue" "Permission denied (tool: $tool): an unattended run never approves a permission prompt; the worker reports it in worker_done."
   else   # human mode, or the deny could not be sent (the worker's relay denies on its own timeout): the human decides, nothing waits
-    yield
+    yield; held="$held $1 "
     [ "$known" = 0 ] || comment "$issue" "A permission request needs a human (message $1, tool: $tool). Reply from any terminal: $(replycmd "$1" allow)   (or deny)"
     show_q "$2" 300; log "permission request waiting: $(replycmd "$1" allow)"; gate_flag "$wtp" "$1" "$2" allow
   fi
@@ -241,6 +244,7 @@ on_question() {
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; log "#$issue: $warns"; flag "$wtp" "#$issue ${warns:0:80}"; }
   else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
     yield   # ...unless the reply failed because the Run was taken back meanwhile
+    held="$held $id "
     case "${ans:-}" in human:*) why="$(head -n 1 <<< "$ans")" ;; esac   # attended: the answerer's reason for handing the plan over
     comment "$issue" "A gate question needs a human (message $id)${why:+, $why}: ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: approve with: <change> to approve with a small change, or revise: <change> to amend the plan)"
     show_q "$q"; log "#$issue: gate question waiting${why:+ ($why)}: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
@@ -297,25 +301,37 @@ handle() {
 }
 
 scope_of() { jq -r '(.body // "") | split("\n") | map(select(test("^\\s*[Ss]cope:"))) | last // "" | sub("^\\s*[Ss]cope:"; "") | gsub(","; " ") | [splits(" +") | select(. != "")] | if length == 0 or index("*") != null then "*" else join(" ") end'; }   # dispatch.sh's rule: none or * = everything
-named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of the automatic pick: dispatch.sh runs them, within the cap and the Scope rule. One that cannot run yet keeps its file, the reason on line 2 (--status shows it)
-  local f n spec v why b sa sb live
+named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of the automatic pick: dispatch.sh runs them, within the cap and the Scope rule. One that cannot run keeps its file, the reason on line 2 (--status shows it)
+  local f n spec v why b sa sb live wts path r out rc   # (a closed issue is the one drop; a failed dispatch is not retried until the human asks again or cancels)
   for f in "$sd/requests"/*; do
-    [ -f "$f" ] || continue; n="${f##*/}"; spec="$(head -n 1 "$f")"; why=""
-    v="$(gh issue view "$n" --json state,body,labels 2> /dev/null)" || { warn "dispatch request #$n: cannot read the issue, kept"; continue; }
+    [ -f "$f" ] || continue; n="${f##*/}"; spec="$(head -n 1 "$f")"; why=""; path=""
+    case "$(sed -n 2p "$f")" in "dispatch failed"*) continue ;; esac
+    if ! v="$(gh issue view "$n" --json state,body,labels 2> /dev/null)"; then printf '%s\n%s\n' "$spec" "cannot read the issue (unknown, or GitHub did not answer)" > "$f"; continue; fi
     if [ "$(jq -r .state <<< "$v")" != OPEN ]; then log "dispatch request for #$n dropped: the issue is not open"; rm -f "$f"; continue; fi
-    if jq -e '.labels | map(.name) | index("hold")' <<< "$v" > /dev/null; then log "dispatch request for #$n dropped: on hold"; comment "$n" "Dispatch request dropped: the issue is on hold."; rm -f "$f"; continue; fi
-    live="$(wl | jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length')"
-    if [ "$live" -ge "$cap" ]; then why="waiting for a free slot (cap $cap)"
+    if jq -e '.labels | map(.name) | index("hold")' <<< "$v" > /dev/null; then why="on hold: remove the hold label to start it"
+    elif [ -z "$spec" ] && jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null; then why="blocked: remove the label, or give a message to re-dispatch it"
+    elif ! wts="$(orca_json worktree list --repo "path:$PWD" | jq -c '.result.worktrees')"; then why="cannot read the worktrees"
     else
-      sa="$(scope_of <<< "$v")"
-      for b in $(orca_json worktree list | jq -r --argjson n "$n" '.result.worktrees[] | select(.linkedIssue != null and .linkedIssue != $n) | .linkedIssue'); do
-        sb="$(gh issue view "$b" --json body 2> /dev/null | scope_of)" || sb="*"
-        jq -ne --arg a "$sa" --arg b "${sb:-*}" '$a == "*" or $b == "*" or ((($a | split(" ")) - (($a | split(" ")) - ($b | split(" ")))) | length > 0)' > /dev/null && { why="Scope overlaps #$b"; break; }
-      done
+      path="$(jq -r --argjson n "$n" '[.[] | select(.linkedIssue == $n)][0].path // empty' <<< "$wts")"
+      r="$(wl | jq -r --arg p "::$path" '[.result.workers[] | select(.dispatchStatus == "dispatched" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty' 2> /dev/null)"
+      live="$(wl | jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length')"
+      if [ -n "$path" ] && [ -n "$r" ]; then why="already running (dispatch $r)"
+      elif [ "$live" -ge "$cap" ]; then why="waiting for a free slot (cap $cap)"
+      else
+        sa="$(scope_of <<< "$v")"
+        for b in $(jq -r --argjson n "$n" '.[] | select(.linkedIssue != null and .linkedIssue != $n) | .linkedIssue' <<< "$wts"); do
+          sb="$(gh issue view "$b" --json body 2> /dev/null | scope_of)" || sb="*"
+          jq -ne --arg a "$sa" --arg b "${sb:-*}" '$a == "*" or $b == "*" or ((($a | split(" ")) - (($a | split(" ")) - ($b | split(" ")))) | length > 0)' > /dev/null && { why="Scope overlaps #$b"; break; }
+        done
+      fi
     fi
-    if [ -z "$why" ]; then
-      ! jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null || gh issue edit "$n" --remove-label blocked > /dev/null 2>&1 || warn "cannot remove the blocked label of #$n"
-      if out="$(RUN="$run" "$DISPATCH_CMD" ${spec:+--address "$spec"} "$n" 2>&1)"; then log "dispatched #$n on request"; rm -f "$f"; continue; fi
+    if [ -z "$why" ]; then   # a kept worktree is re-dispatched (--address, a default message when none was given); none yet: a plain dispatch, the message goes to the issue
+      if [ -n "$path" ]; then out="$(RUN="$run" "$DISPATCH_CMD" --address "${spec:-address: continue from the pushed branch (git log), push, then send worker_done.}" "$n" 2>&1)" && rc=0 || rc=$?
+      else out="$(RUN="$run" "$DISPATCH_CMD" "$n" 2>&1)" && rc=0 || rc=$?; [ "$rc" != 0 ] || [ -z "$spec" ] || comment "$n" "Dispatch request message: $spec"; fi
+      if [ "$rc" = 0 ]; then
+        ! jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null || gh issue edit "$n" --remove-label blocked > /dev/null 2>&1 || warn "cannot remove the blocked label of #$n"
+        log "dispatched #$n on request"; rm -f "$f"; continue
+      fi
       why="dispatch failed: $(tail -n 1 <<< "$out")"
     fi
     printf '%s\n%s\n' "$spec" "$why" > "$f"
@@ -355,12 +371,12 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
   done
 }
 
-notify_queue() {   # attended: one bell for each decision that was not queued at the last look; the ids last seen live in $seen (no file); a failed read changes nothing
-  [ "$answer" = attended ] || return 0
-  local now i; now="$(queue_ids | tr '\n' ' ')" || return 0
-  for i in $now; do case " $seen " in *" $i "*) ;; *) bell ;; esac; done; seen="$now"
+notify_queue() {   # attended: one bell for each decision that was not queued at the last look; the ids last seen live in $seen (no file); a failed read changes nothing.
+  [ "$answer" = attended ] || return 0   # A question counts once THIS loop left it open ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event
+  local now i all; all="$(queue_ids | tr '\n' ' ')" || return 0; now=""
+  for i in $all; do case "$i" in q:*) case " $held " in *" ${i#q:} "*) ;; *) continue ;; esac ;; esac; now="$now$i "; case " $seen " in *" $i "*) ;; *) bell ;; esac; done; seen="$now"
 }
-tick=0; empties=0; seen=""; start="$(now_min)"; budget=0
+tick=0; empties=0; seen=""; held=""; start="$(now_min)"; budget=0
 [ -z "$until" ] || budget=$(((($(mins "$until") - start) + 1440) % 1440))
 while :; do
   tick=$((tick + 1)); yield

@@ -57,8 +57,9 @@ The loop holds the Run, so this session neither dispatches nor lands itself: it 
 
 - **What is running / status**: `coordinator.sh --status --run <run>` (holder, live workers and how long each is silent, the queue, dispatch requests with their reason), plus `gh issue list --state open --json number,title,labels`.
   A worker silent past 15 minutes (`COORD_IDLE_MIN`, no output or heartbeat, no open question) is relaunched once, then blocked by the loop; `observation.agentWait` in `orca orchestration worker-show --dispatch <id>` set means a prompt only the user can answer: tell them.
-- **Dispatch this issue**: `coordinator.sh --run <run> --dispatch <n> ['<message>']` queues it; the loop starts it at its next wake ahead of its own pick (`--address` with the message, a re-dispatch of a blocked issue first loses its label), within the cap
-  (`CONCURRENCY_CAP`, 3) and the Scope rule; a request that cannot start yet stays in `--status` with its reason. Free slots are otherwise filled with the next ready issue by the loop.
+- **Dispatch this issue**: `coordinator.sh --run <run> --dispatch <n> ['<message>']` queues it; the loop starts it at its next wake ahead of its own pick, within the cap (`CONCURRENCY_CAP`, 3) and the Scope rule. A kept worktree is re-dispatched
+  with the message (`--address`; it loses its `blocked` label once started), a new one is dispatched plainly and the message goes to the issue. A request that cannot start (on hold, blocked with no message, already running, a Scope overlap, no free slot,
+  an unreadable issue, a failed dispatch) stays in `--status` with its reason; `--dispatch <n> --cancel` withdraws it. Free slots are otherwise filled with the next ready issue by the loop.
 - **Land this**: the loop lands each finished worker itself (`land.sh --review`: independent review, CI on the exact tip, fast-forward, close). One that cannot be landed (rejected review after 2 rounds, red CI, a conflict) arrives as a blocked item.
 - **What landed**: from Orca, git and GitHub only, never from files the loop keeps: `git fetch` then `git log --since=<switch time> --oneline origin/<base>`; `gh issue list --state closed --search "closed:>=<date>"`;
   `gh issue list --label blocked --state open --json number,title`; `orca orchestration worker-list --run <run> --terminal-state active --json`.

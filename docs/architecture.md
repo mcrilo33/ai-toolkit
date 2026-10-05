@@ -76,9 +76,11 @@ route leftovers). A Claude session never binds the Run, `check`s or reads the in
 
 The session in attended mode only presents the queue, one decision at a time, relays each answer with `coordinator.sh --reply`, writes into the issue any answer that changes what it asks, and shows no routine event.
 Its other requests go through the loop too: `coordinator.sh --run R --dispatch <issue> ['<message>']` queues a request (a file in the reply spool's `requests/`, line 1 the message, line 2 the reason it cannot run yet) that the loop runs
-ahead of its own pick with `dispatch.sh` (`--address` with a message), within the cap and the Scope rule (`--status` lists it with its reason); a finished worker is landed by the loop itself.
+ahead of its own pick with `dispatch.sh` (`--address` with a message, or a default one, for a kept worktree), within the cap and the Scope rule; a request that cannot run (on hold, blocked with no message, already running, a Scope overlap, no free slot, an unreadable issue, a failed dispatch: not retried) stays
+in `--status` with its reason until it runs or `--dispatch <n> --cancel` withdraws it (only a closed issue is dropped); a finished worker is landed by the loop itself.
 The bell is `printf '\a'` appended to a terminal device: Orca has no verb to ring another terminal, so the skill passes its own tty (`--bell-tty`; anything that is not a terminal falls back to the loop's own) and Orca's
-suppress-when-focused keeps it silent while the user works there. The ids last seen live in one shell variable (no file), so a decision rings once and a restart rings once per decision still waiting.
+suppress-when-focused keeps it silent while the user works there. The ids last seen live in one shell variable (no file), so a decision rings once and a restart rings once per decision still waiting. A question counts only once this loop has left it open: one that arrived while the loop was busy
+(a land takes minutes) may still be answered by it, a routine event. `--status` shows only the loop's own `blocked:` comment as the reason, one line without control bytes, since the repository may be public.
 
 ```mermaid
 sequenceDiagram
@@ -154,7 +156,7 @@ While it waits, the dialog is drawn in the worker too; the relay's answer dismis
 
 **Contained permission requests (#450, attended only).** The user's standing rule: allow a command that only writes inside the worker's own worktree or scratchpad. `coordinator.sh --answer attended` allows a request only when all hold, and any
 failure leaves it open for the user (never a deny, never an allow): the tool is `Bash` and the command is shown whole (no `[truncated`); danger-guard did not flag it (`reason: unknown`: a guard finding is a sensitive operation, never self-approved);
-its text, with quotes and backslashes stripped as the guard does, names no protected path (`.claude/`, `.ai-toolkit/`, `orca.yaml`, `.github/workflows`, the reply spool) and has no `..`, `~`, `$` or backtick; its `cwd` resolves (symlinks included) under the worktree
+its text, with quotes and backslashes stripped as the guard does, names no protected path (`.claude/`, `.ai-toolkit/`, `orca.yaml`, `.github`, the reply spool) and has no `..`, `~`, `$`, backtick or brace; its `cwd` resolves (symlinks included) under the worktree
 the loop got from Orca and the dispatch record (never the question's `worktree:` line); and `judge.sh` in its `contained` mode answers exactly `VERDICT: CONTAINED`. That mode is the judge below with its own prompt (everything written, moved, deleted or redirected
 lands in the worktree or the scratchpad `/tmp/claude-<uid>/<the worktree's project slug>/*/scratchpad`, nothing is sent out, no git ref or stash is touched) and all its fences (the command as untrusted numbered lines, a forged `VERDICT:` word never clears, no tools, no settings, a kill timer,
 any failure silent), so a worker cannot argue its way to an allow. It is a classifier over text, **not a sandbox** (same standing as the pattern list above); the independent review at land, the hard denies and the judge's fences are untouched. Issue comments name the tool and the answer only.
