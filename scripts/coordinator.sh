@@ -118,14 +118,15 @@ mode="$answer${until:+ until $until}"; [ "$drain" = 0 ] || mode="$mode drain"
 sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'rm -f "$errf" "$hf"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
 log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
 
-# ctx <dispatch>: sets disp task term wtp issue from the worker's Orca row and the issue linked to its worktree.
+# ctx <dispatch>: sets disp task term wtp issue wtc (the worktree's Orca comment) from the worker's Orca row and the issue linked to its worktree.
 ctx() {
   local r; disp="$1"
   r="$(wl | jq -c --arg d "$1" '[.result.workers[] | select(.dispatchId == $d)][0] // empty')"
   [ -n "$r" ] || { warn "unknown dispatch '$1'"; return 1; }
   task="$(jq -r '.taskId // empty' <<< "$r")"; term="$(jq -r '.agentTerminalHandle // empty' <<< "$r")"
   wtp="$(jq -r '.resource.worktreeId | sub("^.*::"; "")' <<< "$r")"
-  issue="$(orca_json worktree list | jq -r --arg p "$wtp" '[.result.worktrees[] | select(.path == $p) | .linkedIssue // empty][0] // empty')"
+  r="$(orca_json worktree list | jq -c --arg p "$wtp" '[.result.worktrees[] | select(.path == $p)][0] // {}')"
+  issue="$(jq -r '.linkedIssue // empty' <<< "$r")"; wtc="$(jq -r '.comment // empty' <<< "$r")"
   [ -n "$issue" ] || { warn "no issue is linked to $wtp"; return 1; }
 }
 rounds() { wl | jq --arg p "::$wtp" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] | length - 1'; }   # dispatches so far - 1
@@ -269,8 +270,9 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
     ! jq -e --arg d "$d" 'index($d)' <<< "$open" > /dev/null || continue
     read -r age how <<< "$(silent "$d")" || true; [ "${age:-0}" -ge "${COORD_IDLE_MIN:-15}" ] || continue
     ctx "$d" || continue
-    if [ "$how" = wait ]; then log "#$issue: worker $d waits on a prompt only a human can answer (silent ${age}m)"; flag "$wtp" "IDLE #$issue: a prompt waits for the human in its terminal (${age}m)"
-      [ "$age" -ge $((${COORD_IDLE_MIN:-15} + 10)) ] || comment "$issue" "worker $d is silent for ${age}m and may wait on a prompt only a human can answer: check its terminal"; continue; fi
+    if [ "$how" = wait ]; then log "#$issue: worker $d waits on a prompt only a human can answer (silent ${age}m)"
+      case "$wtc" in "IDLE #$issue"*) ;; *) comment "$issue" "worker $d is silent for ${age}m and may wait on a prompt only a human can answer: check its terminal" ;; esac   # once: the IDLE flag on the worktree is the durable mark, an age window misses a late first sweep and repeats on a fast one
+      flag "$wtp" "IDLE #$issue: a prompt waits for the human in its terminal (${age}m)"; continue; fi
     log "#$issue: worker $d silent for ${age}m, relaunching"; release "$d"   # its dispatch is still live: stop it first or the worktree counts twice
     redispatch 1 "address: your agent went idle after an error without worker_done. Continue from the pushed branch (git log), push, then send worker_done." "worker idle again without worker_done"
   done

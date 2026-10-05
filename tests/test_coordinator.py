@@ -421,6 +421,20 @@ def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worke
     assert bool(C.calls("orca worktree set")) == bool(shown.get("wait"))   # a human-only prompt is flagged (worktree comment + bell), nothing else is
 
 
+@pytest.mark.parametrize("silent, flagged, comments", [
+    (16, False, True),   # first seen just past the bound
+    (40, False, True),   # first seen long after it (the auto loop started ~40 min after the stall, or after a hand-over / restart): still commented
+    (40, True, False),   # a later sweep: the worktree already carries the IDLE flag, the issue is not commented again
+    (17, True, False),   # ... however soon it comes (a failing `check --wait` sweeps every few seconds)
+])
+def test_a_human_only_prompt_gets_one_issue_comment_however_late_it_is_first_seen_and_never_a_second(C, silent, flagged, comments):
+    C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 1, "comment": f"IDLE #1: a prompt waits for the human in its terminal ({silent}m)" if flagged else ""}]}}))
+    C.show(silent=silent, wait=True)
+    C.go("--cap", "0", **SWEEP)
+    assert bool(C.calls("gh issue comment")) == comments and not C.stubs.calls("dispatch.sh") and not C.calls("gh issue edit")
+    assert C.calls("orca worktree set") and (not comments or "human can answer" in C.calls("gh issue comment")[0][-1])   # the worktree flag is refreshed every sweep
+
+
 @pytest.mark.parametrize("rows, shown", [
     ([("ctx_1", "failed", "exited"), ("ctx_2", "dispatched", "exited")], {}),   # died again
     ([("ctx_1", "failed", "exited"), ("ctx_2", "dispatched", "live")], dict(silent=20)),   # idle again after a relaunch
