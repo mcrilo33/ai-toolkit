@@ -45,10 +45,16 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",
                 "resource": {"worktreeId": f"r::{wt}"}, "projection": {"liveness": {"verdict": lv}, "stage": {"activity": "working"}}}
 
-    def show(silent=0, wait=False, beat=None, born=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt
+    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, raw=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, raw = the reply verbatim
         ago = lambda m: time.time() - m * 60
-        stubs.reply("orca.orchestration_worker_show", json.dumps({"result": {"terminal": {"lastOutputAt": ago(silent) * 1000}, "observation": {"agentWait": {"source": "hook"} if wait else None},
-            "dispatch": {"dispatchedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ago(born))) if born is not None else "2020-01-01 00:00:00", "lastHeartbeatAt": None if beat is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ago(beat)))}}}))
+        fs = ".123" if frac else ""
+        reply = {"terminal": {"lastOutputAt": ago(silent) * 1000}, "observation": {"agentWait": {"source": "hook"} if wait else None},
+                 "dispatch": {"dispatchedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ago(born))) + fs if born is not None else "2020-01-01 00:00:00", "lastHeartbeatAt": None if beat is None else time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ago(beat))) + fs + "Z"}}
+        if obs == "missing":
+            del reply["observation"]
+        elif obs:
+            reply["observation"] = None
+        stubs.reply("orca.orchestration_worker_show", raw if raw is not None else json.dumps({"result": reply}))
 
     def workers(*rows):
         stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": list(rows)}}))
@@ -444,11 +450,16 @@ def relaunches(C):
     return [a for a in C.stubs.calls("dispatch.sh") if a[0] == "--retry-of"]
 
 
-@pytest.mark.parametrize("idle", [False, True])   # the process exited / the agent is alive but silent past the 15-minute bound after a failed turn
-def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C, idle):
+@pytest.mark.parametrize("idle, shown", [
+    (False, {}),   # the process exited
+    (True, {}),   # the agent is alive but silent past the 15-minute bound after a failed turn
+    (True, dict(beat=25, frac=True)),   # the same, the heartbeat carrying fractional seconds
+    (True, dict(born=25, frac=True)),   # ... or dispatchedAt
+])
+def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C, idle, shown):
     assert re.search(r"COORD_SWEEP_EVERY:-2\}", (V2 / "scripts/coordinator.sh").read_text())   # the defaults, read rather than waited for: a sweep every 2nd empty wait (~10 min), the idle bound 15 minutes
     assert "COORD_IDLE_MIN:-15}" in (V2 / "scripts/coordinator.sh").read_text()
-    C.workers(C.row(lv="live" if idle else "exited")); C.show(silent=25)
+    C.workers(C.row(lv="live" if idle else "exited")); C.show(silent=25, **shown)
     C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
     assert not C.stubs.calls("dispatch.sh")
     r = C.go("--cap", "1", **SWEEP)
@@ -465,18 +476,23 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     ([dict(d="ctx_1", st="failed", lv="exited"), dict(d="ctx_2", lv="live")], {}, False),   # the relaunched worker is alive: left alone
     ([dict()], dict(silent=0, beat=93), False),   # an old heartbeat, the agent working: #415 and #418 at 09:39 UTC
     ([dict()], dict(silent=40, beat=1), False),   # a worker that heartbeats
+    ([dict()], dict(silent=40, beat=1, frac=True), False),   # ... the heartbeat carrying fractional seconds: read, not dropped
     ([dict()], dict(silent=40, born=1), False),   # just (re)dispatched: the old terminal output is not the new worker's silence
     ([dict()], dict(silent=14), False),   # silent, but under the bound
     ([dict()], dict(silent=40, wait=True), False),   # parked on a prompt only a human can answer: flagged, never relaunched
     ([dict()], dict(silent=40), True),   # waiting on an open gate or permission question
+    ([dict()], dict(silent=40, wait=True, obs="null"), False),   # a present terminal with no observation: not provable, so flagged for the human
+    ([dict()], dict(silent=40, wait=True, obs="missing"), False),   # ... also when the key is absent
+    ([dict()], dict(silent=40, raw="not json"), False),   # worker-show unreadable: the age is unknown, so the worker is neither relaunched nor flagged idle
 ])
 def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worker_alone(C, rows, shown, gate):
     C.workers(*[C.row(**r) for r in rows]); C.show(**shown)
     if gate:
         C.inbox(["msg_q"])
-    C.go("--cap", "0", **SWEEP)
+    r = C.go("--cap", "0", **SWEEP)
     assert not C.stubs.calls("dispatch.sh") and not C.calls("gh issue edit") and not C.calls("orca orchestration worker-release")
     assert bool(C.calls("orca worktree set")) == bool(shown.get("wait"))   # a human-only prompt is flagged (worktree comment + bell), nothing else is
+    assert "jq: error" not in r.stderr and ("ctx_1" in r.stderr and "silent" in r.stderr) == ("raw" in shown)   # an unknown age is warned about, naming the dispatch
 
 
 @pytest.mark.parametrize("silent, flagged, comments", [
