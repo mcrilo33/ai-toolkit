@@ -157,7 +157,6 @@ def test_a_failing_claude_or_a_missing_rule_is_an_escalation_not_an_approve(A, t
         r = sh(["bash", gate, str(A.wt)], tmp_path, "PLAN: x", ANSWER_MODEL="m", ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0)
         argv = A.stubs.calls("claude")[-1]
         assert r.returncode == 0 and os.path.realpath(argv[argv.index("--append-system-prompt-file") + 1]) == os.path.realpath(root / RULE_AT[layout])
-        A.stubs.calls("claude").clear() if False else None
 
 
 @pytest.fixture
