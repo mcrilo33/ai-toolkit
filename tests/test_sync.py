@@ -180,23 +180,26 @@ def test_local_env_override_is_never_tracked(sync, target):
     assert "ai-toolkit.local.env" not in git(target, "status", "--porcelain", "-uall")
 
 
+def test_owner_repo_reads_every_remote_form_and_refuses_what_is_no_repo(src, run):
+    forms = ["git@github.com:acme/toolkit.git", "https://github.com/acme/toolkit.git", "https://github.com/acme/toolkit",
+             "ssh://git@github.com/acme/toolkit.git", "https://github.com/acme/toolkit/", "../a/b", "/srv/toolkit", ""]
+    probe = f'. "{src}/v2/scripts/sync.sh"; for u in "$@"; do owner_repo "$u" || printf -; echo; done'
+    r = run(["bash", "-c", probe, "_", *forms])
+    assert r.stdout.splitlines() == ["acme/toolkit"] * 5 + ["-"] * 3  # one bash for every form: no full sync per URL
+
+
 def test_a_host_records_the_toolkits_origin_as_upstream_and_the_toolkit_itself_stays_empty(sync, src, target, run):
     def value():
         return [ln for ln in (target / ".ai-toolkit" / "ai-toolkit.env").read_text().splitlines() if ln.startswith("UPSTREAM_REPO=")]
     assert sync().returncode == 0 and value() == ["UPSTREAM_REPO=acme/toolkit"]
-    for url in ("https://github.com/acme/toolkit.git", "https://github.com/acme/toolkit", "ssh://git@github.com/acme/toolkit.git"):
-        git(src / "v2", "remote", "set-url", "origin", url)
-        assert sync().returncode == 0 and value() == ["UPSTREAM_REPO=acme/toolkit"], url
     write(target / ".ai-toolkit" / "ai-toolkit.local.env", "UPSTREAM_REPO=me/fork\n")  # the per-target override still wins
     probe = f'. "{target}/.ai-toolkit/scripts/lib.sh"; ORCA_ROOT_PATH="{target}" load_env; echo "$UPSTREAM_REPO"'
     assert run(["bash", "-c", probe]).stdout.strip() == "me/fork"
     assert sync(tgt=src / "v2").returncode == 0  # the toolkit syncing into itself: nothing to point at
     assert (src / "v2" / ".ai-toolkit" / "ai-toolkit.env").read_text() == (src / "v2" / "settings" / "ai-toolkit.env").read_text()
-    git(src / "v2", "remote", "set-url", "origin", "../a/b")  # a local path is no repo to file to
-    assert sync().stderr.count("UPSTREAM_REPO") == 1 and value() == ["UPSTREAM_REPO="]
     git(src / "v2", "remote", "remove", "origin")
     r = sync()
-    assert r.returncode == 0 and "UPSTREAM_REPO" in r.stderr and value() == ["UPSTREAM_REPO="]
+    assert r.returncode == 0 and r.stderr.count("UPSTREAM_REPO") == 1 and value() == ["UPSTREAM_REPO="]
 
 
 def test_unmanaged_singletons_are_backed_up_once_then_owned(sync, target):

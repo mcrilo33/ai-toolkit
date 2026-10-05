@@ -11,6 +11,14 @@ set -euo pipefail
 # shellcheck source=lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
+# owner_repo <git-url>: the owner/repo of an https, ssh or scp-style remote; fails on anything else (a local path is no repo to file to).
+owner_repo() {
+  local up
+  up="$(printf '%s' "$1" | sed -E 's#^[a-z+]+://([^@/]+@)?[^/:]+/##; s#^[^@/:]+@[^/:]+:##; s#/$##; s#\.git$##')"
+  [[ "$up" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] && printf '%s' "$up"
+}
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0   # sourced (the tests exercise owner_repo alone): define only
+
 V2="$(cd "$AI_TOOLKIT_LIB_DIR/.." && pwd)"
 SHARED="${AI_TOOLKIT_SHARED:-$V2/shared}"
 [ -d "$SHARED" ] || SHARED="$V2/../shared"   # before cutover shared/ is one level above v2/
@@ -71,8 +79,9 @@ put_tree "$V2/hooks/git" .ai-toolkit/hooks/git
 # A host project files the toolkit's own defects to the toolkit's repo (UPSTREAM_REPO = its origin as owner/repo); the toolkit itself keeps it empty.
 up=""
 if [ "$TARGET" != "$V2" ]; then
-  up="$(git -C "$V2" remote get-url origin 2> /dev/null | sed -E 's#^[a-z+]+://([^@/]+@)?[^/:]+/##; s#^[^@/:]+@[^/:]+:##; s#/$##; s#\.git$##')" || true
-  [[ "$up" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { up=""; warn "the toolkit checkout has no usable origin: UPSTREAM_REPO left empty in $TARGET, so the scopers will draft, not file, a toolkit defect"; }
+  up="$(owner_repo "$(git -C "$V2" remote get-url origin 2> /dev/null)")" || {
+    up=""; warn "the toolkit checkout has no usable origin: UPSTREAM_REPO left empty in $TARGET, so the scopers will draft, not file, a toolkit defect"
+  }
 fi
 sed "s|^UPSTREAM_REPO=.*|UPSTREAM_REPO=$up|" "$V2/settings/ai-toolkit.env" > "$TMP"
 put "$TMP" .ai-toolkit/ai-toolkit.env
