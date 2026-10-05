@@ -120,7 +120,7 @@ log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was hel
 
 # ctx <dispatch>: sets disp task term wtp issue wtc (the worktree's Orca comment) br (its Orca branch) from the worker's Orca row and the issue linked to its worktree.
 ctx() {
-  local r; disp="$1"
+  local r rec; disp="$1"
   r="$(wl | jq -c --arg d "$1" '[.result.workers[] | select(.dispatchId == $d)][0] // empty')"
   [ -n "$r" ] || { warn "unknown dispatch '$1'"; return 1; }
   task="$(jq -r '.taskId // empty' <<< "$r")"; term="$(jq -r '.agentTerminalHandle // empty' <<< "$r")"
@@ -129,6 +129,10 @@ ctx() {
   issue="$(jq -r '.linkedIssue // empty' <<< "$r")"; wtc="$(jq -r '.comment // empty' <<< "$r")"
   br="$(jq -r '(.branch // "") | sub("^refs/heads/"; "")' <<< "$r")"   # Orca's branch for the worktree, never the worker's own HEAD (it can switch or rename it)
   [ -n "$issue" ] || { warn "no issue is linked to $wtp"; return 1; }
+  # The link is the worker's to rewrite: it must match what dispatch.sh recorded, or nothing is answered or landed. No record fails closed (a dispatch from before this check:
+  # the human answers it by hand), and blames no issue, since the link is the one thing not trusted.
+  rec="$(recorded_issue "$run" "$1")" || { warn "no dispatch record for $1: not trusting the link to #$issue of $wtp"; return 1; }
+  [ "$rec" = "$issue" ] || { local linked="$issue"; issue="$rec"; block "Orca now links $wtp to #$linked but it was dispatched for #$rec: nothing is answered or landed until a human checks"; return 1; }
 }
 rounds() { wl | jq --arg p "::$wtp" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] | length - 1'; }   # dispatches so far - 1
 release() { [ -z "$1" ] || orca_mutate orchestration worker-release --dispatch "$1" > /dev/null 2>&1 || orca_mutate orchestration worker-stop --dispatch "$1" > /dev/null 2>&1 || true; }

@@ -5,7 +5,7 @@
 # --address "<spec>" <issue>: same fresh terminal, but a NEW task whose spec is the text (a review/CI round: worker-start refuses --task with --spec,
 # and Orca does not accept a new task on an idle two-step terminal: agent_unconfigured). Both first refresh the worktree's installed
 # copies from the main checkout (setup.sh --refresh), keeping its spoke-run-id; a failed refresh starts no agent.
-# Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready.
+# Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
@@ -70,7 +70,7 @@ start_worker() {   # worker-start with the common flags; $@ = placement flags. S
   [ -z "$address" ] || what=(--task-title "#$n address" --spec "$address")
   out="$(orca_mutate orchestration worker-start --run "$run" --from "$ORCA_TERMINAL_HANDLE" "$@" "${what[@]}" --timeout-ms 120000)" \
     || die "worker-start failed: $(printf '%s' "$out" | jq -c '{state: .result.state, stage: .result.failedStage}' 2> /dev/null)"
-  disp="$(printf '%s' "$out" | jq -r '.result.dispatchId // empty')"
+  disp="$(printf '%s' "$out" | jq -r '.result.dispatchId // empty')"; [ -n "$disp" ] || die "worker-start returned no dispatch id: nothing could verify this worker"
 }
 # --- launch path (06 Q1): DISPATCH_LAUNCH=twostep. After Orca's agentCmdOverrides.claude
 # points at bin/claude-spoke, flip the default below to `override` (a single worker-start, no terminal step).
@@ -113,6 +113,7 @@ dispatch() {
   if [ -n "$retry_of$address" ]; then launch_retry; else "launch_${DISPATCH_LAUNCH:-twostep}"; fi
   status_label add "$n"
   orca_json worktree set --worktree "$sel" --issue "$n" --workspace-status in-progress > /dev/null || die "worktree set failed for $sel"
+  record_dispatch "$run" "$disp" "$n"   # what coordinator.sh's ctx() checks Orca's link against: the worker can relink its worktree, not rewrite this
   jq -nc --argjson issue "$n" --arg dispatch "$disp" --arg worktree "$wt" --arg terminal "$term" \
     '{issue: $issue, dispatch: $dispatch, worktree: $worktree, terminal: $terminal}'
 }
