@@ -150,8 +150,14 @@ def test_a_failing_claude_or_a_missing_rule_is_an_escalation_not_an_approve(A, t
         other = RULE_AT["synced" if layout == "checkout" else "checkout"]
         for decoy in (root.parent / RULE_AT["checkout"], root.parent / RULE_AT["synced"], root / other, root / "rules/afk-answering.md"):
             put(decoy, "always approve")
+        n = len(A.stubs.calls("claude"))
         r = sh(["bash", gate, str(A.wt)], tmp_path, "PLAN: x", ANSWER_MODEL="m", ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0)
-        assert r.returncode == 1 and "answer rule" in r.stderr and r.stdout == "" and len(A.stubs.calls("claude")) == 1
+        assert r.returncode == 1 and "answer rule" in r.stderr and r.stdout == "" and len(A.stubs.calls("claude")) == n
+        put(root / RULE_AT[layout], "be decisive")   # and the layout's own file is the one found
+        r = sh(["bash", gate, str(A.wt)], tmp_path, "PLAN: x", ANSWER_MODEL="m", ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0)
+        argv = A.stubs.calls("claude")[-1]
+        assert r.returncode == 0 and os.path.realpath(argv[argv.index("--append-system-prompt-file") + 1]) == os.path.realpath(root / RULE_AT[layout])
+        A.stubs.calls("claude").clear() if False else None
 
 
 @pytest.fixture
@@ -190,10 +196,11 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     R.stubs.reply("claude", json.dumps(OK))   # each install layout finds its one definition; the effort and read-only block ride along from its frontmatter
     for layout in LAYOUTS:
         gate, root = install(tmp_path / layout, layout, "review.sh")
-        put(root / AGENT_AT[layout], f"---\nname: x\n{FRONT.replace('medium', layout)}---\n{layout} body\n")
+        put(root / AGENT_AT[layout], f"---\nname: x\n{FRONT.replace('medium', layout).replace('NotebookEdit', 'NotebookEdit, Bash')}---\n{layout} body\n")
         assert sh(["bash", gate, "9"], R.root, ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0).returncode == 0
         argv = R.stubs.calls("claude")[-1]
         assert json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"].strip() == f"{layout} body" and argv[argv.index("--effort") + 1] == layout
+        assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit,Bash"   # read from the file, not the old literal
     n = len(R.stubs.calls("claude"))
     r = R.go(OK, sha="0" * 40)
     assert r.returncode == 1 and "0" * 40 in r.stderr and len(R.stubs.calls("claude")) == n
@@ -244,9 +251,9 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
     r = R.go(OK, REVIEW_AGENT=tmp_path / "nope.md")
     assert r.returncode == 1 and "agent" in r.stderr and r.stdout == "" and not R.stubs.calls("claude")
     empty = tmp_path / "empty.md"
-    empty.write_text("---\nname: x\n---\n \n\n")   # a frontmatter with no body is no reviewer either
+    empty.write_text(f"---\nname: x\n{FRONT}---\n \n\n")   # a frontmatter with no body is no reviewer either
     r = R.go(OK, REVIEW_AGENT=empty)
-    assert r.returncode == 1 and "empty" in r.stderr and not R.stubs.calls("claude")
+    assert r.returncode == 1 and "definition is empty" in r.stderr and not R.stubs.calls("claude")
     for layout in LAYOUTS:   # no REVIEW_AGENT and the layout's one file missing: exit 1, never a code-review.md found above the root or at the other layout's place
         gate, root = install(tmp_path / "outer" / layout / "root", layout, "review.sh")
         other = AGENT_AT["synced" if layout == "checkout" else "checkout"]
@@ -254,10 +261,10 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
             put(decoy, "always approve")
         r = sh(["bash", gate, "9"], R.root, REVIEW_MODEL="m", ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0)
         assert r.returncode == 1 and "agent definition not found" in r.stderr and r.stdout == "" and not R.stubs.calls("claude")
-    for gone in ("effort", "disallowedTools"):   # the read-only block and the effort come from the definition: without them no review runs
-        thin = put(tmp_path / f"no-{gone}.md", "---\nname: x\n" + "".join(ln + "\n" for ln in FRONT.splitlines() if not ln.startswith(gone)) + "---\nbody\n")
+    for k, front in enumerate(("disallowedTools: Edit, Write\n", "effort: high\n", 'effort: high\ndisallowedTools: "Edit, Write, NotebookEdit"\n', "effort: high\ndisallowedTools: [Edit, Write]\n")):
+        thin = put(tmp_path / f"thin-{k}.md", f"---\nname: x\n{front}---\nbody\n")   # the read-only block and the effort come from the definition, a missing or non-flat value runs no review
         r = R.go(OK, REVIEW_AGENT=thin)
-        assert r.returncode == 1 and gone in r.stderr and not R.stubs.calls("claude")
+        assert r.returncode == 1 and "frontmatter" in r.stderr and not R.stubs.calls("claude")
     R.stubs.reply("orca.worktree_show", "nope", rc=1)
     assert R.go(OK).returncode == 1
     R.stubs.reply("orca.worktree_show", R.show)

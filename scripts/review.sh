@@ -23,8 +23,9 @@ if [ -z "$agent" ]; then
   case "$here" in */.ai-toolkit/scripts) agent="$here/../../.claude/agents/code-review.md" ;; *) agent="$here/../shared/agents/code-review.md" ;; esac
 fi
 [ -f "$agent" ] || die "code-review agent definition not found"
-front() { awk -v k="$1" 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } index($0, k ": ") == 1 { sub("^[^:]*: *", ""); gsub(" *, *", ","); print; exit }' "$agent"; }   # one flat frontmatter value
+front() { awk -v k="$1" 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } index($0, k ": ") == 1 { gsub(/\r/, ""); sub("^[^:]*: *", ""); gsub(" *, *", ","); print; exit }' "$agent"; }   # one flat frontmatter value
 effort="$(front effort)"; blocked="$(front disallowedTools)"
+case "$effort$blocked" in *[\"\'\[\]]*) die "code-review agent definition: effort and disallowedTools must be plain unquoted values in its frontmatter: $agent" ;; esac
 [ -n "$effort" ] && [ -n "$blocked" ] || die "code-review agent definition lacks effort or disallowedTools in its frontmatter: $agent"
 prose="$(awk 'NR == 1 && $0 != "---" { f = 2 } f < 2 { if ($0 == "---") f++; next } { print }' "$agent")"   # the body after the frontmatter
 printf '%s' "$prose" | grep -q '[^[:space:]]' || die "code-review agent definition is empty: $agent"
