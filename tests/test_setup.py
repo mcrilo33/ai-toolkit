@@ -23,7 +23,8 @@ def test_provisions_claude_dir_run_id_and_excludes_and_is_idempotent(run, repo, 
 
 def test_fails_loud_when_gh_fails_or_the_root_has_no_claude_dir(run, repo, stubs):
     stubs.reply("gh", "boom", rc=1)
-    assert "issue 12" in setup(run, repo, "12-x")[1].stderr
+    wt, r = setup(run, repo, "12-x")   # first provisioning still stops on a failed fetch (only a refresh keeps the old task.md)
+    assert r.returncode != 0 and "issue 12" in r.stderr and not (wt / ".ai-toolkit/setup-done").exists()
     wt, _ = setup(run, repo)
     shutil.rmtree(repo.root / ".claude")
     r = setup(run, repo, wt=wt)[1]
