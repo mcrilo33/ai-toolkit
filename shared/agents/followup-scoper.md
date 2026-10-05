@@ -141,7 +141,7 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
   under `.claude/` or `.ai-toolkit/`, or `shared/` in the toolkit repo itself) is filed to `UPSTREAM_REPO`
   (`owner/repo`, from the main checkout's `.ai-toolkit/ai-toolkit.local.env` (`$ORCA_ROOT_PATH`), else
   `.ai-toolkit/ai-toolkit.env`); empty or unset means the toolkit's own repo only when this checkout has
-  both `shared/` and `scripts/sync.sh` at its root. Otherwise it is a host project with no upstream:
+  `shared/`, `hooks/claude/` and `scripts/sync.sh` at its root. Otherwise it is a host project with no upstream:
   **never file to the host repo**, return the draft and say plainly that no upstream is configured and
   how to set it (see `bug-triage.md`, which also says synced copies are never edited in a host project).
   Without an explicit target the call defaults to the current git remote and misfiles the toolkit's

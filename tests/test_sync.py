@@ -192,6 +192,8 @@ def test_a_host_records_the_toolkits_origin_as_upstream_and_the_toolkit_itself_s
     assert run(["bash", "-c", probe]).stdout.strip() == "me/fork"
     assert sync(tgt=src / "v2").returncode == 0  # the toolkit syncing into itself: nothing to point at
     assert (src / "v2" / ".ai-toolkit" / "ai-toolkit.env").read_text() == (src / "v2" / "settings" / "ai-toolkit.env").read_text()
+    git(src / "v2", "remote", "set-url", "origin", "../a/b")  # a local path is no repo to file to
+    assert sync().stderr.count("UPSTREAM_REPO") == 1 and value() == ["UPSTREAM_REPO="]
     git(src / "v2", "remote", "remove", "origin")
     r = sync()
     assert r.returncode == 0 and "UPSTREAM_REPO" in r.stderr and value() == ["UPSTREAM_REPO="]

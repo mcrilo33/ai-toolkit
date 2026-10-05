@@ -84,7 +84,7 @@ code is broken**, not on which repo you happen to be sitting in:
   `.ai-toolkit/ai-toolkit.local.env` overrides it), even when discovered inside a host project. Otherwise
   the toolkit's own bugs scatter across downstream trackers and never reach its maintainer.
 - **Empty `UPSTREAM_REPO` fails closed.** It means "file here" only in the toolkit's own checkout, which
-  is the one holding both `shared/` and `scripts/sync.sh` at its root (the test `land.sh` uses). Anywhere
+  is the one holding `shared/`, `hooks/claude/` and `scripts/sync.sh` at its root (the test `land.sh` uses). Anywhere
   else it is a host project with no upstream configured: the scoper returns the draft, says plainly that
   no upstream is set and that `UPSTREAM_REPO` goes in `.ai-toolkit/ai-toolkit.local.env` (or re-run
   `sync.sh` from a toolkit checkout with an `origin`), and never files to the host repo.

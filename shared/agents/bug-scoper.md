@@ -110,7 +110,7 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
   **ai-toolkit tooling** defect; anything else is a **host project** defect. File a tooling defect to
   `UPSTREAM_REPO` (`owner/repo`): read it from the main checkout's `.ai-toolkit/ai-toolkit.local.env`
   (`$ORCA_ROOT_PATH`), else from `.ai-toolkit/ai-toolkit.env`. Empty or unset means "the toolkit's own
-  repo" only when this checkout has both `shared/` and `scripts/sync.sh` at its root; otherwise it is a
+  repo" only when this checkout has `shared/`, `hooks/claude/` and `scripts/sync.sh` at its root; otherwise it is a
   host project with no upstream: **never file to the host repo**, return the draft, and say plainly that no
   upstream is configured and how to set it (see `bug-triage.md`, which also says synced copies are never
   edited in a host project). This matters because ai-toolkit is synced
