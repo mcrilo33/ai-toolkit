@@ -140,8 +140,12 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
   **ai-toolkit tooling** (a synced rule, skill, agent, hook, script, `CLAUDE.md`, or `orca.yaml`: anything
   under `.claude/` or `.ai-toolkit/`, or `shared/` in the toolkit repo itself) is filed to `UPSTREAM_REPO`
   (`owner/repo`, from the main checkout's `.ai-toolkit/ai-toolkit.local.env` (`$ORCA_ROOT_PATH`), else
-  `.ai-toolkit/ai-toolkit.env`); empty or unset means the project's own repo. Without an explicit target
-  the call defaults to the current git remote and misfiles the toolkit's follow-up in the host tracker.
+  `.ai-toolkit/ai-toolkit.env`); empty or unset means the toolkit's own repo only when this checkout has
+  both `shared/` and `scripts/sync.sh` at its root. Otherwise it is a host project with no upstream:
+  **never file to the host repo**, return the draft and say plainly that no upstream is configured and
+  how to set it (see `bug-triage.md`, which also says synced copies are never edited in a host project).
+  Without an explicit target the call defaults to the current git remote and misfiles the toolkit's
+  follow-up in the host tracker.
   A follow-up on the **host project's own code** is filed to that project's repo.
 
 State which path you took, and which repo you filed to and why.

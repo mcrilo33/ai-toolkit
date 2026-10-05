@@ -80,9 +80,17 @@ code is broken**, not on which repo you happen to be sitting in:
 
 - A defect in the **ai-toolkit tooling** — a synced rule, skill, agent, hook, script, `CLAUDE.md`, or
   `orca.yaml` (anything under `.claude/` or `.ai-toolkit/` in a host project, `shared/` in the toolkit
-  repo) — is filed to `UPSTREAM_REPO` (`owner/repo`, set in `.ai-toolkit/ai-toolkit.local.env`; empty
-  means the project's own repo), even when discovered inside a host project. Otherwise the toolkit's own
-  bugs scatter across downstream trackers and never reach its maintainer.
+  repo) — is filed to `UPSTREAM_REPO` (`owner/repo`; `sync.sh` fills it from the toolkit's `origin`, and
+  `.ai-toolkit/ai-toolkit.local.env` overrides it), even when discovered inside a host project. Otherwise
+  the toolkit's own bugs scatter across downstream trackers and never reach its maintainer.
+- **Empty `UPSTREAM_REPO` fails closed.** It means "file here" only in the toolkit's own checkout, which
+  is the one holding both `shared/` and `scripts/sync.sh` at its root (the test `land.sh` uses). Anywhere
+  else it is a host project with no upstream configured: the scoper returns the draft, says plainly that
+  no upstream is set and that `UPSTREAM_REPO` goes in `.ai-toolkit/ai-toolkit.local.env` (or re-run
+  `sync.sh` from a toolkit checkout with an `origin`), and never files to the host repo.
+- **Synced copies are not edited in a host project.** There, the toolkit's files are synced copies; a
+  defect or wish about one is filed upstream through the scoper, and the project picks the fix up at its
+  next sync.
 - A defect in the **host project's own code** is filed to the **host project's** repo, as normal.
 
 The `bug-scoper` agent reads `UPSTREAM_REPO` and classifies host-vs-tooling by path, rather than

@@ -68,7 +68,14 @@ put_tree "$V2/scripts" .ai-toolkit/scripts otel.sh   # the collector is per-mach
 put_tree "$V2/bin" .ai-toolkit/bin
 put_tree "$V2/hooks/claude" .claude/hooks   # setup.sh copies .claude/ and .ai-toolkit/rules/ into a new worktree
 put_tree "$V2/hooks/git" .ai-toolkit/hooks/git
-put "$V2/settings/ai-toolkit.env" .ai-toolkit/ai-toolkit.env
+# A host project files the toolkit's own defects to the toolkit's repo (UPSTREAM_REPO = its origin as owner/repo); the toolkit itself keeps it empty.
+up=""
+if [ "$TARGET" != "$V2" ]; then
+  up="$(git -C "$V2" remote get-url origin 2> /dev/null | sed -E 's#^[a-z+]+://##; s#^([^@/]+@)?[^/:]+[:/]##; s#/$##; s#\.git$##')" || true
+  case "$up" in */*/* | */ | /* | "") up=""; warn "the toolkit checkout has no usable origin: UPSTREAM_REPO left empty in $TARGET, so the scopers will draft, not file, a toolkit defect" ;; esac
+fi
+sed "s|^UPSTREAM_REPO=.*|UPSTREAM_REPO=$up|" "$V2/settings/ai-toolkit.env" > "$TMP"
+put "$TMP" .ai-toolkit/ai-toolkit.env
 if [ -f "$V2/settings/claude/settings.json" ]; then put "$V2/settings/claude/settings.json" .claude/settings.json bak
 else warn "$V2/settings/claude/settings.json is missing: .claude/settings.json (hooks) not synced"; fi
 cat > "$TMP" << 'EOF'

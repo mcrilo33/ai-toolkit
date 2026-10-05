@@ -109,8 +109,11 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
   `orca.yaml`: anything under `.claude/` or `.ai-toolkit/`, or `shared/` in the toolkit repo itself) is an
   **ai-toolkit tooling** defect; anything else is a **host project** defect. File a tooling defect to
   `UPSTREAM_REPO` (`owner/repo`): read it from the main checkout's `.ai-toolkit/ai-toolkit.local.env`
-  (`$ORCA_ROOT_PATH`), else from `.ai-toolkit/ai-toolkit.env`. Empty or unset means the toolkit and the
-  project are the same repo: file to the project's own repo. This matters because ai-toolkit is synced
+  (`$ORCA_ROOT_PATH`), else from `.ai-toolkit/ai-toolkit.env`. Empty or unset means "the toolkit's own
+  repo" only when this checkout has both `shared/` and `scripts/sync.sh` at its root; otherwise it is a
+  host project with no upstream: **never file to the host repo**, return the draft, and say plainly that no
+  upstream is configured and how to set it (see `bug-triage.md`, which also says synced copies are never
+  edited in a host project). This matters because ai-toolkit is synced
   *into* other projects: without an explicit target the call defaults to the current git remote and
   misfiles the toolkit's own bug in the host tracker. A host-project defect always goes to that project's
   repo. A fork or rename reroutes by changing `UPSTREAM_REPO`, not this prose.
