@@ -9,8 +9,9 @@
 # cannot widen the read-only tools), no MCP config and no auto-memory, so a worker's .claude/agents, CLAUDE.md, rules or ~/.claude/projects/*/memory never reach it; a missing definition is exit 1, never a fallback.
 # Its effort and read-only block (disallowedTools) come from the definition's frontmatter, a missing one is exit 1. model: is dropped on purpose (REVIEW_MODEL decides) and so is skills:
 # (they resolve from a skills dir, which --setting-sources "" does not load; naming them would load a worker-controlled one or do nothing).
-# --settings autoMemoryEnabled=false is the documented switch; on a CLI bump re-run the probe: ask `claude -p --setting-sources "" --strict-mcp-config --settings '{"autoMemoryEnabled":false}'`
-# whether its context holds a MEMORY.md index (an unknown settings key is ignored silently, so a renamed one would fail open). --bare is no option: it needs an API key, the gates run on a login.
+# Auto-memory is switched off twice, independently: --settings autoMemoryEnabled=false (the documented setting) and CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 in the environment, on every claude call. An unknown settings key
+# is ignored silently, so a CLI rename of the setting would fail open with green tests; the environment variable is a second switch that does not depend on that key. On a CLI bump re-run the probe for each switch alone:
+# ask `claude -p --setting-sources "" --strict-mcp-config` (plus the switch) whether its context holds a MEMORY.md index. --bare is no option: it needs an API key, the gates run on a login.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
@@ -23,9 +24,9 @@ if [ -z "$agent" ]; then
   case "$here" in */.ai-toolkit/scripts) agent="$here/../../.claude/agents/code-review.md" ;; *) agent="$here/../shared/agents/code-review.md" ;; esac
 fi
 [ -f "$agent" ] || die "code-review agent definition not found"
-front() { awk -v k="$1" 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } index($0, k ": ") == 1 { sub("^[^:]*: *", ""); gsub(" *, *", ","); print; exit }' "$agent"; }   # one flat frontmatter value
+front() { awk -v k="$1" 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } index($0, k ": ") == 1 { sub("^[^:]*: *", ""); gsub(" *, *", ","); sub("[ \t]+$", ""); print; exit }' "$agent"; }   # one flat frontmatter value
 effort="$(front effort)"; blocked="$(front disallowedTools)"
-case "$effort$blocked" in *[\"\'\[\]]*) die "code-review agent definition: effort and disallowedTools must be plain unquoted values in its frontmatter: $agent" ;; esac
+case "$effort$blocked" in *[\"\'\[\]#]*) die "code-review agent definition: effort and disallowedTools must be plain unquoted values without an inline comment in its frontmatter: $agent" ;; esac
 [ -n "$effort" ] && [ -n "$blocked" ] || die "code-review agent definition lacks effort or disallowedTools in its frontmatter: $agent"
 prose="$(awk 'NR == 1 && $0 != "---" { f = 2 } f < 2 { if ($0 == "---") f++; next } { print }' "$agent")"   # the body after the frontmatter
 printf '%s' "$prose" | grep -q '[^[:space:]]' || die "code-review agent definition is empty: $agent"
@@ -47,7 +48,7 @@ VALID='type == "object" and (.verdict | IN("APPROVE", "REQUEST_CHANGES")) and (.
 v=""
 for _ in 1 2; do
   # The prompt goes on stdin: --allowedTools is variadic and would swallow a trailing positional argument.
-  out="$(cd "$wt" && printf '%s' "$prompt" | claude -p --model "$REVIEW_MODEL" --agents "$agents" --agent code-review \
+  out="$(cd "$wt" && printf '%s' "$prompt" | CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 claude -p --model "$REVIEW_MODEL" --agents "$agents" --agent code-review \
     --setting-sources "" --strict-mcp-config --settings '{"autoMemoryEnabled":false}' --effort "$effort" --disallowedTools "$blocked" --no-session-persistence \
     --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)")" || out=""
   v="$(printf '%s\n' "$out" | sed '/^```/d' | jq -c "select($VALID)" 2> /dev/null)" || v=""
