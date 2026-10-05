@@ -25,12 +25,10 @@ def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
 
 
 @pytest.mark.parametrize("needle", [
-    "orca orchestration run-use --id", "orca orchestration run-create", "--from $H", "check --run", "--ack", "reply --run", "--id <message-id>",
-    '"approve"', '"approve with: ', '"revise: ', "land.sh --review", "dispatch.sh --address", "dispatch.sh --next", "coordinator.sh --status",
-    "/coordinate auto", "--answer auto", "--until HH:MM", "--drain", "/coordinate attended", "coordinator.sh --stop --run", "You have", "heartbeat",
-    "land.sh --cleanup-only", "worker-release", "blocked", "thread_id", "a land is in flight", "PERMISSION REQUEST", '--body "allow"', '--body "deny"',
-    "Permission answered by the user", "bug-scoper", "followup-scoper", "hold", "COORD_IDLE_MIN", "orca orchestration worker-show --dispatch", "observation.agentWait", "orca terminal read",
-    "printf '\\a' > \"/dev/$(ps -o tty= -p $PPID", "terminal bell", "agent task complete"])
+    "orca terminal create", "--answer attended", "--bell-tty", "ps -o tty= -p $PPID", "coordinator.sh --status", "--reply <message-id> approve", "'approve with: ", "'revise: ", "--dispatch <n>",
+    "one decision at a time", "never binds the Run", "Never show a heartbeat", "/coordinate auto", "--answer auto", "--until HH:MM", "--drain", "/coordinate attended", "coordinator.sh --stop --run",
+    "land.sh --review", "blocked", "hold", "PERMISSION REQUEST", "allow", "deny", "COORD_IDLE_MIN", "orca orchestration worker-show --dispatch", "observation.agentWait", "orca terminal read",
+    "orca orchestration run-list", "afk-answering", "Scope:", "git log --since", "worker-list"])
 def test_the_skill_covers_each_mechanic_of_the_brief(needle):
     assert needle in SKILL
 
@@ -44,19 +42,19 @@ def test_every_script_and_flag_the_skill_names_exists():
 
 def test_every_orchestration_verb_the_skill_names_exists_in_orca():
     verbs = set(re.findall(r"orca orchestration ([a-z-]+)", SKILL))
-    assert {"run-use", "run-create", "check", "reply"} <= verbs and verbs <= ORCHESTRATION_VERBS
+    assert {"run-list", "worker-list", "worker-show"} <= verbs and verbs <= ORCHESTRATION_VERBS   # the session never binds the Run: no run-use, check or reply of its own
 
 
 def test_a_question_is_turned_into_exactly_one_of_three_replies_and_never_a_blind_approve():
-    q = section("On each message")
-    assert q.count('--body "approve"') + q.count('"approve with: ') + q.count('"revise: ') >= 3 and "afk-answering" in q and re.search(r"never .*approve|unless the user", q, re.I)
+    q = section("The queue")
+    assert q.count("--reply <message-id> ") >= 3 and "afk-answering" in q and re.search(r"never .*approve|unless the user", q, re.I)
 
 
 def test_a_permission_question_is_shown_to_the_user_answered_only_with_their_decision_and_commented_without_the_command():
-    q = section("On each message")
+    q = section("The queue")
     p = q[q.index("PERMISSION REQUEST"):]
-    p = p[:p.index("**`worker_done` succeeded**")]   # that question type's paragraph
-    assert "not a plan gate" in p and "allow" in p and "deny" in p and re.search(r"never .*without the user", p, re.I | re.S)
+    p = p[:p.index("- **A blocked issue**")]   # that question type's paragraph
+    assert "not a plan gate" in p and "allow" in p and "deny" in p and re.search(r"only on the user's decision", p, re.I | re.S)
     assert re.search(r"tool and the (answer|decision) only|never the command", p, re.I) and "stale" in p and "afk-answering" not in p
 
 
@@ -67,8 +65,8 @@ def test_the_answerer_rule_and_the_planning_rule_say_a_permission_question_is_ne
 
 
 def test_the_switch_never_reads_state_files_for_the_summary():
-    summary = section("`/coordinate attended`")
-    assert all(w in summary for w in ("gh ", "git log", "orca orchestration inbox", "orca worktree"))
+    summary = section("Requests")
+    assert all(w in summary for w in ("gh ", "git log", "orca orchestration worker-list"))
     assert not re.search(r"AITK_STATE_DIR|holder\.|/replies|\.ai-toolkit/coordinator|state file", summary)
 
 
@@ -85,8 +83,8 @@ def test_the_architecture_doc_describes_both_modes_the_switch_and_the_attended_f
 
 
 def test_between_stop_and_its_exit_the_session_handles_nothing():
-    attended = section("`/coordinate attended`")
-    assert re.search(r"must not (check|handle)", attended) and re.search(r"exits? 0", attended)
+    attended = section("Switching")
+    assert re.search(r"Never start the other loop", attended) and re.search(r"exits? 0", attended)
 
 
 def test_hub_lands_with_the_review():

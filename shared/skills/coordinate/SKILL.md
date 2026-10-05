@@ -1,130 +1,75 @@
 ---
 name: coordinate
-description: "Be the Orca coordinator from this Claude session while the user is attended: hold the Run, handle each pushed orchestration message (discuss a worker's PLAN gate with the user then reply, land finished work, explain failures), dispatch on request, and hand the Run to an unattended coordinator.sh loop and back with an explicit switch. Use on the main checkout for '/coordinate', '/coordinate auto [--until HH:MM] [--drain]', '/coordinate attended', or when a line 'You have N orchestration messages' arrives."
-argument-hint: "[auto [--until HH:MM] [--drain] | attended | status]"
+description: "Run the Orca coordinator from this Claude session, in one of two modes: 'attended' (the coordinator.sh loop does the routine work out of sight and queues every real decision for the user, this session presents them one at a time and rings no routine event) or 'auto' (the loop answers everything itself, for when the user is away). Use on the main checkout for '/coordinate', '/coordinate attended', '/coordinate auto [--until HH:MM] [--drain]', or when the user asks what needs them."
+argument-hint: "[attended | auto [--until HH:MM] [--drain] | status]"
 ---
 # Coordinate
 
-One Run, one holder at a time (Orca fences the other). **Attended**: this session holds the Run; Orca pushes `You have N orchestration message(s). Run orca orchestration check --run <run>` into it. **Auto**: `coordinator.sh --answer auto` holds it (answers gates itself, lands, labels `blocked`). The switch is always an explicit user instruction, never inferred from presence.
-The session converses, decides and calls the scripts in `.ai-toolkit/scripts/` (`dispatch.sh`, `land.sh`, `review.sh`, `answer.sh`, `coordinator.sh`); it never writes task code (see `.ai-toolkit/rules/planning-hub.md`) and keeps no state: ids live in the conversation.
+One Run, and the loop (`coordinator.sh`, in its own Orca terminal) always holds it and does the routine work: dispatch to the cap, land, retry, block, route leftovers. Two modes, switched only on the user's explicit word, never inferred:
+
+- **attended**: the loop answers only what is routine (approves a routine plan, allows a permission request contained in the worker's worktree or scratchpad; `afk-answering`) and **queues everything else for the user**: a plan it handed over, a permission request that is not contained, a blocked issue. This session only presents that queue.
+- **auto**: the loop answers every plan itself, denies every permission request and labels `blocked`; the user decides when back.
+
+This session never binds the Run, `check`s or reads the inbox, never writes task code (`.ai-toolkit/rules/planning-hub.md`), keeps no state: ids live in the conversation. Scripts are in `.ai-toolkit/scripts/` (`coordinator.sh`, `dispatch.sh`, `land.sh`).
 
 ## Preconditions
 
-Main checkout on the base branch, inside an Orca terminal (`$ORCA_TERMINAL_HANDLE`), `orca status` ready, `gh auth status` green.
+Main checkout on the base branch, inside an Orca terminal, `orca status` ready, `gh auth status` green.
 
-## Bind
-
-```bash
-H=$ORCA_TERMINAL_HANDLE
-orca orchestration run-current --from $H --json                 # already holding one? after a context reset start here
-orca orchestration run-use --id <run> --from $H --json          # take an existing Run (the previous holder is fenced)
-orca orchestration run-create --objective "<goal>" --from $H --json   # or a new one
-```
-
-Find the id with `orca orchestration run-list --json` or `coordinator.sh --status --run <run>` (names the holder); say it back to the user.
-
-## On each message
-
-Triggered by the pushed `You have N orchestration message(s)` line (or the user asking you to check):
+## Start
 
 ```bash
-orca orchestration check --run <run> --terminal $H --json                       # one whole batch + its deliveryId
-orca orchestration check --run <run> --terminal $H --ack <deliveryId> --json    # ALWAYS, after handling the whole batch
-```
-
-The ack call may return the next batch: handle it the same way. A batch of only `heartbeat` or `status` messages: ack and say nothing.
-The issue of a message: its `dispatchId` (payload) in `orca orchestration worker-list --run <run> --json` gives `.resource.worktreeId`
-(path after `::`), whose `.linkedIssue` is in `orca worktree list --json`. After a hand-over the Run replays the batch the loop did not
-ack. Ack-and-ignore a `worker_done` whose issue is already closed (`gh issue view <n> --json state`) and a question already answered (in
-`orca orchestration inbox --full --json` a message of this Run whose `thread_id` is the question's id). A `worker_done` whose issue is still
-OPEN while `coordinator.sh --status` says `coordinator.sh` holds the Run means a land is in flight: wait, never land it yourself.
-
-**`question`** (a worker's PLAN gate): show the issue (`gh issue view <n>`, its `Scope:`/`Gate:` footer), the plan, and what bears on it
-(the files it touches, the acceptance criteria, conflicts with other live issues). Say what you would answer and why, then discuss. Never approve blindly: no reply before the user decided, unless they said in this conversation to approve a class of plans. Turn their answer, whatever its wording, into exactly ONE of three replies (which one: `afk-answering.md`, Choosing the reply), then comment `Gate answered by the user: <body>` on the issue:
-
-```bash
-orca orchestration reply --run <run> --from $H --id <message-id> --body "approve"
-orca orchestration reply --run <run> --from $H --id <message-id> --body "approve with: <the change, one sentence>"
-orca orchestration reply --run <run> --from $H --id <message-id> --body "revise: <the change, one paragraph>"
-```
-
-**`question` starting `PERMISSION REQUEST`** (not a plan gate: a worker's permission prompt, relayed by its `permission-relay` hook; it waits at most 9 minutes and then denies itself, so ignore a stale one): show the user the issue, the tool, the full command or change, the cwd and the `reason`. Never reply `allow` or `deny` without the user's decision in this conversation (a standing "allow this class" counts only if they said it), and say what you would answer and why. Reply with exactly that one word, then comment `Permission answered by the user: <body> (tool: <tool>)` on the issue: the tool and the answer only, never the command or content.
-
-```bash
-orca orchestration reply --run <run> --from $H --id <message-id> --body "allow"
-orca orchestration reply --run <run> --from $H --id <message-id> --body "deny"
-```
-
-**`worker_done` succeeded**: run `.ai-toolkit/scripts/land.sh --review <n>` (independent review, CI on the exact tip, fast-forward, close,
-release, remove the worktree; it takes minutes) and report by exit code. 0 landed (say the sha). 2 refused (a precondition: say which).
-3 review rejected, 4 gate red or timed out, 5 merge conflict: show the `BLOCKER:` lines or the last line, and **offer** the re-dispatch
-the loop would do: `RUN=<run> .ai-toolkit/scripts/dispatch.sh --address "address: <blockers or why>" <n>` (a fresh terminal and Task; at
-most 2 rounds for a rejected review, 1 for red CI or a conflict; after that propose `blocked`). 6 landed but cleanup incomplete: run
-`.ai-toolkit/scripts/land.sh --cleanup-only <n>`, never land again. After 0 or 6, route the leftovers without asking (`bug-triage.md`): a defect among land.sh's `WARNING:` lines to the
-`bug-scoper` agent, any other warning and each `DEFERRED:` line of `worker_done` to `followup-scoper`, only what meets the bar in `bug-triage.md`; say file it, not draft;
-no follow-up issue by hand. Report one line each: filed #n, dropped (with the reason), or on `hold` awaiting the user's go.
-
-**`worker_done` failed / `escalation`**: read the body and the kept worktree (`orca worktree show --worktree issue:<n>`), explain what
-happened in two sentences, then propose either `blocked` or one retry with `dispatch.sh --address "<what to do differently>" <n>`.
-`blocked` = label, comment, free the slot, keep the worktree for the human:
-
-```bash
-gh issue edit <n> --add-label blocked --remove-label status:in-progress && gh issue comment <n> -b "blocked: <why>"
-orca orchestration worker-release --dispatch <dispatch-id> --json
-```
-
-**A worker that says nothing**: an agent idle after an error (API outage) sends no message, so check each live worker on every status or switch and whenever the Run is quiet. Silent past 15 minutes (`COORD_IDLE_MIN`, no terminal output or heartbeat, no open question): `orca orchestration worker-show --dispatch <dispatch-id> --json` (`terminal.lastOutputAt`; `observation.agentWait` set = a prompt only the user can answer: tell them) then `orca terminal read --terminal <handle>`. If idle, propose once: `worker-release`, then `dispatch.sh --address "your agent went idle after an error: continue from the pushed branch, push, send worker_done" <n>`; idle again: `blocked`.
-
-## On request
-
-- **Dispatch**: `RUN=<run> .ai-toolkit/scripts/dispatch.sh --next --dry-run` prints the next ready issue (exit 3 = nothing ready); confirm it with the user, then
-  `RUN=<run> .ai-toolkit/scripts/dispatch.sh <n>`. Repeat until exit 3 or `orca orchestration worker-list --run <run> --terminal-state active --json` shows `CONCURRENCY_CAP` live workers (3).
-- **Status**: `.ai-toolkit/scripts/coordinator.sh --status --run <run>` (who holds the Run, live workers, unanswered questions), plus
-  `orca worktree ps --json` and `gh issue list --state open --json number,title,labels`. One table: `#n title · state · next step`.
-
-## The switch
-
-Only on the user's explicit word. While the loop holds the Run, do not `check`, `reply` or `dispatch` as consumer: Orca fences or refuses.
-
-### `/coordinate auto [--until HH:MM] [--drain]`
-
-First settle the session's business: handle and ack the current batch, and tell the user that from now on gates are answered by
-`answer.sh` under the `afk-answering` rule, not by them (a gate they want to discuss must be answered first). Then:
-
-```bash
-date -u +%FT%TZ        # the switch time: say it in your reply, it anchors the summary of what happened while away
+# attended: the loop rings its bell on THIS session's terminal (Orca stays silent while the user is looking at it)
+TTY=/dev/$(ps -o tty= -p $PPID | tr -d ' ')    # the agent has no /dev/tty: ask ps
+orca terminal create --worktree path:$PWD --title coordinator \
+  --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended --bell-tty $TTY [--cap N]"
+# auto
+date -u +%FT%TZ        # the switch time: say it, it anchors the summary of what happened while away
 orca terminal create --worktree path:$PWD --title coordinator \
   --command "bash .ai-toolkit/scripts/coordinator.sh --run <run> --answer auto [--until HH:MM] [--drain] [--cap N]"
 ```
 
-The new terminal takes the Run over (`run-use`; without `--run` it creates one) and this session is fenced: stop consuming. Check with `coordinator.sh --status --run <run>`
-(`held by: coordinator.sh (auto ...)`); if it never shows, read the terminal (`orca terminal read --terminal <handle>`) and rebind with `run-use`.
-`--until` makes the loop exit at that time (live workers keep running; their messages wait in the Run); `--drain` exits when nothing is
-ready and no worker is live.
+Without `--run` the loop creates a Run: find it with `orca orchestration run-list --json`, say it back. It takes the Run over (`run-use`), so no other terminal consumes: check with `coordinator.sh --status --run <run>`
+(`held by: coordinator.sh (attended ...)`); if it never shows, read the terminal (`orca terminal read --terminal <handle>`). `--until` stops the loop at that time (live workers keep running, their messages wait), `--drain` when nothing is ready and no worker is live.
+Before switching to auto tell the user that gates are then answered by `answer.sh` under `afk-answering`, not by them.
 
-### `/coordinate attended`
+## The queue (attended)
+
+When the user arrives, or asks what needs them, `coordinator.sh --status --run <run>` is the queue in the order to present it: open questions oldest first, then blocked issues, then dispatch requests. Present **one decision at a time**, stop for the answer, relay it,
+then the next; when it is empty, say so. Never show a heartbeat, a land, an allow the loop gave, a retry or any other routine event; report what landed only when asked (below). Each item: the issue (`gh issue view <n>`, its `Scope:`/`Gate:` footer), what the
+loop shows, what bears on it (the files, the acceptance criteria, conflicts with other live issues), and **one recommendation with its reason**, not a menu. The user's answer is relayed with `--reply`, which queues it for the loop's next wake (the loop sends it and comments the issue):
+
+```bash
+.ai-toolkit/scripts/coordinator.sh --run <run> --reply <message-id> approve
+.ai-toolkit/scripts/coordinator.sh --run <run> --reply <message-id> 'approve with: <the change, one sentence>'
+.ai-toolkit/scripts/coordinator.sh --run <run> --reply <message-id> 'revise: <the change, one paragraph>'
+```
+
+- **A plan the answerer handed over** (the issue comment says `human: <reason>`): show the plan and that reason, then say what you would answer. Never approve blindly: no reply before the user decided, unless they said in this conversation to approve a class of plans.
+  Turn their answer, whatever its wording, into exactly ONE of the three replies (which one: `afk-answering`, Choosing the reply). An answer that changes what the issue asks goes into the issue body (or a comment) first: the issue is the contract.
+- **`PERMISSION REQUEST`** (not a plan gate: a worker's permission prompt; it waits at most 9 minutes and then its relay denies itself, so ignore a stale one): show the tool, the whole command, the cwd and the `reason`; reply `--reply <id> allow` or `deny` only on the user's decision
+  in this conversation (a standing "allow this class" counts only if they said it). The issue comment names the tool and the answer only, never the command.
+- **A blocked issue** (`blocked: <why>`, worktree kept: `orca worktree show --worktree issue:<n>`): explain in two sentences, then propose one of: guidance for another try (`--dispatch <n> '<message>'`), `hold` (parked on purpose, leaves the queue), or close it.
+
+## Requests
+
+The loop holds the Run, so this session neither dispatches nor lands itself: it asks the loop.
+
+- **What is running / status**: `coordinator.sh --status --run <run>` (holder, live workers and how long each is silent, the queue, dispatch requests with their reason), plus `gh issue list --state open --json number,title,labels`.
+  A worker silent past 15 minutes (`COORD_IDLE_MIN`, no output or heartbeat, no open question) is relaunched once, then blocked by the loop; `observation.agentWait` in `orca orchestration worker-show --dispatch <id>` set means a prompt only the user can answer: tell them.
+- **Dispatch this issue**: `coordinator.sh --run <run> --dispatch <n> ['<message>']` queues it; the loop starts it at its next wake ahead of its own pick (`--address` with the message, a re-dispatch of a blocked issue first loses its label), within the cap
+  (`CONCURRENCY_CAP`, 3) and the Scope rule; a request that cannot start yet stays in `--status` with its reason. Free slots are otherwise filled with the next ready issue by the loop.
+- **Land this**: the loop lands each finished worker itself (`land.sh --review`: independent review, CI on the exact tip, fast-forward, close). One that cannot be landed (rejected review after 2 rounds, red CI, a conflict) arrives as a blocked item.
+- **What landed**: from Orca, git and GitHub only, never from files the loop keeps: `git fetch` then `git log --since=<switch time> --oneline origin/<base>`; `gh issue list --state closed --search "closed:>=<date>"`;
+  `gh issue list --label blocked --state open --json number,title`; `orca orchestration worker-list --run <run> --terminal-state active --json`.
+
+## Switching
+
+Only on the user's explicit word. Stop the running loop, then start the other one (see Start):
 
 ```bash
 .ai-toolkit/scripts/coordinator.sh --stop --run <run>
 ```
 
-This terminal takes the Run back (Orca fences the loop, which exits 0 with "taken back by") and the command waits until the loop is gone;
-exit 1 = still finishing a step (a land): run it again until it exits 0. Until then you must not check, handle or land anything: the loop
-may be mid-land and a second land would race it. Once `--stop` exits 0, `check` the Run (it replays what the loop left unacked) and summarize
-what happened while away **from Orca, git and GitHub only** (never from files the loop keeps), since the switch time:
-
-- Landed: `git fetch` then `git log --since=<switch time> --oneline origin/<base>`; `gh issue list --state closed --search "closed:>=<date>"`.
-- Blocked: `gh issue list --label blocked --state open --json number,title` with each last `blocked:` comment; kept worktrees in `orca worktree ps --json`.
-- Pending questions: `orca orchestration inbox --full --json` (this Run, a `question` with no reply in its thread).
-- Still running: `orca orchestration worker-list --run <run> --terminal-state active --json`.
-
-Present blocked issues and pending questions first, then lands, then running work, each with what you propose next.
-
-## Rules of thumb
-
-- A bare `orca orchestration reply` only works from the bound terminal: when the loop holds the Run, a human answers with
-  `coordinator.sh --run <run> --reply <message-id> approve` (`allow` or `deny` for a permission question); the loop sends it at its next wake.
-- Surface what the user must decide (gates, blocked issues, rejected reviews) before what runs fine; one recommendation, not a menu.
-- **Bell**: end a turn in which the user must act (a PLAN gate or permission request no standing rule answers, a blocked issue, a rejected review needing a decision,
-  any question you ask) by ringing the terminal bell: `printf '\a' > "/dev/$(ps -o tty= -p $PPID | tr -d ' ')"` (the agent has no `/dev/tty`). Never ring for a turn that
-  only reports (heartbeat acked, land done, approval under a standing rule). The user sets Orca once: notifications "agent task complete" off, "terminal bell" on.
+This terminal takes the Run (Orca fences the loop, which exits 0 with "taken back by") and the command waits until the loop is gone; exit 1 = still finishing a step (a land): run it again until it exits 0. Never start the other loop before it does: the first may be mid-land and a second land would race it.
+Nothing is lost: state lives in Orca, git and the issue labels, live workers keep running, and the new loop replays what the old one left unacked. Going back to attended after auto, summarize from "What landed" since the switch time, blocked issues first.
