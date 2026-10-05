@@ -48,6 +48,13 @@ fix will touch, derived from reading the code — never a prose guess.
 
 Both are plain `Key: value` body lines at the foot of the issue.
 
+## Phase 1b: Worth an issue?
+
+Once the evidence holds, apply the bar in the `bug-triage` rule ("Worth filing?") before
+anything else: has it happened or will it, how often, what one occurrence costs against
+the fix. If the fix does not save time, **file nothing**: report `action: dropped (not
+worth an issue)` with a one-line reason and the evidence you checked.
+
 ## Phase 2: Dedup before filing
 
 An issue you duplicate is worse than one you never filed. **Search open issues
@@ -122,7 +129,7 @@ prose parses to no status and scores nothing). Put the human-readable summary in
 ```json
 {
   "status": "completed",
-  "action": "filed | drafted | deduped",
+  "action": "filed | drafted | deduped | dropped (not worth an issue)",
   "issue": "<URL, or #N when deduped, else null>",
   "scope": "<the Scope: paths you derived>",
   "gate": "plan",
@@ -132,7 +139,7 @@ prose parses to no status and scores nothing). Put the human-readable summary in
 
 - **`status`** is the one machine-read field. Use `"completed"` — a recognized success
   status — whenever you terminated normally: an issue **filed**, **drafted** for
-  approval, or **deduped** into an existing one are all "the agent did its job". Only if
+  approval, **deduped** into an existing one, or **dropped (not worth an issue)** are all "the agent did its job". Only if
   you genuinely could not investigate (the defect was unreproducible or you could not
   reach the code to derive a scope) return `"status": "blocked"` (a non-success status)
   and say why in `summary`. Keep the whole object under ~20k characters.
@@ -146,6 +153,7 @@ prose parses to no status and scores nothing). Put the human-readable summary in
 - [ ] Defect located by reading the code, not guessed
 - [ ] `Scope:` is real file paths + their tests, as a footer line (not a header)
 - [ ] `Gate: plan` (`none` only when the user asked for the light lane on this issue)
+- [ ] Worth-it bar applied; a finding that saves no time is dropped with a one-line reason, not filed
 - [ ] Open issues searched; no duplicate filed (deduped into an existing one if overlapping)
 - [ ] Body has Why / What (numbered) / Acceptance in house style
 - [ ] Labels applied (`bug` always; `priority`/`hold` per heuristic)

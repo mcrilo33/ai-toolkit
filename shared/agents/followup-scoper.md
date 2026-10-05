@@ -86,6 +86,13 @@ reading the code — never a prose guess.
 
 Both are plain `Key: value` body lines at the foot of the issue.
 
+## Phase 3b: Worth an issue?
+
+Apply the bar in the `bug-triage` rule ("Worth filing?") to the investigated follow-up: does
+it really improve productivity, at a cost lower than its gain. A tidy-up or a change that
+adds complexity is **not filed**: report `action: dropped (not worth an issue)` with a
+one-line reason and the evidence you checked.
+
 ## Phase 4: Dedup before filing
 
 An issue you duplicate is worse than one you never filed. **Search open issues first:**
@@ -159,7 +166,7 @@ free prose parses to no status and scores nothing). Put the human-readable summa
 ```json
 {
   "status": "completed",
-  "action": "filed | drafted | deduped | deferred-to-parent | dropped",
+  "action": "filed | drafted | deduped | deferred-to-parent | dropped | dropped (not worth an issue)",
   "issue": "<URL, or #N when deduped / deferred-to-parent, else null>",
   "scope": "<the Scope: paths you derived, or null when dropped>",
   "gate": "plan | null",
@@ -169,8 +176,8 @@ free prose parses to no status and scores nothing). Put the human-readable summa
 
 - **`status`** is the one machine-read field. Use `"completed"` — a recognized success
   status — whenever you terminated normally: an issue **filed**, **drafted** for approval,
-  **deduped** into an existing one, **deferred-to-parent**, or a speculative idea
-  correctly **dropped** are all "the agent did its job". Only if you genuinely could not
+  **deduped** into an existing one, **deferred-to-parent**, a speculative idea
+  correctly **dropped**, or one **dropped (not worth an issue)** are all "the agent did its job". Only if you genuinely could not
   file a grounded follow-up (no GitHub MCP and `gh` fails, or you could not reach the code to derive a
   scope) return `"status": "blocked"` (a non-success status) and preserve the follow-up
   text in `summary`. Keep the whole object under ~20k characters.
@@ -185,6 +192,7 @@ free prose parses to no status and scores nothing). Put the human-readable summa
 - [ ] Work located by reading the code, not guessed
 - [ ] `Scope:` is real file paths + their tests, as a footer line (not a header)
 - [ ] `Gate: plan` (`none` only when the user asked for the light lane on this issue)
+- [ ] Worth-it bar applied; a tidy-up or no-productivity-gain follow-up is dropped with a one-line reason
 - [ ] Open issues searched; no duplicate filed (deduped into an existing one if overlapping)
 - [ ] Body has Why / What (numbered) / Acceptance in house style
 - [ ] Labels applied (`enhancement` and `hold` always)

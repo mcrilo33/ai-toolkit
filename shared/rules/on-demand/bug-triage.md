@@ -1,20 +1,50 @@
 ---
-description: "When you discover a confirmed defect during any work, file it via the bug-scoper agent immediately without asking — the agent verifies evidence against the code and dedups, so filing-by-default is safe. Auto-file confirmed bugs; only surface genuine is-this-intended-design uncertainty. ai-toolkit tooling defects go to UPSTREAM_REPO (when set) even from a downstream project, never the host repo. Surfaced on demand, not auto-applied to every session."
+description: "When you discover a confirmed defect during any work, decide from evidence whether fixing it saves time; if so, file it via the bug-scoper agent immediately without asking — the agent verifies evidence against the code and dedups. A rare, theoretical or cosmetic finding is dropped with a one-line reason, not filed. Only surface genuine is-this-intended-design uncertainty. ai-toolkit tooling defects go to UPSTREAM_REPO (when set) even from a downstream project, never the host repo. Surfaced on demand, not auto-applied to every session."
 ---
 # Bug Triage
 
 When you discover a **confirmed defect** during any work — implementing, reviewing,
-smoke-testing, answering a question — file it via the **`bug-scoper` agent
-immediately, without asking permission**. "Want me to file that?" for a real bug is
+smoke-testing, answering a question — and it is worth filing (see "Worth filing?"),
+file it via the **`bug-scoper` agent immediately, without asking permission**. "Want me to file that?" for a real bug is
 the anti-pattern: the answer is always yes, and the question just loses the finding
 to the transcript.
 
 This binds every agent, not just the hub: a spoke that trips over an unrelated bug
 mid-cycle files it and keeps going, rather than burying it in its own run.
 
+"Without asking" applies only to a finding that is worth filing (next section): the
+human is never asked, and a finding that is not worth an issue is dropped, not filed.
+
+## Worth filing?
+
+A real finding is not enough: every filed issue costs a worker cycle, a review and a
+land, and its review produces more findings. Before filing, answer from evidence, not
+from imagination:
+
+1. Has it happened, or how would it happen in normal use?
+2. How often?
+3. What does one occurrence cost, against the cost of the fix (a worker cycle, a
+   review, a land, more code)?
+
+File only if the fix saves time: a bug that has happened or will often enough to cost
+more than its fix, an enhancement that really improves productivity. **Dropped by
+default:**
+
+- a failure that needs a worker acting against its coordinator;
+- two independent failures coinciding, or a race needing a commit in the instant
+  between a check and a merge;
+- a cosmetic or wording nit;
+- a test tidy-up;
+- a refactor with no behaviour change;
+- a hardening against something never observed.
+
+Dropping is not silent: report the finding in one line with the reason ("dropped:
+rare", "dropped: no time saved") in `worker_done` or the land report, and file
+nothing. A dropped finding that later happens is filed then.
+
 ## Confirmed defect vs open question
 
-The rule is *file confirmed bugs without asking* — **not** *auto-file every
+The rule is *file worthwhile confirmed bugs without asking* — **not** *auto-file every
 observation*. Draw the line by what you can prove:
 
 - **Confirmed defect** — you can point at the code and the wrong behavior (a repro, a
@@ -29,9 +59,10 @@ intent is genuinely ambiguous.
 
 ## Why routing through the agent is safe
 
-`bug-scoper` is self-protecting, which is what makes "file by default" the right
-default rather than a noise risk:
+`bug-scoper` is self-protecting, which keeps filing a worthwhile finding from being a
+noise risk:
 
+- It applies the "Worth filing?" bar and **drops** what does not meet it.
 - It **verifies the evidence against the code** before filing, so a claim that
   doesn't hold up is dropped, not filed.
 - It **dedups against open issues**, so a rediscovery becomes a comment, not a
@@ -58,9 +89,9 @@ The `bug-scoper` agent reads `UPSTREAM_REPO` and classifies host-vs-tooling by p
 defaulting to the current project's git remote or naming a bare literal (see its Phase 5). A fork or
 rename reroutes tooling defects by changing `UPSTREAM_REPO`, not agent prose.
 
-## Deferred follow-ups: file them, don't lose them
+## Deferred follow-ups: file the worthwhile ones, don't lose them
 
-A **grounded, deliberately-deferred follow-up** — an optimization, cleanup, or hardening
+A **grounded, deliberately-deferred follow-up that meets the bar in "Worth filing?"** — an optimization, cleanup, or hardening
 you consciously chose to leave out of the current issue, backed by evidence (a `file:line`,
 a profile number, a measured cost) and a concrete fix direction — is filed via the
 **`followup-scoper` agent immediately, without asking**, exactly as a confirmed bug is
@@ -73,6 +104,12 @@ follow-up is grounded (a vague "would be nice" is **dropped, not filed**), dedup
 open issues, derives the real `Scope:`/`Gate:` footer, applies the `enhancement` label,
 and routes tooling follow-ups upstream. A follow-up that is really the parent issue's own
 deferred scope is surfaced as a comment / `UPGRADE` marker, **not** a new issue.
+
+A worker that defers an item it does not file itself puts it in `worker_done` on its own
+line, `DEFERRED: <item>`, one item per line. After the land only those lines are routed;
+an unmarked mention is not routed, and an item already filed is never marked. A worker
+marks `DEFERRED:` only what meets the bar in "Worth filing?"; the rest is a one-line
+"dropped: <reason>".
 
 **Best-effort, fail loud (AFK principles #2, #6):** dispatching `followup-scoper` must
 **never fail the caller's cycle** — it rides alongside the work. But a follow-up it cannot
