@@ -730,5 +730,5 @@ def test_pre_commit_allows_the_first_commit_of_a_repo(tmp_path):
 
 def test_hook_line_budgets():
     n = lambda *g: sum(len(f.read_text().splitlines()) for q in g for f in HOOKS.glob(q))  # noqa: E731
-    assert n("claude/*.sh") <=      235 and n("git/*") <= 40
+    assert n("claude/*.sh") <=      247 and n("git/*") <= 40   # 235 + 12 for judge.sh contained mode (#450): the attended loop reuses the judge and its fences instead of a second copy
     assert len((V2 / "settings/claude/settings.json").read_text().splitlines()) <= 40
