@@ -76,7 +76,7 @@ def test_seed_for_a_plan_gate_asks_before_coding_and_never_touches_the_base(d):
     for part in (".ai-toolkit/task.md", "approve,revise", "do not edit code before approve", "RED", "git push -u origin HEAD",
                  "worker_done --outcome succeeded", "Never merge or push the base branch", "in-spoke code-review",
                  "approve with: <change>", "do NOT ask again", "revise: <change>, amend the plan and ask again",
-                 ".ai-toolkit/rules/bug-triage.md"):
+                 ".ai-toolkit/rules/bug-triage.md", "DEFERRED: <item>"):
         assert part in seed, part
 
 
@@ -89,7 +89,7 @@ def test_gate_none_and_model_footer_override_the_defaults(d):
     seed = ws[ws.index("--spec") + 1]
     assert "approve,revise" not in seed and "approve with" not in seed and "code-review" not in seed  # light lane: no PLAN gate, no in-worker review
     assert "RED" in seed and "git push -u origin HEAD" in seed and "worker_done" in seed
-    assert ".ai-toolkit/rules/bug-triage.md" in seed  # both lanes route discovered bugs and follow-ups to the scopers
+    assert ".ai-toolkit/rules/bug-triage.md" in seed and "DEFERRED: <item>" in seed  # both lanes route discovered bugs and follow-ups to the scopers, and mark what stays unfiled
 
 
 def test_missing_gate_footer_falls_back_to_the_env_default(d):
