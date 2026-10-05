@@ -32,6 +32,13 @@ orca.yaml                  Orca hooks of THIS repo (setup/archive); a synced tar
 
 ## Lifecycle of one issue
 
+**Orchestration facts come from Orca** (the principle: Project Goal in `shared/rules/guidelines.md`). The coordinator sets the issue link at dispatch
+(`worktree set --issue`), names the branch and worktree (`<n>-<slug>`), opens the Run and the dispatch, and answers the gates (`orchestration reply`).
+`answer.sh`, `review.sh`, `land.sh` and the loop read the issue link, branch, worktree path, Run, dispatch id and gate replies back from Orca, never from
+`task.md`, a branch name, an environment variable or a worker's message; when Orca does not answer they wait or hand the question to the human.
+A script that still reads a worker-controlled source, or a worker that can still rewrite these facts through its own `orca` CLI, is an open bug, not design
+(#415, #418, and the issues filed by the #417 audit).
+
 1. **Issue.** `gh issue create` with a footer: `Scope: <paths>` (disjointness is the parallelism contract), `Gate: plan` (default, the full cycle) or `none` (the light lane: no PLAN gate, no in-worker review; only the user sets it), optional
    `Model: <id> [effort]`; labels `priority`, `hold`, `blocked`. Blocked-by relations are GitHub's own.
 2. **Pick.** `dispatch.sh --next`: open, not `hold`/`blocked`, all blockers closed, not already linked to a worktree of this repo, `Scope`
