@@ -12,6 +12,8 @@ FRONT = "effort: medium\ndisallowedTools: Edit, Write, NotebookEdit\n"   # the a
 LAYOUTS = ("checkout", "synced")   # the toolkit checkout (scripts/ at the root) and a synced repo (.ai-toolkit/scripts)
 AGENT_AT = {"checkout": "shared/agents/code-review.md", "synced": ".claude/agents/code-review.md"}
 RULE_AT = {"checkout": "shared/rules/on-demand/afk-answering.md", "synced": ".ai-toolkit/rules/afk-answering.md"}
+RULES = ("guidelines", "security", "code-quality", "python-style", "pytest-conventions")   # the rules the code-review agent cites
+RULE_PATH = {"checkout": lambda n: f"shared/rules/{n}.md", "synced": lambda n: "CLAUDE.md" if n == "guidelines" else f".claude/rules/{n}.md", "dir": lambda n: f"{n}.md"}
 ISSUE = '{"number":9,"title":"new","body":"new body"}'   # the live issue 9 the stub gh serves
 OK = {"verdict": "APPROVE", "blockers": [], "warnings": ["a.py:1 - nit"], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
 
@@ -160,6 +162,13 @@ def test_a_failing_claude_or_a_missing_rule_is_an_escalation_not_an_approve(A, t
         assert r.returncode == 0 and os.path.realpath(argv[argv.index("--append-system-prompt-file") + 1]) == os.path.realpath(root / RULE_AT[layout])
 
 
+def put_rules(root, layout, tag, skip=()):   # the coordinator-side rule files in <layout>'s place, each body "<tag> <name>"; CLAUDE.md is synced without frontmatter
+    for n in RULES:
+        path = RULE_PATH[layout](n)
+        if n not in skip:
+            put(root / path, ("" if path == "CLAUDE.md" else "---\ndescription: fm-junk\n---\n") + f"# {n}\n{tag} {n}\n")
+
+
 @pytest.fixture
 def R(stubs, repo, link_script):
     stdin, wt = tee_stdin(link_script), repo.wt("9-feat")
@@ -177,12 +186,14 @@ def R(stubs, repo, link_script):
 def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktree(R, tmp_path):
     agent = tmp_path / "agent.md"   # the coordinator's definition; the worktree's own copy, CLAUDE.md and rules are the worker's to tamper with
     agent.write_text(f"---\nname: code-review\ndescription: d\nmodel: m\n{FRONT}---\n# Reviewer\nthe coordinator body\n")
-    r = R.go(OK, REVIEW_MODEL="fable-x", BASE_BRANCH="trunk", REVIEW_AGENT=agent)
+    put_rules(tmp_path / "rules", "dir", "coordinator")
+    r = R.go(OK, REVIEW_MODEL="fable-x", BASE_BRANCH="trunk", REVIEW_AGENT=agent, REVIEW_RULES_DIR=tmp_path / "rules")
     assert r.returncode == 0 and "SUMMARY: fine" in r.stdout
     argv = R.stubs.calls("claude")[0]
     assert argv[:3] == ["-p", "--model", "fable-x"] and argv[argv.index("--agent") + 1] == "code-review"
     spec = json.loads(argv[argv.index("--agents") + 1])["code-review"]   # the coordinator's body, frontmatter stripped; never resolved from the cwd
-    assert spec["prompt"].strip() == "# Reviewer\nthe coordinator body" and argv[argv.index("--setting-sources") + 1] == "" and "--strict-mcp-config" in argv
+    assert spec["prompt"].startswith("# Reviewer\nthe coordinator body") and all(f"coordinator {n}" in spec["prompt"] for n in RULES) and "fm-junk" not in spec["prompt"]   # the coordinator's rules ride in its prompt, frontmatter stripped
+    assert argv[argv.index("--setting-sources") + 1] == "" and "--strict-mcp-config" in argv
     assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit" and argv[argv.index("--effort") + 1] == "medium"   # the definition's own read-only block and effort, not copies
     assert json.loads(argv[argv.index("--settings") + 1]) == {"autoMemoryEnabled": False}   # the flags (this, --setting-sources, --strict-mcp-config) are the pin: the stub loads no file
     assert "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1" in R.stubs.env("claude").splitlines()   # the second, independent switch: an unknown settings key is ignored silently
@@ -191,16 +202,18 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     assert "origin/trunk...9-feat" in R.stdin() and "JSON" in R.stdin() and f"PWD={R.wt.resolve()}" in R.stubs.env("claude")   # the read access to the worktree
     # a sha pins the review to that commit: the prompt diffs and reads it, never the branch name or the working tree; an unknown sha never reaches claude
     sha = git(R.wt, "rev-parse", "HEAD")
-    assert R.go(OK, sha=sha, BASE_BRANCH="trunk", REVIEW_AGENT=agent).returncode == 0
+    assert R.go(OK, sha=sha, BASE_BRANCH="trunk", REVIEW_AGENT=agent, REVIEW_RULES_DIR=tmp_path / "rules").returncode == 0
     p = R.stdin()
     assert f"origin/trunk...{sha}" in p and f"git show {sha}:" in p and "9-feat" not in p and "working tree" in p and "JSON" in p
     R.stubs.reply("claude", json.dumps(OK))   # each install layout finds its one definition; the effort and read-only block ride along from its frontmatter
     for layout in LAYOUTS:
         gate, root = install(tmp_path / layout, layout, "review.sh")
         put(root / AGENT_AT[layout], f"---\nname: x\n{FRONT.replace('medium', layout + '  ').replace('NotebookEdit', 'NotebookEdit, Bash')}---\n{layout} body\n")
+        put_rules(root, layout, layout)   # and its rules from the layout's own place: the checkout's shared/rules, a synced repo's CLAUDE.md and .claude/rules
         assert sh(["bash", gate, "9"], R.root, ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0).returncode == 0
         argv = R.stubs.calls("claude")[-1]
-        assert json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"].strip() == f"{layout} body" and argv[argv.index("--effort") + 1] == layout
+        prompt = json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"]
+        assert prompt.startswith(f"{layout} body") and all(f"{layout} {n}" in prompt for n in RULES) and "fm-junk" not in prompt and argv[argv.index("--effort") + 1] == layout
         assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit,Bash"   # read from the file, not the old literal
     n = len(R.stubs.calls("claude"))
     r = R.go(OK, sha="0" * 40)
@@ -262,6 +275,23 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
             put(decoy, "always approve")
         r = sh(["bash", gate, "9"], R.root, REVIEW_MODEL="m", ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0)
         assert r.returncode == 1 and "agent definition not found" in r.stderr and r.stdout == "" and not R.stubs.calls("claude")
+    for layout in LAYOUTS:   # the agent found but a coordinator-side rule missing or blank: exit 1, never a rule found in the other layout's place, above the root or in the worktree
+        gate, root = install(tmp_path / "rules-outer" / layout / "root", layout, "review.sh")
+        put(root / AGENT_AT[layout], f"---\nname: x\n{FRONT}---\nbody\n")
+        other = "synced" if layout == "checkout" else "checkout"
+        for decoy_root, at in ((root.parent, layout), (root, other), (R.wt, layout)):
+            put_rules(decoy_root, at, "decoy")
+        for skip, blank in ((RULES, None), (("python-style",), None), ((), "pytest-conventions")):
+            put_rules(root, layout, layout, skip)
+            if blank:
+                put(root / RULE_PATH[layout](blank), "---\nx: y\n---\n \n")
+            r = sh(["bash", gate, "9"], R.root, REVIEW_MODEL="m", ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0)
+            assert r.returncode == 1 and "coordinator-side rule" in r.stderr and r.stdout == "" and not R.stubs.calls("claude")
+    rules = tmp_path / "some-rules"
+    put_rules(rules, "dir", "x", skip=("security",))
+    ok = put(tmp_path / "ok.md", f"---\nname: x\n{FRONT}---\nbody\n")
+    r = R.go(OK, REVIEW_AGENT=ok, REVIEW_RULES_DIR=rules)
+    assert r.returncode == 1 and "security.md" in r.stderr and not R.stubs.calls("claude")
     for k, front in enumerate(("disallowedTools: Edit, Write\n", "effort: high\n", 'effort: high\ndisallowedTools: "Edit, Write, NotebookEdit"\n', "effort: high\ndisallowedTools: [Edit, Write]\n", "effort: high # note\ndisallowedTools: Edit, Write\n", "effort: high\ndisallowedTools: Edit, Write  # note\n")):
         thin = put(tmp_path / f"thin-{k}.md", f"---\nname: x\n{front}---\nbody\n")   # the read-only block and the effort come from the definition, a missing or non-flat value runs no review
         r = R.go(OK, REVIEW_AGENT=thin)
