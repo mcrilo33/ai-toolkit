@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop: the Run loop (06 section 4,
+# coordinator.sh [--run R] [--answer auto|attended|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop: the Run loop (06 section 4,
 # "The coordinator"). One foreground process in an Orca terminal on the main checkout, the single consumer of ONE Run
 # (--run re-binds it with run-use; none creates one). Loop: fill slots to --cap (dispatch.sh) -> check --wait -> route each message
 # -> ack the delivery. question: answer.sh (auto) or the human, who types the answer on this terminal; worker_done succeeded: land.sh
@@ -9,6 +9,9 @@
 # liveness change) for COORD_IDLE_MIN minutes (15) with no open question: worst-case detection = that bound + the sweep period (~25 min). A silent worker Orca shows parked on a human-only prompt, or cannot prove (absent agentWait, null terminal), is blocked at once, never relaunched: the loop cannot answer it, and its slot and Scope must not be held without bound, in either --answer mode (the block comment is the notice). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
 # back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD.
+# --answer attended (the /coordinate attended loop, #450): the routine work out of sight, the human only for a decision. A routine plan is approved by answer.sh; a plan it hands over (exit 3, a reason) and every permission
+# request stay OPEN (the loop never approves one), queued for the human with the other open questions and the blocked issues; one bell (--bell-tty: the session's terminal) per NEW queued decision. --dispatch <issue> [message]
+# queues a dispatch request the loop runs ahead of its own pick (cap and Scope rule apply). auto and human are unchanged.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
 # consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
 # the Run from this terminal, then wait until the loop is gone.
@@ -17,21 +20,31 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; reply=0; reply_id=""; reply_body=""; stop=0
+run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; reply=0; reply_id=""; reply_body=""; stop=0; bell_arg=""; dreq=0; dreq_n=""; dreq_text=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;; --answer) answer="${2:-}"; shift ;;
     --cap) cap="${2:-}"; shift ;; --until) until="${2:-}"; shift ;;
-    --drain) drain=1 ;; --status) status=1 ;; --stop) stop=1 ;;
+    --drain) drain=1 ;; --status) status=1 ;; --stop) stop=1 ;; --bell-tty) bell_arg="${2:-}"; shift ;;
+    --dispatch) dreq=1; dreq_n="${2:-}"; dreq_text="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
     --reply) reply=1; reply_id="${2:-}"; reply_body="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
-    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny" ;;
+    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|attended|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny | --run R --dispatch <issue> [message] (--bell-tty <tty> with the loop)" ;;
   esac; shift
 done
-case "$answer" in auto | human) ;; *) usage_exit "--answer takes auto or human" ;; esac
+case "$answer" in auto | attended | human) ;; *) usage_exit "--answer takes auto, attended or human" ;; esac
 [ "$stop" = 0 ] || [ -n "$run" ] || usage_exit "--stop needs --run <run-id>"
 [ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
 [ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid>)
+if [ "$dreq" = 1 ]; then   # a dispatch request: <issue> = its one-line message (empty = a plain dispatch), queued in the reply spool's shape for the loop's next wake
+  [ -n "$run" ] || usage_exit "--dispatch needs --run <run-id>"; [[ $dreq_n =~ ^[0-9]+$ ]] || usage_exit "--dispatch takes an issue number and an optional one-line message"
+  d="$(spool_dir "$run")/requests"; (umask 077; mkdir -p "$d"); chmod 700 "$d"
+  [ "$dreq_text" != --cancel ] || { rm -f "$d/$dreq_n"; echo "dispatch request for #$dreq_n cancelled"; exit 0; }
+  printf '%s\n' "$(printf '%s' "$dreq_text" | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-1000)" > "$d/.$dreq_n.tmp" && mv "$d/.$dreq_n.tmp" "$d/$dreq_n"
+  echo "dispatch request for #$dreq_n queued: the loop starts it at its next wake, or --status says why not"; exit 0
+fi
+bell_tty="${COORD_BELL_TTY:-/dev/tty}"   # the terminal the human answers in (the attended session's, passed by the skill), else this one
+[ -z "$bell_arg" ] || { [ -c "$bell_arg" ] && bell_tty="$bell_arg" || warn "--bell-tty $bell_arg is not a terminal: ringing on this terminal instead"; }
 DISPATCH_CMD="${DISPATCH_CMD:-$here/dispatch.sh}"; LAND_CMD="${LAND_CMD:-$here/land.sh}"; ANSWER_CMD="${ANSWER_CMD:-$here/answer.sh}"
 cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
@@ -57,8 +70,9 @@ show_q() {   # the question as the human must read it: control bytes dropped, wr
 }
 flag() {   # $1 worktree path ("" = none known), $2 its comment (optional with no path): the Orca surfaces of anything the human must see: the worktree comment, and a bell on this terminal
   [ -z "$1" ] || orca_json worktree set --worktree "path:$1" --comment "$(printf '%s' "$2" | tr '\n' ' ')" > /dev/null 2>&1 || warn "cannot set the worktree comment"   # (Orca turns the bell into its own
-  { printf '\a' > "${COORD_BELL_TTY:-/dev/tty}"; } 2> /dev/null || true   # notification when terminalBell is on; it carries no text, the text is the comment, the issue comment and this log)
+  [ "$answer" = attended ] || bell   # attended rings once per NEW queued decision instead (notify_queue). notification when terminalBell is on; it carries no text, the text is the comment, the issue comment and this log)
 }
+bell() { { printf '\a' >> "$bell_tty"; } 2> /dev/null || true; }
 gate_flag() { flag "$1" "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2" "${4:-approve}")"; }   # $1 worktree path, $2 message id, $3 question, $4 the reply word shown
 mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
 now_min() { mins "${AI_TOOLKIT_NOW:-$(date +%H:%M)}"; }
@@ -86,6 +100,11 @@ yield() {   # exit 0 when another terminal holds the Run. $1 set = Orca already 
   local h; h="$(holder)"; [ -n "$h" ] || h="${1:+another terminal}"
   [ -z "$h" ] || [ "$h" = "${H:-}" ] || { log "Run $run taken back by $h: exiting; an unfinished batch replays to it"; exit 0; }
 }
+open_q() { pending | jq -c '.open | sort_by(.sequence // 0)[]'; }   # the open questions, oldest first (Orca lists newest first, each with a sequence)
+blocked_q() { gh issue list --label blocked --state open --limit 100 --json number,title,labels | jq -r '[.[] | select(.labels | map(.name) | index("hold") | not)] | sort_by(.number)[] | "\(.number)\t\(.title)"'; }   # hold = parked on purpose
+queue_ids() {   # the decisions waiting for the human, in the order to present them, one word each: q:<message id> (a worker waits, a slot is held), then b:<issue> (blocked; a review that kept rejecting is one)
+  local q; q="$(open_q | jq -r '"q:\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
+}
 replycmd() { printf 'bash %s --run %s --reply %s %s' "$here/coordinator.sh" "$run" "$1" "${2:-approve}"; }
 if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to
   [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"
@@ -93,9 +112,16 @@ if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the que
   echo "live workers:"   # verdict, the agent's activity and the silence: `unverifiable` for a long run tells a stuck worker from a working one
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "\(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict) \(.projection.stage.activity // "-")"' | while read -r d w v a; do
     read -r age how <<< "$(silent "$d")" || true; echo "  $d $w $v $a, silent ${age:-?}m$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done
-  echo "pending questions:"
-  pending | jq -c '.open[]' | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"
+  echo "queue (the order to present it):"
+  open_q | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"
     if is_perm "$(question_of "$m")"; then echo "    reply: $(replycmd "$id" allow)   (or deny)"; else echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; fi; done
+  me="$(gh api user --jq .login 2> /dev/null)" || me=""   # the reason is the loop's own last "blocked:" comment (this gh login): the repo may be public, any other author's text is not shown
+  { blocked_q || true; } | while IFS=$'\t' read -r n t; do   # one line each, no control byte, capped: the text is somebody else's, it must not forge a queue item or move the cursor
+    w="$(gh issue view "$n" --json comments 2> /dev/null | jq -r --arg me "$me" '[.comments[] | select(.author.login == $me and (.body | startswith("blocked: "))) | .body] | last // "" | .[9:]' 2> /dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-160)" || w=""
+    echo "  blocked #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)${w:+: $w}"
+    echo "    decide: re-dispatch (comment the guidance, then remove the blocked label, or --dispatch $n '<message>'), park it with the hold label, or close it"; done
+  echo "dispatch requests:"
+  for f in "$(spool_dir "$run")/requests"/*; do [ -f "$f" ] && echo "  #${f##*/} $(head -n 1 "$f"): $(sed -n 2p "$f" | grep . || echo queued)"; done
   exit 0
 fi
 
@@ -144,7 +170,7 @@ block() {   # $1 = why. Label, comment, flag (log, worktree comment, bell), free
   yield; gh issue edit "$issue" --add-label blocked > /dev/null 2>&1 \
     || { gh label create blocked --color B60205 > /dev/null 2>&1 || true; gh issue edit "$issue" --add-label blocked > /dev/null || warn "cannot label #$issue"; }
   status_label remove "$issue"
-  comment "$issue" "blocked: $1"; log "#$issue blocked: $1"; flag "$wtp" "BLOCKED #$issue: ${1:0:80}"; release "$disp"
+  bdirty=1; comment "$issue" "blocked: $1"; log "#$issue blocked: $1"; flag "$wtp" "BLOCKED #$issue: ${1:0:80}"; release "$disp"
 }
 redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds are spent. A fresh terminal and a NEW Task (dispatch.sh --address):
   local r out; r="$(rounds)"   # worker-start refuses --task with --spec, and Orca refuses a new task on the idle two-step terminal
@@ -186,25 +212,27 @@ on_permission() {   # $1 message id, $2 question, $3 dispatch id: a worker's too
   if [ "$answer" = auto ] && orca_mutate orchestration reply --run "$run" --from "$H" --id "$1" --body deny > /dev/null; then
     log "permission denied (tool: $tool, message $1): an unattended run never approves one"
     [ "$known" = 0 ] || comment "$issue" "Permission denied (tool: $tool): an unattended run never approves a permission prompt; the worker reports it in worker_done."
-  else   # human mode, or the deny could not be sent (the worker's relay denies on its own timeout): the human decides, nothing waits
-    yield
+  else   # attended or human mode, or the deny could not be sent (the worker's relay denies on its own timeout): the human decides, nothing waits
+    yield; held="$held $1 "
     [ "$known" = 0 ] || comment "$issue" "A permission request needs a human (message $1, tool: $tool). Reply from any terminal: $(replycmd "$1" allow)   (or deny)"
     show_q "$2" 300; log "permission request waiting: $(replycmd "$1" allow)"; gate_flag "$wtp" "$1" "$2" allow
   fi
 }
 on_question() {
-  local id q ans body warns
+  local id q ans body warns why=""
   id="$(jq -r .id <<< "$1")"; q="$(question_of "$1")"
   if is_perm "$q"; then on_permission "$id" "$q" "$(pj "$1" dispatchId)"; return 0; fi
-  ctx "$(pj "$1" dispatchId)" || { [ $? = 2 ] || { log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; flag ""; }; return 1; }   # 2: ctx already blocked it
-  if [ "$answer" = auto ] && ans="$(printf '%s' "$q" | "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
+  ctx "$(pj "$1" dispatchId)" || { [ $? = 2 ] || { held="$held $id "; log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; flag ""; }; return 1; }   # 2: ctx already blocked it
+  if [ "$answer" != human ] && ans="$(printf '%s' "$q" | ANSWER_MODE="$answer" "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; log "#$issue: $warns"; flag "$wtp" "#$issue ${warns:0:80}"; }
   else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
     yield   # ...unless the reply failed because the Run was taken back meanwhile
-    comment "$issue" "A gate question needs a human (message $id): ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: approve with: <change> to approve with a small change, or revise: <change> to amend the plan)"
-    show_q "$q"; log "#$issue: gate question waiting: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
+    held="$held $id "
+    case "${ans:-}" in human:*) why="$(head -n 1 <<< "$ans")" ;; esac   # attended: the answerer's reason for handing the plan over
+    comment "$issue" "A gate question needs a human (message $id)${why:+, $why}: ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: approve with: <change> to approve with a small change, or revise: <change> to amend the plan)"
+    show_q "$q"; log "#$issue: gate question waiting${why:+ ($why)}: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
   fi
 }
 triage() {   # $1 = land output, $2 = the worker's report: after a land, hand what is left over (review warnings, the report's DEFERRED: lines) to the scoper agents (bug-triage rule)
@@ -257,8 +285,39 @@ handle() {
   esac
 }
 
+named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of the automatic pick: dispatch.sh runs them, within the cap and the Scope rule. One that cannot run keeps its file, the reason on line 2 (--status shows it)
+  local f n spec v why live wts path r out rc   # (a closed issue is the one drop; a failed dispatch is not retried until the human asks again or cancels)
+  for f in "$sd/requests"/*; do
+    [ -f "$f" ] || continue; n="${f##*/}"; spec="$(head -n 1 "$f")"; why=""; path=""
+    case "$(sed -n 2p "$f")" in "dispatch failed"*) continue ;; esac
+    if ! v="$(gh issue view "$n" --json state,body,labels 2> /dev/null)"; then printf '%s\n%s\n' "$spec" "cannot read the issue (unknown, or GitHub did not answer)" > "$f"; continue; fi
+    if [ "$(jq -r .state <<< "$v")" != OPEN ]; then log "dispatch request for #$n dropped: the issue is not open"; rm -f "$f"; continue; fi
+    if jq -e '.labels | map(.name) | index("hold")' <<< "$v" > /dev/null; then why="on hold: remove the hold label to start it"
+    elif [ -z "$spec" ] && jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null; then why="blocked: remove the label, or give a message to re-dispatch it"
+    elif ! wts="$(orca_json worktree list --repo "path:$PWD" | jq -c '.result.worktrees')"; then why="cannot read the worktrees"
+    else
+      path="$(jq -r --argjson n "$n" '[.[] | select(.linkedIssue == $n)][0].path // empty' <<< "$wts")"
+      r="$(wl | jq -r --arg p "::$path" '[.result.workers[] | select(.dispatchStatus == "dispatched" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty' 2> /dev/null)"
+      live="$(wl | jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length')"
+      if [ -n "$path" ] && [ -n "$r" ]; then why="already running (dispatch $r)"
+      elif [ "$live" -ge "$cap" ]; then why="waiting for a free slot (cap $cap)"; fi
+    fi
+    [ -n "$why" ] || [ -n "$path" ] || [ -z "$spec" ] || why="no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"
+    if [ -z "$why" ]; then   # a kept worktree is re-dispatched (--address, a default message when none was given); none yet: dispatch.sh --next <n> starts it only if it is ready (its rule: hold, blocked, in flight, Scope)
+      if [ -n "$path" ]; then out="$(RUN="$run" "$DISPATCH_CMD" --address "${spec:-address: continue from the pushed branch (git log), push, then send worker_done.}" "$n" 2>&1)" && rc=0 || rc=$?
+      else out="$(RUN="$run" "$DISPATCH_CMD" --next "$n" 2>&1)" && rc=0 || rc=$?; [ "$rc" = 0 ] || [ "$rc" = 3 ] || orca_json worktree rm --worktree "issue:$n" --force > /dev/null 2>&1 || true; fi   # a failed fresh dispatch may leave a half-made worktree (as fill() does)
+      if [ "$rc" = 0 ]; then
+        ! jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null || gh issue edit "$n" --remove-label blocked > /dev/null 2>&1 || warn "cannot remove the blocked label of #$n"
+        log "dispatched #$n on request"; rm -f "$f"; continue
+      fi
+      why="$(tail -n 1 <<< "$out")"; if [ "$rc" = 3 ]; then why="$why (dispatch.sh exit 3)"; else why="dispatch failed: $why"; fi   # a refusal is dispatch.sh's own words and is asked again at the next wake
+    fi
+    printf '%s\n%s\n' "$spec" "$why" > "$f"
+  done
+}
 fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --next finds nothing
   local live n rc i out
+  named
   live="$(wl | jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length')"; ready=1
   for ((i = live; i < cap; i++)); do
     n="$(RUN="$run" "$DISPATCH_CMD" --next --dry-run)" && rc=0 || rc=$?
@@ -290,7 +349,13 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
   done
 }
 
-tick=0; empties=0; start="$(now_min)"; budget=0
+notify_queue() {   # attended: one bell for each decision that was not queued at the last look; the ids last seen live in $seen (no file); a failed read changes nothing.
+  [ "$answer" = attended ] || return 0   # A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event
+  local now i all; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
+  all="$(queue_ids | tr '\n' ' ')" || return 0; now=""
+  for i in $all; do case "$i" in q:*) case " $held " in *" ${i#q:} "*) ;; *) continue ;; esac ;; esac; now="$now$i "; case " $seen " in *" $i "*) ;; *) bell ;; esac; done; seen="$now"
+}
+tick=0; empties=0; seen=""; bids=""; bdirty=1; held=" $(open_q | jq -r .id | tr '\n' ' ' || true)"; start="$(now_min)"; budget=0
 [ -z "$until" ] || budget=$(((($(mins "$until") - start) + 1440) % 1440))
 while :; do
   tick=$((tick + 1)); yield
@@ -306,11 +371,12 @@ while :; do
   msgs="$(jq -c '.result.messages[]?' <<< "$out" 2> /dev/null)" || msgs=""
   if [ -z "$msgs" ]; then
     empties=$((empties + 1)); [ "$rc" = 0 ] || sleep "${AI_TOOLKIT_POLL:-3}"
-    [ $((empties % ${COORD_SWEEP_EVERY:-2})) -ne 0 ] || sweep
-    continue
+    [ $((empties % ${COORD_SWEEP_EVERY:-2})) -ne 0 ] || { sweep; bdirty=1; }
+    notify_queue; continue
   fi
   # fd 3, not stdin: a handler that reads stdin (claude -p, ssh) must not swallow the rest of the batch.
   while IFS= read -r m <&3; do yield; handle "$m" || warn "message $(jq -r .id <<< "$m") not fully handled"; done 3<<< "$msgs"
   # Always ack, after the whole batch: a replied question is replayed until acked (03 #20).
   yield; orca_json orchestration check --run "$run" --terminal "$H" --ack "$(jq -r '.result.deliveryId // empty' <<< "$out")" > /dev/null || warn "ack failed"
+  notify_queue
 done

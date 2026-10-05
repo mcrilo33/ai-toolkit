@@ -33,11 +33,11 @@ case "$effort$blocked" in *[\"\'\[\]#]*) die "code-review agent definition: effo
 [ -n "$effort" ] && [ -n "$blocked" ] || die "code-review agent definition lacks effort or disallowedTools in its frontmatter: $agent"
 body() { awk 'NR == 1 && $0 != "---" { f = 2 } f < 2 { if ($0 == "---") f++; next } { print }' "$1"; }   # the body after the frontmatter
 prose="$(body "$agent")"
-printf '%s' "$prose" | grep -q '[^[:space:]]' || die "code-review agent definition is empty: $agent"
+[[ $prose == *[![:space:]]* ]] || die "code-review agent definition is empty: $agent"
 for r in guidelines security code-quality python-style pytest-conventions; do   # the rules the agent cites, from the coordinator's copies; a missing or blank one is exit 1
   f="$rules_d/$r.md"; [ "$r" != guidelines ] || f="$goal"
   [ -f "$f" ] || die "coordinator-side rule not found: $f"
-  text="$(body "$f")"; printf '%s' "$text" | grep -q '[^[:space:]]' || die "coordinator-side rule is empty: $f"
+  text="$(body "$f")"; [[ $text == *[![:space:]]* ]] || die "coordinator-side rule is empty: $f"
   prose="$prose"$'\n\n'"--- project rule: $r ---"$'\n\n'"$text"
 done
 agents="$(jq -nc --arg p "$prose" '{"code-review": {description: "independent pre-land code review", prompt: $p}}')"

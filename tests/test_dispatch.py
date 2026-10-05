@@ -203,8 +203,11 @@ def stub_board(d, nodes, busy):
     d.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"linkedIssue": None}, *({"linkedIssue": b} for b in busy)]}}))
 
 
-@pytest.mark.parametrize("nodes,busy,want", [x[1:] for x in NEXT], ids=[x[0] for x in NEXT])
-def test_next_picks_the_first_ready_issue(d, nodes, busy, want):
+ALSO_READY = {"lowest number first": [5], "priority beats a lower number": [3]}   # ready too, though not the pick: --next <issue> still starts it
+
+
+@pytest.mark.parametrize("name,nodes,busy,want", NEXT, ids=[x[0] for x in NEXT])
+def test_next_picks_the_first_ready_issue(d, name, nodes, busy, want):
     stub_board(d, nodes, busy)
     r = d.go("--next", "--dry-run")
     if want is None:
@@ -213,6 +216,11 @@ def test_next_picks_the_first_ready_issue(d, nodes, busy, want):
         assert r.returncode == 0 and r.stdout.strip() == str(want), r.stderr
     # a dry run launches nothing; only THIS repo's worktrees are in flight (issue numbers of other registered repos must not collide)
     assert d.orca() == [["worktree", "list", "--repo", f"path:{d.root}"]]
+    # --next <issue> is the same pick restricted to that issue (how the coordinator asks "may this one start?"): the one it would pick is ready, an in-flight one never is, and nothing ready refuses every issue
+    ready = {want, *ALSO_READY.get(name, ())}
+    for i in sorted({*busy, *[n["number"] for n in nodes]}):   # a request for a ready issue starts even when another would be picked first; a held, blocked, in-flight or clashing one never does
+        r = d.go("--next", "--dry-run", str(i))
+        assert (r.returncode, r.stdout.strip()) == ((0, str(i)) if i in ready else (3, "")) and (i in ready or f"#{i} is not ready" in r.stderr), r.stderr
 
 
 def test_next_dispatches_the_pick(d):
