@@ -41,10 +41,10 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",
                 "resource": {"worktreeId": f"r::{wt}"}, "projection": {"liveness": {"verdict": lv}, "stage": {"activity": "working"}}}
 
-    def show(silent=0, wait=False, beat=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt
+    def show(silent=0, wait=False, beat=None, born=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt
         ago = lambda m: time.time() - m * 60
         stubs.reply("orca.orchestration_worker_show", json.dumps({"result": {"terminal": {"lastOutputAt": ago(silent) * 1000}, "observation": {"agentWait": {"source": "hook"} if wait else None},
-            "dispatch": {"dispatchedAt": "2020-01-01 00:00:00", "lastHeartbeatAt": None if beat is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ago(beat)))}}}))
+            "dispatch": {"dispatchedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ago(born))) if born is not None else "2020-01-01 00:00:00", "lastHeartbeatAt": None if beat is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ago(beat)))}}}))
 
     def workers(*rows):
         stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": list(rows)}}))
@@ -379,7 +379,7 @@ def test_landed_but_cleanup_incomplete_finishes_once_and_parks_a_still_open_issu
     assert bool(C.calls("gh issue edit")) == (cleanup_rc == 6)   # else `--next` would pick the open issue again
 
 
-SWEEP = dict(COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=2)   # the sweep runs on every 2nd empty wait here (10 by default): two ticks reach it
+SWEEP = dict(COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=2)   # the sweep runs on every 2nd empty wait here (2 by default): two ticks reach it
 
 
 def relaunches(C):
@@ -407,6 +407,7 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     ([dict(d="ctx_1", st="failed", lv="exited"), dict(d="ctx_2", lv="live")], {}, False),   # the relaunched worker is alive: left alone
     ([dict()], dict(silent=0, beat=93), False),   # an old heartbeat, the agent working: #415 and #418 at 09:39 UTC
     ([dict()], dict(silent=40, beat=1), False),   # a worker that heartbeats
+    ([dict()], dict(silent=40, born=1), False),   # just (re)dispatched: the old terminal output is not the new worker's silence
     ([dict()], dict(silent=14), False),   # silent, but under the bound
     ([dict()], dict(silent=40, wait=True), False),   # parked on a prompt only a human can answer: flagged, never relaunched
     ([dict()], dict(silent=40), True),   # waiting on an open gate or permission question

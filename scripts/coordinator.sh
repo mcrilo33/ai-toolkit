@@ -6,7 +6,7 @@
 # --review inline (lands are serialized by construction); a rejected review, red CI or a conflict goes back to the SAME worker for a
 # bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked. Every 2nd empty wait (COORD_SWEEP_EVERY,
 # ~10 min): a sweep of the workers that died or went idle without worker_done: one relaunch, then blocked. Idle = silent (no terminal output, heartbeat or
-# liveness change) for COORD_IDLE_MIN minutes (15) with no open question and no human-only prompt: worst-case detection = that bound + the sweep period (~25 min).
+# liveness change) for COORD_IDLE_MIN minutes (15) with no open question and no human-only prompt: worst-case detection = that bound + the sweep period (~25 min). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
 # back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
@@ -69,9 +69,9 @@ pending() {   # {open: questions nobody has replied to (waiting for the human), 
        answered: [$m[] | select(.thread_id != null and .thread_id != .id) | .thread_id], truncated: ($all | length >= 200)}'
 }
 silent() {   # $1 dispatch: "<minutes> <run|wait>": minutes since the newest sign of life (terminal output, liveness observation, heartbeat, never before dispatchedAt);
-  orca_json orchestration worker-show --dispatch "$1" < /dev/null | jq -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer
+  orca_json orchestration worker-show --dispatch "$1" < /dev/null | jq -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer, or Orca could not prove the worker (never "not waiting")
     | ([($r.terminal.lastOutputAt, $r.projection.liveness.observedAt | select(. != null) / 1000), ($r.dispatch.lastHeartbeatAt, $r.dispatch.dispatchedAt | select(. != null) | sub(" "; "T") | sub("Z?$"; "Z") | fromdateiso8601)] | max) as $t
-    | "\(([(($now - $t) / 60) | floor, 0] | max)) \(if $r.observation.agentWait then "wait" else "run" end)"'
+    | "\(([(($now - $t) / 60) | floor, 0] | max)) \(if ($r.terminal == null or ($r.observation | has("agentWait") | not) or $r.observation.agentWait) then "wait" else "run" end)"'
 }
 holder() { orca_json orchestration run-show --id "$run" 2> /dev/null | jq -r '.result.run.coordinator_handle // empty'; }   # the terminal that holds the Run
 live_hold() {   # $1 eq|ne, $2 a handle: if a live coordinator.sh (holder.<pid> = "<handle> <mode>", the pid's command must still be coordinator.sh) is bound as
@@ -269,7 +269,8 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
     ! jq -e --arg d "$d" 'index($d)' <<< "$open" > /dev/null || continue
     read -r age how <<< "$(silent "$d")" || true; [ "${age:-0}" -ge "${COORD_IDLE_MIN:-15}" ] || continue
     ctx "$d" || continue
-    if [ "$how" = wait ]; then log "#$issue: worker $d waits on a prompt only a human can answer (silent ${age}m)"; flag "$wtp" "IDLE #$issue: a prompt waits for the human in its terminal (${age}m)"; continue; fi
+    if [ "$how" = wait ]; then log "#$issue: worker $d waits on a prompt only a human can answer (silent ${age}m)"; flag "$wtp" "IDLE #$issue: a prompt waits for the human in its terminal (${age}m)"
+      [ "$age" -ge $((${COORD_IDLE_MIN:-15} + 10)) ] || comment "$issue" "worker $d is silent for ${age}m and may wait on a prompt only a human can answer: check its terminal"; continue; fi
     log "#$issue: worker $d silent for ${age}m, relaunching"; release "$d"   # its dispatch is still live: stop it first or the worktree counts twice
     redispatch 1 "address: your agent went idle after an error without worker_done. Continue from the pushed branch (git log), push, then send worker_done." "worker idle again without worker_done"
   done
