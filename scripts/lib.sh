@@ -60,16 +60,9 @@ gh() { command "${AI_TOOLKIT_GH:-gh}" "$@"; }
 # gh_issue <n>: {number,title,body} of one issue.
 gh_issue() { gh issue view "$1" --json number,title,body; }
 
-# stale_note <why>: warn on stderr and print the note a gate adds to its prompt when it cannot read the live issue (the intent may be stale).
-stale_note() {
-  warn "$1; keeping the existing .ai-toolkit/task.md"
-  printf ' NOTE: %s, so .ai-toolkit/task.md may be stale: the issue may have changed since dispatch.' "$1"
-}
-
-# The one definition of .ai-toolkit/task.md. task_md renders {number,title,body} (stdin) to the file text; task_md_number reads the number
-# back from the header. Keep them together: a header change in one breaks the other.
+# The one definition of .ai-toolkit/task.md text: task_md renders {number,title,body} (stdin) to it. setup.sh writes the file with it; the
+# gates put the same text in their prompt (issue_text) and never read or write the file.
 task_md() { jq -r '"# #\(.number) \(.title)\n\n\(.body)"'; }
-task_md_number() { sed -n '1s/^# #\([0-9][0-9]*\)[[:space:]].*/\1/p' "$1" 2> /dev/null || true; }
 
 # issue_of <worktree> [tries]: the issue a worktree belongs to, from Orca's link ONLY. Which issue a worktree is for is set by the coordinator and read
 # back from Orca; the branch name and task.md are the worker's to rewrite, so a gate never reads them. An Orca that cannot answer (error, non-JSON, no
@@ -87,13 +80,12 @@ issue_of() {
   printf '%s' "$n"
 }
 
-# refresh_task <worktree> <issue>: rewrite the worktree's .ai-toolkit/task.md from the live issue, so a gate judges the issue as it is now.
-# An issue that cannot be read or written keeps the old copy and prints the stale note for the gate's prompt; never a failure.
-refresh_task() {
-  local t f="$1/.ai-toolkit/task.md"
-  if t="$(gh_issue "$2" | task_md)" && [ -n "$t" ] && mkdir -p "$1/.ai-toolkit" \
-    && printf '%s\n' "$t" > "$f.new" && mv "$f.new" "$f"; then :
-  else stale_note "issue $2 could not be refreshed"; fi
+# issue_text <n>: the live issue text for a gate's prompt, from GitHub only. The worker's worktree copy is its own to rewrite, so no gate judges it
+# and none falls back to it. A gh that fails (or returns nothing) is retried every AI_TOOLKIT_POLL seconds, ORCA_LINK_TRIES times (the same bound as
+# issue_of: about 2 minutes), then rc 1 names the issue on stderr: the gate declines rather than judging a weaker source.
+_issue_text_once() { local t; t="$({ gh_issue "$1" | task_md; } 2> /dev/null)" && [ -n "$t" ] && printf '%s' "$t"; }   # prints only on success: a failed try leaks nothing
+issue_text() {
+  wait_until "${ORCA_LINK_TRIES:-40}" "${AI_TOOLKIT_POLL:-3}" _issue_text_once "$1" || { printf '%s: cannot read issue %s from GitHub (gh failed or returned nothing); nothing is judged\n' "${0##*/}" "$1" >&2; return 1; }
 }
 
 # status_label <add|remove> <issue>: the one `status:in-progress` marker follows the worker. A failure only warns: the work it marks is already done.

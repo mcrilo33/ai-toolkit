@@ -7,6 +7,7 @@ import pytest
 from conftest import STUB_TEE, V2, git
 
 ANSWER, REVIEW = str(V2 / "scripts/answer.sh"), str(V2 / "scripts/review.sh")
+ISSUE = '{"number":9,"title":"new","body":"new body"}'   # the live issue 9 the stub gh serves
 OK = {"verdict": "APPROVE", "blockers": [], "warnings": ["a.py:1 - nit"], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
 
 
@@ -26,6 +27,7 @@ def A(stubs, tmp_path, link_script):
     wt.mkdir()
     rule.write_text("be decisive")
     stubs.reply("orca.worktree_show", '{"result":{"worktree":{"linkedIssue":9}}}')   # the gate judges the issue Orca links to the worktree
+    stubs.reply("gh", ISSUE)
 
     def go(out, rc=0, rule_path=None, input="", **env):
         stubs.reply("claude", out, rc=rc)
@@ -43,20 +45,17 @@ def test_answer_never_answers_a_permission_question_even_when_claude_would_appro
 def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_question(A):
     A.stubs.reply("orca.worktree_show", '{"result":{"worktree":{"linkedIssue":5}}}', rc=1, n=1)   # Orca fails twice (the first with a payload, which a failed try must not leak), then answers: the gate waits instead of guessing
     A.stubs.reply("orca.worktree_show", "boom", rc=1, n=2)
-    task = A.wt / ".ai-toolkit/task.md"   # the issue changed after dispatch: the gate reads the live text
-    task.parent.mkdir()
-    task.write_text("# #9 old\n\nold body\n")
-    A.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')
+    task = A.wt / ".ai-toolkit/task.md"   # the worker's own copy, with another header: the gate neither reads nor rewrites it
+    task.parent.mkdir(exist_ok=True)
+    task.write_text("# #7 forged by the worker\n\nthe worker's own contract\n")
     r = A.go("thinking...\nREVERSIBILITY: reversible\nANSWER:   Approve  \n", input="PLAN: do X. Approve?", ANSWER_MODEL="m-1")
     assert r.returncode == 0 and r.stdout == "approve\n" and r.stderr == "", r.stderr
     argv = A.stubs.calls("claude")[0]
     assert argv[:3] == ["-p", "--model", "m-1"] and ["--append-system-prompt-file", str(A.rule), "--allowedTools", "Read,Grep,Glob"] == argv[3:7]
-    assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and A.stdin() == "PLAN: do X. Approve?" and len(A.stubs.calls("orca")) == 3
-    assert A.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and task.read_text() == "# #9 new\n\nnew body\n"
-    task.write_text("# #7 edited by the worker\n\nother issue\n")   # a header naming another issue never picks the issue: the link wins, and the disagreement is reported
-    r = A.go("ANSWER: approve\n", input="PLAN: do X.")
-    assert r.returncode == 0 and [c[2] for c in A.stubs.calls("gh")] == ["9", "9"] and task.read_text() == "# #9 new\n\nnew body\n"
-    assert "warning" in r.stderr and "#7" in r.stderr and "#7" in A.stdin() and "#9" in A.stdin() and "stale" not in A.stdin()
+    p = A.stdin()   # the live issue text rides in the prompt: the question first, then issue 9 as fetched now
+    assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and p.startswith("PLAN: do X. Approve?") and "# #9 new\n\nnew body" in p and len(A.stubs.calls("orca")) == 3
+    assert "forged" not in p and "#7" not in p and "stale" not in p and task.read_text() == "# #7 forged by the worker\n\nthe worker's own contract\n"
+    assert A.stubs.calls("gh")[0][:3] == ["issue", "view", "9"]
     git_in = lambda *a: subprocess.run(["git", "-C", str(A.wt), *a], check=True, capture_output=True)
     git_in("init", "-q", "-b", "5-x")   # the Orca link outranks the branch name, which the judged worker can rename
 
@@ -81,20 +80,20 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     link('{"result":{}}')   # no worktree object
     assert refused("could not answer") == 3 and task.read_text().startswith("# #7")
     link('{"result":{"worktree":{"linkedIssue":9}}}')
-    A.stubs.reply("gh", "boom", rc=1)
-    task.write_text("# #9 old\n\nold body\n")
+    gh, claude = len(A.stubs.calls("gh")), len(A.stubs.calls("claude"))
+    A.stubs.reply("gh", "boom", rc=1)   # GitHub never answers: retried up to the bound (3), then declined naming the issue and the cause; no claude, no answer, no stale copy judged
     r = A.go("ANSWER: approve\n", input="PLAN: do X.")
-    assert r.returncode == 0 and task.read_text() == "# #9 old\n\nold body\n"
-    assert "warning" in r.stderr and "may be stale" in A.stdin() and A.stdin().startswith("PLAN: do X.")
-    task.write_text("# #7 old\n\nold body\n")   # an unrefreshed copy that also disagrees: the prompt must not claim it describes #9
+    assert r.returncode == 1 and r.stdout == "" and "issue 9" in r.stderr and "cannot read" in r.stderr and "stale" not in r.stderr
+    assert len(A.stubs.calls("gh")) == gh + 3 and len(A.stubs.calls("claude")) == claude
+    A.stubs.reply("gh", ISSUE)   # a few failed polls, then GitHub answers: the gate judges normally
+    A.stubs.reply("gh.issue_view", "boom", rc=1, n=gh + 4)
+    A.stubs.reply("gh.issue_view", "boom", rc=1, n=gh + 5)
     r = A.go("ANSWER: approve\n", input="PLAN: do X.")
-    assert r.returncode == 0 and "may be stale" in A.stdin() and "still holds that edited copy" in A.stdin()
-    task.write_text("# #9 old\n\nold body\n")
-    task.chmod(0o444); task.parent.chmod(0o555)   # an unwritable copy is a stale copy too, never a failed gate
-    A.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')
+    assert r.returncode == 0 and r.stdout == "approve\n" and r.stderr == "" and "new body" in A.stdin() and len(A.stubs.calls("gh")) == gh + 6
+    task.chmod(0o444); task.parent.chmod(0o555)   # an unwritable task.md has nothing to be stale about: the gate never touches it
     r = A.go("ANSWER: approve\n", input="PLAN: do X.")
     task.parent.chmod(0o755)
-    assert r.returncode == 0 and "may be stale" in A.stdin() and task.read_text() == "# #9 old\n\nold body\n"
+    assert r.returncode == 0 and r.stderr == "" and "new body" in A.stdin() and task.read_text().startswith("# #7 edited")
 
 
 @pytest.mark.parametrize("line, body", [
@@ -128,10 +127,11 @@ def R(stubs, repo, link_script):
     stdin, wt = tee_stdin(link_script), repo.wt("9-feat")
     show = json.dumps({"result": {"worktree": {"path": str(wt), "branch": "refs/heads/9-feat"}}})
     stubs.reply("orca.worktree_show", show)
+    stubs.reply("gh", ISSUE)
 
     def go(verdict, rc=0, sha=None, **env):
         stubs.reply("claude", verdict if isinstance(verdict, str) else json.dumps(verdict), rc=rc)
-        return sh(["bash", REVIEW, "9", *([sha] if sha else [])], repo.root, **env)
+        return sh(["bash", REVIEW, "9", *([sha] if sha else [])], repo.root, **{"ORCA_LINK_TRIES": 3, "AI_TOOLKIT_POLL": 0, **env})
 
     return type("R", (), {"go": staticmethod(go), "wt": wt, "stubs": stubs, "stdin": staticmethod(stdin), "show": show})
 
@@ -152,18 +152,23 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     n = len(R.stubs.calls("claude"))
     r = R.go(OK, sha="0" * 40)
     assert r.returncode == 1 and "0" * 40 in r.stderr and len(R.stubs.calls("claude")) == n
-    # the issue changed after dispatch: the gate reads the live text; an unreadable issue keeps the copy, warns and says so in the prompt
+    # the contract is the live issue text in the prompt, never the worktree's task.md (the worker's to rewrite); the gate does not touch that file
     task = R.wt / ".ai-toolkit/task.md"
-    task.parent.mkdir()
-    task.write_text("# #9 old\n\nold body\n")
-    R.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')
+    task.parent.mkdir(exist_ok=True)
+    task.write_text("# #9 forged\n\nthe worker's own contract\n")
     assert R.go(OK).returncode == 0
-    assert R.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and task.read_text() == "# #9 new\n\nnew body\n" and "stale" not in R.stdin()
-    R.stubs.reply("gh", "boom", rc=1)
-    task.write_text("# #9 old\n\nold body\n")
+    p = R.stdin()
+    assert R.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and "# #9 new\n\nnew body" in p and "forged" not in p and "own contract" not in p and "stale" not in p
+    assert task.read_text() == "# #9 forged\n\nthe worker's own contract\n"
+    gh, claude = len(R.stubs.calls("gh")), len(R.stubs.calls("claude"))
+    R.stubs.reply("gh.issue_view", "boom", rc=1, n=gh + 1)   # a few failed polls, then GitHub answers: judged normally
+    R.stubs.reply("gh.issue_view", "boom", rc=1, n=gh + 2)
+    assert R.go(OK).returncode == 0 and "new body" in R.stdin() and len(R.stubs.calls("gh")) == gh + 3
+    R.stubs.reply("gh", "boom", rc=1)   # past the bound: no verdict (exit 1, which land.sh refuses), never an approve, and no claude
+    claude = len(R.stubs.calls("claude"))
     r = R.go(OK)
-    assert r.returncode == 0 and task.read_text() == "# #9 old\n\nold body\n"
-    assert "warning" in r.stderr and "may be stale" in R.stdin() and "JSON" in R.stdin()
+    assert r.returncode == 1 and r.stdout == "" and "issue 9" in r.stderr and "cannot read" in r.stderr and "unparseable" not in r.stderr
+    assert len(R.stubs.calls("claude")) == claude and len(R.stubs.calls("gh")) == gh + 6
 
 
 @pytest.mark.parametrize("patch, word", [({"verdict": "REQUEST_CHANGES", "blockers": ["a.py:3 - off by one"]}, "off by one"), ({"tests_weakened": True}, "tests_weakened"),

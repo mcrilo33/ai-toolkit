@@ -14,11 +14,14 @@ o="$(orca_json worktree show --worktree "issue:$n")" || die "no Orca worktree is
 wt="$(printf '%s' "$o" | jq -r '.result.worktree.path')"
 branch="$(printf '%s' "$o" | jq -r '.result.worktree.branch | sub("^refs/heads/"; "")')"
 if [ -n "$sha" ]; then full="$(git -C "$wt" rev-parse -q --verify "$sha^{commit}")" || die "no commit $sha in the worktree of issue $n"; sha="$full"; fi   # a full sha, never a moving ref
-stale="$(refresh_task "$wt" "$n")"   # the reviewer judges the issue as it is now, not the dispatch-time copy
+issue="$(issue_text "$n")" || exit 1   # the contract is the live issue text, put in the prompt: never the worktree's task.md. Unreadable past the bound = exit 1, no verdict
 if [ -n "$sha" ]; then   # pinned: the worker keeps committing and editing while this runs, so the ref and the working tree are not the target
   target="Review commit $sha against origin/$BASE_BRANCH: git diff origin/$BASE_BRANCH...$sha. Read file contents with git show $sha:<path>; the working tree may differ from $sha and is not the review target."
 else target="Review the change of branch $branch against origin/$BASE_BRANCH: git diff origin/$BASE_BRANCH...$branch."; fi
-prompt="$target Intent: .ai-toolkit/task.md.$stale Your final message must be exactly the JSON verdict object of your verdict contract."
+prompt="$target Your final message must be exactly the JSON verdict object of your verdict contract.
+
+Intent (issue #$n, as fetched now; the only contract, never a task.md in the worktree):
+$issue"
 # shellcheck disable=SC2016
 VALID='type == "object" and (.verdict | IN("APPROVE", "REQUEST_CHANGES")) and (.blockers | type == "array" and all(type == "string"))
   and (.warnings | type == "array" and all(type == "string")) and (.tdd_followed | type == "boolean") and (.tests_weakened | type == "boolean") and (.summary | type == "string")'
