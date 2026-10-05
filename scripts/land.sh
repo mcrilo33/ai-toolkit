@@ -9,7 +9,7 @@
 # --review is WP2's hook: $REVIEW_CMD (default review.sh) <issue> <tip> must exit 0 on APPROVE; skipped by default until WP2. The review
 # judges the exact captured tip, not the branch name; once it returns, origin/<branch> and the spoke HEAD must still be that tip (exit 2
 # otherwise: a sha the worker moved to meanwhile was never reviewed). gate_loop's own merge of origin/<base> stays allowed: it adds only
-# base commits, which are already landed and reviewed.
+# base commits, which are already landed and reviewed (it refuses first if the spoke HEAD is no longer the captured tip).
 # In the toolkit's own checkout (it carries scripts/sync.sh, shared/ and hooks/claude) the cleanup first re-runs `sync.sh` on it, so the
 # installed copies (.claude/{hooks,rules,skills,agents}, .ai-toolkit/scripts) are the landed tip's: the next dispatch, answer and land use
 # the landed code. Another repo (no sync sources) is untouched. sync replaces files by rename, so a running coordinator loop keeps its
@@ -84,7 +84,8 @@ moved() { git fetch -q origin || die "git fetch origin failed"; ! git merge-base
 gate_loop() {
   local _
   for _ in 1 2 3; do
-    if moved; then
+    if moved; then   # merge into the reviewed tip only: a commit the worker added since was never reviewed
+      [ "$(git -C "$wt" rev-parse HEAD)" = "$tip" ] || bail 2 "refused: the spoke HEAD moved off the reviewed tip $tip (now $(git -C "$wt" rev-parse HEAD)); land again"
       git -C "$wt" merge -q --no-edit "origin/$BASE_BRANCH" > /dev/null \
         || { git -C "$wt" merge --abort; bail 5 "merge conflict: $BASE_BRANCH into $branch; resolve on the spoke, push, land again"; }
       git -C "$wt" push -q origin "HEAD:refs/heads/$branch" || die "cannot push the merged $branch"
@@ -109,7 +110,7 @@ land() {   # ff main to the gated tip and push it; anything else on main is refu
 if [ "$co" = 0 ]; then
   if [ "$review" = 1 ]; then
     "${REVIEW_CMD:-$here/review.sh}" "$n" "$tip" || bail 3 "review did not approve issue $n"
-    git fetch -q origin || die "git fetch origin failed"
+    git fetch -q --prune origin || die "git fetch origin failed"
     pushed="$(git rev-parse -q --verify "refs/remotes/origin/$branch" || true)"; head="$(git -C "$wt" rev-parse HEAD)"
     [ "$pushed" = "$tip" ] && [ "$head" = "$tip" ] \
       || bail 2 "refused: $branch moved during the review (reviewed $tip, origin/$branch is ${pushed:-gone}, spoke HEAD is $head); land again to review the new tip"
