@@ -6,11 +6,11 @@ description: "When you discover a confirmed defect during any work, decide from 
 When you discover a **confirmed defect** during any work — implementing, reviewing,
 smoke-testing, answering a question — and it is worth filing (see "Worth filing?"),
 file it via the **`bug-scoper` agent immediately, without asking permission**. "Want me to file that?" for a real bug is
-the anti-pattern: the answer is always yes, and the question just loses the finding
+the anti-pattern: the answer is yes, and the question just loses the finding
 to the transcript.
 
 This binds every agent, not just the hub: a spoke that trips over an unrelated bug
-mid-cycle files it and keeps going, rather than burying it in its own run.
+mid-cycle files it (if worth filing) and keeps going, rather than burying it in its own run.
 
 "Without asking" applies only to a finding that is worth filing (next section): the
 human is never asked, and a finding that is not worth an issue is dropped, not filed.
@@ -54,7 +54,7 @@ observation*. Draw the line by what you can prove:
   and let the human decide. That judgement is not the agent's to make.
 
 When unsure which side a finding falls on, a check against the code usually
-settles it. Bias toward filing once it's confirmed; bias toward asking only while
+settles it. Bias toward filing once it's confirmed and worth filing; bias toward asking only while
 intent is genuinely ambiguous.
 
 ## Why routing through the agent is safe

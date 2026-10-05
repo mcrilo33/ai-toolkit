@@ -51,8 +51,7 @@ Both are plain `Key: value` body lines at the foot of the issue.
 ## Phase 1b: Worth an issue?
 
 Once the evidence holds, apply the bar in the `bug-triage` rule ("Worth filing?") before
-anything else: has it happened or will it, how often, what one occurrence costs against
-the fix. If the fix does not save time, **file nothing**: report `action: dropped (not
+anything else. If it fails, **file nothing**: report `action: dropped (not
 worth an issue)` with a one-line reason and the evidence you checked.
 
 ## Phase 2: Dedup before filing

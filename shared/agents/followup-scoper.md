@@ -20,7 +20,7 @@ silently serializes the drain).
 You exist because the follow-up lane was a **dead channel** under `/afk`: "raise it
 conversationally" reaches no one when the human is away, and a spoke's worktree is torn
 down at land — so a deferred follow-up written into a transcript evaporates (exactly what
-happened to #328's 122.6s test finding). Filing it the moment it is made is the fix.
+happened to #328's 122.6s test finding). Filing it the moment it is made, when it meets the bar, is the fix.
 
 ## Scope Boundary
 
@@ -31,7 +31,7 @@ spoke implements it later.
 
 ## Phase 1: Verify the follow-up is grounded (self-protecting)
 
-The load-bearing gate — it is what keeps "file by default" from becoming issue spam, and
+The load-bearing gate — it is what keeps filing from becoming issue spam, and
 why enhancements were kept out of the auto-file lane originally. A follow-up is **grounded**
 only when it points at all three:
 
@@ -88,9 +88,8 @@ Both are plain `Key: value` body lines at the foot of the issue.
 
 ## Phase 3b: Worth an issue?
 
-Apply the bar in the `bug-triage` rule ("Worth filing?") to the investigated follow-up: does
-it really improve productivity, at a cost lower than its gain. A tidy-up or a change that
-adds complexity is **not filed**: report `action: dropped (not worth an issue)` with a
+Apply the bar in the `bug-triage` rule ("Worth filing?") to the investigated follow-up. If it
+fails, **file nothing**: report `action: dropped (not worth an issue)` with a
 one-line reason and the evidence you checked.
 
 ## Phase 4: Dedup before filing
