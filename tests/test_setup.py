@@ -8,7 +8,11 @@ from conftest import V2, git
 
 def setup(run, repo, branch="wp0", wt=None, mode=()):
     wt = wt or repo.wt(branch)
-    return wt, run(["bash", f"{V2}/scripts/setup.sh", *mode], cwd=wt, ORCA_ROOT_PATH=repo.root, ORCA_WORKTREE_PATH=wt)
+    return wt, run(["bash", f"{V2}/scripts/setup.sh", *mode], cwd=wt, ORCA_ROOT_PATH=repo.root, ORCA_WORKTREE_PATH=wt, ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0)
+
+
+def link(stubs, n):   # what `orca worktree show` answers for the worktree's linked issue
+    stubs.reply("orca.worktree_show", f'{{"result":{{"worktree":{{"linkedIssue":{n}}}}}}}')
 
 
 def test_provisions_claude_dir_run_id_and_excludes_and_is_idempotent(run, repo, stubs):
@@ -33,18 +37,32 @@ def test_fails_loud_when_gh_fails_or_the_root_has_no_claude_dir(run, repo, stubs
     assert r.returncode != 0 and ".claude" in r.stderr and not (wt / ".ai-toolkit/setup-done").exists()
 
 
-@pytest.mark.parametrize("branch,linked,issue", [("12-add-hello", None, "12"), ("12-add-hello", 7, "7"), ("12-add-hello", '"x;y"', "12"), ("wp0", None, None)])
-def test_task_md_comes_from_the_linked_issue_or_the_branch_number(run, repo, stubs, branch, linked, issue):
-    if linked:
-        stubs.reply("orca.worktree_show", f'{{"result":{{"worktree":{{"linkedIssue":{linked}}}}}}}')
+@pytest.mark.parametrize("branch,linked,issue,mode", [
+    ("12-add-hello", None, "12", ()), ("12-add-hello", 7, "7", ()), ("12-add-hello", '"x;y"', "12", ()), ("wp0", None, None, ()),
+    ("12-add-hello", "boom", "12", ()),   # first provisioning: no worker has run yet, so the branch name the coordinator chose may stand in for the link
+    ("12-add-hello", None, None, ("--refresh",)), ("12-add-hello", '"x;y"', None, ("--refresh",)), ("12-add-hello", "boom", None, ("--refresh",)),
+    ("12-add-hello", 7, "7", ("--refresh",)),   # a refresh (a worker has run, and may have renamed its branch) reads Orca's link only
+])
+def test_task_md_comes_from_the_linked_issue_and_only_first_provisioning_may_use_the_branch_number(run, repo, stubs, branch, linked, issue, mode):
+    (repo.root / ".ai-toolkit").mkdir(exist_ok=True)
+    (repo.root / ".ai-toolkit/sync-manifest").write_text(".claude/hooks/guard.sh\n")   # a refresh needs the synced set
+    if linked == "boom":
+        stubs.reply("orca.worktree_show", "boom", rc=1)
+    else:
+        link(stubs, "null" if linked is None else linked)   # null: Orca answers, the worktree has no linked issue yet
     stubs.reply("gh", '{"number":12,"title":"Add hello","body":"Do it.\\nGate: plan"}')
-    wt, r = setup(run, repo, branch)
+    wt = repo.wt(branch)
+    (wt / ".ai-toolkit").mkdir()
+    (wt / ".ai-toolkit/task.md").write_text("# #99 old\n")
+    wt, r = setup(run, repo, wt=wt, mode=mode)
     assert r.returncode == 0, r.stderr
     if issue:
         assert stubs.calls("gh")[0][:3] == ["issue", "view", issue] and stubs.calls("orca")[0][-1] == "--json"
         assert (wt / ".ai-toolkit/task.md").read_text() == "# #12 Add hello\n\nDo it.\nGate: plan\n"   # the format the gates' refresh writes too (one definition in lib.sh)
     else:
-        assert stubs.calls("gh") == [] and not (wt / ".ai-toolkit/task.md").exists()
+        assert stubs.calls("gh") == [] and (wt / ".ai-toolkit/task.md").read_text() == "# #99 old\n"
+        assert bool(mode) == ("keeping the existing task.md" in r.stderr)
+    assert len(stubs.calls("orca")) == (3 if mode and linked == "boom" else 1)   # a refresh waits for Orca up to the bound; first provisioning asks once
 
 
 @pytest.mark.parametrize("mode", [(), ("--refresh",)], ids=["setup", "refresh"])
@@ -57,6 +75,7 @@ def test_runs_the_hosts_setup_local_hook(run, repo, stubs, mode):
 
 def test_refresh_recopies_claude_and_task_md_but_keeps_run_id_and_a_failed_fetch_keeps_the_old_task_md(run, repo, stubs):
     stubs.reply("gh", '{"number":12,"title":"Add hello","body":"Do it."}')
+    link(stubs, 12)   # a refresh learns the issue from Orca, never from the branch
     (repo.root / ".ai-toolkit").mkdir()
     manifest = repo.root / ".ai-toolkit/sync-manifest"
     (repo.root / ".claude/hooks/old.sh").write_text("old\n")

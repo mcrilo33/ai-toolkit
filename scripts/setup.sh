@@ -59,9 +59,14 @@ for p in $patterns; do grep -qxF "$p" "$excl" 2>/dev/null || echo "$p" >> "$excl
 # One id per spoke, kept across re-runs: the Langfuse session key (bin/claude-spoke).
 [ -s .ai-toolkit/spoke-run-id ] || uuidgen | tr '[:upper:]' '[:lower:]' > .ai-toolkit/spoke-run-id
 
-# task.md from the linked issue: Orca's link, else the `<n>-<slug>` branch name (worker-start
-# links the issue only after setup).
-n="$(issue_of "$wt")"
+# task.md from the linked issue. Orca's link only, except on first provisioning, where the `<n>-<slug>` branch name the coordinator chose at dispatch
+# may stand in (worker-start links the issue only after setup, and no worker has run yet). A kept worktree (--refresh) has had a worker that may have
+# renamed its branch: Orca's link only, waited for; with no answer the existing task.md stays.
+if [ "$refresh" = 1 ]; then n="$(issue_of "$wt")" || { warn "keeping the existing task.md"; n=""; }
+else
+  n="$(issue_of "$wt" 1 2> /dev/null || true)"
+  [ -n "$n" ] || { b="$(git branch --show-current)"; n="${b%%-*}"; case "$n" in *[!0-9]*) n="" ;; esac; }
+fi
 if [ -n "$n" ]; then
   fetched="$(mktemp .ai-toolkit/task.md.XXXXXX)"   # a failed fetch must not truncate the task.md already there
   if gh_issue "$n" | task_md > "$fetched"; then mv "$fetched" .ai-toolkit/task.md
