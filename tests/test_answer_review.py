@@ -124,14 +124,19 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     assert r.returncode == 0 and r.stderr == "" and "new body" in A.stdin() and task.read_text().startswith("# #7 edited")
 
 
-@pytest.mark.parametrize("line, body", [
-    ("revise: drop the extra file", "revise: drop the extra file"),
-    ("approve with: drop the extra file", "approve with: drop the extra file"),
-    ("Approve  With:   drop the extra file  ", "approve with: drop the extra file"),
+@pytest.mark.parametrize("line, body, mode, rc", [
+    ("revise: drop the extra file", "revise: drop the extra file", "", 0),
+    ("approve with: drop the extra file", "approve with: drop the extra file", "", 0),
+    ("Approve  With:   drop the extra file  ", "approve with: drop the extra file", "", 0),
+    ("human: the plan adds a mechanism the issue left open", "human: the plan adds a mechanism the issue left open", "attended", 3),   # the third answer: attended only, with a reason, exit 3
+    ("Human:   raises a cap  ", "human: raises a cap", "attended", 3),
+    ("human:", "", "attended", 1), ("human:   ", "", "attended", 1), ("humans: x", "", "attended", 1),
+    ("human: raises a cap", "", "auto", 1), ("human: raises a cap", "", "", 1),   # auto always answers: a hand-over is no usable answer there (the loop's unanswered path, as before)
 ])
-def test_revise_and_approve_with_keep_their_text_and_warn_lines_follow_the_answer(A, line, body):
-    r = A.go(f"WARN: touches the CI config\nREVERSIBILITY: scope\nWARN: second\nANSWER: {line}\n")
-    assert r.returncode == 0 and r.stdout == f"{body}\nWARN: touches the CI config\nWARN: second\n"
+def test_revise_approve_with_and_for_the_human_keep_their_text_and_warn_lines_follow_the_answer(A, line, body, mode, rc):
+    r = A.go(f"WARN: touches the CI config\nREVERSIBILITY: scope\nWARN: second\nANSWER: {line}\n", **({"ANSWER_MODE": mode} if mode else {}))
+    assert r.returncode == rc and r.stdout == (f"{body}\nWARN: touches the CI config\nWARN: second\n" if body else "")
+    assert A.stdin().splitlines()[-1] == f"Mode: {mode or 'auto'}"   # the answerer's own last line, after the worker's text and the issue: the rule keys on it
 
 
 @pytest.mark.parametrize("out", [
