@@ -483,7 +483,7 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     ([dict()], dict(silent=14), False),   # silent, but under the bound
     ([dict()], dict(silent=14, wait=True), False),   # ... also with a proved human-only prompt
     ([dict()], dict(silent=40), True),   # waiting on an open gate or permission question
-    ([dict()], dict(silent=40, raw="not json"), False),   # worker-show unreadable: the age is unknown, so the worker is neither relaunched nor flagged idle
+    ([dict()], dict(silent=40, raw="not json"), False),   # worker-show unreadable: the age is unknown, so the worker is neither relaunched nor blocked idle
 ])
 def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worker_alone(C, rows, shown, gate):
     C.workers(*[C.row(**r) for r in rows]); C.show(**shown)
