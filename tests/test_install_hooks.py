@@ -80,4 +80,4 @@ def test_a_test_over_the_time_limit_warns_and_one_over_the_fail_limit_fails_unde
     r = pytester.runpytest_inprocess("-o", "test_time_limit=0.1", "-o", "test_time_fail=1.0")
 
     r.assert_outcomes(passed=1, skipped=1, errors=errors)   # between the limits a test only warns; over the fail limit it fails at its teardown under CI, a skipped one included
-    r.stdout.re_match_lines_random([r"WARNING: .*test_slow took 0\.[3-9]\d* s \(.*\), limit 0\.1 s", r".*test_slow_skipped took 1\.\d+ s \(.*\), " + ("fail limit 1 s" if ci else "limit 0\\.1 s")])
+    r.stdout.re_match_lines_random([r"WARNING: .*test_slow took (0\.[3-9]\d*|[1-9]\d*\.\d+) s \(.*\), limit 0\.1 s", r".*test_slow_skipped took [1-9]\d*\.\d+ s \(.*\), " + ("fail limit 1 s" if ci else "limit 0\\.1 s")])

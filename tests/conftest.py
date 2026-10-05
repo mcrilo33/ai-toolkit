@@ -58,7 +58,8 @@ def pytest_runtest_makereport(item, call):   # no marker or option opts a test o
     if call.when == "teardown" and not any(failed for _, failed in phases.values()) and spent > limit:   # skipped and xfailed tests count; a failed phase is not reported twice
         parts = " + ".join(f"{k} {d:.2f}" for k, (d, _) in phases.items())
         failing = bool(os.environ.get("CI")) and spent > fail   # load alone swings a test 2x, so only one far over the limit fails; GitHub sets CI=true
-        msg = f"{item.nodeid} took {spent:.2f} s ({parts}), {'fail limit ' + format(fail, 'g') if failing else 'limit ' + format(limit, 'g')} s"
+        bound = f"fail limit {fail:g}" if failing else f"limit {limit:g}"
+        msg = f"{item.nodeid} took {spent:.2f} s ({parts}), {bound} s"
         if failing:
             rep.outcome, rep.longrepr = "failed", msg
         else:
