@@ -189,6 +189,18 @@ on_question() {
     show_q "$q"; log "#$issue: gate question waiting: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
   fi
 }
+triage() {   # $1 = land output, $2 = the worker's report: after a land, hand what is left over (review warnings, a deferral in the report) to the scoper agents (bug-triage rule)
+  local items max="${TRIAGE_CAP:-3}" routed kept out   # in ONE headless session; never fails the land (the caller ignores the status), a failure keeps the text as a warning + an issue comment
+  items="$(sed -n 's/^WARNING: /review warning: /p' <<< "$1")"
+  ! grep -Eiq 'defer|follow-?up|left out|out of scope' <<< "$2" || items="${items:+$items$'\n'}worker report: $(tr '\n' ' ' <<< "$2")"
+  [ -n "$items" ] || return 0
+  routed="$(head -n "$max" <<< "$items")"; kept="$(tail -n +$((max + 1)) <<< "$items" | tr '\n' ' ')"
+  [ -z "$kept" ] || { warn "#$issue: more than $max findings, not routed: $kept"; comment "$issue" "Findings not routed to a scoper (cap $max per land), file by hand: $kept"; }
+  if out="$(printf 'Issue #%s just landed. Findings left over, one per line:\n%s\n\nRoute EACH one with the Agent tool, asking no one (rule: .ai-toolkit/rules/bug-triage.md): a concrete defect -> subagent bug-scoper; a non-defect warning or a deferred item -> subagent followup-scoper (filed with the hold label). Do not judge or filter them: the scoper verifies the evidence and drops ungrounded or duplicate ones. Never edit code. Answer one line per item: filed #n | dropped: why | duplicate of #n | drafted, not filed: why.' "$issue" "$routed" \
+    | claude -p --model "${TRIAGE_MODEL:-$ANSWER_MODEL}" --no-session-persistence --allowedTools 'Agent,Read,Grep,Glob,Bash(gh issue:*),Bash(gh label:*)' 2>&1)" && [ -n "$out" ]; then
+    log "#$issue leftover findings routed:"; printf '%s\n' "$out" | sed 's/^/  | /'
+  else warn "#$issue: routing the leftover findings failed, they are kept in a comment: $routed"; comment "$issue" "Routing to the scopers failed, file by hand: $routed"; fi
+}
 on_done() {
   local out rc=0 branch bl last
   ctx "$(pj "$1" dispatchId)" || return 1
@@ -211,6 +223,7 @@ on_done() {
          || block "landed, but cleanup is incomplete (finish with land.sh --cleanup-only $issue); blocked so the still-open issue is not dispatched again" ;;
     *) block "land.sh exited $rc: $last" ;;
   esac
+  case $rc in 0 | 6) triage "$out" "$(jq -r '.body // ""' <<< "$1")" || true ;; esac   # landed: what is left over goes to the scopers, after the land's own work
 }
 handle() {
   case "$(jq -r .type <<< "$1")" in

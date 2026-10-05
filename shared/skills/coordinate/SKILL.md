@@ -63,7 +63,9 @@ release, remove the worktree; it takes minutes) and report by exit code. 0 lande
 3 review rejected, 4 gate red or timed out, 5 merge conflict: show the `BLOCKER:` lines or the last line, and **offer** the re-dispatch
 the loop would do: `RUN=<run> .ai-toolkit/scripts/dispatch.sh --address "address: <blockers or why>" <n>` (a fresh terminal and Task; at
 most 2 rounds for a rejected review, 1 for red CI or a conflict; after that propose `blocked`). 6 landed but cleanup incomplete: run
-`.ai-toolkit/scripts/land.sh --cleanup-only <n>`, never land again.
+`.ai-toolkit/scripts/land.sh --cleanup-only <n>`, never land again. After 0 or 6, route the leftovers without asking (`bug-triage.md`): a defect among land.sh's `WARNING:` lines to the
+`bug-scoper` agent, any other warning and anything the worker deferred in `worker_done` to `followup-scoper`; no pre-filtering (they verify
+and dedup), no follow-up issue by hand. Report one line each: filed #n, dropped (ungrounded or duplicate), or on `hold` awaiting the user's go.
 
 **`worker_done` failed / `escalation`**: read the body and the kept worktree (`orca worktree show --worktree issue:<n>`), explain what
 happened in two sentences, then propose either `blocked` or one retry with `dispatch.sh --address "<what to do differently>" <n>`.

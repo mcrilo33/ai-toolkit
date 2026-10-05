@@ -334,7 +334,7 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
         assert "bug-scoper" in p and "followup-scoper" in p
         assert all(t in p for t in re.findall(r"w\d|deferred|x|y", routed)) and ("w4" not in p)
     if crc:   # a failed routing never reddens the land, and the finding is kept: warned and commented on the landed issue
-        assert W + "x" in r.stderr and any(W + "x" in a[-1] for a in C.calls("gh issue comment")[1:])
+        assert "a.py:3 - x" in r.stderr and any("a.py:3 - x" in a[-1] for a in C.calls("gh issue comment")[1:])
     if "w1" in routed:
         assert any("w4" in a[-1] and "w5" in a[-1] for a in C.calls("gh issue comment")[1:])
 
