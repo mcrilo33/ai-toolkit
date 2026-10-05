@@ -237,7 +237,7 @@ on_question() {
   local id q ans body warns why=""
   id="$(jq -r .id <<< "$1")"; q="$(question_of "$1")"
   if is_perm "$q"; then on_permission "$id" "$q" "$(pj "$1" dispatchId)"; return 0; fi
-  ctx "$(pj "$1" dispatchId)" || { [ $? = 2 ] || { log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; flag ""; }; return 1; }   # 2: ctx already blocked it
+  ctx "$(pj "$1" dispatchId)" || { [ $? = 2 ] || { held="$held $id "; log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; flag ""; }; return 1; }   # 2: ctx already blocked it
   if [ "$answer" != human ] && ans="$(printf '%s' "$q" | ANSWER_MODE="$answer" "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
@@ -325,9 +325,10 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
         done
       fi
     fi
-    if [ -z "$why" ]; then   # a kept worktree is re-dispatched (--address, a default message when none was given); none yet: a plain dispatch, the message goes to the issue
+    [ -n "$why" ] || [ -n "$path" ] || [ -z "$spec" ] || why="no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"
+    if [ -z "$why" ]; then   # a kept worktree is re-dispatched (--address, a default message when none was given); none yet: a plain dispatch
       if [ -n "$path" ]; then out="$(RUN="$run" "$DISPATCH_CMD" --address "${spec:-address: continue from the pushed branch (git log), push, then send worker_done.}" "$n" 2>&1)" && rc=0 || rc=$?
-      else out="$(RUN="$run" "$DISPATCH_CMD" "$n" 2>&1)" && rc=0 || rc=$?; [ "$rc" != 0 ] || [ -z "$spec" ] || comment "$n" "Dispatch request message: $spec"; fi
+      else out="$(RUN="$run" "$DISPATCH_CMD" "$n" 2>&1)" && rc=0 || rc=$?; [ "$rc" = 0 ] || orca_json worktree rm --worktree "issue:$n" --force > /dev/null 2>&1 || true; fi   # a failed fresh dispatch may leave a half-made worktree (as fill() does)
       if [ "$rc" = 0 ]; then
         ! jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null || gh issue edit "$n" --remove-label blocked > /dev/null 2>&1 || warn "cannot remove the blocked label of #$n"
         log "dispatched #$n on request"; rm -f "$f"; continue

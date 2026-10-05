@@ -76,10 +76,10 @@ route leftovers). A Claude session never binds the Run, `check`s or reads the in
 
 The session in attended mode only presents the queue, one decision at a time, relays each answer with `coordinator.sh --reply`, writes into the issue any answer that changes what it asks, and shows no routine event.
 Its other requests go through the loop too: `coordinator.sh --run R --dispatch <issue> ['<message>']` queues a request (a file in the reply spool's `requests/`, line 1 the message, line 2 the reason it cannot run yet) that the loop runs
-ahead of its own pick with `dispatch.sh` (`--address` with a message, or a default one, for a kept worktree), within the cap and the Scope rule; a request that cannot run (on hold, blocked with no message, already running, a Scope overlap, no free slot, an unreadable issue, a failed dispatch: not retried) stays
+ahead of its own pick with `dispatch.sh` (`--address` with a message, or a default one, for a kept worktree; a fresh worker reads only the issue body, so a message with no worktree is refused), within the cap and the Scope rule; a request that cannot run (on hold, blocked with no message, already running, a Scope overlap, no free slot, an unreadable issue, a failed dispatch: not retried) stays
 in `--status` with its reason until it runs or `--dispatch <n> --cancel` withdraws it (only a closed issue is dropped); a finished worker is landed by the loop itself.
 The bell is `printf '\a'` appended to a terminal device: Orca has no verb to ring another terminal, so the skill passes its own tty (`--bell-tty`; anything that is not a terminal falls back to the loop's own) and Orca's
-suppress-when-focused keeps it silent while the user works there. The ids last seen live in one shell variable (no file), so a decision rings once and a restart rings once per decision still waiting. A question counts only once this loop has left it open: one that arrived while the loop was busy
+suppress-when-focused keeps it silent while the user works there. The ids last seen live in one shell variable (no file), so a decision rings once; a restart rings again for the blocked issues still waiting, while a question left open before it is in `--status`. A question counts only once this loop has left it open: one that arrived while the loop was busy
 (a land takes minutes) may still be answered by it, a routine event. `--status` shows only the loop's own `blocked:` comment as the reason, one line without control bytes, since the repository may be public.
 
 ```mermaid
