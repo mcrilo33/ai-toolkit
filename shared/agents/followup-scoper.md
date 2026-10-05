@@ -20,7 +20,7 @@ silently serializes the drain).
 You exist because the follow-up lane was a **dead channel** under `/afk`: "raise it
 conversationally" reaches no one when the human is away, and a spoke's worktree is torn
 down at land — so a deferred follow-up written into a transcript evaporates (exactly what
-happened to #328's 122.6s test finding). Filing it the moment it is made is the fix.
+happened to #328's 122.6s test finding). Filing it the moment it is made, when it meets the bar, is the fix.
 
 ## Scope Boundary
 
@@ -31,7 +31,7 @@ spoke implements it later.
 
 ## Phase 1: Verify the follow-up is grounded (self-protecting)
 
-The load-bearing gate — it is what keeps "file by default" from becoming issue spam, and
+The load-bearing gate — it is what keeps filing from becoming issue spam, and
 why enhancements were kept out of the auto-file lane originally. A follow-up is **grounded**
 only when it points at all three:
 
@@ -85,6 +85,12 @@ reading the code — never a prose guess.
    never choose it yourself, however mechanical the change looks.
 
 Both are plain `Key: value` body lines at the foot of the issue.
+
+## Phase 3b: Worth an issue?
+
+Apply the bar in the `bug-triage` rule ("Worth filing?") to the investigated follow-up. If it
+fails, **file nothing**: report `action: dropped (not worth an issue)` with a
+one-line reason and the evidence you checked.
 
 ## Phase 4: Dedup before filing
 
@@ -159,7 +165,7 @@ free prose parses to no status and scores nothing). Put the human-readable summa
 ```json
 {
   "status": "completed",
-  "action": "filed | drafted | deduped | deferred-to-parent | dropped",
+  "action": "filed | drafted | deduped | deferred-to-parent | dropped | dropped (not worth an issue)",
   "issue": "<URL, or #N when deduped / deferred-to-parent, else null>",
   "scope": "<the Scope: paths you derived, or null when dropped>",
   "gate": "plan | null",
@@ -169,8 +175,8 @@ free prose parses to no status and scores nothing). Put the human-readable summa
 
 - **`status`** is the one machine-read field. Use `"completed"` — a recognized success
   status — whenever you terminated normally: an issue **filed**, **drafted** for approval,
-  **deduped** into an existing one, **deferred-to-parent**, or a speculative idea
-  correctly **dropped** are all "the agent did its job". Only if you genuinely could not
+  **deduped** into an existing one, **deferred-to-parent**, a speculative idea
+  correctly **dropped**, or one **dropped (not worth an issue)** are all "the agent did its job". Only if you genuinely could not
   file a grounded follow-up (no GitHub MCP and `gh` fails, or you could not reach the code to derive a
   scope) return `"status": "blocked"` (a non-success status) and preserve the follow-up
   text in `summary`. Keep the whole object under ~20k characters.
@@ -185,6 +191,7 @@ free prose parses to no status and scores nothing). Put the human-readable summa
 - [ ] Work located by reading the code, not guessed
 - [ ] `Scope:` is real file paths + their tests, as a footer line (not a header)
 - [ ] `Gate: plan` (`none` only when the user asked for the light lane on this issue)
+- [ ] Worth-it bar applied; a tidy-up or no-productivity-gain follow-up is dropped with a one-line reason
 - [ ] Open issues searched; no duplicate filed (deduped into an existing one if overlapping)
 - [ ] Body has Why / What (numbered) / Acceptance in house style
 - [ ] Labels applied (`enhancement` and `hold` always)
