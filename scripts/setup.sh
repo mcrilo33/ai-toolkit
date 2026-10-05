@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Orca setup hook (orca.yaml scripts.setup). Runs in the NEW worktree before the agent starts
 # (wait-for-setup), so a non-zero exit keeps the agent off a half-provisioned tree. Idempotent.
+# A worker gets main's .claude/ and .ai-toolkit/rules/ (the on-demand rules its seed and agents name; .ai-toolkit/ is untracked).
 # Orca env: ORCA_ROOT_PATH (main checkout), ORCA_WORKTREE_PATH. Claude Code only (D4).
 # --refresh: the same provisioning for a KEPT worktree (dispatch.sh --address / --retry-of): the main checkout's current
-# .claude/ synced files (and the removal of those main dropped) and setup.local.sh output land again, spoke-run-id stays, and task.md is
+# .claude/ synced files and .ai-toolkit/rules/ (and the removal of those main dropped) and setup.local.sh output land again, spoke-run-id stays, and task.md is
 # rewritten from the issue as it reads now (an issue edited since the first dispatch must reach the worker and its reviewer); an issue that cannot be fetched keeps the old task.md and warns.
 set -euo pipefail
 refresh=0
@@ -24,7 +25,9 @@ mkdir -p .claude .ai-toolkit
 manifest="$root/.ai-toolkit/sync-manifest"
 installed=.ai-toolkit/synced-claude
 synced="$(grep '^\.claude/' "$manifest" 2> /dev/null | grep -v '\.\.' || true)"
-if [ "$refresh" = 0 ]; then cp -R "$root/.claude/." .claude/
+if [ "$refresh" = 0 ]; then
+  cp -R "$root/.claude/." .claude/
+  if [ -d "$root/.ai-toolkit/rules" ]; then mkdir -p .ai-toolkit/rules; cp -R "$root/.ai-toolkit/rules/." .ai-toolkit/rules/; fi
 else   # a kept worktree: tracked .claude files reach it through git (the branch's own, and main's via land's merge); copying them would
   # dirty the tree, clobber the worker's edits, or leave an untracked file that makes that merge fail. Only the untracked synced copies are refreshed.
   [ -n "$synced" ] || die "$manifest lists no .claude/ files (missing, empty or cut short): sync ai-toolkit into the main checkout first"   # never delete against an empty set
@@ -39,6 +42,10 @@ else   # a kept worktree: tracked .claude files reach it through git (the branch
   fi
   copy="$(grep -vxFf <(printf '%s\n' "$tracked") <<< "$synced" || true)"
   [ -z "$copy" ] || printf '%s\n' "$copy" | tar -C "$root" -cf - -T - | tar -xf -   # symlinks stay symlinks
+  # .ai-toolkit/rules/ is untracked and wholly sync-owned: mirror the manifest's entries (a rule main dropped goes; the empty-manifest die above ran first).
+  rules="$(grep '^\.ai-toolkit/rules/' "$manifest" | grep -v '\.\.' || true)"
+  rm -rf .ai-toolkit/rules
+  [ -z "$rules" ] || printf '%s\n' "$rules" | tar -C "$root" -cf - -T - | tar -xf -
 fi
 printf '%s\n' "$synced" > "$installed"
 

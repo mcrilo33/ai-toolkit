@@ -12,11 +12,13 @@ def setup(run, repo, branch="wp0", wt=None, mode=()):
 
 
 def test_provisions_claude_dir_run_id_and_excludes_and_is_idempotent(run, repo, stubs):
+    (repo.root / ".ai-toolkit/rules").mkdir(parents=True)
+    (repo.root / ".ai-toolkit/rules/bug-triage.md").write_text("main rule\n")   # the seed names this path: a worker needs it too
     wt, r = setup(run, repo)
     rid = (wt / ".ai-toolkit/spoke-run-id").read_text()
     assert r.returncode == 0, r.stderr
     assert rid.strip() and (wt / ".claude/hooks/guard.sh").exists() and git(wt, "status", "--porcelain") == ""
-    assert (wt / ".ai-toolkit/setup-done").exists()
+    assert (wt / ".ai-toolkit/setup-done").exists() and (wt / ".ai-toolkit/rules/bug-triage.md").read_text() == "main rule\n"
     assert setup(run, repo, wt=wt)[1].returncode == 0 and (wt / ".ai-toolkit/spoke-run-id").read_text() == rid
     assert (repo.root / ".git/info/exclude").read_text().count(".ai-toolkit/") == 1
 
@@ -59,7 +61,10 @@ def test_refresh_recopies_claude_and_task_md_but_keeps_run_id_and_a_failed_fetch
     manifest = repo.root / ".ai-toolkit/sync-manifest"
     (repo.root / ".claude/hooks/old.sh").write_text("old\n")
     (repo.root / ".claude/settings.local.json").write_text("main local\n")
-    manifest.write_text(".claude/hooks/guard.sh\n.claude/hooks/old.sh\n")
+    (repo.root / ".ai-toolkit/rules").mkdir()
+    (repo.root / ".ai-toolkit/rules/bug-triage.md").write_text("rule\n")
+    (repo.root / ".ai-toolkit/rules/old-rule.md").write_text("old rule\n")
+    manifest.write_text(".claude/hooks/guard.sh\n.claude/hooks/old.sh\n.ai-toolkit/rules/bug-triage.md\n.ai-toolkit/rules/old-rule.md\n")
     wt, r = setup(run, repo, "12-x")
     rid, task = (wt / ".ai-toolkit/spoke-run-id").read_text(), (wt / ".ai-toolkit/task.md").read_text()
     (repo.root / ".claude/hooks/guard.sh").write_text("#!/bin/sh\nnewer\n")   # main moved on while this worktree was kept
@@ -70,10 +75,13 @@ def test_refresh_recopies_claude_and_task_md_but_keeps_run_id_and_a_failed_fetch
     (wt / ".claude/worker-note").write_text("mine\n")
     (repo.root / ".claude/settings.local.json").write_text("main local moved\n")
     (repo.root / ".claude/hooks/old.sh").unlink()   # a land's sync dropped old.sh from main
-    manifest.write_text(".claude/hooks/guard.sh\n")
+    (repo.root / ".ai-toolkit/rules/bug-triage.md").write_text("rule, moved on\n")   # a land changed a rule; another was dropped from the synced set
+    (repo.root / ".ai-toolkit/rules/old-rule.md").unlink()
+    manifest.write_text(".claude/hooks/guard.sh\n.ai-toolkit/rules/bug-triage.md\n")
     calls = len(stubs.calls("gh"))
     r = setup(run, repo, wt=wt, mode=("--refresh",))[1]
     assert r.returncode == 0, r.stderr
+    assert (wt / ".ai-toolkit/rules/bug-triage.md").read_text() == "rule, moved on\n" and not (wt / ".ai-toolkit/rules/old-rule.md").exists()
     assert not (wt / ".claude/hooks/old.sh").exists() and (wt / ".claude/worker-note").read_text() == "mine\n"
     assert (wt / ".claude/settings.local.json").read_text() == "worker grants\n"
     assert (wt / ".claude/hooks/guard.sh").read_text() == "#!/bin/sh\nnewer\n" and (wt / ".ai-toolkit/setup-done").exists()
@@ -90,11 +98,11 @@ def test_refresh_recopies_claude_and_task_md_but_keeps_run_id_and_a_failed_fetch
     git(wt, "merge", "-q", "main")   # the branch now tracks it too
     (repo.root / ".claude/hooks/guard.sh").write_text("main moved again\n")
     (repo.root / ".claude/hooks/extra.sh").write_text("untracked\n")
-    manifest.write_text(".claude/hooks/guard.sh\n.claude/hooks/extra.sh\n")
+    manifest.write_text(".claude/hooks/guard.sh\n.claude/hooks/extra.sh\n.ai-toolkit/rules/bug-triage.md\n")
     (wt / ".claude/hooks/guard.sh").write_text("worker edit\n")
     assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0
     assert (wt / ".claude/hooks/extra.sh").read_text() == "untracked\n" and (wt / ".claude/hooks/guard.sh").read_text() == "worker edit\n"
-    manifest.write_text(".claude/hooks/extra.sh\n")   # the branch tracks guard.sh, so main dropping it from the synced set does not delete it
+    manifest.write_text(".claude/hooks/extra.sh\n.ai-toolkit/rules/bug-triage.md\n")   # the branch tracks guard.sh, so main dropping it from the synced set does not delete it
     assert setup(run, repo, wt=wt, mode=("--refresh",))[1].returncode == 0 and (wt / ".claude/hooks/guard.sh").read_text() == "worker edit\n"
     (repo.root / ".git/info/exclude").write_text("")   # a repo that tracks .claude does not ignore it (an ignored file would be merged over silently)
     (repo.root / ".claude/rules").mkdir()
@@ -111,6 +119,7 @@ def test_refresh_recopies_claude_and_task_md_but_keeps_run_id_and_a_failed_fetch
         manifest.unlink(missing_ok=True) if cut is None else manifest.write_text(cut)
         r = setup(run, repo, wt=wt, mode=("--refresh",))[1]
         assert r.returncode != 0 and "manifest" in r.stderr and (wt / ".claude/hooks/extra.sh").exists() and not (wt / ".ai-toolkit/setup-done").exists()
+        assert (wt / ".ai-toolkit/rules/bug-triage.md").exists()   # a failed refresh deletes no rule either
     shutil.rmtree(repo.root / ".claude")
     r = setup(run, repo, wt=wt, mode=("--refresh",))[1]   # a failed refresh is loud and leaves no ready marker
     assert r.returncode != 0 and ".claude" in r.stderr and not (wt / ".ai-toolkit/setup-done").exists()
