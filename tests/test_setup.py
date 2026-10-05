@@ -33,7 +33,7 @@ def test_fails_loud_when_gh_fails_or_the_root_has_no_claude_dir(run, repo, stubs
     assert r.returncode != 0 and ".claude" in r.stderr and not (wt / ".ai-toolkit/setup-done").exists()
 
 
-@pytest.mark.parametrize("branch,linked,issue", [("12-add-hello", None, "12"), ("12-add-hello", 7, "7"), ("wp0", None, None)])
+@pytest.mark.parametrize("branch,linked,issue", [("12-add-hello", None, "12"), ("12-add-hello", 7, "7"), ("12-add-hello", '"x;y"', "12"), ("wp0", None, None)])
 def test_task_md_comes_from_the_linked_issue_or_the_branch_number(run, repo, stubs, branch, linked, issue):
     if linked:
         stubs.reply("orca.worktree_show", f'{{"result":{{"worktree":{{"linkedIssue":{linked}}}}}}}')
@@ -42,7 +42,7 @@ def test_task_md_comes_from_the_linked_issue_or_the_branch_number(run, repo, stu
     assert r.returncode == 0, r.stderr
     if issue:
         assert stubs.calls("gh")[0][:3] == ["issue", "view", issue] and stubs.calls("orca")[0][-1] == "--json"
-        assert "#12 Add hello" in (wt / ".ai-toolkit/task.md").read_text()
+        assert (wt / ".ai-toolkit/task.md").read_text() == "# #12 Add hello\n\nDo it.\nGate: plan\n"   # the format the gates' refresh writes too (one definition in lib.sh)
     else:
         assert stubs.calls("gh") == [] and not (wt / ".ai-toolkit/task.md").exists()
 
@@ -87,6 +87,7 @@ def test_refresh_recopies_claude_and_task_md_but_keeps_run_id_and_a_failed_fetch
     assert (wt / ".claude/hooks/guard.sh").read_text() == "#!/bin/sh\nnewer\n" and (wt / ".ai-toolkit/setup-done").exists()
     assert (wt / ".ai-toolkit/spoke-run-id").read_text() == rid and "Do it differently." in (wt / ".ai-toolkit/task.md").read_text() != task
     assert len(stubs.calls("gh")) == calls + 1   # the refresh reads the issue once
+    assert (wt / ".ai-toolkit/task.md").read_text() == "# #12 Add hello\n\nDo it differently.\n"
     stubs.reply("gh", "boom", rc=1)   # an outage must not block a re-dispatch: the old text stays and the warning names the issue
     kept = (wt / ".ai-toolkit/task.md").read_text()
     r = setup(run, repo, wt=wt, mode=("--refresh",))[1]

@@ -18,10 +18,15 @@ fi
 [ -f "$rule" ] || die "answer rule (afk-answering.md) not found"
 q="$(cat)"; t="${q#"${q%%[![:space:]]*}"}"   # a worker's permission prompt (permission-relay.sh) is never answered here: the loop denies it, only the user allows it
 [[ $t != "PERMISSION REQUEST"* ]] || die "a permission question is never auto-answered (the coordinator denies it; only the user can allow it)"
-# The answerer judges the issue as it is now: its number is task.md's header, else the `<n>-<slug>` branch.
-n="$(sed -n '1s/^# #\([0-9][0-9]*\)[[:space:]].*/\1/p' "$wt/.ai-toolkit/task.md" 2> /dev/null)" || n=""
-if [ -z "$n" ]; then n="$(git -C "$wt" branch --show-current 2> /dev/null)" || n=""; n="${n%%-*}"; fi
-case "$n" in '' | *[!0-9]*) q="$q$(stale_note "no issue number found for this worktree")" ;; *) q="$q$(refresh_task "$wt" "$n")" ;; esac
+# The answerer judges the issue as it is now. Its number never comes from task.md (the judged worker can rewrite it): Orca's link, else the branch.
+h="$(task_md_number "$wt/.ai-toolkit/task.md")"; n="$(issue_of "$wt")"   # h before the refresh, which rewrites the header
+if [ -z "$n" ]; then q="$q$(stale_note "no issue number found for this worktree")"; else
+  q="$q$(refresh_task "$wt" "$n")"
+  if [ -n "$h" ] && [ "$h" != "$n" ]; then
+    warn "task.md header names #$h but this worktree is issue #$n; judging #$n"
+    q="$q NOTE: the worker's .ai-toolkit/task.md header named #$h, but this worktree is issue #$n (Orca link or branch); judged #$n, so the worker may have edited that header."
+  fi
+fi
 out="$(cd "$wt" && printf '%s' "$q" | claude -p --model "$ANSWER_MODEL" --append-system-prompt-file "$rule" --allowedTools Read,Grep,Glob --no-session-persistence)" || die "claude failed"
 last="$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 1)"
 body="$(printf '%s' "$last" | sed -n 's/^ANSWER:[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p')"

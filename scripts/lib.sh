@@ -66,11 +66,26 @@ stale_note() {
   printf ' NOTE: %s, so .ai-toolkit/task.md may be stale: the issue may have changed since dispatch.' "$1"
 }
 
+# The one definition of .ai-toolkit/task.md. task_md renders {number,title,body} (stdin) to the file text; task_md_number reads the number
+# back from the header. Keep them together: a header change in one breaks the other.
+task_md() { jq -r '"# #\(.number) \(.title)\n\n\(.body)"'; }
+task_md_number() { sed -n '1s/^# #\([0-9][0-9]*\)[[:space:]].*/\1/p' "$1" 2> /dev/null || true; }
+
+# issue_of <worktree>: the issue a worktree belongs to, from sources its worker cannot choose by editing files: Orca's link, else the `<n>-<slug>`
+# branch name. Prints nothing when neither names a number. Never task.md's header: that is the worker's to rewrite.
+issue_of() {
+  local n b
+  n="$(orca_json worktree show --worktree "path:$1" 2> /dev/null | jq -r '.result.worktree.linkedIssue // empty' 2> /dev/null || true)"
+  case "$n" in '' | *[!0-9]*) b="$(git -C "$1" branch --show-current 2> /dev/null || true)"; n="${b%%-*}" ;; esac
+  case "$n" in *[!0-9]*) n="" ;; esac
+  printf '%s' "$n"
+}
+
 # refresh_task <worktree> <issue>: rewrite the worktree's .ai-toolkit/task.md from the live issue, so a gate judges the issue as it is now.
 # An issue that cannot be read or written keeps the old copy and prints the stale note for the gate's prompt; never a failure.
 refresh_task() {
   local t f="$1/.ai-toolkit/task.md"
-  if t="$(gh_issue "$2" | jq -r '"# #\(.number) \(.title)\n\n\(.body)"')" && [ -n "$t" ] && mkdir -p "$1/.ai-toolkit" \
+  if t="$(gh_issue "$2" | task_md)" && [ -n "$t" ] && mkdir -p "$1/.ai-toolkit" \
     && printf '%s\n' "$t" > "$f.new" && mv "$f.new" "$f"; then :
   else stale_note "issue $2 could not be refreshed"; fi
 }

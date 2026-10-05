@@ -61,14 +61,10 @@ for p in $patterns; do grep -qxF "$p" "$excl" 2>/dev/null || echo "$p" >> "$excl
 
 # task.md from the linked issue: Orca's link, else the `<n>-<slug>` branch name (worker-start
 # links the issue only after setup).
-n="$(orca_json worktree show --worktree "path:$wt" 2>/dev/null | jq -r '.result.worktree.linkedIssue // empty' 2>/dev/null || true)"
-if [ -z "$n" ]; then
-  b="$(git branch --show-current)"
-  case "${b%%-*}" in '' | *[!0-9]*) ;; *) n="${b%%-*}" ;; esac
-fi
+n="$(issue_of "$wt")"
 if [ -n "$n" ]; then
   fetched="$(mktemp .ai-toolkit/task.md.XXXXXX)"   # a failed fetch must not truncate the task.md already there
-  if gh_issue "$n" | jq -r '"# #\(.number) \(.title)\n\n\(.body)"' > "$fetched"; then mv "$fetched" .ai-toolkit/task.md
+  if gh_issue "$n" | task_md > "$fetched"; then mv "$fetched" .ai-toolkit/task.md
   else
     rm -f "$fetched"
     if [ "$refresh" = 1 ]; then warn "cannot fetch issue $n: keeping the existing task.md"; else die "cannot fetch issue $n for task.md"; fi

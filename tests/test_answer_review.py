@@ -46,12 +46,29 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     assert argv[:3] == ["-p", "--model", "m-1"] and ["--append-system-prompt-file", str(A.rule), "--allowedTools", "Read,Grep,Glob"] == argv[3:7]
     assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and A.stdin().startswith("PLAN: do X. Approve?") and "no issue number" in A.stdin()
     # the issue changed after dispatch: the gate reads the live text; an unreadable issue keeps the copy, warns and says so in the prompt
+    link = lambda n: A.stubs.reply("orca.worktree_show", f'{{"result":{{"worktree":{{"linkedIssue":{n}}}}}}}')   # the number comes from the Orca link, never from the worktree's own files
+    link(9)
     task = A.wt / ".ai-toolkit/task.md"
     task.parent.mkdir()
     task.write_text("# #9 old\n\nold body\n")
     A.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')
     assert A.go("ANSWER: approve\n", input="PLAN: do X.").returncode == 0
     assert A.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and task.read_text() == "# #9 new\n\nnew body\n" and "stale" not in A.stdin()
+    task.write_text("# #7 edited by the worker\n\nother issue\n")   # a header naming another issue never picks the issue: the link wins, and the disagreement is reported
+    r = A.go("ANSWER: approve\n", input="PLAN: do X.")
+    assert r.returncode == 0 and [c[2] for c in A.stubs.calls("gh")] == ["9", "9"] and task.read_text() == "# #9 new\n\nnew body\n"
+    assert "warning" in r.stderr and "#7" in r.stderr and "#7" in A.stdin() and "#9" in A.stdin() and "stale" not in A.stdin()
+    git_in = lambda *a: subprocess.run(["git", "-C", str(A.wt), *a], check=True, capture_output=True)
+    git_in("init", "-q", "-b", "5-x")   # the Orca link outranks the branch; without a link the branch number is used
+    assert A.go("ANSWER: approve\n", input="PLAN: do X.").returncode == 0 and A.stubs.calls("gh")[-1][2] == "9"
+    link("")
+    assert A.go("ANSWER: approve\n", input="PLAN: do X.").returncode == 0 and A.stubs.calls("gh")[-1][2] == "5"
+    git_in("branch", "-m", "wp0")   # neither source: today's note, no fetch, even with a header in the worktree
+    task.write_text("# #7 edited by the worker\n\nother issue\n")
+    n_gh = len(A.stubs.calls("gh"))
+    r = A.go("ANSWER: approve\n", input="PLAN: do X.")
+    assert r.returncode == 0 and len(A.stubs.calls("gh")) == n_gh and "no issue number" in A.stdin() and task.read_text().startswith("# #7")
+    link(9); git_in("branch", "-m", "9-feat")
     A.stubs.reply("gh", "boom", rc=1)
     task.write_text("# #9 old\n\nold body\n")
     r = A.go("ANSWER: approve\n", input="PLAN: do X.")
