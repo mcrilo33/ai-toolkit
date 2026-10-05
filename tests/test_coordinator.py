@@ -34,6 +34,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     cmds.mkdir()
     for n in ("dispatch.sh", "land.sh", "answer.sh"):   # sub-commands are stubs that also record their stdin
         link_script(cmds / n, STUB_TEE)
+    link_script(tmp_path / "stubs/bin/claude", STUB_TEE)   # the post-land triage prompt goes on its stdin
 
     def row(d="ctx_1", st="dispatched", lv="live"):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",
@@ -308,13 +309,34 @@ def test_a_failed_or_escalating_worker_blocks_the_issue(C, kind, extra):
     assert C.blocked() and not C.stubs.calls("land.sh") and C.calls("orca orchestration check ack")
 
 
-def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_once_after_all_its_messages(C):
+W = "WARNING: a.py:3 - "   # a review warning as land.sh prints it
+
+
+@pytest.mark.parametrize("land, body, crc, routed", [
+    ("", "the body", 0, ""),                                                    # nothing left over: no scoper call
+    (f"{W}x\n{W}zeta\n", "the body", 0, "xzeta"), (f"{W}x\n", "the body", 1, "x"),    # the routing succeeds / fails: the land reads the same
+    ("", "done; deferred: cache the lookup", 0, "cache the lookup"),                    # a deferral in the worker's report
+    ("".join(f"{W}w{i}\n" for i in range(1, 6)), "the body", 0, "w1w2w3")])    # five warnings: three routed, the other two kept in a comment
+def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_once_after_all_its_messages(C, land, body, crc, routed):
     C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # a failing handler must not stop the rest, nor the ack
-    C.mail([msg("question", "msg_q", question="q"), msg("worker_done", "msg_d", outcome="succeeded")])
-    C.go()
+    C.stubs.reply("land.sh", f"{land}landed #1 in abc\n")
+    C.stubs.reply("claude", "filed #9\n", rc=crc)
+    C.mail([msg("question", "msg_q", question="q"), {**msg("worker_done", "msg_d", outcome="succeeded"), "body": body}])
+    r = C.go()
     assert C.stubs.calls("land.sh") == [["--review", "1"]] and len(C.calls("orca orchestration check ack")) == 1
+    assert r.returncode == 0 and "#1 landed" in r.stdout and "not fully handled" not in r.stderr   # the land reads the same whatever the routing did
     assert "msg_q" in C.calls("gh issue comment")[0][-1] and C.calls("orca worktree set")   # the unreplied question is flagged for the human
     in_order(C.kinds(), "orca orchestration reply", "land.sh", "orca orchestration check ack")
+    assert len(C.stubs.calls("claude")) == bool(routed)
+    if routed:   # one headless session after the land: the findings (three at most), the two scopers to use, nothing else
+        in_order(C.kinds(), "land.sh", "claude")
+        p = C.stdin("claude")
+        assert "bug-scoper" in p and "followup-scoper" in p
+        assert all(t in p for t in re.findall(r"w\d|cache the lookup|zeta|x", routed)) and ("w4" not in p)
+    if crc:   # a failed routing never reddens the land, and the finding is kept: warned and commented on the landed issue
+        assert "a.py:3 - x" in r.stderr and any("a.py:3 - x" in a[-1] for a in C.calls("gh issue comment")[1:])
+    if "w1" in routed:
+        assert any("w4" in a[-1] and "w5" in a[-1] for a in C.calls("gh issue comment")[1:])
 
 
 @pytest.mark.parametrize("rc, out, limit", [(3, "BLOCKER: a.py:3 - bug\nBLOCKER: b.py:1 - no test\n", 2), (4, "land.sh: CI is red for abc\n", 1),
@@ -334,10 +356,10 @@ def test_a_rejected_land_re_dispatches_the_reason_to_the_same_worker_a_bounded_n
 @pytest.mark.parametrize("rc, out", [(3, "no verdict\n"), (4, "land.sh: CI for abc timed out\n"), (4, "land.sh: main keeps moving; land again\n"),
                                      (2, "land.sh: refused: the spoke worktree is dirty\n"), (1, "land.sh: boom\n")])
 def test_a_land_that_the_worker_cannot_fix_blocks_at_once(C, rc, out):
-    C.stubs.reply("land.sh", out, rc=rc)
+    C.stubs.reply("land.sh", f"{W}x\n{out}", rc=rc)
     C.mail([msg("worker_done", outcome="succeeded")])
     C.go()
-    assert C.blocked()
+    assert C.blocked() and not C.stubs.calls("claude")   # nothing landed, nothing to route
 
 
 @pytest.mark.parametrize("cleanup_rc", [0, 6])
