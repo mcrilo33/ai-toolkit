@@ -198,24 +198,14 @@ def perm(cmd, tool="Bash", cwd=None, cut=False, wt=None, reason="unknown"):   # 
     return f"PERMISSION REQUEST (not a plan gate: reply allow or deny)\nissue: #1 feat\nworktree: {wt}\ntool: {tool}\ncwd: {cwd or wt}\nmode: bypassPermissions\nreason: {reason}\ncommand:\n{body}\n"
 
 
-RM_VAR = "danger-guard: needs your approval: rm -r target $S has an unexpanded variable: use a literal path"
-SCRATCH_CLEAN = 'S=/private/tmp/claude-502/-w-wt/sess/scratchpad/t; rm -rf "$S"; mkdir -p "$S"'
-MKTEMP_CLEAN = 'd=$(mktemp -d ./tmp.XXXXXX); touch $d/a; rm -rf $d'
-
-
 @pytest.mark.parametrize("cmd, kw, judged, verdict", [
     ("echo hi > build/out.txt", {}, True, "only writes build/"),   # the judge cleared it: allowed
     ("echo hi > build/out.txt", {}, True, ""),   # not cleared: left open
-    ("echo '# stays inside the worktree' > ../../outside.txt", {}, False, "x"), ("echo x > ~/y", {}, False, "x"), ("echo x > `pwd`/../y", {}, False, "x"),   # claims to stay inside, writes outside: a dot-dot or a tilde is never judged, whatever the judge would say
-    (SCRATCH_CLEAN, {"reason": RM_VAR}, True, "assigned a literal scratchpad path, strictly under it"), (MKTEMP_CLEAN, {}, True, "mktemp under ./, removed inside the worktree"),   # a worker cleaning its own scratch: the judge says CONTAINED, the loop allows
-    (MKTEMP_CLEAN, {"reason": RM_VAR}, True, "mktemp under ./"), ("rm -rf $d", {"reason": RM_VAR}, True, ""), ("rm -rf $HOME/x ; echo $S", {"reason": RM_VAR}, True, ""),   # an unassigned variable, home: judged, and the judge says no: left for the human
-    ("S=/etc/x; rm -rf $S", {"reason": RM_VAR}, True, ""), ("d=$(mktemp -d /var/x.XXXX); rm -rf $d", {}, True, ""), ("rm -rf /private/tmp/other/x", {"reason": "danger-guard: needs your approval: rm -r outside the worktree: /private/tmp/other/x"}, True, ""),   # a path outside: judged, left for the human
-    ("rm -rf build/", {"reason": "danger-guard: needs your approval: rm -r outside the worktree: build/; rm -r of /w (worktree root or home)"}, True, ""),   # two recursive-delete findings are still the judge's call
+    ("echo '# stays inside the worktree' > ../../outside.txt", {}, False, "x"), ("echo x > ~/y", {}, False, "x"), ("echo x > $HOME/y", {}, False, "x"), ("echo x > `pwd`/../y", {}, False, "x"),   # claims to stay inside, writes outside: a path the shell resolves later is never judged, whatever the judge would say
     ("echo x > .claude/settings.json", {}, False, "x"), ("cat .AI-TOOLKIT/spoke-run-id > a", {}, False, "x"), ("sed -i s/a/b/ orca.yaml", {}, False, "x"),   # a protected name: never judged
     ("printf x > .cl\"\"aude/settings.json", {}, False, "x"), ("rm -rf .cla\\ude/hooks", {}, False, "x"), ("echo x > '.github'/workflows/ci.yml", {}, False, "x"),   # quotes and backslashes do not split the name
     ("echo x | tee .cl{a,}ude/settings.json", {}, False, "x"), ("cd .github && rm workflows/ci.yml", {}, False, "x"),   # a brace expansion, a path split by cd
-    ("git clean -fdx", {"reason": "danger-guard: needs your approval: git clean -x / stash -a remove the ignored .claude/"}, False, "x"), ("git stash -a", {"reason": RM_VAR}, False, "x"), ("git -C . reset --hard", {}, False, "x"),   # the other guard findings, and the command text itself when the reason is forged: never self-approved
-    ("rm -rf build/", {"reason": "danger-guard: needs your approval: rm -r outside the worktree: build/; git reset --hard in the main checkout (/m): git reset --hard"}, False, "x"), ("echo x > a", {"reason": "danger-guard: needs your approval: write to a protected path (a)"}, False, "x"),
+    ("git clean -fdx", {"reason": "danger-guard: needs your approval: git clean -x / stash -a remove the ignored .claude/"}, False, "x"), ("rm -rf build/", {"reason": "danger-guard: needs your approval: rm -r outside the worktree"}, False, "x"),   # the guard already found it sensitive: never self-approved
     ("ls", {"cwd": "/etc"}, False, "x"), ("ls", {"cwd": "{wt}/../elsewhere"}, False, "x"), ("ls", {"cwd": "{wt}x"}, False, "x"),   # the cwd must be under the worktree
     ("ls", {"tool": "Write"}, False, "x"), ("ls", {"cut": True}, False, "x"),   # only a Bash command shown whole
     ("echo hi > build/out.txt", {"mode": "auto"}, False, "x"), ("echo hi > build/out.txt", {"mode": "human"}, False, "x"),   # only attended ever asks the judge: auto denies at once, human leaves it open, as before

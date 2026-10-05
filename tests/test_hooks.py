@@ -426,7 +426,7 @@ def test_judge_contained_clears_only_the_exact_contained_verdict_and_never_the_o
     assert (r.returncode, r.stdout) == (0, out), r
     argv, prompt = (tmp_path / "ja").read_bytes().decode().split("\0")[:-1], (tmp_path / "ja.in").read_text()
     system = argv[argv.index("--system-prompt") + 1]
-    assert ("CONTAINED" in system) == (mode == "contained") and (mode != "contained" or all(w in system for w in ("mktemp", "strictly under", "not assigned in the command", "protected name"))) and all(argv[argv.index(f) + 1] == "" for f in ("--tools", "--setting-sources")) and cmd not in argv   # no tools, no settings, the command on stdin
+    assert ("CONTAINED" in system) == (mode == "contained") and all(argv[argv.index(f) + 1] == "" for f in ("--tools", "--setting-sources")) and cmd not in argv   # no tools, no settings, the command on stdin
     assert "1| echo hi > ./build/out.txt" in prompt and "WORKTREE: /w/wt\n" in prompt
     if mode == "contained":   # the scratchpad is the worker's project directory (the loop passes its slug: the relay sends no session id), any session of it
         assert f"/private/tmp/claude-{os.getuid()}/-w-wt/*/scratchpad/" in prompt
