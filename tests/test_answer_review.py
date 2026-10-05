@@ -61,8 +61,12 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     git_in = lambda *a: subprocess.run(["git", "-C", str(A.wt), *a], check=True, capture_output=True)
     git_in("init", "-q", "-b", "5-x")   # the Orca link outranks the branch; without a link the branch number is used
     assert A.go("ANSWER: approve\n", input="PLAN: do X.").returncode == 0 and A.stubs.calls("gh")[-1][2] == "9"
-    link("")
+    link("null")
     assert A.go("ANSWER: approve\n", input="PLAN: do X.").returncode == 0 and A.stubs.calls("gh")[-1][2] == "5"
+    link('"x;y"')   # a link that is no number is reported, then the branch is used
+    r = A.go("ANSWER: approve\n", input="PLAN: do X.")
+    assert "not an issue number" in r.stderr and A.stubs.calls("gh")[-1][2] == "5"
+    link("null")
     git_in("branch", "-m", "wp0")   # neither source: today's note, no fetch, even with a header in the worktree
     task.write_text("# #7 edited by the worker\n\nother issue\n")
     n_gh = len(A.stubs.calls("gh"))
@@ -73,6 +77,10 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     task.write_text("# #9 old\n\nold body\n")
     r = A.go("ANSWER: approve\n", input="PLAN: do X.")
     assert r.returncode == 0 and task.read_text() == "# #9 old\n\nold body\n"
+    task.write_text("# #7 old\n\nold body\n")   # an unrefreshed copy that also disagrees: the prompt must not claim it describes #9
+    r = A.go("ANSWER: approve\n", input="PLAN: do X.")
+    assert r.returncode == 0 and "may be stale" in A.stdin() and "still holds that edited copy" in A.stdin()
+    task.write_text("# #9 old\n\nold body\n")
     assert "warning" in r.stderr and "may be stale" in A.stdin() and A.stdin().startswith("PLAN: do X.")
     task.chmod(0o444); task.parent.chmod(0o555)   # an unwritable copy is a stale copy too, never a failed gate
     A.stubs.reply("gh", '{"number":9,"title":"new","body":"new body"}')

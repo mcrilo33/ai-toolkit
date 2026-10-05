@@ -76,7 +76,7 @@ task_md_number() { sed -n '1s/^# #\([0-9][0-9]*\)[[:space:]].*/\1/p' "$1" 2> /de
 issue_of() {
   local n b
   n="$(orca_json worktree show --worktree "path:$1" 2> /dev/null | jq -r '.result.worktree.linkedIssue // empty' 2> /dev/null || true)"
-  case "$n" in '' | *[!0-9]*) b="$(git -C "$1" branch --show-current 2> /dev/null || true)"; n="${b%%-*}" ;; esac
+  case "$n" in '' | *[!0-9]*) [ -z "$n" ] || warn "Orca link '$n' is not an issue number; using the branch name"; b="$(git -C "$1" branch --show-current 2> /dev/null || true)"; n="${b%%-*}" ;; esac
   case "$n" in *[!0-9]*) n="" ;; esac
   printf '%s' "$n"
 }
