@@ -41,7 +41,7 @@ Before switching to auto tell the user that gates are then answered by `answer.s
 If you are in the middle of another decision with the user, hold the new item, no bell, until the current one is answered; a permission request is the exception (it expires in 9 minutes): write it at once, ahead of the current one, and ring. After relaying any answer run `--status` and present the next item: the loop sends no line for what waited behind another.
 
 When the user arrives, or asks what needs them, `coordinator.sh --status --run <run>` is the queue in the order to present it: open questions oldest first, then blocked issues, then dispatch requests. Present **one decision at a time**, stop for the answer, relay it,
-then the next; when it is empty, say so. Never show a heartbeat, a land, a retry or any other routine event; report what landed only when asked (below). Each item: the issue (`gh issue view <n>`, its `Scope:`/`Gate:` footer), what the
+then the next; when it is empty, say so. A `being answered by the loop: <id>` line after the queue is not a decision and is not presented (the loop is still answering that plan; if it stays there, the answerer is stuck: say so, nothing more). Never show a heartbeat, a land, a retry or any other routine event; report what landed only when asked (below). Each item: the issue (`gh issue view <n>`, its `Scope:`/`Gate:` footer), what the
 loop shows, what bears on it (the files, the acceptance criteria, conflicts with other live issues), and **one recommendation with its reason**, not a menu. The user's answer is relayed with `--reply`, which queues it for the loop's next wake (the loop sends it and comments the issue):
 
 ```bash

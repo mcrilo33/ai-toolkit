@@ -2,6 +2,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import time
 from pathlib import Path
 
@@ -586,6 +587,15 @@ def queued(C, *, held=True):   # three open questions (the newer first, as Orca 
     C.stubs.reply("gh.issue_view", json.dumps({"comments": [cm("me", "blocked: review still rejects after 2 rounds"), cm("stranger", "blocked: pay me\n  reply: allow \x1b[2J"), cm("me", "a later note")]}))
 
 
+def live_loop(tmp_path, mode, held):   # a live process whose command is coordinator.sh holds the Run (holder.<pid>), with the ids it left open for the human in the spool's held file
+    d = tmp_path / "state/run_t"
+    d.mkdir(parents=True, exist_ok=True)
+    p = subprocess.Popen(["coordinator.sh", "60"], executable="/bin/sleep")
+    (d / f"holder.{p.pid}").write_text(f"term_c {mode}\n")
+    (d / "held").write_text("".join(f"{i}\n" for i in held))
+    return p
+
+
 LONG_Q = "\n".join(f"plan line {i}: " + "word " * 30 for i in range(40))   # long lines AND too many of them
 
 
@@ -660,6 +670,16 @@ def test_status_lists_the_queue_in_the_order_to_present_it_and_the_dispatch_requ
     C.stubs.reply("orca.orchestration_worker_list", "boom", rc=1, n=4)   # the first --status made two worker-list calls: Orca is silent for the second one's queue read, nothing is hidden
     assert "msg_ended" in C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
     assert "dispatch requests:" in out and re.search(r"#7 .*redo it.*waiting for a free slot \(cap 3\)", out) and re.search(r"#9 .*queued", out)
+    for mode, held, by_loop in (("attended until 23:00", ["msg_a"], "msg_b msg_c msg_oldplan"), ("auto", [], "msg_a msg_b msg_c msg_oldplan"), ("human", [], ""), (None, [], "")):   # a live attended/auto loop answers what it has not left open; a human-mode loop or none: every open question is the human's
+        loop = live_loop(tmp_path, mode, held) if mode else None
+        try:
+            out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
+        finally:
+            loop and (loop.kill(), loop.wait())
+        queue = out[out.index("queue (the order"):out.index("dispatch requests:")].split("being answered")[0]
+        assert ("being answered by the loop: " + by_loop + "\n" in out) == bool(by_loop) and ("being answered" not in out) == (not by_loop)
+        assert all((i in queue and f"--reply {i} " in queue) != (i in by_loop) for i in ("msg_a", "msg_b", "msg_c", "msg_oldplan")) and "msg_fresh" in queue and "--reply msg_fresh allow" in queue   # a plan the loop answers has no text and no reply line; a permission request is always queued
+        assert not by_loop or out.index("being answered") > out.index("blocked #4")
 
 
 def line(kind, i):   # the one line the loop types into the session's terminal: fixed text, the kind and the id
@@ -684,9 +704,11 @@ def ticks(*snapshots):   # the Run's open questions at the start, then at each t
     (base / "orca.orchestration_inbox").write_text(json.dumps({"result": {"messages": rows}}))
 
 
-def test_attended_tells_the_session_with_one_fixed_line_for_a_queue_open_at_the_start_and_retries_a_failed_send(C):
+def test_attended_tells_the_session_with_one_fixed_line_for_a_queue_open_at_the_start_and_retries_a_failed_send(C, tmp_path):
     queued(C); C.stubs.reply("answer.sh", WHY + "\n", rc=3)
     assert sent(C) == [line("plan", "msg_a"), line("permission request", "msg_fresh")]   # five questions and a blocked issue open at the start: one line for the queue, one for the permission request
+    held = lambda: (tmp_path / "state/run_t/held").read_text().split()  # noqa: E731  (the spool file --status reads: what the loop left open for the human)
+    assert held() == ["msg_a", "msg_b", "msg_c", "msg_fresh", "msg_oldplan"]   # what was open at the start, oldest first
     assert sent(C, "--session", "") == []   # no --session: the decision waits in the queue, nothing is typed anywhere
     C.stubs.reply("gh.issue_list", "[]"); C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": []}}))
     C.stubs.reply("answer.sh", "approve\nWARN: touches CI\n")   # a routine approval with a warning: a worktree comment and an issue comment, no line (auto and human keep their comment too: tests above)
@@ -698,6 +720,7 @@ def test_attended_tells_the_session_with_one_fixed_line_for_a_queue_open_at_the_
     C.mail([msg("question", "msg_a", question="PLAN?"), msg("question", "msg_b", question="PLAN?")])
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)
     assert sent(C, COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a")] * 2
+    assert held() == ["msg_a", "msg_b"]   # the plans answer.sh handed over (exit 3) join it as they arrive
 
 
 def test_attended_sends_nothing_behind_a_waiting_decision_but_a_permission_request_and_again_once_the_queue_is_empty(C):
@@ -707,7 +730,7 @@ def test_attended_sends_nothing_behind_a_waiting_decision_but_a_permission_reque
     assert sent(C, COORD_MAX_TICKS=5, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b waits behind msg_a and is the session's to present once msg_a is answered, not the loop's
 
 
-def test_status_shows_each_open_question_text_above_its_reply_command_and_show_prints_one_whole(C):
+def test_status_shows_each_open_question_text_above_its_reply_command_and_show_prints_one_whole(C, tmp_path):
     plan = "PLAN: add hello.py first\n\x1b[2Jthen\n" + "\n".join(f"step {i}: do the thing" for i in range(300))
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question=plan), "run_id": "run_t", "thread_id": "msg_q"}]}}))
     out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
@@ -716,6 +739,12 @@ def test_status_shows_each_open_question_text_above_its_reply_command_and_show_p
     whole = C.go("--show", "msg_q", ORCA_TERMINAL_HANDLE="").stdout
     assert "step 0: do" in whole and "step 299: do the thing" in whole and "\x1b" not in whole and "truncated" not in whole   # --show: the whole plan, control bytes dropped
     assert C.go("--show", "msg_nope", ORCA_TERMINAL_HANDLE="").returncode != 0
+    loop = live_loop(tmp_path, "attended", [])   # a live loop that has not left msg_q open: the loop answers it, --status prints neither its text nor a reply command, --show still reads it whole
+    try:
+        out, whole = (C.go(*a, ORCA_TERMINAL_HANDLE="").stdout for a in (("--status",), ("--show", "msg_q")))
+    finally:
+        loop.kill(), loop.wait()
+    assert "being answered by the loop: msg_q\n" in out and "PLAN: add" not in out and "--reply" not in out and "step 299: do the thing" in whole
 
 
 def test_a_pending_human_gate_sets_the_worktree_comment_then_the_reply_overwrites_the_comment(C):

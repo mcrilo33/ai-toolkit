@@ -49,6 +49,7 @@ def test_every_orchestration_verb_the_skill_names_exists_in_orca():
 def test_a_question_is_turned_into_exactly_one_of_three_replies_and_never_a_blind_approve():
     q = section("The queue")
     assert q.count("--reply <message-id> ") >= 3 and "afk-answering" in q and re.search(r"never .*approve|unless the user", q, re.I)
+    assert re.search(r"being answered by the loop.{0,80}not (a decision|presented)", q, re.I | re.S)   # --status prints a plan the loop still answers apart from the queue
 
 
 def test_a_permission_question_is_shown_to_the_user_answered_only_with_their_decision_and_commented_without_the_command():

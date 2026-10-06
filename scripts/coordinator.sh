@@ -36,7 +36,7 @@ case "$answer" in auto | attended | human) ;; *) usage_exit "--answer takes auto
 [ "$stop" = 0 ] || [ -n "$run" ] || usage_exit "--stop needs --run <run-id>"
 [ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"; [[ -z $session || $session =~ ^term_[A-Za-z0-9_-]+$ ]] || usage_exit "--session takes an Orca terminal handle"; [ "$answer" != attended ] || [ -n "$session" ] || warn "attended without --session: the loop cannot tell the session of a decision, only --status shows the queue"
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
-[ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid>)
+[ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid> and held: the ids the loop left open for the human)
 if [ "$dreq" = 1 ]; then   # a dispatch request: <issue> = its one-line message (empty = a plain dispatch), queued in the reply spool's shape for the loop's next wake
   [ -n "$run" ] || usage_exit "--dispatch needs --run <run-id>"; [[ $dreq_n =~ ^[0-9]+$ ]] || usage_exit "--dispatch takes an issue number and an optional one-line message"
   d="$(spool_dir "$run")/requests"; (umask 077; mkdir -p "$d"); chmod 700 "$d"
@@ -112,22 +112,25 @@ blocked_q() { gh issue list --label blocked --state open --limit 100 --json numb
 queue_ids() {   # the decisions waiting for the human, in the order to present them, one word each: q:<message id> (a plan: a worker waits, a slot is held) or p:<message id> (a permission request), then b:<issue> (blocked; a review that kept rejecting is one)
   local q; q="$(open_q | jq -r '"\(if ((.payload // "{}" | if type == "string" then fromjson else . end).question // .body // "") | test("^\\s*PERMISSION REQUEST") then "p" else "q" end):\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
 }
+hold() { held="$held $1 "; printf '%s\n' "$1" >> "$sd/held"; }   # $1 message id: left open for the human, in the loop's memory and in the spool for --status (a plan outside it is the loop's to answer)
+by_loop() { case "${lm%% *}" in attended | auto) ! is_perm "$2" && ! grep -qxF "$1" "$(spool_dir "$run")/held" 2> /dev/null ;; *) false ;; esac; }   # $1 message id, $2 its question, $lm the live loop's mode (none or human: every open question is the human's)
 replycmd() { printf 'bash %s --run %s --reply %s %s' "$here/coordinator.sh" "$run" "$1" "${2:-approve}"; }
 if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to; --show: one of them whole
   [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"; if [ -n "$show_id" ]; then m="$(open_q | jq -c --arg i "$show_id" 'select(.id == $i)')" && [ -n "$m" ] || die "no open question $show_id on run $run"; show_q "$(question_of "$m")" 1000000; exit 0; fi
   log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold eq "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
-  live_hold ne "" > /dev/null || echo "no coordinator.sh loop is running for this Run"; q=""; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || q="$q${f##*/} "; done; [ -z "$q" ] || echo "replies queued in the spool: $q"
+  lm="$(live_hold ne "")" || echo "no coordinator.sh loop is running for this Run"; q=""; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || q="$q${f##*/} "; done; [ -z "$q" ] || echo "replies queued in the spool: $q"
   echo "live workers:"   # verdict, the agent's activity and the silence: `unverifiable` for a long run tells a stuck worker from a working one
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "\(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict) \(.projection.stage.activity // "-")"' | while read -r d w v a; do
     read -r age how <<< "$(silent "$d")" || true; echo "  $d $w $v $a, silent ${age:-?}m$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done || echo "  (Orca did not answer)"
   echo "queue (the order to present it):"
-  open_q | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"
-    if is_perm "$(question_of "$m")"; then echo "    reply: $(replycmd "$id" allow)   (or deny)"; else echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; fi; done
+  oq="$(open_q)"; mine=""; while IFS= read -r m; do [ -n "$m" ] || continue; id="$(jq -r .id <<< "$m")"; if by_loop "$id" "$(question_of "$m")"; then mine="$mine $id"; continue; fi; echo "  $id"; show_q "$(question_of "$m")"
+    if is_perm "$(question_of "$m")"; then echo "    reply: $(replycmd "$id" allow)   (or deny)"; else echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; fi; done <<< "$oq"
   me="$(gh api user --jq .login 2> /dev/null)" || me=""   # the reason is the loop's own last "blocked:" comment (this gh login): the repo may be public, any other author's text is not shown
   { blocked_q || true; } | while IFS=$'\t' read -r n t; do   # one line each, no control byte, capped: the text is somebody else's, it must not forge a queue item or move the cursor
     w="$(gh issue view "$n" --json comments 2> /dev/null | jq -r --arg me "$me" '[.comments[] | select(.author.login == $me and (.body | startswith("blocked: "))) | .body] | last // "" | .[9:]' 2> /dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-160)" || w=""
     echo "  blocked #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)${w:+: $w}"
     echo "    decide: re-dispatch (comment the guidance, then remove the blocked label, or --dispatch $n '<message>'), park it with the hold label, or close it"; done
+  [ -z "$mine" ] || echo "being answered by the loop:$mine"   # not decisions: no text, no reply command
   echo "dispatch requests:"
   for f in "$(spool_dir "$run")/requests"/*; do [ -f "$f" ] && echo "  #${f##*/} $(head -n 1 "$f"): $(sed -n 2p "$f" | grep . || echo queued)"; done
   exit 0
@@ -227,7 +230,7 @@ on_permission() {   # $1 message id, $2 question, $3 dispatch id: a worker's too
     log "permission denied (tool: $tool, message $1): an unattended run never approves one"
     [ "$known" = 0 ] || comment "$issue" "Permission denied (tool: $tool): an unattended run never approves a permission prompt; the worker reports it in worker_done."
   else   # attended or human mode, or the deny could not be sent (the worker's relay denies on its own timeout): the human decides, nothing waits
-    yield; held="$held $1 "
+    yield; hold "$1"
     [ "$known" = 0 ] || comment "$issue" "A permission request needs a human (message $1, tool: $tool). Reply from any terminal: $(replycmd "$1" allow)   (or deny)"
     show_q "$2" 300; log "permission request waiting: $(replycmd "$1" allow)"; gate_flag "$wtp" "$1" "$2" allow
   fi
@@ -236,14 +239,14 @@ on_question() {
   local id q ans body warns why=""
   id="$(jq -r .id <<< "$1")"; q="$(question_of "$1")"
   if is_perm "$q"; then on_permission "$id" "$q" "$(pj "$1" dispatchId)"; return 0; fi
-  ctx "$(pj "$1" dispatchId)" || { [ $? = 2 ] || { held="$held $id "; log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; }; return 1; }   # 2: ctx already blocked it
+  ctx "$(pj "$1" dispatchId)" || { [ $? = 2 ] || { hold "$id"; log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; }; return 1; }   # 2: ctx already blocked it
   if [ "$answer" != human ] && ans="$(printf '%s' "$q" | ANSWER_MODE="$answer" "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; log "#$issue: $warns"; flag "$wtp" "#$issue ${warns:0:80}"; }
   else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
     yield   # ...unless the reply failed because the Run was taken back meanwhile
-    held="$held $id "
+    hold "$id"
     case "${ans:-}" in human:*) why="$(head -n 1 <<< "$ans")" ;; esac   # attended: the answerer's reason for handing the plan over
     comment "$issue" "A gate question needs a human (message $id)${why:+, $why}; read it whole with: bash $here/coordinator.sh --run $run --show $id -- Reply from any terminal: $(replycmd "$id")   (or end it with: approve with: <change> to approve with a small change, or revise: <change> to amend the plan)"
     show_q "$q"; log "#$issue: gate question waiting${why:+ ($why)}: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
@@ -375,7 +378,7 @@ notify_queue() {   # attended: tell the session of a decision that was not queue
     case " $seen " in *" $i "*) continue ;; esac; [ "$k" = p ] || [ "$first" = 1 ] || continue; [ "$k" = p ] || first=0; tell "$k" "${i#?:}" || fail=1
   done; [ "$fail" = 1 ] || seen="$now"
 }
-tick=0; empties=0; seen=""; bids=""; bdirty=1; held=" $(open_q | jq -r .id | tr '\n' ' ' || true)"; start="$(now_min)"; budget=0
+tick=0; empties=0; seen=""; bids=""; bdirty=1; held=" $(open_q | jq -r .id | tr '\n' ' ' || true)"; tr ' ' '\n' <<< "${held# }" | sed '/^$/d' > "$sd/held"; start="$(now_min)"; budget=0
 [ -z "$until" ] || budget=$(((($(mins "$until") - start) + 1440) % 1440))
 while :; do
   tick=$((tick + 1)); yield
