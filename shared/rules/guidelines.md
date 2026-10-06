@@ -15,7 +15,7 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 
 ## Toolkit files and upstream
 
-- In a host project the toolkit's files (`.claude/`, `.ai-toolkit/`, `orca.yaml`) are synced copies: never edit them there, and never edit the toolkit's own checkout from a host session.
+- In a host project the toolkit's files (`CLAUDE.md`, `.claude/`, `.ai-toolkit/`, `orca.yaml`) are synced copies: never edit them there, and never edit the toolkit's own checkout from a host session.
 - A defect in the toolkit, or a wish about it (a new or changed rule, skill, hook or script), is filed as an issue in the toolkit's repository (`UPSTREAM_REPO` in `.ai-toolkit/ai-toolkit.env`; in the toolkit's own checkout that is this repository), without asking the user first when it meets the filing bar: a defect through the `bug-scoper` agent, a wish through `followup-scoper`. The project picks the change up at its next sync.
 - The details (routing, the filing bar, an unset `UPSTREAM_REPO`) are in `bug-triage`; do not restate them.
 
