@@ -2,8 +2,8 @@
 # ai-toolkit v2 sync: copy policy + lifecycle into a target repo. Claude Code only (D4): no per-platform
 # projection, the frontmatter lives in the source files. Idempotent; files a previous run wrote and this
 # run did not are removed (manifest GC). Usage: sync.sh <target-repo> [--local-only] [--migrate-v1]
-#   rules/*.md (minus guidelines)  -> .claude/rules/    (no paths: = always on; paths: = conditional)
-#   rules/guidelines.md            -> CLAUDE.md         rules/on-demand/*.md -> .ai-toolkit/rules/ (never auto-loaded)
+#   rules/*.md (guidelines too)    -> .claude/rules/ai-toolkit/ (no paths: = always on; paths: = conditional)
+#   rules/on-demand/*.md           -> .ai-toolkit/rules/ (never auto-loaded). The project's own CLAUDE.md is never read, written or backed up.
 #   skills/ agents/ prompts/       -> .claude/{skills,agents,commands}
 #   {scripts,bin} (under v2/ until the cutover), hooks/git, ai-toolkit.env -> .ai-toolkit/   hooks/claude -> .claude/hooks   settings/claude/settings.json -> .claude/settings.json
 #   orca.yaml generated (setup/archive run from $ORCA_ROOT_PATH, where a new worktree has no .ai-toolkit)
@@ -30,16 +30,19 @@ done
 git -C "$TARGET" rev-parse --git-dir > /dev/null 2>&1 || die "$TARGET is not a git repository"
 TARGET="$(cd "$TARGET" && pwd)"
 OLD="$TARGET/.ai-toolkit/sync-manifest"
+TRACKED="$(git -C "$TARGET" -c core.quotePath=false ls-files -- .claude .ai-toolkit CLAUDE.md)"
+tracked() { [[ $'\n'$TRACKED$'\n' == *$'\n'"$1"$'\n'* ]]; }
 NEW="$(mktemp)"; TMP="$(mktemp)"; PUT_TMP=""
 trap 'rm -f "$NEW" "$TMP" "$PUT_TMP"' EXIT   # PUT_TMP: a put() cut short must not leave its half-written <dst>.new.<pid> behind
 
 # put <src> <dst-rel> [bak]: copy when different (no mtime churn) and record it. bak = a singleton
-# (CLAUDE.md, settings.json, orca.yaml): an existing file this tool never wrote is kept once as <dst>.bak.
+# (settings.json, orca.yaml): an existing file this tool never wrote is kept once as <dst>.bak.
 # The copy is a rename, never an in-place write: land.sh syncs under a live coordinator loop, and bash reads its script by offset,
 # so a truncate+write would corrupt the next line it reads. A renamed-over file leaves the loop's open inode complete (old code, consistent).
 # The new file takes the destination's mode (cp -p of it, then its content) and a symlinked destination is written through, as an in-place cp did.
 put() {
   local d="$TARGET/$2"
+  case "$2" in .claude/*) if tracked "$2"; then warn "$2 is tracked by the project: left alone"; return 0; fi ;; esac   # a .claude/ file the project tracks is its own
   mkdir -p "$(dirname "$d")"
   if ! cmp -s "$1" "$d"; then
     if [ "${3:-}" = bak ] && [ -f "$d" ] && [ ! -e "$d.bak" ] && ! grep -qxF "$2" "$OLD" 2> /dev/null; then cp "$d" "$d.bak"; fi
@@ -52,12 +55,9 @@ put() {
   fi
   echo "$2" >> "$NEW"
 }
-put_md() { # put_md <src-dir> <dst-rel-dir> [skip-name]: the *.md files of one directory
+put_md() { # put_md <src-dir> <dst-rel-dir>: the *.md files of one directory
   local f
-  for f in "$1"/*.md; do
-    [ -f "$f" ] || continue
-    [ "${f##*/}" = "${3:-}" ] || put "$f" "$2/${f##*/}"
-  done
+  for f in "$1"/*.md; do if [ -f "$f" ]; then put "$f" "$2/${f##*/}"; fi; done
 }
 put_tree() { # put_tree <src-dir> <dst-rel-dir> [skip-name]: everything below it, minus caches
   local f
@@ -65,10 +65,8 @@ put_tree() { # put_tree <src-dir> <dst-rel-dir> [skip-name]: everything below it
   while IFS= read -r f; do put "$1/$f" "$2/$f"; done < <(cd "$1" && find . -type f ! -name .DS_Store ! -name "${3:-.DS_Store}" ! -name '*.pyc' ! -path '*/__pycache__/*' | sed 's|^\./||' | LC_ALL=C sort)
 }
 
-put_md "$SHARED/rules" .claude/rules guidelines.md
+put_md "$SHARED/rules" .claude/rules/ai-toolkit
 put_md "$SHARED/rules/on-demand" .ai-toolkit/rules
-awk 'NR == 1 && /^---$/ { fm = 1; next } fm && /^---$/ { fm = 0; next } !fm' "$SHARED/rules/guidelines.md" > "$TMP"
-put "$TMP" CLAUDE.md bak   # the frontmatter is for the lint, not for CLAUDE.md
 put_tree "$SHARED/skills" .claude/skills
 put_md "$SHARED/agents" .claude/agents
 put_md "$SHARED/prompts" .claude/commands
@@ -97,6 +95,8 @@ EOF
 # never touched (a manifest is data in the target, not trusted).
 drop() {
   case "$1" in '' | /* | *..*) return 0 ;; esac
+  if tracked "$1"; then warn "$1 is tracked in $TARGET, so it stays: git rm it if it is the toolkit's"; return 0; fi
+  if [ "$1" = CLAUDE.md ] && [ -f "$TARGET/CLAUDE.md.bak" ]; then mv -f "$TARGET/CLAUDE.md.bak" "$TARGET/CLAUDE.md"; return 0; fi   # an earlier sync replaced the project's own
   rm -f "$TARGET/$1"
   (cd "$TARGET" && rmdir -p "$(dirname "$1")" 2> /dev/null) || true
 }
@@ -122,14 +122,15 @@ mkdir -p "$TARGET/.ai-toolkit"
 LC_ALL=C sort -u "$NEW" > "$TMP"
 cmp -s "$TMP" "$OLD" || cp "$TMP" "$OLD"
 
-# Per-clone ignores, as a marked block in .git/info/exclude (never the tracked .gitignore):
-# .ai-toolkit/ always (holds ai-toolkit.local.env); --local-only also the deployment files.
+# Per-clone ignores, as a marked block in .git/info/exclude (never the tracked .gitignore): .ai-toolkit/ (holds
+# ai-toolkit.local.env) and every .claude/ path written, on every sync; --local-only also orca.yaml (written, never committed).
 ex="$(git -C "$TARGET" rev-parse --path-format=absolute --git-path info/exclude)"
 mkdir -p "$(dirname "$ex")"
 {
   sed '/^# >>> ai-toolkit sync/,/^# <<< ai-toolkit sync/d' "$ex" 2> /dev/null || true
   echo '# >>> ai-toolkit sync'; echo '/.ai-toolkit/'
-  if [ "$LOCAL" -eq 1 ]; then printf '/.claude/\n/CLAUDE.md\n/orca.yaml\n'; fi
+  grep '^\.claude/' "$NEW" | sed 's|^|/|' || true   # what this run wrote there, path by path: a file the project tracks or owns is never swept in
+  if [ "$LOCAL" -eq 1 ]; then echo /orca.yaml; fi
   echo '# <<< ai-toolkit sync'
 } > "$TMP"
 cmp -s "$TMP" "$ex" || cp "$TMP" "$ex"

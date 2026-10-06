@@ -78,7 +78,7 @@ a fix direction, and any label/scope hints — so it verifies fast.
 ai-toolkit is synced *into* other projects, so where a bug is filed depends on **whose
 code is broken**, not on which repo you happen to be sitting in:
 
-- A defect in the **ai-toolkit tooling** — a synced rule, skill, agent, hook, script, `CLAUDE.md`, or
+- A defect in the **ai-toolkit tooling** — a synced rule, skill, agent, hook, script, or
   `orca.yaml` (anything under `.claude/` or `.ai-toolkit/` in a host project, `shared/` in the toolkit
   repo) — is filed to `UPSTREAM_REPO` (`owner/repo`; `sync.sh` fills it from the toolkit's `origin`, and
   `.ai-toolkit/ai-toolkit.local.env` overrides it), even when discovered inside a host project. Otherwise

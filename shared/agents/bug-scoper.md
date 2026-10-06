@@ -105,7 +105,7 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
 - **Attended (a human is present to approve):** return the full drafted issue —
   title, body, footer, labels — for a one-look approval instead of filing blind.
 - **Target repo — set `owner`/`repo` EXPLICITLY, never rely on the ambient default.** A defect whose
-  fix touches an ai-toolkit-owned file (a synced rule, skill, agent, hook, script, `CLAUDE.md`, or
+  fix touches an ai-toolkit-owned file (a synced rule, skill, agent, hook, script, or
   `orca.yaml`: anything under `.claude/` or `.ai-toolkit/`, or `shared/` in the toolkit repo itself) is an
   **ai-toolkit tooling** defect; anything else is a **host project** defect. File a tooling defect to
   `UPSTREAM_REPO` (`owner/repo`): read it from the main checkout's `.ai-toolkit/ai-toolkit.local.env`

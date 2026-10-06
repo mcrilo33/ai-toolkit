@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Orca setup hook (orca.yaml scripts.setup). Runs in the NEW worktree before the agent starts
 # (wait-for-setup), so a non-zero exit keeps the agent off a half-provisioned tree. Idempotent.
-# A worker gets main's .claude/ and .ai-toolkit/rules/ (the on-demand rules its seed and agents name; .ai-toolkit/ is untracked).
+# A worker gets main's .claude/ (rules/ai-toolkit/ holds the guidelines and every always-on rule; no root CLAUDE.md) and .ai-toolkit/rules/ (the on-demand rules its seed and agents name; .ai-toolkit/ is untracked).
 # Orca env: ORCA_ROOT_PATH (main checkout), ORCA_WORKTREE_PATH. Claude Code only (D4).
 # --refresh: the same provisioning for a KEPT worktree (dispatch.sh --address / --retry-of): the main checkout's current
 # .claude/ synced files and .ai-toolkit/rules/ (and the removal of those main dropped) and setup.local.sh output land again, spoke-run-id stays, and task.md is

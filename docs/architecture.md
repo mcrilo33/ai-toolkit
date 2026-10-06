@@ -189,11 +189,11 @@ or re-bind after a restart: everything else is re-derived from `worker-list`, `w
    collector. `jq` is a hard requirement: without it the Claude hooks fail closed and deny every tool call.
 2. `~/.zshrc` must skip tmux autostart in Orca terminals (`TERM_PROGRAM=Orca`), or Orca cannot see agents; `install.sh` warns.
 3. In the target repo: `<toolkit>/scripts/sync.sh <repo> [--local-only]`, then `<toolkit>/scripts/install.sh <repo>` (repo-local `core.hooksPath`, never global), then `orca repo add --path <repo>` (once,
-   never remove it: a removed repo leaves a stale card). `--local-only` keeps every synced file untracked (`.claude/ CLAUDE.md orca.yaml`); then commit a tiny `orca.yaml` yourself, because Orca reads the tracked one.
+   never remove it: a removed repo leaves a stale card). The rules and the guidelines land in `.claude/rules/ai-toolkit/` (Claude Code loads subfolders), the project's own `CLAUDE.md` is never read, written or backed up, and what the sync wrote under `.claude/` plus `.ai-toolkit/` stays untracked through `.git/info/exclude` (a `.claude/` file the project tracks is left alone). `orca.yaml` is the one tracked file, because Orca reads the tracked one; `--local-only` also excludes it, then commit a tiny `orca.yaml` yourself. A host synced the old way is cleaned up from its manifest: the flat rule files and the generated root `CLAUDE.md` go, a `CLAUDE.md.bak` is restored, tracked leftovers are reported, never removed.
 4. Per-machine settings go in `<repo>/.ai-toolkit/ai-toolkit.local.env` (gitignored): `CHECK_CMD`, `BASE_BRANCH`, `LOCAL_GATE=1` if the repo has no CI, `CONCURRENCY_CAP`,
    model ids, `LANGFUSE_*`. Precedence: caller env > local env > `.ai-toolkit/ai-toolkit.env`. CI must run on **every branch push** (`land.sh` waits for the run of the exact tip).
 5. The first Claude start in a new repo root shows the workspace-trust dialog (default "No, exit"): `dispatch.sh` answers it (Down+Enter); a human can pre-trust the root.
-6. The toolkit repo itself: `scripts/sync.sh .` generates `CLAUDE.md` (from `shared/rules/guidelines.md`, gitignored), `.claude/` and `.ai-toolkit/`; it never overwrites the tracked `orca.yaml`.
+6. The toolkit repo itself: `scripts/sync.sh .` generates `.claude/` (the rules and `guidelines.md` under `rules/ai-toolkit/`; no root `CLAUDE.md`) and `.ai-toolkit/`; it never overwrites the tracked `orca.yaml`.
 7. Optional telemetry (D1): `scripts/otel.sh up` (Langfuse keys in the local env) starts the collector; spokes launched by `dispatch.sh` already export to it.
 
 ## Testing

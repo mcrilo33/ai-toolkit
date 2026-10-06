@@ -5,9 +5,9 @@ The frontmatter lives in each source file under `shared/`; `scripts/sync.sh` cop
 
 | Content | Source | Synced to | Allowed keys |
 |---|---|---|---|
-| Rules | `shared/rules/*.md` | `.claude/rules/` | `description`, `paths` |
+| Rules | `shared/rules/*.md` | `.claude/rules/ai-toolkit/` | `description`, `paths` |
 | On-demand rules | `shared/rules/on-demand/*.md` | `.ai-toolkit/rules/` (never auto-loaded) | `description` |
-| Guidelines | `shared/rules/guidelines.md` | `CLAUDE.md` (frontmatter stripped; gitignored in this repo) | `description` |
+| Guidelines | `shared/rules/guidelines.md` | `.claude/rules/ai-toolkit/guidelines.md` (a rule like the others; the project's `CLAUDE.md` is never touched) | `description` |
 | Skills | `shared/skills/<name>/SKILL.md` (+ references, scripts) | `.claude/skills/<name>/` | `name`, `description`, `argument-hint`, `disable-model-invocation`, `user-invocable`, `allowed-tools`, `paths`, `context`, `agent`, `when_to_use`, `arguments`, `model`, `effort`, `hooks`, `shell` |
 | Agents | `shared/agents/<name>.md` | `.claude/agents/` | `name`, `description`, `model`, `effort`, `tools`, `disallowedTools`, `skills`, `maxTurns`, `color` |
 | Commands | `shared/prompts/*.md` | `.claude/commands/` | `description`, `argument-hint`, `allowed-tools`, `model` |
@@ -15,7 +15,7 @@ The frontmatter lives in each source file under `shared/`; `scripts/sync.sh` cop
 ## Rules of the lint
 
 - `description` is mandatory, one double-quoted line, no inner double quote or backslash, at most 1024 characters.
-- **Rule loading.** Claude Code loads every `.claude/rules/*.md` that has no `paths:`, and the others only when a matching file is open. Always-on rules are exactly
+- **Rule loading.** Claude Code loads every `.claude/rules/**/*.md` (subfolders included) that has no `paths:`, and the others only when a matching file is open. Always-on rules are exactly
   `security`, `agent-orchestration`, `scientific-integrity`; every other top-level rule carries `paths:` (a YAML list of globs). `alwaysApply`, `applyTo` and `globs`
   (Cursor/Copilot syntax) do not exist any more. Policy an agent must read on demand (workflow, planning-hub, afk-answering, issue-hygiene, bug-triage) goes in `on-demand/`
   and is referenced by path from the skills that need it.

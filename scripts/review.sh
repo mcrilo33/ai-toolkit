@@ -20,12 +20,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 load_env
 n="${1:-}"; sha="${2:-}"; [ -n "$n" ] || usage_exit "usage: review.sh <issue> [<sha>]"
 o="$(orca_json worktree show --worktree "issue:$n")" || die "no Orca worktree is linked to issue $n"
-case "$here" in   # the one place of this install layout: the checkout's shared/, or the synced repo's .claude/ and CLAUDE.md
-  */.ai-toolkit/scripts) agents_d="$here/../../.claude/agents"; rules_d="$here/../../.claude/rules"; goal="$here/../../CLAUDE.md" ;;
-  *) agents_d="$here/../shared/agents"; rules_d="$here/../shared/rules"; goal="$rules_d/guidelines.md" ;;
+case "$here" in   # the one place of this install layout: the checkout's shared/, or the synced repo's .claude/ (rules under rules/ai-toolkit/)
+  */.ai-toolkit/scripts) agents_d="$here/../../.claude/agents"; rules_d="$here/../../.claude/rules/ai-toolkit" ;;
+  *) agents_d="$here/../shared/agents"; rules_d="$here/../shared/rules" ;;
 esac
 agent="${REVIEW_AGENT:-$agents_d/code-review.md}"
-if [ -n "${REVIEW_RULES_DIR:-}" ]; then rules_d="$REVIEW_RULES_DIR"; goal="$rules_d/guidelines.md"; fi
+[ -z "${REVIEW_RULES_DIR:-}" ] || rules_d="$REVIEW_RULES_DIR"
 [ -f "$agent" ] || die "code-review agent definition not found"
 front() { awk -v k="$1" 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } index($0, k ": ") == 1 { sub("^[^:]*: *", ""); gsub(" *, *", ","); sub("[ \t]+$", ""); print; exit }' "$agent"; }   # one flat frontmatter value
 effort="$(front effort)"; blocked="$(front disallowedTools)"
@@ -35,7 +35,7 @@ body() { awk 'NR == 1 && $0 != "---" { f = 2 } f < 2 { if ($0 == "---") f++; nex
 prose="$(body "$agent")"
 [[ $prose == *[![:space:]]* ]] || die "code-review agent definition is empty: $agent"
 for r in guidelines security code-quality python-style pytest-conventions; do   # the rules the agent cites, from the coordinator's copies; a missing or blank one is exit 1
-  f="$rules_d/$r.md"; [ "$r" != guidelines ] || f="$goal"
+  f="$rules_d/$r.md"
   [ -f "$f" ] || die "coordinator-side rule not found: $f"
   text="$(body "$f")"; [[ $text == *[![:space:]]* ]] || die "coordinator-side rule is empty: $f"
   prose="$prose"$'\n\n'"--- project rule: $r ---"$'\n\n'"$text"

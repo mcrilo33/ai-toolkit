@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cutover rehearsal on a THROWAWAY clone of this repo; GitHub is never touched: the clone's origin is a LOCAL bare repo made from this checkout's objects,
 # the issue side is a stubbed gh (AI_TOOLKIT_GH) and the gate is local (LOCAL_GATE=1). It runs the coordinator's checklist: v2 branch -> main merged in ->
-# cutover.sh -> tests + shellcheck + sync-twice -> --no-ff merge into main -> sync into itself (regenerates CLAUDE.md) -> install.sh -> one real worker
+# cutover.sh -> tests + shellcheck + sync-twice -> --no-ff merge into main -> sync into itself (the guidelines land in .claude/rules/ai-toolkit/) -> install.sh -> one real worker
 # dispatched, reviewed and landed on the local bare origin. The clone is registered in Orca once and kept (a removed repo leaves a stale card).
 # REHEARSAL_REF (default HEAD) = the commit to treat as branch v2. Run from an Orca terminal; needs pytest + xdist (and shellcheck) on PATH.
 set -euo pipefail
@@ -57,12 +57,10 @@ if command -v shellcheck > /dev/null; then shellcheck scripts/*.sh bin/claude-sp
 t="$(mktemp -d)"; git -C "$t" init -q; snap() { (cd "$t" && find . -path ./.git -prune -o -type f -exec cksum {} + | LC_ALL=C sort); }
 bash scripts/sync.sh "$t" > /dev/null; snap > "$E/s1"; bash scripts/sync.sh "$t" > /dev/null; snap > "$E/s2"; cmp -s "$E/s1" "$E/s2" || fail "a second sync drifts"; rm -rf "$t"
 
-step=4; say "merge v2 into main (--no-ff), push to the LOCAL origin; sync.sh into itself regenerates CLAUDE.md; install.sh wires repo-local hooks"
+step=4; say "merge v2 into main (--no-ff), push to the LOCAL origin; sync.sh into itself writes the rules under .claude/rules/ai-toolkit/; install.sh wires repo-local hooks"
 git checkout -q main; git merge -q --no-ff -m "Merge v2: cutover" v2; git push -q origin main
-[ -z "$(git ls-files CLAUDE.md)" ] && [ ! -e CLAUDE.md ] || fail "CLAUDE.md is tracked or present before the self-sync"
 bash scripts/sync.sh "$C" > /dev/null; bash scripts/sync.sh "$C" > /dev/null
-{ [ -s CLAUDE.md ] && ! head -n 1 CLAUDE.md | grep -q '^---'; } || fail "sync did not generate CLAUDE.md"
-awk 'NR == 1 && /^---$/ { fm = 1; next } fm && /^---$/ { fm = 0; next } !fm' shared/rules/guidelines.md | cmp -s - CLAUDE.md || fail "CLAUDE.md is not the stripped guidelines"
+cmp -s shared/rules/guidelines.md .claude/rules/ai-toolkit/guidelines.md && [ ! -e CLAUDE.md ] || fail "the guidelines are not under .claude/rules/ai-toolkit/, or the sync wrote a root CLAUDE.md"
 [ -z "$(git status --porcelain)" ] || fail "the self-sync dirtied the tree: $(git status --porcelain | head -n 3)"
 bash scripts/install.sh "$C" > /dev/null 2>&1 || fail "install.sh failed"
 [ "$(git config --local core.hooksPath)" = "$C/.ai-toolkit/hooks/git" ] || fail "core.hooksPath is not repo-local"

@@ -16,9 +16,10 @@ writes them to the target's `.git/info/exclude` (per-clone, unversioned, one mar
 the tracked `.gitignore`:
 
 - `/.ai-toolkit/` (scripts, hooks, env files, `sync-manifest`, and the per-machine `ai-toolkit.local.env`)
+- every `.claude/` path the sync wrote, one line each (a `.claude/` file the project tracks is never listed)
 
-With `--local-only`, the same block additionally excludes the synced deployment files (`.claude/`, `CLAUDE.md`,
-`orca.yaml`) for a personal deployment.
+The project's own `CLAUDE.md` is never read, written or ignored. `orca.yaml` is the one file the sync leaves
+tracked; with `--local-only` the same block also excludes it, for a deployment that is never committed.
 
 ## Secrets are not a name-based ignore concern
 

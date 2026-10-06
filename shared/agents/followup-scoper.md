@@ -137,7 +137,7 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
 - **Attended (a human is present to approve):** return the full drafted issue — title,
   body, footer, labels — for a one-look approval instead of filing blind.
 - **Target repo — set `owner`/`repo` EXPLICITLY, never rely on the ambient default.** A follow-up on the
-  **ai-toolkit tooling** (a synced rule, skill, agent, hook, script, `CLAUDE.md`, or `orca.yaml`: anything
+  **ai-toolkit tooling** (a synced rule, skill, agent, hook, script, or `orca.yaml`: anything
   under `.claude/` or `.ai-toolkit/`, or `shared/` in the toolkit repo itself) is filed to `UPSTREAM_REPO`
   (`owner/repo`, from the main checkout's `.ai-toolkit/ai-toolkit.local.env` (`$ORCA_ROOT_PATH`), else
   `.ai-toolkit/ai-toolkit.env`); empty or unset means the toolkit's own repo only when this checkout has
