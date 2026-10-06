@@ -25,7 +25,7 @@ def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
 
 
 @pytest.mark.parametrize("needle", [
-    "orca terminal create", "--answer attended", "--bell-tty", "ps -o tty= -p $PPID", "coordinator.sh --status", "--reply <message-id> approve", "'approve with: ", "'revise: ", "--dispatch <n>",
+    "orca terminal create", "--answer attended", "--session", "$ORCA_TERMINAL_HANDLE", "--show", "ps -o tty= -p $PPID", "printf '\\a'", "coordinator.sh --status", "--reply <message-id> approve", "'approve with: ", "'revise: ", "--dispatch <n>",
     "one decision at a time", "never binds the Run", "Never show a heartbeat", "/coordinate auto", "--answer auto", "--until HH:MM", "--drain", "/coordinate attended", "coordinator.sh --stop --run",
     "land.sh --review", "blocked", "hold", "PERMISSION REQUEST", "allow", "deny", "COORD_IDLE_MIN", "orca orchestration worker-show --dispatch", "observation.agentWait", "orca terminal read",
     "orca orchestration run-list", "afk-answering", "Scope:", "git log --since", "worker-list",

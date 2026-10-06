@@ -91,7 +91,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     def go(*args, run_id="run_t", **env):
         cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh")}
         return run(["bash", CO, *(["--run", run_id] if run_id else []), *args], cwd=repo.root,
-                   **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", "COORD_BELL_TTY": tmp_path / "bell", **cmd_env, **env})
+                   **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", **cmd_env, **env})
 
     def trail():   # [("orca orchestration check ack", argv), ("gh issue edit", argv), ("land.sh", argv)...] in call order
         rows = (Path(os.environ["STUB_DIR"]) / "calls.log").read_text().splitlines()
@@ -101,10 +101,10 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     def calls(kind):
         return [a for k, a in trail() if k == kind]
 
-    def blocked():   # label + comment + Orca surfaces (worktree comment, bell) + release; the worktree is kept and nothing is re-dispatched
+    def blocked():   # label + comment + Orca surface (worktree comment) + release; the worktree is kept and nothing is re-dispatched
         ks = [k for k, _ in trail()]
         edits = [a[3:] for a in calls("gh issue edit")]   # one in-progress or blocked label, never both
-        return (["--add-label", "blocked"] in edits and edits.index(["--remove-label", "status:in-progress"]) > edits.index(["--add-label", "blocked"]) and "gh issue comment" in ks and (tmp_path / "bell").exists()
+        return (["--add-label", "blocked"] in edits and edits.index(["--remove-label", "status:in-progress"]) > edits.index(["--add-label", "blocked"]) and "gh issue comment" in ks
                 and any(arg(a, "--comment").startswith("BLOCKED #1") and arg(a, "--worktree") == f"path:{wt}" for a in calls("orca worktree set"))
                 and "orca orchestration worker-release" in ks and "--address" not in sum(stubs.calls("dispatch.sh"), []) and "orca worktree rm" not in ks)
 
@@ -145,14 +145,14 @@ def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_ac
     assert C.go("--answer", "auto").returncode == 0
     if link != "ok":
         assert not C.stubs.calls("answer.sh") and not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack")
-        assert (tmp_path / "bell").exists() and (not C.calls("gh issue edit") if link == "norecord" else moved(C, link))
+        assert not C.calls("orca terminal send") and (not C.calls("gh issue edit") if link == "norecord" else moved(C, link))
         return
     assert C.stubs.calls("answer.sh") == [[C.wt]] and C.stdin("answer.sh") == "PLAN: do X?"
     rep = C.calls("orca orchestration reply")[0]
     assert (arg(rep, "--id"), arg(rep, "--body"), arg(rep, "--run")) == ("msg_q", "revise: drop the extra file", "run_t")
     in_order(C.kinds(), "answer.sh", "orca orchestration reply", "orca orchestration check ack")   # the warning goes to the human
     assert arg(C.calls("orca orchestration check ack")[0], "--ack") == "d0" and "touches CI" in C.calls("gh issue comment")[0][-1]
-    assert "touches CI" in arg(C.calls("orca worktree set")[0], "--comment") and (tmp_path / "bell").read_text() == "\a"   # Orca's surfaces: worktree comment + bell
+    assert "touches CI" in arg(C.calls("orca worktree set")[0], "--comment") and not C.calls("orca terminal send")   # Orca's surface: the worktree comment; the loop rings nothing
 
 
 REPLY = "bash {}/scripts/coordinator.sh --run run_t --reply msg_q approve".format(V2)
@@ -170,7 +170,7 @@ def test_a_question_for_the_human_is_flagged_with_the_exact_reply_command_and_ac
     assert not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack") and (len(C.stubs.calls("answer.sh")) == 1) == (mode != "human")
     c = C.calls("gh issue comment")[0][-1]
     assert REPLY in c and "revise:" in c and "--reply msg_q" in arg(C.calls("orca worktree set")[0], "--comment") and "approve with: <change>" in c
-    assert (tmp_path / "bell").exists() == (mode != "attended")   # attended rings once per queued decision from the queue (below), never per event
+    assert not C.calls("orca terminal send")   # no mode types into a terminal for a routine event; attended does from the queue (below), and only with a --session
     assert (WHY in c) == (mode == "attended") and (mode == "human" or f"ANSWER_MODE={mode}" in C.stubs.env("answer.sh").splitlines())   # the reason travels with the plan; the answerer is told which mode it serves
 
 
@@ -190,7 +190,7 @@ def test_auto_denies_a_permission_question_and_never_hands_it_to_the_answerer(C,
     c = C.calls("gh issue comment")[0][-1]
     assert "Bash" in c and "denied" in c and "curl" not in c and "secret" not in c   # the issue comment names the tool and the answer only, never the command
     in_order(C.kinds(), "orca orchestration reply", "orca orchestration check ack")
-    assert not C.calls("orca worktree set") and not (tmp_path / "bell").exists()   # nothing for the human to do: log and issue comment only
+    assert not C.calls("orca worktree set") and not C.calls("orca terminal send")   # nothing for the human to do: log and issue comment only
 
 
 def test_auto_whose_deny_cannot_be_sent_falls_back_to_the_human_never_to_an_allow(C):
@@ -207,10 +207,10 @@ def test_auto_denies_a_permission_question_from_a_worker_it_cannot_resolve_witho
     assert [arg(a, "--body") for a in C.calls("orca orchestration reply")] == ["deny"] and not C.calls("gh issue comment")   # nothing to comment on, still denied
 
 
-def test_human_mode_flags_a_permission_question_from_a_worker_it_cannot_resolve_with_a_bell_and_no_worktree_comment(C, tmp_path):
+def test_human_mode_flags_a_permission_question_from_a_worker_it_cannot_resolve_with_no_worktree_comment(C):
     C.stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": []}}))
     C.mail([msg("question", "msg_p", question=PQ)])
-    assert C.go("--answer", "human").returncode == 0 and (tmp_path / "bell").exists() and not C.calls("orca worktree set")
+    assert C.go("--answer", "human").returncode == 0 and not C.calls("orca worktree set") and not C.calls("orca terminal send")
 
 
 @pytest.mark.parametrize("mode", ["human", "attended"])   # attended too: the loop never approves a permission request, it queues it for the human
@@ -221,7 +221,7 @@ def test_human_mode_leaves_a_permission_question_open_with_an_allow_or_deny_repl
     c = C.calls("gh issue comment")[0][-1]
     assert REPLY_P in c and "deny" in c and "curl" not in c and "approve" not in c and "Bash" in c
     cm = C.calls("orca worktree set")
-    assert len(cm) == 1 and f"reply: {REPLY_P}" in arg(cm[0], "--comment") and (tmp_path / "bell").exists() == (mode == "human")   # attended rings from the queue, once per decision (below)
+    assert len(cm) == 1 and f"reply: {REPLY_P}" in arg(cm[0], "--comment") and not C.calls("orca terminal send")   # attended tells the session from the queue (below)
 
 
 def test_the_human_sees_the_whole_permission_change_not_the_25_line_cap_of_a_plan(C):
@@ -545,7 +545,7 @@ def test_slots_are_filled_up_to_the_cap_and_a_failed_dispatch_is_cleaned_up_and_
     C.stubs.reply(key("dispatch.sh", "5"), "boom", rc=1)
     assert C.go("--cap", "2").returncode == 0
     assert C.calls("orca worktree rm")[0][2:4] == ["--worktree", "issue:5"] and C.calls("gh issue edit")[0][:3] == ["issue", "edit", "5"]
-    assert (tmp_path / "bell").exists() and not C.calls("orca worktree set")   # the worktree is gone: bell only, never a comment on a stale one
+    assert not C.calls("orca worktree set")   # the worktree is gone: never a comment on a stale one
 
 
 def test_drain_stops_when_nothing_is_ready_and_no_worker_is_live_but_not_before(C):
@@ -660,28 +660,43 @@ def test_status_lists_the_queue_in_the_order_to_present_it_and_the_dispatch_requ
     assert "dispatch requests:" in out and re.search(r"#7 .*redo it.*waiting for a free slot \(cap 3\)", out) and re.search(r"#9 .*queued", out)
 
 
-def test_attended_rings_once_for_each_new_queued_decision_on_its_terminal_and_never_for_a_routine_event(C, tmp_path):
-    bell = tmp_path / "bell"
+def line(kind, i):   # the one line the loop types into the session's terminal: fixed text, the kind and the id
+    return f"[coordinator loop] new decision waiting: {kind} {i}. Read it whole, present it with one recommendation, then ring."
 
-    def run(*args, **env):   # the loop handles a batch of two plans (the answerer hands both over); a third question was already open when it started (a restart)
-        queued(C)
-        C.stubs.reply("answer.sh", WHY + "\n", rc=3)
-        C.mail([msg("question", i, question="PLAN?") for i in ("msg_a", "msg_b")])
-        return C.go("--answer", "attended", *args, **env)
 
-    assert run(COORD_MAX_TICKS=2).returncode == 0
-    assert bell.read_text() == "\a" * 6   # msg_a, msg_b, msg_c (open at the start: seeded, so a restart rings once for it), the fresh permission request, the old plan gate and #4 once each on the first pass (a stale permission request and an ended dispatch's question never ring, nor are seeded); the unchanged queue rings nothing on the second; #5 is on hold
-    bell.unlink()
-    assert run("--bell-tty", "/dev/null").returncode == 0 and not bell.exists()   # --bell-tty is where it rings: a terminal, not the loop's own
-    err = run("--bell-tty", str(tmp_path / "plain")).stderr
-    assert "not a terminal" in err and bell.read_text() == "\a" * 6 and not (tmp_path / "plain").exists()   # anything else falls back to this terminal, the decision is never lost
-    bell.unlink(missing_ok=True); C.stubs.reply("gh.issue_list", "[]"); C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": []}})); C.stubs.reply("answer.sh", "approve\nWARN: touches CI\n")   # a routine approval, with a warning: a worktree comment and an issue comment, no bell (auto and human keep their per-event bell: tests above)
+def test_attended_tells_the_session_with_one_fixed_line_when_a_decision_arrives_on_an_empty_queue_and_never_rings(C):
+    log = Path(os.environ["STUB_DIR"]) / "calls.log"
+
+    def sent(*args, **env):   # the lines one loop run typed into the session's terminal
+        log.unlink(missing_ok=True)
+        r = C.go("--answer", "attended", *args, **env)
+        assert r.returncode == 0 and not any("\a" in c for c in (r.stdout, r.stderr))   # the loop itself rings nothing
+        return [arg(a, "--text") for a in C.calls("orca terminal send") if arg(a, "--terminal") == "term_s" and "--enter" in a]
+
+    def inbox(*ticks):   # the open questions at the start, then at each tick (two reads each); a question carries its sequence (oldest first), p* ones are permission requests
+        for i, ids in enumerate(ticks):
+            rows = [{**msg("question", q, question=PQ if q.startswith("msg_p") else "PLAN\x1b[2J?\nrm -rf /"), "run_id": "run_t", "thread_id": q, "sequence": ord(q[-1])} for q in ids]
+            for n in ((1,) if i == 0 else (2 * i, 2 * i + 1)):
+                C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}), n=n)
+        C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
+
+    S = ("--session", "term_s")
+    queued(C); C.stubs.reply("answer.sh", WHY + "\n", rc=3)
+    assert sent(*S, COORD_MAX_TICKS=2) == [line("plan", "msg_a"), line("permission request", "msg_fresh")]   # five questions and a blocked issue open at the start: one line for the queue, one for the permission request, nothing on the unchanged second look
+    assert sent(COORD_MAX_TICKS=2) == []   # no --session: the decision waits in the queue, nothing is typed anywhere
+    C.stubs.reply("gh.issue_list", "[]")   # a decision arrives, a second plan and a permission request behind it, then the queue empties and a new one arrives (a sweep never reads the inbox here)
+    inbox([], [], ["msg_a"], ["msg_a", "msg_b"], ["msg_a", "msg_b", "msg_pc"], ["msg_a", "msg_b", "msg_pc", "msg_d"], ["msg_b", "msg_d"], [], ["msg_e"])
+    C.mail([], [msg("question", "msg_a", question="PLAN?")], [msg("question", "msg_b", question="PLAN?")], [msg("question", "msg_pc", question=PQ)], [msg("question", "msg_d", question="PLAN?")], [], [], [msg("question", "msg_e", question="PLAN?")])
+    assert sent(*S, COORD_MAX_TICKS=9, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b and msg_d wait behind msg_a, and msg_b (left once msg_a is answered) is the session's to present, not the loop's
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": []}}))
+    C.stubs.reply("answer.sh", "approve\nWARN: touches CI\n")   # a routine approval with a warning: a worktree comment and an issue comment, no line (auto and human keep their comment too: tests above)
     C.mail([msg("question", "msg_q", question="PLAN?")])
-    assert C.go("--answer", "attended").returncode == 0 and C.calls("orca worktree set") and not bell.exists()
-    C.workers(C.row(rec=None))   # a question from a live worker the loop cannot resolve (no dispatch record) is left for the human by hand: it rings too
-    C.mail([msg("question", "msg_u", question="PLAN?")])
-    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_u"), "run_id": "run_t", "thread_id": "msg_u", "sequence": 1}]}}))
-    assert C.go("--answer", "attended").returncode == 0 and bell.read_text() == "\a"
+    assert sent(*S) == [] and C.calls("orca worktree set")
+    C.stubs.reply("orca.terminal_send", "boom", rc=1, n=1)   # two plans arrive together and the first send fails: nothing is marked seen, the next wake sends again, once
+    inbox([], ["msg_a", "msg_b"])
+    C.mail([msg("question", "msg_a", question="PLAN?"), msg("question", "msg_b", question="PLAN?")])
+    C.stubs.reply("answer.sh", WHY + "\n", rc=3)
+    assert sent(*S, COORD_MAX_TICKS=3, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a")] * 2
 
 
 def test_status_shows_each_open_question_text_above_its_reply_command(C):
@@ -690,13 +705,22 @@ def test_status_shows_each_open_question_text_above_its_reply_command(C):
     assert "  | PLAN: add hello.py first" in lines_before(out, "--reply msg_q")
 
 
-def test_a_pending_human_gate_sets_the_worktree_comment_and_rings_the_bell_then_the_reply_overwrites_the_comment(C, tmp_path):
+def test_show_prints_one_open_question_whole_where_status_cuts_it_at_25_lines(C):
+    plan = "PLAN\x1b[2J:\n" + "\n".join(f"step {i}: do the thing" for i in range(300))
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question=plan), "run_id": "run_t", "thread_id": "msg_q"}]}}))
+    out = C.go("--show", "msg_q", ORCA_TERMINAL_HANDLE="").stdout
+    assert "step 299: do the thing" in out and "step 0: do the thing" in out and "\x1b" not in out and "truncated" not in out
+    st = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
+    assert "step 299" not in st and "[display truncated" in st   # the default view is unchanged
+    assert C.go("--show", "msg_nope", ORCA_TERMINAL_HANDLE="").returncode != 0
+
+
+def test_a_pending_human_gate_sets_the_worktree_comment_then_the_reply_overwrites_the_comment(C):
     C.mail([msg("question", "msg_q", question="PLAN: add hello.py\nthen a test")])
     assert C.go("--answer", "human").returncode == 0
     cm = [a for a in C.calls("orca worktree set")]
     assert len(cm) == 1 and arg(cm[0], "--worktree") == f"path:{C.wt}"
     assert arg(cm[0], "--comment") == f"GATE waiting: PLAN: add hello.py then a test | reply: {REPLY}"   # the full line: it needs --run
-    assert (tmp_path / "bell").read_text() == "\a"   # one bell per gate, on the coordinator's terminal
     C.inbox(["msg_q"]); C.spool("msg_q", "approve")
     assert C.go().returncode == 0
     last = C.calls("orca worktree set")[-1]   # Orca ignores --comment "": the comment is overwritten, never cleared
@@ -706,4 +730,4 @@ def test_a_pending_human_gate_sets_the_worktree_comment_and_rings_the_bell_then_
 def test_an_auto_answered_gate_neither_rings_nor_comments(C, tmp_path):
     C.mail([msg("question", "msg_q", question="PLAN?")])
     assert C.go("--answer", "auto").returncode == 0
-    assert not C.calls("orca worktree set") and not (tmp_path / "bell").exists()
+    assert not C.calls("orca worktree set") and not C.calls("orca terminal send")
