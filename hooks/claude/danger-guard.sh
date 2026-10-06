@@ -51,7 +51,7 @@ prot() { case "$1" in "$root/orca.yaml" | "$home/.claude/settings.json") return 
   [ -n "$spoke" ] && case "$1" in "$root/.claude/settings.json" | "$root/.claude/settings.local.json" | "$root/.claude/hooks" | "$root/.claude/hooks/"* | "$root/.ai-toolkit/spoke-run-id" | "$root/.ai-toolkit/claude-settings.json" | "$root/.ai-toolkit/hooks/"* | "${AI_TOOLKIT_DIR:-/nonexistent}" | "${AI_TOOLKIT_DIR:-/nonexistent}/"*) return 0;; esac
   return 1; }
 fp="$(j '.tool_input.file_path // .tool_input.notebook_path')"
-spool="(~|HOME\}?|$home)/\.ai-toolkit/coordinator"; sy='(^|[;&|(])[[:space:]]*((bash|sh|zsh|source|\.)[[:space:]]+)?[^[:space:];&|]*sync\.sh([[:space:]]|$)' # spool: a file there is sent as the human's answer, so a worker never writes it; sy: a sync.sh run commits and pushes the base branch inside the script, where push-guard cannot see
+spool="(~|HOME\}?|$home)/\.ai-toolkit/coordinator"; sy='(^|[;&|(]|[[:cntrl:]])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((env|time|nohup|exec|bash|sh|zsh|source|\.)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?[^[:space:];&|]*sync\.sh([[:space:]]|$)' # spool: a file there is sent as the human's answer, so a worker never writes it; sy: a sync.sh run commits and pushes the base branch inside the script, where push-guard cannot see
 if [ -n "$fp" ]; then fc="$(canon "$fp")"; if prot "$fc"; then sens "write to a protected path ($fp)"; fi
   [ -z "$spoke" ] || case "$fc" in "$home/.ai-toolkit/coordinator" | "$home/.ai-toolkit/coordinator/"*) deny "write to the human's reply spool ($fp)";; esac
   case "$fc" in "$root/.github/workflows" | "$root/.github/workflows/"*) sens "write to .github/workflows ($fp)";; esac; fi

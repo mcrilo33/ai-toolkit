@@ -47,7 +47,7 @@ EOF
 tg() { git -C "$TARGET" "$@"; }
 # linked <dir>: a linked worktree, by git's own answer (its git dir is not the common one), not by a path or a variable a worker controls. A push made inside this script
 # is invisible to push-guard (it reads command text), so a worker must not reach the base branch through it: refused for the target and for the toolkit copy being run.
-linked() { [ "$(git -C "$1" rev-parse --path-format=absolute --git-dir 2> /dev/null)" != "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2> /dev/null)" ]; }
+linked() { local g; g="$(git -C "$1" rev-parse --path-format=absolute --git-dir --git-common-dir 2> /dev/null)"; [ "${g%%$'\n'*}" != "${g#*$'\n'}" ]; }
 MSG="chore(ai-toolkit): sync orca.yaml with the toolkit (#0)"
 if [ "$COMMIT" -eq 1 ]; then   # the refusals, before anything is written to the host
   if linked "$TARGET"; then die "$TARGET is a linked worktree: sync the main checkout (--no-commit writes the files without a commit)"; fi
@@ -164,11 +164,11 @@ if [ "$COMMIT" -eq 1 ]; then
     tg add -- orca.yaml && AI_TOOLKIT_ALLOW_BASE_COMMIT=1 tg commit -q -m "$MSG" -- orca.yaml || die "could not commit orca.yaml (a host hook? no git identity?): it is written, commit it yourself"
   fi
   if [ -z "$(tg status --porcelain -- orca.yaml)" ] && [ -z "$(tg ls-files -- orca.yaml)" ]; then warn "orca.yaml is ignored by git here (a global or project ignore rule): Orca reads the tracked one, so add it yourself (git add -f orca.yaml) and commit it"; fi
-  range="origin/$BASE..HEAD"; tg rev-parse -q --verify "refs/remotes/origin/$BASE" > /dev/null || range=HEAD   # no remote branch yet: everything is waiting
+  range="origin/$BASE..HEAD" from="origin/$BASE"; tg rev-parse -q --verify "refs/remotes/origin/$BASE" > /dev/null || { range=HEAD; from="$(tg hash-object -t tree /dev/null)"; }   # no remote branch yet: everything is waiting
   waiting="$(tg log --format=%s "$range" 2> /dev/null || true)"
-  # Only the sync's own commits go out: its subject, orca.yaml alone, and the tip's orca.yaml byte for byte what this run writes (a subject alone is no proof)
+  # Only the sync's own commits go out: its subject on every waiting commit and the net change against the base is orca.yaml alone (tree, not per-commit names: a merge hides its files; a subject alone is no proof)
   if [ -z "$waiting" ]; then :
-  elif [ -n "$(printf '%s\n' "$waiting" | grep -vxF "$MSG" || true)$(tg log --format= --name-only "$range" | grep -v '^$' | grep -vxF orca.yaml || true)" ] || ! tg show HEAD:orca.yaml 2> /dev/null | cmp -s - <(orca_yaml); then
+  elif [ -n "$(printf '%s\n' "$waiting" | grep -vxF "$MSG" || true)$(tg diff --name-only "$from" HEAD | grep -vxF orca.yaml || true)" ]; then
     warn "commits other than the sync's orca.yaml are waiting on $BASE: push them yourself (git -C $TARGET push origin HEAD:$BASE), the sync never publishes them"
   elif err="$(GIT_TERMINAL_PROMPT=0 tg push -q origin "HEAD:refs/heads/$BASE" 2>&1)"; then echo "committed and pushed orca.yaml to origin/$BASE"
   else warn "orca.yaml is committed locally, NOT pushed (${err%%$'\n'*}): fix the remote and run the sync again, or push it yourself: git -C $TARGET push origin HEAD:$BASE (a protected branch takes a pull request)"; fi

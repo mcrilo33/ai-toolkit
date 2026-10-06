@@ -245,7 +245,8 @@ def test_a_host_records_the_toolkits_origin_as_upstream_and_the_toolkit_itself_s
 def test_an_unmanaged_orca_yaml_is_backed_up_once_then_owned(sync, target):
     write(target / "orca.yaml", "scripts: {}\n")
     sync()
-    assert "orca.yaml.bak" not in git(target, "status", "--porcelain", "-uall")   # the project's own copy is kept, out of git status    assert (target / "orca.yaml.bak").read_text() == "scripts: {}\n" and (target / "orca.yaml").read_text().startswith("setupAgentStartupPolicy")
+    assert "orca.yaml.bak" not in git(target, "status", "--porcelain", "-uall")   # the project's own copy is kept, out of git status
+    assert (target / "orca.yaml.bak").read_text() == "scripts: {}\n" and (target / "orca.yaml").read_text().startswith("setupAgentStartupPolicy")
     (target / "orca.yaml").write_text("edited after sync\n")
     sync()  # now managed: overwritten again, the original backup is kept
     assert (target / "orca.yaml.bak").read_text() == "scripts: {}\n" and (target / "orca.yaml").read_text().startswith("setupAgentStartupPolicy")
@@ -382,7 +383,7 @@ def test_a_host_sync_commits_and_pushes_orca_yaml_once_then_is_idempotent(host_s
     assert git(h, "show", "--format=", "--name-only", "HEAD").splitlines() == ["orca.yaml"] and "changed" in (h / ".claude/rules/ai-toolkit/security.md").read_text()
 
 
-@pytest.mark.parametrize("case", ["unreachable-remote", "a-human-commit-waits", "a-commit-with-the-sync-subject-and-other-content"])
+@pytest.mark.parametrize("case", ["unreachable-remote", "a-human-commit-waits", "a-commit-with-the-sync-subject-and-other-content", "an-evil-merge-with-the-sync-subject", "orca-yaml-is-ignored"])
 def test_a_refused_push_keeps_the_commit_and_the_next_run_pushes_it(host_sync, host, case, tmp_path):
     h, origin = host
     adopt(host, True)
@@ -394,6 +395,26 @@ def test_a_refused_push_keeps_the_commit_and_the_next_run_pushes_it(host_sync, h
         git(h, "config", "remote.origin.url", str(origin))
         before = history(h)
         assert host_sync().returncode == 0 and history(h) == before and history(origin, "main") == before   # the next run pushes the waiting commit, makes none
+    elif case == "orca-yaml-is-ignored":   # the tracked file Orca reads would never exist: said, not silent
+        write(h / ".gitignore", "orca.yaml\n")
+        git(h, "add", ".gitignore")
+        git(h, "commit", "-qm", "chore: ignore (#6)")
+        git(h, "push", "-q", "origin", "main")
+        before = history(h)
+        r = host_sync()
+        assert r.returncode == 0 and "ignored by git" in r.stderr and history(h) == before and history(origin, "main") == before
+    elif case == "an-evil-merge-with-the-sync-subject":   # git log --name-only shows no files for a merge: the gate looks at the net tree change instead
+        git(h, "checkout", "-q", "-b", "side")
+        git(h, "commit", "-q", "--allow-empty", "-m", "feat: side (#7)")
+        git(h, "push", "-q", "origin", "side:main")
+        git(h, "checkout", "-q", "main")
+        git(h, "merge", "-q", "--no-ff", "--no-commit", "side")
+        write(h / "evil.sh", "x\n")
+        git(h, "add", "evil.sh")
+        git(h, "commit", "-q", "-m", MSG)
+        pushed = history(origin, "main")
+        r = host_sync()
+        assert r.returncode == 0 and "waiting on main" in r.stderr and history(origin, "main") == pushed and MSG in history(h)
     else:   # someone's unpushed work is never published by a sync, whatever subject it carries
         subject = "feat: mine (#2)" if case == "a-human-commit-waits" else MSG
         write(h / "mine.txt", "x\n")
