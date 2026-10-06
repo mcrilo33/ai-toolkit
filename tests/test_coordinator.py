@@ -749,7 +749,7 @@ def test_a_failed_orca_read_never_ends_the_loop_it_warns_naming_the_call_and_run
     fails(C, call)
     r = C.go(COORD_MAX_TICKS=2)
     assert r.returncode == 0 and len(C.calls("orca orchestration check")) == 2 and "gh issue edit" not in C.kinds()
-    assert (call == "run_show") == bool(C.stubs.calls("dispatch.sh")) and ["--next", "--dry-run"] in C.stubs.calls("dispatch.sh") + [["--next", "--dry-run"]]   # a failed worker read dispatches nothing, not even a dry run
+    assert (call == "run_show") == bool(C.stubs.calls("dispatch.sh"))   # a failed worker read dispatches nothing, not even a dry run
     assert f"orca orchestration {call.replace('_', '-')} failed: runtime_unavailable" in r.stderr and "jq: error" not in r.stderr   # nothing is dispatched or blocked from a read that failed
 
 

@@ -149,14 +149,14 @@ if [ "$stop" = 1 ]; then   # the caller holds the Run now: the loop's wait retur
   die "run $run is bound to $H, but coordinator.sh is still finishing its step (a land?): it exits when done, see --status"
 fi
 mode="$answer${until:+ until $until}"; [ "$drain" = 0 ] || mode="$mode drain"
-sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$BASH_COMMAND"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
-log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
-
 died() {   # the EXIT trap, $1 = the exit status, $2 = the last command: a planned exit (status 0: --until, drained, taken back, a limit; Ctrl-C, hang-up, kill) is silent, any other is logged and, attended, typed into the session
   rm -f "$errf" "$hf"; case $1 in 0 | 129 | 130 | 143) return 0 ;; esac
   log "exiting on an error: status $1, last command: ${2:0:100}"
   [ "$answer" != attended ] || [ -z "$session" ] || orca_json terminal send --terminal "$session" --text "[coordinator loop] stopped on an error: nothing coordinates Run $run, read its terminal and start it again." --enter > /dev/null 2>&1 || true
 }
+sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$BASH_COMMAND"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
+log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
+
 # ctx <dispatch>: sets disp task term wtp issue br (its Orca branch) from the worker's Orca row and the issue linked to its worktree.
 ctx() {
   local r rec rows; disp="$1"
@@ -359,6 +359,7 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
     how="$(silent "$d")" || true; [ -n "$how" ] || { warn "worker $d: cannot tell how long it has been silent (worker-show or its jq failed), left alone"; continue; }; read -r age how <<< "$how"; [ "$age" -ge "${COORD_IDLE_MIN:-15}" ] || continue   # never an age of 0: an unknown age is not an idle check that passed
     ctx "$d" || continue
     if [ "$how" = wait ]; then block "worker $d is silent for ${age}m and waits on a prompt only a human can answer, or Orca cannot prove it works: slot freed, worktree kept, check its terminal"; continue; fi   # never a relaunch: it may be healthy
+    rounds > /dev/null || continue   # Orca did not answer: not released and not blocked on a guess, the next sweep looks again
     log "#$issue: worker $d silent for ${age}m, relaunching"; release "$d"   # its dispatch is still live: stop it first or the worktree counts twice
     redispatch 1 "address: your agent went idle after an error without worker_done. Continue from the pushed branch (git log), push, then send worker_done." "worker idle again without worker_done"
   done
