@@ -90,7 +90,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
 
     def go(*args, run_id="run_t", **env):
         cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh")}
-        return run(["bash", CO, *(["--run", run_id] if run_id else []), *args], cwd=repo.root,
+        return run(["bash", CO, *(["--run", run_id] if run_id else []), "--session", "term_s", *args], cwd=repo.root,
                    **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", **cmd_env, **env})
 
     def trail():   # [("orca orchestration check ack", argv), ("gh issue edit", argv), ("land.sh", argv)...] in call order
@@ -170,7 +170,7 @@ def test_a_question_for_the_human_is_flagged_with_the_exact_reply_command_and_ac
     assert not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack") and (len(C.stubs.calls("answer.sh")) == 1) == (mode != "human")
     c = C.calls("gh issue comment")[0][-1]
     assert REPLY in c and "revise:" in c and "--reply msg_q" in arg(C.calls("orca worktree set")[0], "--comment") and "approve with: <change>" in c
-    assert not C.calls("orca terminal send")   # no mode types into a terminal for a routine event; attended does from the queue (below), and only with a --session
+    assert not C.calls("orca terminal send")   # the event itself types nothing in any mode: attended tells the session from the queue it reads back (below)
     assert (WHY in c) == (mode == "attended") and (mode == "human" or f"ANSWER_MODE={mode}" in C.stubs.env("answer.sh").splitlines())   # the reason travels with the plan; the answerer is told which mode it serves
 
 
@@ -664,54 +664,55 @@ def line(kind, i):   # the one line the loop types into the session's terminal: 
     return f"[coordinator loop] new decision waiting: {kind} {i}. Read it whole, present it with one recommendation, then ring."
 
 
-def test_attended_tells_the_session_with_one_fixed_line_when_a_decision_arrives_on_an_empty_queue_and_never_rings(C):
+def sent(C, *args, **env):   # the lines one attended loop run typed into the session's terminal (the harness gives it --session term_s)
     log = Path(os.environ["STUB_DIR"]) / "calls.log"
+    log.unlink(missing_ok=True)
+    r = C.go("--answer", "attended", *args, **env)
+    assert r.returncode == 0 and "\a" not in r.stdout + r.stderr   # the loop itself rings nothing
+    return [arg(a, "--text") for a in C.calls("orca terminal send") if arg(a, "--terminal") == "term_s" and "--enter" in a]
 
-    def sent(*args, **env):   # the lines one loop run typed into the session's terminal
-        log.unlink(missing_ok=True)
-        r = C.go("--answer", "attended", *args, **env)
-        assert r.returncode == 0 and not any("\a" in c for c in (r.stdout, r.stderr))   # the loop itself rings nothing
-        return [arg(a, "--text") for a in C.calls("orca terminal send") if arg(a, "--terminal") == "term_s" and "--enter" in a]
 
-    def inbox(*ticks):   # the open questions at the start, then at each tick (two reads each); a question carries its sequence (oldest first), p* ones are permission requests
-        for i, ids in enumerate(ticks):
-            rows = [{**msg("question", q, question=PQ if q.startswith("msg_p") else "PLAN\x1b[2J?\nrm -rf /"), "run_id": "run_t", "thread_id": q, "sequence": ord(q[-1])} for q in ids]
-            for n in ((1,) if i == 0 else (2 * i, 2 * i + 1)):
-                C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}), n=n)
-        C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
+def ticks(*snapshots):   # the Run's open questions at the start, then at each tick (two inbox reads each; sweeps off): ids by sequence, "msg_p*" ones are permission requests
+    base = Path(os.environ["STUB_DIR"])
+    (base / "orca.orchestration_inbox.count").unlink(missing_ok=True)   # the stub numbers its replies per call: start again at the first
+    for i, ids in enumerate(snapshots):
+        rows = [{**msg("question", q, question=PQ if q.startswith("msg_p") else "PLAN\x1b[2J?\nrm -rf /"), "run_id": "run_t", "thread_id": q, "sequence": ord(q[-1])} for q in ids]
+        for n in ((1,) if i == 0 else (2 * i, 2 * i + 1)):
+            (base / f"orca.orchestration_inbox.{n}").write_text(json.dumps({"result": {"messages": rows}}))
+    (base / "orca.orchestration_inbox").write_text(json.dumps({"result": {"messages": rows}}))
 
-    S = ("--session", "term_s")
+
+def test_attended_tells_the_session_with_one_fixed_line_for_a_queue_open_at_the_start_and_retries_a_failed_send(C):
     queued(C); C.stubs.reply("answer.sh", WHY + "\n", rc=3)
-    assert sent(*S, COORD_MAX_TICKS=2) == [line("plan", "msg_a"), line("permission request", "msg_fresh")]   # five questions and a blocked issue open at the start: one line for the queue, one for the permission request, nothing on the unchanged second look
-    assert sent(COORD_MAX_TICKS=2) == []   # no --session: the decision waits in the queue, nothing is typed anywhere
-    C.stubs.reply("gh.issue_list", "[]")   # a decision arrives, a second plan and a permission request behind it, then the queue empties and a new one arrives (a sweep never reads the inbox here)
-    inbox([], [], ["msg_a"], ["msg_a", "msg_b"], ["msg_a", "msg_b", "msg_pc"], ["msg_a", "msg_b", "msg_pc", "msg_d"], ["msg_b", "msg_d"], [], ["msg_e"])
-    C.mail([], [msg("question", "msg_a", question="PLAN?")], [msg("question", "msg_b", question="PLAN?")], [msg("question", "msg_pc", question=PQ)], [msg("question", "msg_d", question="PLAN?")], [], [], [msg("question", "msg_e", question="PLAN?")])
-    assert sent(*S, COORD_MAX_TICKS=9, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b and msg_d wait behind msg_a, and msg_b (left once msg_a is answered) is the session's to present, not the loop's
-    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": []}}))
+    assert sent(C) == [line("plan", "msg_a"), line("permission request", "msg_fresh")]   # five questions and a blocked issue open at the start: one line for the queue, one for the permission request
+    assert sent(C, "--session", "") == []   # no --session: the decision waits in the queue, nothing is typed anywhere
+    C.stubs.reply("gh.issue_list", "[]"); C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": []}}))
     C.stubs.reply("answer.sh", "approve\nWARN: touches CI\n")   # a routine approval with a warning: a worktree comment and an issue comment, no line (auto and human keep their comment too: tests above)
     C.mail([msg("question", "msg_q", question="PLAN?")])
-    assert sent(*S) == [] and C.calls("orca worktree set")
-    C.stubs.reply("orca.terminal_send", "boom", rc=1, n=1)   # two plans arrive together and the first send fails: nothing is marked seen, the next wake sends again, once
-    inbox([], ["msg_a", "msg_b"])
+    assert sent(C) == [] and C.calls("orca worktree set")
+    C.stubs.reply("orca.terminal_send", "boom", rc=1, n=1)   # two plans arrive together and the first send fails: nothing is marked seen, the next wake sends again
+    (Path(os.environ["STUB_DIR"]) / "orca.terminal_send.count").unlink(missing_ok=True)
+    ticks([], ["msg_a", "msg_b"])
     C.mail([msg("question", "msg_a", question="PLAN?"), msg("question", "msg_b", question="PLAN?")])
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)
-    assert sent(*S, COORD_MAX_TICKS=3, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a")] * 2
+    assert sent(C, COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a")] * 2
 
 
-def test_status_shows_each_open_question_text_above_its_reply_command(C):
-    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question="PLAN: add hello.py first"), "run_id": "run_t", "thread_id": "msg_q"}]}}))
+def test_attended_sends_nothing_behind_a_waiting_decision_but_a_permission_request_and_again_once_the_queue_is_empty(C):
+    ticks([], ["msg_a"], ["msg_a", "msg_b"], ["msg_a", "msg_b", "msg_pc"], ["msg_b"], [], ["msg_e"])   # a plan, a second plan behind it, a permission request, the first and the permission answered (the second remains), all answered, a new plan
+    C.stubs.reply("answer.sh", WHY + "\n", rc=3)
+    C.mail([msg("question", "msg_a", question="PLAN?")], [msg("question", "msg_b", question="PLAN?")], [msg("question", "msg_pc", question=PQ)], [], [], [msg("question", "msg_e", question="PLAN?")])
+    assert sent(C, COORD_MAX_TICKS=6, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b waits behind msg_a and is the session's to present once msg_a is answered, not the loop's
+
+
+def test_status_shows_each_open_question_text_above_its_reply_command_and_show_prints_one_whole(C):
+    plan = "PLAN: add hello.py first\n\x1b[2Jthen\n" + "\n".join(f"step {i}: do the thing" for i in range(300))
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question=plan), "run_id": "run_t", "thread_id": "msg_q"}]}}))
     out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
     assert "  | PLAN: add hello.py first" in lines_before(out, "--reply msg_q")
-
-
-def test_show_prints_one_open_question_whole_where_status_cuts_it_at_25_lines(C):
-    plan = "PLAN\x1b[2J:\n" + "\n".join(f"step {i}: do the thing" for i in range(300))
-    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question=plan), "run_id": "run_t", "thread_id": "msg_q"}]}}))
-    out = C.go("--show", "msg_q", ORCA_TERMINAL_HANDLE="").stdout
-    assert "step 299: do the thing" in out and "step 0: do the thing" in out and "\x1b" not in out and "truncated" not in out
-    st = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
-    assert "step 299" not in st and "[display truncated" in st   # the default view is unchanged
+    assert "step 299" not in out and "[display truncated" in out   # the default view stays at 25 lines
+    whole = C.go("--show", "msg_q", ORCA_TERMINAL_HANDLE="").stdout
+    assert "step 0: do" in whole and "step 299: do the thing" in whole and "\x1b" not in whole and "truncated" not in whole   # --show: the whole plan, control bytes dropped
     assert C.go("--show", "msg_nope", ORCA_TERMINAL_HANDLE="").returncode != 0
 
 

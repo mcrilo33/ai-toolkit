@@ -10,7 +10,7 @@
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
 # back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD.
 # --answer attended (the /coordinate attended loop, #450): the routine work out of sight, the human only for a decision. A routine plan is approved by answer.sh; a plan it hands over (exit 3, a reason) and every permission
-# request stay OPEN (the loop never approves one), queued for the human with the other open questions and the blocked issues; one bell (--bell-tty: the session's terminal) per NEW queued decision. --dispatch <issue> [message]
+# request stay OPEN (the loop never approves one), queued for the human with the other open questions and the blocked issues; the session is told by ONE line typed into its terminal (--session <handle>, orca terminal send) when a decision arrives on an empty queue, and for every permission request; the loop rings nothing. --show <message-id> prints one open question whole. --dispatch <issue> [message]
 # queues a dispatch request the loop runs ahead of its own pick (cap and Scope rule apply). auto and human are unchanged.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
 # consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
@@ -20,20 +20,20 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; reply=0; reply_id=""; reply_body=""; stop=0; bell_arg=""; dreq=0; dreq_n=""; dreq_text=""
+run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; reply=0; reply_id=""; reply_body=""; stop=0; session=""; show_id=""; dreq=0; dreq_n=""; dreq_text=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;; --answer) answer="${2:-}"; shift ;;
     --cap) cap="${2:-}"; shift ;; --until) until="${2:-}"; shift ;;
-    --drain) drain=1 ;; --status) status=1 ;; --stop) stop=1 ;; --bell-tty) bell_arg="${2:-}"; shift ;;
+    --drain) drain=1 ;; --status) status=1 ;; --stop) stop=1 ;; --session) session="${2:-}"; shift ;; --show) show_id="${2:-}"; shift ;;
     --dispatch) dreq=1; dreq_n="${2:-}"; dreq_text="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
     --reply) reply=1; reply_id="${2:-}"; reply_body="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
-    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|attended|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny | --run R --dispatch <issue> [message] (--bell-tty <tty> with the loop)" ;;
+    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|attended|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny | --run R --dispatch <issue> [message] | --run R --show <message-id> (--session <terminal-handle> with the loop)" ;;
   esac; shift
 done
 case "$answer" in auto | attended | human) ;; *) usage_exit "--answer takes auto, attended or human" ;; esac
 [ "$stop" = 0 ] || [ -n "$run" ] || usage_exit "--stop needs --run <run-id>"
-[ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"
+[ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"; [[ -z $session || $session =~ ^term_[A-Za-z0-9_-]+$ ]] || usage_exit "--session takes an Orca terminal handle"
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
 [ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid>)
 if [ "$dreq" = 1 ]; then   # a dispatch request: <issue> = its one-line message (empty = a plain dispatch), queued in the reply spool's shape for the loop's next wake
@@ -43,8 +43,6 @@ if [ "$dreq" = 1 ]; then   # a dispatch request: <issue> = its one-line message 
   printf '%s\n' "$(printf '%s' "$dreq_text" | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-1000)" > "$d/.$dreq_n.tmp" && mv "$d/.$dreq_n.tmp" "$d/$dreq_n"
   echo "dispatch request for #$dreq_n queued: the loop starts it at its next wake, or --status says why not"; exit 0
 fi
-bell_tty="${COORD_BELL_TTY:-/dev/tty}"   # the terminal the human answers in (the attended session's, passed by the skill), else this one
-[ -z "$bell_arg" ] || { [ -c "$bell_arg" ] && bell_tty="$bell_arg" || warn "--bell-tty $bell_arg is not a terminal: ringing on this terminal instead"; }
 DISPATCH_CMD="${DISPATCH_CMD:-$here/dispatch.sh}"; LAND_CMD="${LAND_CMD:-$here/land.sh}"; ANSWER_CMD="${ANSWER_CMD:-$here/answer.sh}"
 cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
@@ -68,11 +66,9 @@ show_q() {   # the question as the human must read it: control bytes dropped, wr
   printf '%s\n' "$all" | head -n "$n" | sed 's/^/  | /' || true
   total="$(printf '%s\n' "$all" | wc -l)"; [ "$total" -le "$n" ] || echo "  [display truncated: $((total - n)) more lines; deny if unsure]"
 }
-flag() {   # $1 worktree path ("" = none known), $2 its comment (optional with no path): the Orca surfaces of anything the human must see: the worktree comment, and a bell on this terminal
-  [ -z "$1" ] || orca_json worktree set --worktree "path:$1" --comment "$(printf '%s' "$2" | tr '\n' ' ')" > /dev/null 2>&1 || warn "cannot set the worktree comment"   # (Orca turns the bell into its own
-  [ "$answer" = attended ] || bell   # attended rings once per NEW queued decision instead (notify_queue). notification when terminalBell is on; it carries no text, the text is the comment, the issue comment and this log)
+flag() {   # $1 worktree path ("" = none known), $2 its comment (optional with no path): the Orca surface of anything the human must see: the worktree comment
+  [ -z "$1" ] || orca_json worktree set --worktree "path:$1" --comment "$(printf '%s' "$2" | tr '\n' ' ')" > /dev/null 2>&1 || warn "cannot set the worktree comment"   # 
 }
-bell() { { printf '\a' >> "$bell_tty"; } 2> /dev/null || true; }
 gate_flag() { flag "$1" "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2" "${4:-approve}")"; }   # $1 worktree path, $2 message id, $3 question, $4 the reply word shown
 mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
 now_min() { mins "${AI_TOOLKIT_NOW:-$(date +%H:%M)}"; }
@@ -108,12 +104,12 @@ open_q() {   # the open questions a human can still answer, oldest first (Orca l
       and ((($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") | not) or ((try ((.created_at | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)) catch $now) >= $now - 540)))' <<< "$o"
 }
 blocked_q() { gh issue list --label blocked --state open --limit 100 --json number,title,labels | jq -r '[.[] | select(.labels | map(.name) | index("hold") | not)] | sort_by(.number)[] | "\(.number)\t\(.title)"'; }   # hold = parked on purpose
-queue_ids() {   # the decisions waiting for the human, in the order to present them, one word each: q:<message id> (a worker waits, a slot is held), then b:<issue> (blocked; a review that kept rejecting is one)
-  local q; q="$(open_q | jq -r '"q:\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
+queue_ids() {   # the decisions waiting for the human, in the order to present them, one word each: q:<message id> (a plan: a worker waits, a slot is held) or p:<message id> (a permission request), then b:<issue> (blocked; a review that kept rejecting is one)
+  local q; q="$(open_q | jq -r '"\(if ((.payload // "{}" | if type == "string" then fromjson else . end).question // .body // "") | test("^\\s*PERMISSION REQUEST") then "p" else "q" end):\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
 }
 replycmd() { printf 'bash %s --run %s --reply %s %s' "$here/coordinator.sh" "$run" "$1" "${2:-approve}"; }
-if [ "$status" = 1 ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to
-  [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"
+if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to; --show: one of them whole
+  [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"; if [ -n "$show_id" ]; then m="$(open_q | jq -c --arg i "$show_id" 'select(.id == $i)')" && [ -n "$m" ] || die "no open question $show_id on run $run"; show_q "$(question_of "$m")" 1000000; exit 0; fi
   log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold eq "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
   echo "live workers:"   # verdict, the agent's activity and the silence: `unverifiable` for a long run tells a stuck worker from a working one
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "\(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict) \(.projection.stage.activity // "-")"' | while read -r d w v a; do
@@ -172,7 +168,7 @@ ctx() {
 }
 rounds() { wl | jq --arg p "::$wtp" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] | length - 1'; }   # dispatches so far - 1
 release() { [ -z "$1" ] || orca_mutate orchestration worker-release --dispatch "$1" > /dev/null 2>&1 || orca_mutate orchestration worker-stop --dispatch "$1" > /dev/null 2>&1 || true; }
-block() {   # $1 = why. Label, comment, flag (log, worktree comment, bell), free the slot; the worktree stays for the human. Never when the Run was taken back (yield).
+block() {   # $1 = why. Label, comment, flag (log, worktree comment), free the slot; the worktree stays for the human. Never when the Run was taken back (yield).
   yield; gh issue edit "$issue" --add-label blocked > /dev/null 2>&1 \
     || { gh label create blocked --color B60205 > /dev/null 2>&1 || true; gh issue edit "$issue" --add-label blocked > /dev/null || warn "cannot label #$issue"; }
   status_label remove "$issue"
@@ -237,7 +233,7 @@ on_question() {
     yield   # ...unless the reply failed because the Run was taken back meanwhile
     held="$held $id "
     case "${ans:-}" in human:*) why="$(head -n 1 <<< "$ans")" ;; esac   # attended: the answerer's reason for handing the plan over
-    comment "$issue" "A gate question needs a human (message $id)${why:+, $why}: ${q:0:500} -- Reply from any terminal: $(replycmd "$id")   (or end it with: approve with: <change> to approve with a small change, or revise: <change> to amend the plan)"
+    comment "$issue" "A gate question needs a human (message $id)${why:+, $why}; read it whole with: bash $here/coordinator.sh --run $run --show $id -- Reply from any terminal: $(replycmd "$id")   (or end it with: approve with: <change> to approve with a small change, or revise: <change> to amend the plan)"
     show_q "$q"; log "#$issue: gate question waiting${why:+ ($why)}: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
   fi
 }
@@ -355,11 +351,15 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
   done
 }
 
-notify_queue() {   # attended: one bell for each decision that was not queued at the last look; the ids last seen live in $seen (no file); a failed read changes nothing.
-  [ "$answer" = attended ] || return 0   # A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event
-  local now i all; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
-  all="$(queue_ids | tr '\n' ' ')" || return 0; now=""
-  for i in $all; do case "$i" in q:*) case " $held " in *" ${i#q:} "*) ;; *) continue ;; esac ;; esac; now="$now$i "; case " $seen " in *" $i "*) ;; *) bell ;; esac; done; seen="$now"
+tell() {   # $1 kind (p|q|b), $2 id: one fixed line typed into the session's terminal, never text a worker wrote (it lands in an agent's prompt); no --session = nothing to send
+  [ -n "$session" ] || return 0; local kind=plan; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; esac
+  orca_json terminal send --terminal "$session" --text "[coordinator loop] new decision waiting: $kind $(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2"). Read it whole, present it with one recommendation, then ring." --enter > /dev/null 2>&1 || { warn "cannot tell the session ($kind $2): retried at the next wake"; return 1; }
+}
+notify_queue() {   # attended: tell the session of a decision that was not queued at the last look, once: the first one when nothing was waiting, and every permission request (it expires in 9 minutes); the ids last seen live in $seen (no file); a failed read or send changes nothing, the next wake looks again. A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event.
+  [ "$answer" = attended ] || return 0; local now i all k first=0 fail=0; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
+  all="$(queue_ids | tr '\n' ' ')" || return 0; now=""; [ -n "${seen// }" ] || first=1; for i in $all; do k="${i%%:*}"; [ "$k" = b ] || case " $held " in *" ${i#?:} "*) ;; *) continue ;; esac; now="$now$i "
+    case " $seen " in *" $i "*) continue ;; esac; [ "$k" = p ] || [ "$first" = 1 ] || continue; [ "$k" = p ] || first=0; tell "$k" "${i#?:}" || fail=1
+  done; [ "$fail" = 1 ] || seen="$now"
 }
 tick=0; empties=0; seen=""; bids=""; bdirty=1; held=" $(open_q | jq -r .id | tr '\n' ' ' || true)"; start="$(now_min)"; budget=0
 [ -z "$until" ] || budget=$(((($(mins "$until") - start) + 1440) % 1440))
