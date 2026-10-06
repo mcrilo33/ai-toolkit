@@ -78,6 +78,8 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         rows += [{"id": f"x{i}", "type": "status", "run_id": "run_other", "thread_id": None, "body": "", "payload": None} for i in range(pad)]   # other Runs' mail
         stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
 
+    inbox()   # an Orca read always answers with a .result: an empty stub reply would be a failed read
+
     def spool(mid, body):   # a queued human reply, as `coordinator.sh --reply` writes it
         (tmp_path / "state/run_t/replies").mkdir(parents=True, mode=0o700, exist_ok=True)
         (tmp_path / "state/run_t/replies" / mid).write_text(body + "\n")
@@ -732,3 +734,38 @@ def test_an_auto_answered_gate_neither_rings_nor_comments(C, tmp_path):
     C.mail([msg("question", "msg_q", question="PLAN?")])
     assert C.go("--answer", "auto").returncode == 0
     assert not C.calls("orca worktree set") and not C.calls("orca terminal send")
+
+
+ORCA_ERR = json.dumps({"id": "x", "ok": False, "error": {"code": "runtime_unavailable", "message": "the runtime is not reachable"}, "_meta": {"runtimeId": "rt"}}, indent=2)   # what Orca prints for any failed call: 11 lines on stdout, exit 1, nothing on stderr, no .result
+
+
+def fails(C, call, calls=(None,)):   # a failed Orca read: the numbered calls only, or every call
+    for n in calls:
+        C.stubs.reply(f"orca.orchestration_{call}", ORCA_ERR, rc=1, n=n)
+
+
+@pytest.mark.parametrize("call", ["run_show", "worker_list"])
+def test_a_failed_orca_read_never_ends_the_loop_it_warns_naming_the_call_and_runs_its_next_tick(C, call):
+    fails(C, call)
+    r = C.go(COORD_MAX_TICKS=2)
+    assert r.returncode == 0 and len(C.calls("orca orchestration check")) == 2 and "gh issue edit" not in C.kinds()
+    assert (call == "run_show") == bool(C.stubs.calls("dispatch.sh")) and ["--next", "--dry-run"] in C.stubs.calls("dispatch.sh") + [["--next", "--dry-run"]]   # a failed worker read dispatches nothing, not even a dry run
+    assert f"orca orchestration {call.replace('_', '-')} failed: runtime_unavailable" in r.stderr and "jq: error" not in r.stderr   # nothing is dispatched or blocked from a read that failed
+
+
+def test_a_failed_inbox_read_is_a_warning_not_a_bare_jq_error_and_a_queued_reply_is_sent_at_the_next_tick(C):
+    C.inbox(["msg_q"]); C.spool("msg_q", "approve")
+    fails(C, "inbox", calls=[1, 2, 3])   # the start, then the reply drain and the wait's read of the first tick
+    r = C.go(COORD_MAX_TICKS=2)
+    assert r.returncode == 0 and "jq: error" not in r.stderr and "orca orchestration inbox failed: runtime_unavailable" in r.stderr
+    assert [arg(a, "--id") for a in C.calls("orca orchestration reply")] == ["msg_q"] and not C.spooled("msg_q")   # sent once the inbox answers, at tick 2
+
+
+def test_a_loop_that_ends_on_an_error_names_its_status_tells_the_session_and_status_says_no_loop_runs_and_lists_the_queued_reply(C):
+    C.spool("msg_q", "approve")
+    r = C.go("--answer", "attended", "--until", "23:59", AI_TOOLKIT_NOW="bad")   # an arithmetic error before the first tick: no handler, no guard
+    assert r.returncode != 0 and re.search(r"coordinator: exiting on an error: status \d+, last command: ", r.stdout.splitlines()[-1])
+    assert [arg(a, "--text") for a in C.calls("orca terminal send") if arg(a, "--terminal") == "term_s"] == [
+        "[coordinator loop] stopped on an error: nothing coordinates Run run_t, read its terminal and start it again."]
+    out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
+    assert "no coordinator.sh loop is running for this Run" in out and re.search(r"replies queued.*msg_q", out)

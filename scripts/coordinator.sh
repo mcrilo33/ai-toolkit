@@ -15,6 +15,7 @@
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
 # consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
 # the Run from this terminal, then wait until the loop is gone.
+# A failed Orca read is one warning naming the call and its error code, retried at the next wake; an exit on an error is logged with its status and the failing command (attended: typed into the session), and --status says when no loop runs.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
@@ -48,10 +49,14 @@ cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
 log() { printf '%s coordinator: %s\n' "$(date +%H:%M:%S)" "$*"; }
 comment() { gh issue comment "$1" -b "$2" > /dev/null || warn "cannot comment on #$1"; }
+okread() {   # an Orca read whose reply has .result: prints it; any other reply (an error is 11 lines on stdout, exit 1, no .result) is ONE warning naming the call and its error code, status 1
+  local o c; o="$(orca_json "$@" 2> /dev/null)" && jq -e '.result' <<< "$o" > /dev/null 2>&1 && { printf '%s\n' "$o"; return 0; }
+  c="$(jq -r '.error.code // empty' <<< "$o" 2> /dev/null || true)"; warn "orca $1 $2 failed: ${c:-no reply}"; return 1
+}
 wl() {   # every page of the Run's workers (newest first, 100 a page), in the shape of one reply; live = dispatchStatus "dispatched"
   local cur="" out all="[]"
   while :; do
-    out="$(orca_json orchestration worker-list --run "$run" --limit 100 ${cur:+--cursor "$cur"})" || return 1
+    out="$(okread orchestration worker-list --run "$run" --limit 100 ${cur:+--cursor "$cur"})" || return 1
     all="$(jq -c --argjson o "$out" '. + $o.result.workers' <<< "$all")"; cur="$(jq -r '.result.page.nextCursor // empty' <<< "$out")"
     [ -n "$cur" ] || break
   done
@@ -74,16 +79,16 @@ mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
 now_min() { mins "${AI_TOOLKIT_NOW:-$(date +%H:%M)}"; }
 
 pending() {   # {open: questions nobody has replied to (waiting for the human), answered: ids with a reply, truncated: the page was full}
-  orca_json orchestration inbox --limit 200 --full | jq -c --arg r "$run" '.result.messages as $all | [$all[] | select(.run_id == $r)] as $m
+  okread orchestration inbox --limit 200 --full | jq -c --arg r "$run" '.result.messages as $all | [$all[] | select(.run_id == $r)] as $m
     | {open: [$m[] | select(.type == "question") | select(. as $q | $m | any(.id != $q.id and .thread_id == $q.id) | not)],
        answered: [$m[] | select(.thread_id != null and .thread_id != .id) | .thread_id], truncated: ($all | length >= 200)}'
 }
 silent() {   # $1 dispatch: "<minutes> <run|wait>": minutes since the newest sign of life (terminal output, liveness observation, heartbeat, never before dispatchedAt);
-  orca_json orchestration worker-show --dispatch "$1" < /dev/null | jq -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer, or Orca could not prove the worker (never "not waiting")
+  okread orchestration worker-show --dispatch "$1" < /dev/null | jq -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer, or Orca could not prove the worker (never "not waiting")
     | ([($r.terminal.lastOutputAt, $r.projection.liveness.observedAt | select(. != null) / 1000), ($r.dispatch.lastHeartbeatAt, $r.dispatch.dispatchedAt | select(. != null) | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)] | max) as $t
     | "\(([(($now - $t) / 60) | floor, 0] | max)) \(if ($r.terminal == null or (($r.observation // {}) | has("agentWait") | not) or $r.observation.agentWait) then "wait" else "run" end)"'
 }
-holder() { orca_json orchestration run-show --id "$run" 2> /dev/null | jq -r '.result.run.coordinator_handle // empty'; }   # the terminal that holds the Run
+holder() { okread orchestration run-show --id "$run" | jq -r '.result.run.coordinator_handle // empty' || true; }   # the terminal that holds the Run
 live_hold() {   # $1 eq|ne, $2 a handle: if a live coordinator.sh (holder.<pid> = "<handle> <mode>", the pid's command must still be coordinator.sh) is bound as
   local f h  # (eq) / as anything but (ne) that handle, print its mode and succeed
   for f in "$(spool_dir "$run")"/holder.*; do
@@ -111,9 +116,10 @@ replycmd() { printf 'bash %s --run %s --reply %s %s' "$here/coordinator.sh" "$ru
 if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to; --show: one of them whole
   [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"; if [ -n "$show_id" ]; then m="$(open_q | jq -c --arg i "$show_id" 'select(.id == $i)')" && [ -n "$m" ] || die "no open question $show_id on run $run"; show_q "$(question_of "$m")" 1000000; exit 0; fi
   log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold eq "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
+  live_hold ne "" > /dev/null || echo "no coordinator.sh loop is running for this Run"; q=""; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || q="$q${f##*/} "; done; [ -z "$q" ] || echo "replies queued in the spool: $q"
   echo "live workers:"   # verdict, the agent's activity and the silence: `unverifiable` for a long run tells a stuck worker from a working one
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "\(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict) \(.projection.stage.activity // "-")"' | while read -r d w v a; do
-    read -r age how <<< "$(silent "$d")" || true; echo "  $d $w $v $a, silent ${age:-?}m$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done
+    read -r age how <<< "$(silent "$d")" || true; echo "  $d $w $v $a, silent ${age:-?}m$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done || echo "  (Orca did not answer)"
   echo "queue (the order to present it):"
   open_q | while IFS= read -r m; do id="$(jq -r .id <<< "$m")"; echo "  $id"; show_q "$(question_of "$m")"
     if is_perm "$(question_of "$m")"; then echo "    reply: $(replycmd "$id" allow)   (or deny)"; else echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; fi; done
@@ -143,9 +149,14 @@ if [ "$stop" = 1 ]; then   # the caller holds the Run now: the loop's wait retur
   die "run $run is bound to $H, but coordinator.sh is still finishing its step (a land?): it exits when done, see --status"
 fi
 mode="$answer${until:+ until $until}"; [ "$drain" = 0 ] || mode="$mode drain"
-sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'rm -f "$errf" "$hf"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
+sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$BASH_COMMAND"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
 log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
 
+died() {   # the EXIT trap, $1 = the exit status, $2 = the last command: a planned exit (status 0: --until, drained, taken back, a limit; Ctrl-C, hang-up, kill) is silent, any other is logged and, attended, typed into the session
+  rm -f "$errf" "$hf"; case $1 in 0 | 129 | 130 | 143) return 0 ;; esac
+  log "exiting on an error: status $1, last command: ${2:0:100}"
+  [ "$answer" != attended ] || [ -z "$session" ] || orca_json terminal send --terminal "$session" --text "[coordinator loop] stopped on an error: nothing coordinates Run $run, read its terminal and start it again." --enter > /dev/null 2>&1 || true
+}
 # ctx <dispatch>: sets disp task term wtp issue br (its Orca branch) from the worker's Orca row and the issue linked to its worktree.
 ctx() {
   local r rec rows; disp="$1"
@@ -153,7 +164,7 @@ ctx() {
   [ -n "$r" ] || { warn "unknown dispatch '$1'"; return 1; }
   task="$(jq -r '.taskId // empty' <<< "$r")"; term="$(jq -r '.agentTerminalHandle // empty' <<< "$r")"
   wtp="$(jq -r '.resource.worktreeId | sub("^.*::"; "")' <<< "$r")"
-  r="$(orca_json worktree list)"
+  r="$(okread worktree list)" || return 1
   rows="$(jq -c '.result.worktrees' <<< "$r")"; r="$(jq -c --arg p "$wtp" '[.result.worktrees[] | select(.path == $p)][0] // {}' <<< "$r")"
   issue="$(jq -r '.linkedIssue // empty' <<< "$r")"
   br="$(jq -r '(.branch // "") | sub("^refs/heads/"; "")' <<< "$r")"   # Orca's branch for the worktree, never the worker's own HEAD (it can switch or rename it)
@@ -166,6 +177,7 @@ ctx() {
   [ "$(jq --argjson i "$issue" '[.[] | select(.linkedIssue == $i)] | length' <<< "$rows")" = 1 ] \
     || { block "more than one worktree is linked to #$issue in Orca: nothing is answered or landed until a human checks"; return 2; }
 }
+nlive() { jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length'; }   # the workers of one wl reply that are live
 rounds() { wl | jq --arg p "::$wtp" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] | length - 1'; }   # dispatches so far - 1
 release() { [ -z "$1" ] || orca_mutate orchestration worker-release --dispatch "$1" > /dev/null 2>&1 || orca_mutate orchestration worker-stop --dispatch "$1" > /dev/null 2>&1 || true; }
 block() {   # $1 = why. Label, comment, flag (log, worktree comment), free the slot; the worktree stays for the human. Never when the Run was taken back (yield).
@@ -175,7 +187,7 @@ block() {   # $1 = why. Label, comment, flag (log, worktree comment), free the s
   bdirty=1; comment "$issue" "blocked: $1"; log "#$issue blocked: $1"; flag "$wtp" "BLOCKED #$issue: ${1:0:80}"; release "$disp"
 }
 redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds are spent. A fresh terminal and a NEW Task (dispatch.sh --address):
-  local r out; r="$(rounds)"   # worker-start refuses --task with --spec, and Orca refuses a new task on the idle two-step terminal
+  local r out; r="$(rounds)" || { block "cannot count the rounds: Orca did not answer"; return 0; }   # worker-start refuses --task with --spec, and Orca refuses a new task on the idle two-step terminal
   [ "$r" -lt "$1" ] || { block "$3"; return 0; }
   out="$(RUN="$run" "$DISPATCH_CMD" --address "$2" "$issue" 2>&1)" || { warn "re-dispatch: $out"; block "re-dispatch failed"; return 0; }
   orca terminal close --terminal "$term" --json > /dev/null 2>&1 || true   # the old, idle terminal
@@ -288,7 +300,7 @@ handle() {
 }
 
 named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of the automatic pick: dispatch.sh runs them, within the cap and the Scope rule. One that cannot run keeps its file, the reason on line 2 (--status shows it)
-  local f n spec v why live wts path r out rc   # (a closed issue is the one drop; a failed dispatch is not retried until the human asks again or cancels)
+  local f n spec v why live wts all path r out rc   # (a closed issue is the one drop; a failed dispatch is not retried until the human asks again or cancels)
   for f in "$sd/requests"/*; do
     [ -f "$f" ] || continue; n="${f##*/}"; spec="$(head -n 1 "$f")"; why=""; path=""
     case "$(sed -n 2p "$f")" in "dispatch failed"*) continue ;; esac
@@ -296,11 +308,11 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
     if [ "$(jq -r .state <<< "$v")" != OPEN ]; then log "dispatch request for #$n dropped: the issue is not open"; rm -f "$f"; continue; fi
     if jq -e '.labels | map(.name) | index("hold")' <<< "$v" > /dev/null; then why="on hold: remove the hold label to start it"
     elif [ -z "$spec" ] && jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null; then why="blocked: remove the label, or give a message to re-dispatch it"
-    elif ! wts="$(orca_json worktree list --repo "path:$PWD" | jq -c '.result.worktrees')"; then why="cannot read the worktrees"
+    elif ! wts="$(okread worktree list --repo "path:$PWD" | jq -c '.result.worktrees')"; then why="cannot read the worktrees"
+    elif ! all="$(wl)"; then why="cannot read the workers"
     else
       path="$(jq -r --argjson n "$n" '[.[] | select(.linkedIssue == $n)][0].path // empty' <<< "$wts")"
-      r="$(wl | jq -r --arg p "::$path" '[.result.workers[] | select(.dispatchStatus == "dispatched" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty' 2> /dev/null)"
-      live="$(wl | jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length')"
+      r="$(jq -r --arg p "::$path" '[.result.workers[] | select(.dispatchStatus == "dispatched" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty' <<< "$all")"; live="$(nlive <<< "$all")"
       if [ -n "$path" ] && [ -n "$r" ]; then why="already running (dispatch $r)"
       elif [ "$live" -ge "$cap" ]; then why="waiting for a free slot (cap $cap)"; fi
     fi
@@ -318,9 +330,9 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
   done
 }
 fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --next finds nothing
-  local live n rc i out
+  local live n rc i out; ready=1
   named
-  live="$(wl | jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length')"; ready=1
+  live="$(wl | nlive)" || return 0   # Orca did not answer: nothing is dispatched on a guess, the next wake tries again
   for ((i = live; i < cap; i++)); do
     n="$(RUN="$run" "$DISPATCH_CMD" --next --dry-run)" && rc=0 || rc=$?
     case $rc in 0) ;; 3) ready=0; break ;; *) warn "dispatch --next failed ($rc)"; break ;; esac
@@ -332,11 +344,12 @@ fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --n
   done
 }
 sweep() {   # a worker without worker_done whose process exited (and was not relaunched), or that is alive but silent for COORD_IDLE_MIN minutes: one relaunch, then blocked
-  local d age how open
+  local d age how open r
   for d in $(wl | jq -r '.result.workers as $w | $w[] | select(.dispatchStatus == "dispatched" and .projection.liveness.verdict == "exited")
       | .resource.worktreeId as $p | select([$w[] | select(.resource.worktreeId == $p and .dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited")] | length == 0) | .dispatchId'); do
     ctx "$d" || continue
-    if [ "$(rounds)" -lt 1 ]; then
+    r="$(rounds)" || continue
+    if [ "$r" -lt 1 ]; then
       log "#$issue: worker $d exited without worker_done, relaunching"; RUN="$run" "$DISPATCH_CMD" --retry-of "$d" --task "$task" "$issue" > /dev/null || block "relaunch failed"
     else block "worker exited again without worker_done"; fi
   done
@@ -368,7 +381,7 @@ while :; do
   if [ -n "$until" ] && [ $((($(now_min) - start + 1440) % 1440)) -ge "$budget" ]; then log "reached $until"; break; fi
   [ -z "${COORD_MAX_TICKS:-}" ] || [ "$tick" -le "$COORD_MAX_TICKS" ] || break
   fill
-  if [ "$drain" = 1 ] && [ "$ready" = 0 ] && [ "$(wl | jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length')" = 0 ]; then log "drained"; break; fi
+  if [ "$drain" = 1 ] && [ "$ready" = 0 ] && [ "$(wl | nlive)" = 0 ]; then log "drained"; break; fi
   drain_replies
   rc=0; wait_ms="${COORD_WAIT_MS:-300000}"   # 30 s while a question waits for the human: its reply is picked up soon
   [ "$(pending | jq '.open | length')" -eq 0 ] 2> /dev/null || wait_ms="${COORD_WAIT_PENDING_MS:-30000}"
