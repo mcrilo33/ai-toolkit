@@ -55,7 +55,7 @@ step=3; say "tests, shellcheck, sync twice into a temp repo: no drift (the ci.ym
 pytest -n auto tests -q > "$E/pytest.txt" 2>&1 || fail "tests are red after the cutover: $(tail -n 5 "$E/pytest.txt")"; tail -n 1 "$E/pytest.txt"
 if command -v shellcheck > /dev/null; then shellcheck scripts/*.sh bin/claude-spoke hooks/claude/*.sh hooks/git/* e2e/*.sh || fail "shellcheck"; else echo "shellcheck not installed: skipped"; fi
 t="$(mktemp -d)"; git -C "$t" init -q; snap() { (cd "$t" && find . -path ./.git -prune -o -type f -exec cksum {} + | LC_ALL=C sort); }
-bash scripts/sync.sh "$t" > /dev/null; snap > "$E/s1"; bash scripts/sync.sh "$t" > /dev/null; snap > "$E/s2"; cmp -s "$E/s1" "$E/s2" || fail "a second sync drifts"; rm -rf "$t"
+bash scripts/sync.sh "$t" --no-commit > /dev/null; snap > "$E/s1"; bash scripts/sync.sh "$t" --no-commit > /dev/null; snap > "$E/s2"; cmp -s "$E/s1" "$E/s2" || fail "a second sync drifts"; rm -rf "$t"
 
 step=4; say "merge v2 into main (--no-ff), push to the LOCAL origin; sync.sh into itself writes the rules under .claude/rules/ai-toolkit/; install.sh wires repo-local hooks"
 git checkout -q main; git merge -q --no-ff -m "Merge v2: cutover" v2; git push -q origin main

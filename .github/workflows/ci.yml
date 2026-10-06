@@ -32,6 +32,6 @@ jobs:
         run: |
           t="$(mktemp -d)"; git -C "$t" init -q
           snap() { (cd "$t" && find . -path ./.git -prune -o -type f -exec cksum {} + | LC_ALL=C sort); }
-          bash scripts/sync.sh "$t" > /dev/null; snap > first.txt
-          bash scripts/sync.sh "$t" > /dev/null; snap > second.txt
+          bash scripts/sync.sh "$t" --no-commit > /dev/null; snap > first.txt
+          bash scripts/sync.sh "$t" --no-commit > /dev/null; snap > second.txt
           diff first.txt second.txt
