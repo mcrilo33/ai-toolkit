@@ -72,7 +72,7 @@ def host(tmp_path):
 
 @pytest.fixture
 def host_sync(src, host, run):   # the committing run, from the toolkit's main checkout
-    return lambda *flags, tgt=None, script=None: run(["bash", str(script or src / "v2" / "scripts" / "sync.sh"), str(tgt or host[0]), *flags])
+    return lambda *flags, tgt=None, script=None, **env: run(["bash", str(script or src / "v2" / "scripts" / "sync.sh"), str(tgt or host[0]), *flags], **env)
 
 
 def history(repo, ref="HEAD"):
@@ -245,7 +245,7 @@ def test_a_host_records_the_toolkits_origin_as_upstream_and_the_toolkit_itself_s
 def test_an_unmanaged_orca_yaml_is_backed_up_once_then_owned(sync, target):
     write(target / "orca.yaml", "scripts: {}\n")
     sync()
-    assert (target / "orca.yaml.bak").read_text() == "scripts: {}\n" and (target / "orca.yaml").read_text().startswith("setupAgentStartupPolicy")
+    assert "orca.yaml.bak" not in git(target, "status", "--porcelain", "-uall")   # the project's own copy is kept, out of git status    assert (target / "orca.yaml.bak").read_text() == "scripts: {}\n" and (target / "orca.yaml").read_text().startswith("setupAgentStartupPolicy")
     (target / "orca.yaml").write_text("edited after sync\n")
     sync()  # now managed: overwritten again, the original backup is kept
     assert (target / "orca.yaml.bak").read_text() == "scripts: {}\n" and (target / "orca.yaml").read_text().startswith("setupAgentStartupPolicy")
@@ -348,11 +348,20 @@ def test_a_host_synced_the_old_way_is_cleaned_up_from_its_manifest_only(sync, sr
     assert [(target / rel).read_text() if (target / rel).exists() else None for rel in own] == [want, want]
 
 
-@pytest.mark.parametrize("with_history", [False, True], ids=["empty-host", "host-with-history"])
+@pytest.mark.parametrize("with_history", [False, True, "no-commit-leftover"], ids=["empty-host", "host-with-history", "no-commit-leftover"])
 def test_a_host_sync_commits_and_pushes_orca_yaml_once_then_is_idempotent(host_sync, host, src, with_history):
     h, origin = host
     adopt(host, with_history)
     before = history(h)
+    if with_history == "no-commit-leftover":   # a --no-commit run leaves orca.yaml changed with the sync's own bytes: the next run commits it, it is no human's edit
+        write(h / "orca.yaml", "scripts: {}\n")
+        git(h, "add", "orca.yaml")
+        git(h, "commit", "-qm", "chore: own orca.yaml (#5)")
+        git(h, "push", "-q", "origin", "main")
+        before = history(h)
+        assert host_sync("--no-commit").returncode == 0 and git(h, "status", "--porcelain").strip() == "M orca.yaml" and history(h) == before
+        assert host_sync().returncode == 0 and history(h) == [MSG, *before] and history(origin, "main") == history(h)
+        return
     if with_history:
         git(h, "config", "core.hooksPath", str(V2 / "hooks" / "git"))   # the real commit-msg and pre-commit: the message conforms and the script's own commit passes the base-branch bar
         write(h / "wip.txt", "staged by a human\n")
@@ -373,7 +382,7 @@ def test_a_host_sync_commits_and_pushes_orca_yaml_once_then_is_idempotent(host_s
     assert git(h, "show", "--format=", "--name-only", "HEAD").splitlines() == ["orca.yaml"] and "changed" in (h / ".claude/rules/ai-toolkit/security.md").read_text()
 
 
-@pytest.mark.parametrize("case", ["unreachable-remote", "a-human-commit-waits"])
+@pytest.mark.parametrize("case", ["unreachable-remote", "a-human-commit-waits", "a-commit-with-the-sync-subject-and-other-content"])
 def test_a_refused_push_keeps_the_commit_and_the_next_run_pushes_it(host_sync, host, case, tmp_path):
     h, origin = host
     adopt(host, True)
@@ -385,18 +394,19 @@ def test_a_refused_push_keeps_the_commit_and_the_next_run_pushes_it(host_sync, h
         git(h, "config", "remote.origin.url", str(origin))
         before = history(h)
         assert host_sync().returncode == 0 and history(h) == before and history(origin, "main") == before   # the next run pushes the waiting commit, makes none
-    else:   # someone's unpushed work is never published by a sync
+    else:   # someone's unpushed work is never published by a sync, whatever subject it carries
+        subject = "feat: mine (#2)" if case == "a-human-commit-waits" else MSG
         write(h / "mine.txt", "x\n")
         git(h, "add", "mine.txt")
-        git(h, "commit", "-qm", "feat: mine (#2)")
+        git(h, "commit", "-qm", subject)
         r = host_sync()
-        assert r.returncode == 0 and "waiting on main" in r.stderr and history(h)[:2] == [MSG, "feat: mine (#2)"]
+        assert r.returncode == 0 and "waiting on main" in r.stderr and history(h)[:2] == [MSG, subject]
         assert history(origin, "main") == ["chore: init (#1)"]
 
 
 @pytest.mark.parametrize("case,message", [
     ("wrong-branch", "base branch"), ("behind-upstream", "origin/main"), ("humans-edit-to-orca-yaml", "orca.yaml"),
-    ("linked-worktree-target", "linked worktree"), ("toolkit-copy-in-a-linked-worktree", "linked worktree")])
+    ("linked-worktree-target", "linked worktree"), ("toolkit-copy-in-a-linked-worktree", "linked worktree"), ("linked-worktree-despite-GIT_DIR", "linked worktree")])
 def test_a_host_sync_refuses_before_it_writes_or_commits_anything(host_sync, host, src, case, message, tmp_path):
     h, origin = host
     adopt(host, True)
@@ -411,7 +421,7 @@ def test_a_host_sync_refuses_before_it_writes_or_commits_anything(host_sync, hos
     elif case == "humans-edit-to-orca-yaml":
         assert host_sync().returncode == 0   # installed and committed
         write(h / "orca.yaml", "scripts: {}\n")
-    elif case == "linked-worktree-target":
+    elif case in ("linked-worktree-target", "linked-worktree-despite-GIT_DIR"):   # an environment variable must not turn a linked worktree into a main checkout
         target = tmp_path / "wt"
         git(h, "worktree", "add", "-q", "-b", "feat", str(target))
     else:
@@ -421,7 +431,7 @@ def test_a_host_sync_refuses_before_it_writes_or_commits_anything(host_sync, hos
         script = tmp_path / "toolkit-wt" / "scripts" / "sync.sh"
         shutil.copytree(src / "v2" / "scripts", script.parent, dirs_exist_ok=True)
     count, pushed = len(history(target)), history(origin, "main")
-    r = host_sync(tgt=target, script=script)
+    r = host_sync(tgt=target, script=script, **({"GIT_DIR": h / ".git"} if "GIT_DIR" in case else {}))
     assert r.returncode != 0 and message in r.stderr, r.stderr
     assert len(history(target)) == count and history(origin, "main") == pushed   # no commit, no push
     if case == "humans-edit-to-orca-yaml":
@@ -430,12 +440,15 @@ def test_a_host_sync_refuses_before_it_writes_or_commits_anything(host_sync, hos
         assert not (target / ".ai-toolkit").exists() and not (target / "orca.yaml").exists()   # refused before anything was written
 
 
-@pytest.mark.parametrize("how", ["--no-commit", "--local-only", "the-toolkit-itself"])
-def test_no_commit_local_only_and_the_toolkit_itself_commit_nothing(host_sync, host, src, how):
+@pytest.mark.parametrize("how", ["--no-commit", "--local-only", "the-toolkit-itself", "the-toolkit-through-a-symlink"])
+def test_no_commit_local_only_and_the_toolkit_itself_commit_nothing(host_sync, host, src, how, tmp_path):
     h, origin = host
     adopt(host, True)
+    git(h, "checkout", "-q", "-b", "dev")   # off the base branch: a committing run would refuse, so these runs prove they never try
+    git(src / "v2", "symbolic-ref", "HEAD", "refs/heads/trunk")   # the toolkit is not on BASE_BRANCH either
+    (tmp_path / "link").symlink_to(src / "v2")
     before = (history(h), history(origin, "main"))
-    r = host_sync(tgt=src / "v2") if how == "the-toolkit-itself" else host_sync(how)
+    r = host_sync(tgt=tmp_path / "link" if how.endswith("symlink") else src / "v2") if how.startswith("the-toolkit") else host_sync(how)
     assert r.returncode == 0, r.stderr
     assert (history(h), history(origin, "main")) == before and history(src / "v2") == []   # no commit anywhere, no push
-    assert (h / "orca.yaml").exists() == (how != "the-toolkit-itself")   # orca.yaml is written (no-commit) or written and excluded (local-only), never committed
+    assert (h / "orca.yaml").exists() == (not how.startswith("the-toolkit"))   # orca.yaml is written (no-commit) or written and excluded (local-only), never committed

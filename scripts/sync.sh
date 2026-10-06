@@ -22,7 +22,7 @@ owner_repo() {
 }
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0   # sourced (the tests exercise owner_repo alone): define only
 
-V2="$(cd "$AI_TOOLKIT_LIB_DIR/.." && pwd)"
+V2="$(cd "$AI_TOOLKIT_LIB_DIR/.." && pwd -P)"   # physical paths: the toolkit reached through a symlink is still the toolkit
 SHARED="${AI_TOOLKIT_SHARED:-$V2/shared}"
 [ -d "$SHARED" ] || SHARED="$V2/../shared"   # before cutover shared/ is one level above v2/
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE   # git's own answer about a checkout, never the environment's
@@ -32,7 +32,7 @@ for a in "$@"; do
 done
 [ -n "$TARGET" ] || die "usage: sync.sh <target-repo> [--no-commit] [--local-only] [--migrate-v1]"
 git -C "$TARGET" rev-parse --git-dir > /dev/null 2>&1 || die "$TARGET is not a git repository"
-TARGET="$(cd "$TARGET" && pwd)"
+TARGET="$(cd "$TARGET" && pwd -P)"
 if [ "$LOCAL" -eq 1 ] || [ "$TARGET" = "$V2" ]; then COMMIT=0; fi   # the toolkit's own checkout and a never-committed deployment have nothing to commit
 OLD="$TARGET/.ai-toolkit/sync-manifest"
 TRACKED="$(git -C "$TARGET" -c core.quotePath=false ls-files -- .claude .ai-toolkit CLAUDE.md)"
@@ -154,6 +154,7 @@ mkdir -p "$(dirname "$ex")"
   echo '# >>> ai-toolkit sync'; echo '/.ai-toolkit/'
   grep '^\.claude/' "$NEW" | sed 's|^|/|' || true   # what this run wrote there, path by path: a file the project tracks or owns is never swept in
   if [ "$LOCAL" -eq 1 ]; then echo /orca.yaml; fi
+  if [ -e "$TARGET/orca.yaml.bak" ]; then echo /orca.yaml.bak; fi   # the project's own, kept once: out of git status, never committed
   echo '# <<< ai-toolkit sync'
 } > "$TMP"
 cmp -s "$TMP" "$ex" || cp "$TMP" "$ex"
@@ -162,9 +163,13 @@ if [ "$COMMIT" -eq 1 ]; then
   if [ -n "$(tg status --porcelain -- orca.yaml)" ]; then   # changed or new: that file alone, whatever else the host has staged
     tg add -- orca.yaml && AI_TOOLKIT_ALLOW_BASE_COMMIT=1 tg commit -q -m "$MSG" -- orca.yaml || die "could not commit orca.yaml (a host hook? no git identity?): it is written, commit it yourself"
   fi
-  waiting="$(tg log --format=%s "origin/$BASE..HEAD" 2> /dev/null || tg log --format=%s HEAD 2> /dev/null || true)"
+  if [ -z "$(tg status --porcelain -- orca.yaml)" ] && [ -z "$(tg ls-files -- orca.yaml)" ]; then warn "orca.yaml is ignored by git here (a global or project ignore rule): Orca reads the tracked one, so add it yourself (git add -f orca.yaml) and commit it"; fi
+  range="origin/$BASE..HEAD"; tg rev-parse -q --verify "refs/remotes/origin/$BASE" > /dev/null || range=HEAD   # no remote branch yet: everything is waiting
+  waiting="$(tg log --format=%s "$range" 2> /dev/null || true)"
+  # Only the sync's own commits go out: its subject, orca.yaml alone, and the tip's orca.yaml byte for byte what this run writes (a subject alone is no proof)
   if [ -z "$waiting" ]; then :
-  elif [ -n "$(printf '%s\n' "$waiting" | grep -vxF "$MSG" || true)" ]; then warn "commits other than the sync's are waiting on $BASE: push them yourself (git -C $TARGET push origin HEAD:$BASE), the sync never publishes them"
+  elif [ -n "$(printf '%s\n' "$waiting" | grep -vxF "$MSG" || true)$(tg log --format= --name-only "$range" | grep -v '^$' | grep -vxF orca.yaml || true)" ] || ! tg show HEAD:orca.yaml 2> /dev/null | cmp -s - <(orca_yaml); then
+    warn "commits other than the sync's orca.yaml are waiting on $BASE: push them yourself (git -C $TARGET push origin HEAD:$BASE), the sync never publishes them"
   elif err="$(GIT_TERMINAL_PROMPT=0 tg push -q origin "HEAD:refs/heads/$BASE" 2>&1)"; then echo "committed and pushed orca.yaml to origin/$BASE"
-  else warn "orca.yaml is committed locally, NOT pushed (${err##*$'\n'}): fix the remote or the branch protection and run the sync again, or push it yourself: git -C $TARGET push origin HEAD:$BASE"; fi
+  else warn "orca.yaml is committed locally, NOT pushed (${err%%$'\n'*}): fix the remote and run the sync again, or push it yourself: git -C $TARGET push origin HEAD:$BASE (a protected branch takes a pull request)"; fi
 fi

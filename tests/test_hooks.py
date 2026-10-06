@@ -185,6 +185,9 @@ WRITE_DENY = [
     "cd $AI_TOOLKIT_DIR && echo x > hooks/claude/push-guard.sh", "cd {tk}",
     "echo x > ~/tk/claude-settings.json", "echo x > $HOME/tk/hooks/claude/push-guard.sh", "echo x > {tk}/scripts/setup.sh",
     "echo x >> {tk}/ai-toolkit.local.env",
+    # sync.sh commits and pushes the base branch inside the script: a worker running it reaches the base branch where push-guard cannot see; so does the base-commit switch
+    "bash /x/ai-toolkit/scripts/sync.sh /repo", "cd x && ./scripts/sync.sh .", "sh scripts/sync.sh --no-commit .", "$AI_TOOLKIT_DIR/scripts/sync.sh /repo",
+    "AI_TOOLKIT_ALLOW_BASE_COMMIT=1 git commit -m x",
     # relative and indirect spellings of the same tree: a cd, a ../ climb, a path prefix of any depth, the variable held in another, the bare name in an interpreter
     "cd ~ && echo x > tk/../x/.ai-toolkit/bin/claude-spoke", "echo x > ../../x/.ai-toolkit/scripts/land.sh", "echo x > R/.ai-toolkit/ai-toolkit.local.env",
     "echo x > .ai-toolkit/bin/claude-spoke", 'echo x > "$(printenv AI_TOOLKIT_DIR)/claude-settings.json"', "d=$AI_TOOLKIT_DIR; echo x > $d/hooks/claude/push-guard.sh",
@@ -198,7 +201,7 @@ WRITE_ALLOW = [
     "cat orca.yaml", "git add orca.yaml .github/workflows/ci.yml", "ls .github/workflows", "cat .claude/settings.json",
     "grep -n hooks .claude/settings.json", "echo hi > out.txt", "cat orca.yaml > /dev/null", "cat orca.yaml > out.txt",
     "cat .github/workflows/ci.yml 2>&1 | head", "git diff -- orca.yaml", "sed -n 1,5p orca.yaml",
-    "git commit -m 'update orca.yaml'", "echo x > .claude/rules/a.md", "cat {tk}/claude-settings.json", "grep -n hooks .ai-toolkit/claude-settings.json", "ls {tk}/hooks/claude",
+    "git commit -m 'update orca.yaml'", "echo x > .claude/rules/a.md", "cat scripts/sync.sh", "grep -n sync scripts/sync.sh", "pytest tests/test_sync.py", "git commit -m 'document sync.sh (#1)'", "cat {tk}/claude-settings.json", "grep -n hooks .ai-toolkit/claude-settings.json", "ls {tk}/hooks/claude",
 ]
 
 

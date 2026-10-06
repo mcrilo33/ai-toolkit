@@ -51,7 +51,7 @@ prot() { case "$1" in "$root/orca.yaml" | "$home/.claude/settings.json") return 
   [ -n "$spoke" ] && case "$1" in "$root/.claude/settings.json" | "$root/.claude/settings.local.json" | "$root/.claude/hooks" | "$root/.claude/hooks/"* | "$root/.ai-toolkit/spoke-run-id" | "$root/.ai-toolkit/claude-settings.json" | "$root/.ai-toolkit/hooks/"* | "${AI_TOOLKIT_DIR:-/nonexistent}" | "${AI_TOOLKIT_DIR:-/nonexistent}/"*) return 0;; esac
   return 1; }
 fp="$(j '.tool_input.file_path // .tool_input.notebook_path')"
-spool="(~|HOME\}?|$home)/\.ai-toolkit/coordinator" # the human's reply spool: a file there is sent as the human's answer, so a worker never writes it
+spool="(~|HOME\}?|$home)/\.ai-toolkit/coordinator"; sy='(^|[;&|(])[[:space:]]*((bash|sh|zsh|source|\.)[[:space:]]+)?[^[:space:];&|]*sync\.sh([[:space:]]|$)' # spool: a file there is sent as the human's answer, so a worker never writes it; sy: a sync.sh run commits and pushes the base branch inside the script, where push-guard cannot see
 if [ -n "$fp" ]; then fc="$(canon "$fp")"; if prot "$fc"; then sens "write to a protected path ($fp)"; fi
   [ -z "$spoke" ] || case "$fc" in "$home/.ai-toolkit/coordinator" | "$home/.ai-toolkit/coordinator/"*) deny "write to the human's reply spool ($fp)";; esac
   case "$fc" in "$root/.github/workflows" | "$root/.github/workflows/"*) sens "write to .github/workflows ($fp)";; esac; fi
@@ -64,7 +64,7 @@ if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.j
 w="(>|[[:space:]](tee|cp|mv|rm|touch|ln|dd|install|rsync|truncate|patch|chmod|python[0-9.]*|perl|ruby|node)[[:space:]]|[[:space:]]sed[[:space:]][^;|&]*(-[a-z]*i|--in-place))"
 va="${w}[^;|&]*|[[:space:]](cd|pushd)[[:space:]][^;|&]*" # a verb before the path, or a cd into it
 if [ -n "$spoke" ] && [[ $c =~ ($va)($spool) ]]; then deny "write to the human's reply spool: $(printf '%.200s' "$cmd" | tr '\n' ' ')"; fi
-bw=""; if [[ $c =~ ($va)($p) ]] || { [ -n "$spoke" ] && [[ $c =~ AI_TOOLKIT_DIR ]] && [[ $c =~ $w ]]; }; then bw="a protected path (orca.yaml, claude settings/hooks)"; fi
+bw=""; if [[ $c =~ ($va)($p) ]] || { [ -n "$spoke" ] && { [[ $c =~ $sy ]] || [[ $c =~ AI_TOOLKIT_ALLOW_BASE_COMMIT ]] || { [[ $c =~ AI_TOOLKIT_DIR ]] && [[ $c =~ $w ]]; }; }; }; then bw="a protected path, sync.sh or the base-commit switch (orca.yaml, claude settings/hooks, the toolkit's guards)"; fi
 if [[ $c =~ ($va)($pre\.github/workflows) ]]; then bw="${bw:+$bw and }.github/workflows"; fi
 [ -z "$bw" ] || sens "write to $bw: ${cmd:0:200}"
 
