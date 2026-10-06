@@ -169,7 +169,7 @@ def test_a_question_for_the_human_is_flagged_with_the_exact_reply_command_and_ac
     assert C.go("--answer", mode).returncode == 0
     assert not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack") and (len(C.stubs.calls("answer.sh")) == 1) == (mode != "human")
     c = C.calls("gh issue comment")[0][-1]
-    assert REPLY in c and "revise:" in c and "--reply msg_q" in arg(C.calls("orca worktree set")[0], "--comment") and "approve with: <change>" in c
+    assert REPLY in c and "--show msg_q" in c and "revise:" in c and "--reply msg_q" in arg(C.calls("orca worktree set")[0], "--comment") and "approve with: <change>" in c
     assert not C.calls("orca terminal send")   # the event itself types nothing in any mode: attended tells the session from the queue it reads back (below)
     assert (WHY in c) == (mode == "attended") and (mode == "human" or f"ANSWER_MODE={mode}" in C.stubs.env("answer.sh").splitlines())   # the reason travels with the plan; the answerer is told which mode it serves
 
@@ -699,10 +699,10 @@ def test_attended_tells_the_session_with_one_fixed_line_for_a_queue_open_at_the_
 
 
 def test_attended_sends_nothing_behind_a_waiting_decision_but_a_permission_request_and_again_once_the_queue_is_empty(C):
-    ticks([], ["msg_a"], ["msg_a", "msg_b"], ["msg_a", "msg_b", "msg_pc"], ["msg_b"], [], ["msg_e"])   # a plan, a second plan behind it, a permission request, the first and the permission answered (the second remains), all answered, a new plan
+    ticks([], ["msg_a"], ["msg_a", "msg_b"], ["msg_a", "msg_b", "msg_pc"], ["msg_b"], ["msg_e"])   # a plan, a second plan behind it, a permission request, the first and the permission answered (the second remains), the second answered as a new plan arrives
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)
-    C.mail([msg("question", "msg_a", question="PLAN?")], [msg("question", "msg_b", question="PLAN?")], [msg("question", "msg_pc", question=PQ)], [], [], [msg("question", "msg_e", question="PLAN?")])
-    assert sent(C, COORD_MAX_TICKS=6, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b waits behind msg_a and is the session's to present once msg_a is answered, not the loop's
+    C.mail([msg("question", "msg_a", question="PLAN?")], [msg("question", "msg_b", question="PLAN?")], [msg("question", "msg_pc", question=PQ)], [], [msg("question", "msg_e", question="PLAN?")])
+    assert sent(C, COORD_MAX_TICKS=5, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b waits behind msg_a and is the session's to present once msg_a is answered, not the loop's
 
 
 def test_status_shows_each_open_question_text_above_its_reply_command_and_show_prints_one_whole(C):

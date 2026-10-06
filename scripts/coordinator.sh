@@ -33,7 +33,7 @@ while [ $# -gt 0 ]; do
 done
 case "$answer" in auto | attended | human) ;; *) usage_exit "--answer takes auto, attended or human" ;; esac
 [ "$stop" = 0 ] || [ -n "$run" ] || usage_exit "--stop needs --run <run-id>"
-[ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"; [[ -z $session || $session =~ ^term_[A-Za-z0-9_-]+$ ]] || usage_exit "--session takes an Orca terminal handle"
+[ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"; [[ -z $session || $session =~ ^term_[A-Za-z0-9_-]+$ ]] || usage_exit "--session takes an Orca terminal handle"; [ "$answer" != attended ] || [ -n "$session" ] || warn "attended without --session: the loop cannot tell the session of a decision, only --status shows the queue"
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
 [ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid>)
 if [ "$dreq" = 1 ]; then   # a dispatch request: <issue> = its one-line message (empty = a plain dispatch), queued in the reply spool's shape for the loop's next wake
@@ -67,7 +67,7 @@ show_q() {   # the question as the human must read it: control bytes dropped, wr
   total="$(printf '%s\n' "$all" | wc -l)"; [ "$total" -le "$n" ] || echo "  [display truncated: $((total - n)) more lines; deny if unsure]"
 }
 flag() {   # $1 worktree path ("" = none known), $2 its comment (optional with no path): the Orca surface of anything the human must see: the worktree comment
-  [ -z "$1" ] || orca_json worktree set --worktree "path:$1" --comment "$(printf '%s' "$2" | tr '\n' ' ')" > /dev/null 2>&1 || warn "cannot set the worktree comment"   # 
+  [ -z "$1" ] || orca_json worktree set --worktree "path:$1" --comment "$(printf '%s' "$2" | tr '\n' ' ')" > /dev/null 2>&1 || warn "cannot set the worktree comment"
 }
 gate_flag() { flag "$1" "GATE waiting: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80) | reply: $(replycmd "$2" "${4:-approve}")"; }   # $1 worktree path, $2 message id, $3 question, $4 the reply word shown
 mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
@@ -224,7 +224,7 @@ on_question() {
   local id q ans body warns why=""
   id="$(jq -r .id <<< "$1")"; q="$(question_of "$1")"
   if is_perm "$q"; then on_permission "$id" "$q" "$(pj "$1" dispatchId)"; return 0; fi
-  ctx "$(pj "$1" dispatchId)" || { [ $? = 2 ] || { held="$held $id "; log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; flag ""; }; return 1; }   # 2: ctx already blocked it
+  ctx "$(pj "$1" dispatchId)" || { [ $? = 2 ] || { held="$held $id "; log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; }; return 1; }   # 2: ctx already blocked it
   if [ "$answer" != human ] && ans="$(printf '%s' "$q" | ANSWER_MODE="$answer" "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
@@ -355,9 +355,9 @@ tell() {   # $1 kind (p|q|b), $2 id: one fixed line typed into the session's ter
   [ -n "$session" ] || return 0; local kind=plan; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; esac
   orca_json terminal send --terminal "$session" --text "[coordinator loop] new decision waiting: $kind $(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2"). Read it whole, present it with one recommendation, then ring." --enter > /dev/null 2>&1 || { warn "cannot tell the session ($kind $2): retried at the next wake"; return 1; }
 }
-notify_queue() {   # attended: tell the session of a decision that was not queued at the last look, once: the first one when nothing was waiting, and every permission request (it expires in 9 minutes); the ids last seen live in $seen (no file); a failed read or send changes nothing, the next wake looks again. A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event.
+notify_queue() {   # attended: tell the session of a decision that was not queued at the last look, once: the first one when nothing that was waiting at the last look still is, and every permission request (it expires in 9 minutes); the ids last seen live in $seen (no file); a failed read or send changes nothing, the next wake looks again. A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event.
   [ "$answer" = attended ] || return 0; local now i all k first=0 fail=0; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
-  all="$(queue_ids | tr '\n' ' ')" || return 0; now=""; [ -n "${seen// }" ] || first=1; for i in $all; do k="${i%%:*}"; [ "$k" = b ] || case " $held " in *" ${i#?:} "*) ;; *) continue ;; esac; now="$now$i "
+  all="$(queue_ids | tr '\n' ' ')" || return 0; now=""; first=1; for i in $seen; do case " $all " in *" $i "*) first=0 ;; esac; done; for i in $all; do k="${i%%:*}"; [ "$k" = b ] || case " $held " in *" ${i#?:} "*) ;; *) continue ;; esac; now="$now$i "
     case " $seen " in *" $i "*) continue ;; esac; [ "$k" = p ] || [ "$first" = 1 ] || continue; [ "$k" = p ] || first=0; tell "$k" "${i#?:}" || fail=1
   done; [ "$fail" = 1 ] || seen="$now"
 }
