@@ -76,7 +76,8 @@ def test_seed_for_a_plan_gate_asks_before_coding_and_never_touches_the_base(d):
     seed = ws[ws.index("--spec") + 1]
     for part in (".ai-toolkit/task.md", "approve,revise", "do not edit code before approve", "RED", "git push -u origin HEAD",
                  "worker_done --outcome succeeded", "Never merge or push the base branch", "in-spoke code-review",
-                 "approve with: <change>", "do NOT ask again", "revise: <change>, amend the plan and ask again",
+                 "approve with: <change>", "do NOT ask again", "An ask that times out is still pending: resume it with orca orchestration ask --resume <message id> and keep waiting",
+                 "never send worker_done --outcome failed because a question got no reply yet", "revise: <change>, amend the plan and ask again",
                  ".ai-toolkit/rules/bug-triage.md", "DEFERRED: <item>", "Send no heartbeat messages: report only with worker_done, a question, or an escalation.",
                  "In a recursive delete, write the target as a literal path inside the worktree or the scratch directory, never a variable or a command substitution: the guard allows the first and asks for the second."):
         assert part in seed, part
@@ -91,6 +92,7 @@ def test_gate_none_and_model_footer_override_the_defaults(d):
     seed = ws[ws.index("--spec") + 1]
     assert "approve,revise" not in seed and "approve with" not in seed and "code-review" not in seed  # light lane: no PLAN gate, no in-worker review
     assert "RED" in seed and "git push -u origin HEAD" in seed and "worker_done" in seed
+    assert "--resume <message id>" in seed and "never send worker_done --outcome failed because a question got no reply yet" in seed  # a timed-out ask is not a failure, in both lanes (#461)
     assert ".ai-toolkit/rules/bug-triage.md" in seed and "DEFERRED: <item>" in seed  # both lanes route discovered bugs and follow-ups to the scopers, and mark what stays unfiled
     assert "Send no heartbeat messages: report only with worker_done, a question, or an escalation." in seed  # nothing consumes heartbeats (#451): both lanes tell the worker to send none
     assert "In a recursive delete, write the target as a literal path inside the worktree or the scratch directory, never a variable or a command substitution: the guard allows the first and asks for the second." in seed  # the guard allows a literal-path recursive delete and asks for a variable one (#452): both lanes tell the worker which form passes

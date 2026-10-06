@@ -30,7 +30,7 @@ extended, the tests new, and the net count (`pytest-conventions`, Test economy).
 | `approve` | start the cycle |
 | `approve with: <change>` | apply the change to the plan and start the cycle; never `ask` again. If you cannot apply it without altering the approach, say so in your `worker_done` report |
 | `revise: …` | amend the plan, `ask` again (max 2 rounds, then `worker_done --outcome failed` naming the blocker) |
-| the call times out | re-run the same `ask`; never start coding unanswered |
+| the call times out | the question is still pending: `orca orchestration ask --resume <message id>` (the id is in the timeout output) and keep waiting; never re-ask, never start coding unanswered |
 
 `Gate: none` is the **light lane**, set only by the user for that issue: it skips this gate and the in-spoke
 `code-review` (step 5); anchor, RED/GREEN, push and the independent review at land all stay. Never edit code, tests, or config before `approve` on a `plan` issue.
@@ -77,6 +77,8 @@ CI runs on your branch; format and lint before committing so it stays green.
 When every acceptance criterion in `task.md` holds and the last subtask is pushed, run your preamble's
 `worker_done --outcome succeeded` with a 3-sentence body: what you did, what you found, what is left.
 Then stop; do not poll and do not start new work.
+
+A question with no reply yet is not a blocker, and neither is a permission request nobody answered in time (the relay says so and lets you make the call again, up to 3 requests in total): resume the pending `ask` and keep waiting; never send `--outcome failed` for it.
 
 If you are stuck (ambiguity you cannot resolve, a failing dependency you do not own, a scope breach), send
 `--outcome failed` with the blocker. The coordinator labels the issue `blocked` and tells the human.

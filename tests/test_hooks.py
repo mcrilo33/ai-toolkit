@@ -458,7 +458,7 @@ def test_danger_guard_judge_clears_the_observed_false_positives_without_a_prompt
 # in bypass mode, a subagent's), measured on claude 2.1.289 in bypass mode. Its payload: tool_name, tool_input, cwd, permission_mode; no reason, no tool_use_id.
 ASK_SHIM = """#!/bin/bash
 printf '%s\\0' "$@" > "$SHIM_ARGS"; echo x >> "$SHIM_ARGS.n"
-sleep "${SHIM_SLEEP:-0}"; printf '%s' "${SHIM_REPLY-}"; exit "${SHIM_RC:-0}"
+sleep "${SHIM_SLEEP:-0}"; printf '%s' "${SHIM_REPLY-}"; printf '%s' "${SHIM_ERR-}" >&2; exit "${SHIM_RC:-0}"
 """
 
 
@@ -492,6 +492,7 @@ def test_relay_allows_only_on_the_exact_word_allow(relay, reply, behavior):
     r = relay.run(reply=reply)
     assert (r.rc, r.out["hookEventName"], r.behavior) == (0, "PermissionRequest", behavior) and r.asks == 1
     assert ("message" in r.out["decision"]) == (behavior == "deny")
+    assert behavior == "allow" or "Do not retry the same call" in r.out["decision"]["message"]  # an explicit deny, or any reply that is not allow, is final
 
 
 def test_relay_does_nothing_outside_a_worker(relay):
@@ -530,7 +531,7 @@ def test_relay_truncates_only_past_a_cap_and_says_so(relay):
 @pytest.mark.parametrize("tool", ["AskUserQuestion", "ExitPlanMode"])
 def test_relay_denies_the_tools_a_yes_cannot_answer_without_asking(relay, tool):
     r = relay.run(tool, {"questions": []}, reply="allow")  # measured: a hook allow does not resolve ExitPlanMode; AskUserQuestion needs the user's answers
-    assert (r.rc, r.behavior, r.asks) == (0, "deny", 0) and "worker_done" in r.out["decision"]["message"]
+    assert (r.rc, r.behavior, r.asks) == (0, "deny", 0) and "worker_done" in r.out["decision"]["message"] and "Do not retry the same call" in r.out["decision"]["message"]
 
 
 def fail_closed(relay, **kw):
@@ -539,31 +540,41 @@ def fail_closed(relay, **kw):
     return r
 
 
+def final_deny(relay, **kw):
+    r = fail_closed(relay, **kw)
+    assert "Do not retry the same call" in r.out["decision"]["message"]
+    return r
+
+
 def test_relay_denies_when_the_ask_fails_even_if_it_printed_allow(relay):
-    assert fail_closed(relay, reply="allow", rc=1).asks == 1  # orca erroring, or no Run to ask
+    r = final_deny(relay, reply="allow", rc=1, SHIM_ERR="no Run to ask")  # orca erroring, or no Run to ask
+    assert r.asks == 1 and "the ask failed" in r.out["decision"]["message"]
 
 
 def test_relay_denies_without_a_terminal_handle(relay):
-    assert fail_closed(relay, env={"ORCA_TERMINAL_HANDLE": ""}).asks == 0
+    assert final_deny(relay, env={"ORCA_TERMINAL_HANDLE": ""}).asks == 0
 
 
 def test_relay_denies_when_orca_is_missing(relay):
-    fail_closed(relay, env={"PATH": "/usr/bin:/bin"})  # no orca on the path at all
+    final_deny(relay, env={"PATH": "/usr/bin:/bin"})  # no orca on the path at all
 
 
-def test_relay_denies_on_a_timeout_before_the_hook_does_so_no_dialog_is_left_waiting(relay):
-    r = fail_closed(relay, SHIM_SLEEP=3, PERMISSION_RELAY_KILL_S=1)  # measured: when the hook times out it is killed with NO decision and the local dialog stays
-    assert "timed out" in r.out["decision"]["message"]
+# measured on orca 2026-10-06: an ask whose --timeout-ms expires exits 1 with an empty stdout and "ask timeout after <n>ms; question is still pending" on stderr
+@pytest.mark.parametrize("kw", [{"SHIM_SLEEP": 3, "PERMISSION_RELAY_KILL_S": 1},   # measured: when the hook times out it is killed with NO decision and the local dialog stays
+                                {"rc": 1, "SHIM_ERR": "ask timeout after 540000ms; question is still pending (messageId: msg_x)"}], ids=["kill-timer", "orca-timeout"])
+def test_relay_denies_on_a_timeout_before_the_hook_does_but_lets_the_worker_ask_again(relay, kw):
+    m = fail_closed(relay, **kw).out["decision"]["message"]
+    assert "nobody answered in time" in m and "up to 3 requests in total" in m and "the ask failed" not in m and "Do not retry" not in m
 
 
 @pytest.mark.parametrize("raw", ["not json", "", "{"])
 def test_relay_denies_an_unparsable_payload(relay, raw):
-    assert fail_closed(relay, raw=raw).asks == 0
+    assert final_deny(relay, raw=raw).asks == 0
 
 
 def test_relay_denies_without_jq(relay):
     (relay.tmp / "nojq").mkdir()
-    fail_closed(relay, env={"PATH": str(relay.tmp / "nojq")})
+    final_deny(relay, env={"PATH": str(relay.tmp / "nojq")})
 
 
 WF = {"file_path": ".github/workflows/ci.yml", "content": "x"}

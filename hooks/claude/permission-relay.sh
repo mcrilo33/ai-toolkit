@@ -3,14 +3,14 @@
 # rule, a prompt Claude Code raises itself in bypass mode, a subagent's), is put to the Run with `orca orchestration ask` and resolved with the reply:
 # exactly `allow` lets the call through, anything else denies. Outside a worker: no output, the local prompt stays. Measured on claude 2.1.289: the event
 # fires in bypass mode and an allow/deny from it dismisses the dialog, but a hook that hits its own timeout is killed with NO decision and the dialog stays
-# waiting, so the ask is bounded by a kill timer below the hook timeout (settings: 600 s) and every failure (no handle, no Run, orca erroring, timeout,
+# waiting, so the ask is bounded by a kill timer below the hook timeout (settings: 600 s) and every failure (no handle, no Run, orca erroring, timeout (the worker may ask again, up to 3 requests),
 # unparsable payload, no jq) answers deny. AskUserQuestion and ExitPlanMode are denied without asking: a hook allow does not resolve ExitPlanMode and
 # AskUserQuestion needs the user's answers, not a yes. The question's first line, PERMISSION REQUEST, is what coordinator.sh and the coordinate skill key on.
 set -eo pipefail
 root="${CLAUDE_PROJECT_DIR:-$PWD}"
 [ -e "$root/.ai-toolkit/spoke-run-id" ] || exit 0
-deny() { printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"permission relay: denied (%s). Do not retry the same call; say so in your worker_done report."}}}\n' "$1"; exit 0; }
-trap 'deny "the relay itself failed"' ERR
+deny() { printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"permission relay: denied (%s). %s"}}}\n' "$1" "${2:-Do not retry the same call; say so in your worker_done report.}"; exit 0; }
+trap 'deny "the relay itself failed"' ERR; late="You may make the same call again, up to 3 requests in total; if the third is also unanswered, treat it as denied and say so in your worker_done report." # an unanswered request can come back, an explicit deny cannot
 in="$(cat)"; tool="$(jq -er .tool_name <<< "$in")"
 case "$tool" in AskUserQuestion | ExitPlanMode) deny "$tool is not a permission: ask the coordinator with your preamble's orchestration ask";; esac
 h="${ORCA_TERMINAL_HANDLE:-}"; [ -n "$h" ] || deny "no Orca terminal handle"
@@ -23,11 +23,11 @@ q="$(jq -r --arg root "$root" --arg issue "${issue:-unknown}" --arg reason "$rea
   "PERMISSION REQUEST (not a plan gate: reply allow or deny)", "issue: \($issue)", "worktree: \($root)", "tool: \(.tool_name)", "cwd: \(.cwd // "?")",
   "mode: \(.permission_mode // "?")", "reason: \($reason)",
   (.tool_input // {} | if type == "object" then to_entries[] else {key: "input", value: .} end | "\(.key | gsub("\n"; " ")):", (.value | if type == "string" then . else tojson end | show | split("\n") | map("  " + .) | join("\n")))' <<< "$in" | LC_ALL=C tr -d '\000-\010\013-\037\177')" # no control bytes (ESC, CR, BEL): the question must not rewrite the approver's terminal
-o="$(mktemp)"; orca orchestration ask --from "$h" --question "$q" --options allow,deny --timeout-ms "${PERMISSION_RELAY_ASK_MS:-540000}" > "$o" 2> /dev/null & p=$!
+o="$(mktemp)"; orca orchestration ask --from "$h" --question "$q" --options allow,deny --timeout-ms "${PERMISSION_RELAY_ASK_MS:-540000}" > "$o" 2> "$o.err" & p=$!
 { sleep "${PERMISSION_RELAY_KILL_S:-570}" && touch "$o.killed" && kill -9 $p; } > /dev/null 2>&1 & w=$!   # && : a sleep killed on the normal path must not go on to kill
 rc=0; wait $p 2> /dev/null || rc=$?; pkill -P $w 2> /dev/null || :; kill $w 2> /dev/null || :; wait $w 2> /dev/null || :
-reply="$(cat "$o")"; killed=0; [ ! -e "$o.killed" ] || killed=1; rm -f "$o" "$o.killed"
-[ "$killed" = 0 ] || deny "no answer before the relay timed out"
+reply="$(cat "$o")"; killed=0; [ ! -e "$o.killed" ] || killed=1; late_ask=0; grep -q '^ask timeout after' "$o.err" 2> /dev/null && late_ask=1; rm -f "$o" "$o.killed" "$o.err" # measured: orca's own timeout exits 1, stdout empty, "ask timeout after <n>ms; question is still pending" on stderr
+[ "$killed$late_ask" = 00 ] || deny "nobody answered in time" "$late"
 [ "$rc" = 0 ] || deny "the ask failed: no Run to ask, or orca erroring"
 reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
 [ "$reply" = allow ] || deny "the Run did not answer allow"
