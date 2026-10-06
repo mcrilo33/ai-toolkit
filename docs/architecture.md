@@ -57,7 +57,7 @@ A script that still reads a worker-controlled source, or a worker that can still
    `worker-release` every dispatch, `worktree rm --run-hooks`. In the toolkit's own checkout the cleanup first re-runs `sync.sh` on it, so the toolkit's self-sync is automatic after a land;
    a running loop keeps its own `coordinator.sh` until it is restarted (sync replaces files by rename).
 9. **Rounds.** A rejected review (max 2 rounds), red CI or a merge conflict (1 round) goes back to the worker as a fresh dispatch whose spec starts with
-   `address:`. Still failing, a timeout, a `failed` completion or an escalation: label `blocked` + comment + the Orca surfaces (worktree comment, terminal bell), the worker is released,
+   `address:`. Still failing, a timeout, a `failed` completion or an escalation: label `blocked` + comment + the Orca surface (worktree comment), the worker is released,
    the **worktree is kept** for the human.
    `dispatch.sh --address` / `--retry-of` refresh the kept worktree's installed copies first (`setup.sh --refresh`, output to stderr): the synced `.claude/` set listed in main's `sync-manifest`
    is copied, what main's sync has dropped since is removed, and files outside that set (`settings.local.json`, locks, anything the worker made) are left alone.
@@ -72,15 +72,16 @@ route leftovers). A Claude session never binds the Run, `check`s or reads the in
 |---|---|---|
 | PLAN gate | `answer.sh` always answers (`Mode: auto`) | a routine plan is approved by `answer.sh` (`Mode: attended`); any other plan is its third outcome, `human: <reason>` (exit 3): left open on the Run, the worker waits |
 | Permission request | `deny` at once, no model | never answered by the loop: left open for the user, who has the relay's 9 minutes (it denies itself after that) |
-| What reaches the user | blocked issues, each flagged with the bell of the loop's terminal | the **queue**: open questions (oldest first), blocked issues without `hold`, in `--status`; one bell per NEW queued decision on the session's terminal (`--bell-tty`) |
+| What reaches the user | blocked issues, each flagged with a worktree comment | the **queue**: open questions (oldest first), blocked issues without `hold`, in `--status`; one line typed into the session's terminal (`--session`) when a decision arrives on an empty queue, and one for every permission request |
 
 The session in attended mode only presents the queue, one decision at a time, relays each answer with `coordinator.sh --reply`, writes into the issue any answer that changes what it asks, and shows no routine event.
 Its other requests go through the loop too: `coordinator.sh --run R --dispatch <issue> ['<message>']` queues a request (a file in the reply spool's `requests/`, line 1 the message, line 2 the reason it cannot run yet) that the loop runs
 ahead of its own pick with `dispatch.sh` (`--address` with a message, or a default one, for a kept worktree; a fresh worker reads only the issue body, so a message with no worktree is refused), within the cap; for a fresh issue `dispatch.sh --next <issue>` decides with its own ready rule (hold, blocked, open blocker, in flight, Scope overlap) and its refusal, with its exit code 3, is the reason; a request that cannot run (on hold, blocked with no message, already running, not ready for `dispatch.sh` (a Scope overlap among others), no free slot, an unreadable issue, a failed dispatch: not retried) stays
 in `--status` with its reason until it runs or `--dispatch <n> --cancel` withdraws it (only a closed issue is dropped); a finished worker is landed by the loop itself.
-The bell is `printf '\a'` appended to a terminal device: Orca has no verb to ring another terminal, so the skill passes its own tty (`--bell-tty`; anything that is not a terminal falls back to the loop's own) and Orca's
-suppress-when-focused keeps it silent while the user works there. The ids last seen live in one shell variable (no file), so a decision rings once; a restart rings once more for the blocked issues still waiting and for the questions already open when the loop starts (they count as queued), and the blocked list is read again only after a sweep or when the loop itself blocked something. Otherwise a question counts only once this loop has left it open: one that arrived while the loop was busy
-(a land takes minutes) may still be answered by it, a routine event. `--status` shows only the loop's own `blocked:` comment as the reason, one line without control bytes, since the repository may be public.
+The loop never rings. The bell means the coordinator session has just written a decision for the user, so only the session rings (`printf '\a'` on its own tty, after presenting). The loop's part is one fixed line typed into the session's terminal (`orca terminal send --enter` to the handle in `--session`): `[coordinator loop] new decision waiting: <kind> <id>`, never text a worker wrote, since it lands in an agent's prompt.
+It is sent when a decision arrives and none was waiting at the last look, and for every permission request even behind a waiting decision (it expires after 9 minutes, so the session writes it at once). A plan or a blocked issue behind a waiting decision sends nothing and waits in the queue; when the first is answered the session runs `--status` and presents the next, and the loop sends nothing for it. A send that fails is logged and the same look is made again at the next wake. The line arrives like typed input, so it can cut into what the user is typing: accepted, it only happens when the user writes to the coordinator spontaneously and a decision arrives on an empty queue.
+The ids last seen live in one shell variable (no file); a restart sends once more for the blocked issues still waiting and for the questions already open when the loop starts (they count as queued), and the blocked list is read again only after a sweep or when the loop itself blocked something. Otherwise a question counts only once this loop has left it open: one that arrived while the loop was busy
+(a land takes minutes) may still be answered by it, a routine event. `coordinator.sh --run R --show <message-id>` prints one open question whole (`--status` cuts each at 25 lines); the issue comment of a gate question no longer copies the plan, it points to `--show`. `--status` shows only the loop's own `blocked:` comment as the reason, one line without control bytes, since the repository may be public.
 
 ```mermaid
 sequenceDiagram
@@ -95,10 +96,9 @@ sequenceDiagram
     L->>O: reply approve
     W->>O: ask (next plan: a cap raised)
     L->>L: answer.sh: human: <reason> (exit 3)
-    L-->>S: bell on the session's terminal
-    U->>S: what needs me?
-    S->>L: coordinator.sh --status (the queue)
-    S->>U: one decision: issue, plan, recommendation
+    L-->>S: one line typed into the session's terminal
+    S->>L: coordinator.sh --show id (the plan, whole)
+    S->>U: one decision: issue, plan, recommendation, then the bell
     U->>S: decision
     S->>L: coordinator.sh --reply <id> approve | approve with: ... | revise: ...
     L->>O: reply, at its next wake
@@ -138,7 +138,7 @@ sequenceDiagram
     W->>O: ask "PERMISSION REQUEST ..." (allow, deny)
     O-->>L: check --wait
     L->>L: auto: reply deny (never answer.sh)
-    L-->>S: attended: left open, queued, one bell
+    L-->>S: attended: left open, queued, one line to the session
     S->>U: tool, command or change, reason
     U->>S: decision
     S->>L: coordinator.sh --reply <id> allow | deny
@@ -163,15 +163,13 @@ orca terminal create --worktree path:<main-checkout> --title coordinator \
 ```
 
 One foreground process in an Orca terminal on the main checkout, the single consumer of one Run (`run-create`, or `--run R` to take it over from a session
-or re-bind after a restart: everything else is re-derived from `worker-list`, `worktree list` and labels). Flags: `--answer auto|attended|human`, `--bell-tty <tty>` (attended: where the bell rings), `--cap N` (default `CONCURRENCY_CAP`),
-`--until HH:MM`, `--drain` (stop when nothing is ready and no worker is live), `--status` (read-only: Run, who holds it, live workers, the queue in the order to present it with each reply line, dispatch requests),
+or re-bind after a restart: everything else is re-derived from `worker-list`, `worktree list` and labels). Flags: `--answer auto|attended|human`, `--session <terminal-handle>` (attended: the session's terminal, where the loop types its line), `--cap N` (default `CONCURRENCY_CAP`),
+`--until HH:MM`, `--drain` (stop when nothing is ready and no worker is live), `--status` (read-only: Run, who holds it, live workers, the queue in the order to present it with each reply line, dispatch requests), `--run R --show <message-id>` (one open question whole),
 `--run R --reply <message-id> <answer>` and `--run R --dispatch <issue> ['<message>']` (queue a human answer or a dispatch request for the loop),
 `--run R --stop` (take the Run from this terminal and wait for the loop to exit).
 
 - **Human answers (`--answer human`, or when `answer.sh` has no usable answer).** The loop never pauses. It prints the question (wrapped, at most 25 lines) above the exact
-  reply line in the coordinator terminal (and in `--status`), comments on the issue, sets the spoke worktree's Orca comment to `GATE waiting: ... | reply: ...`, rings the bell
-  of its terminal. Notifications are Orca's, the project raises none itself: Orca turns that bell into its own notification when Settings > Notifications > Terminal Bell is on (off by default;
-  the notification says only "Bell in <worktree>", never the event: the worktree comment, the issue comment and this log carry the text). A `blocked` issue and an auto-answer `WARN:` flag the same way. Run the reply line from ANY terminal (a bare `orca orchestration reply` is refused outside the Run's bound terminal):
+  reply line in the coordinator terminal (and in `--status`), comments on the issue, sets the spoke worktree's Orca comment to `GATE waiting: ... | reply: ...`. The loop rings no bell (the attended session does, see above); the worktree comment, the issue comment and this log carry the text. A `blocked` issue and an auto-answer `WARN:` flag the same way. Run the reply line from ANY terminal (a bare `orca orchestration reply` is refused outside the Run's bound terminal):
   `bash .ai-toolkit/scripts/coordinator.sh --run <run-id> --reply <message-id> approve` or `... 'approve with: <small change>'` or `... 'revise: <what to change>'`; a permission question takes `allow` or `deny` instead.
   It queues one file in `~/.ai-toolkit/coordinator/<run-id>/replies/` (`AITK_STATE_DIR` relocates it); the loop sends it at its next wake (30 s while a question waits).
 - **The queue (`--answer attended`).** Open questions (a plan handed over with its reason, a permission request) and open `blocked` issues without `hold`; the loop rings once for each new one. Answer with `--reply`; a blocked issue by a

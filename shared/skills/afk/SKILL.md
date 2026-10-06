@@ -16,6 +16,6 @@ Orca terminal, stop consuming). State lives in Orca, git and issue labels; nothi
 | `/afk status` | `coordinator.sh --status --run <run>`, plus the survey from `hub` |
 | `/afk off` | `/coordinate attended`: stop the auto loop, start the attended one (it queues only the real decisions) and summarize what happened while away |
 
-In auto, gates are answered by `answer.sh` under the `afk-answering` rule (attended: only a routine plan, the rest is queued for you); blocked issues are labelled, commented, and flagged through Orca (worktree comment, terminal bell) for you to decide
-when you are back (turn on Orca's Settings > Notifications > Terminal Bell, or the bell is only an unread dot). `--cap N` (default `CONCURRENCY_CAP`, 3) bounds the concurrent spokes: the shared usage window saturates past ~4.
+In auto, gates are answered by `answer.sh` under the `afk-answering` rule (attended: only a routine plan, the rest is queued for you); blocked issues are labelled, commented, and flagged through Orca (worktree comment) for you to decide
+when you are back (the loop rings nothing; only the attended session rings, once it has written a decision for you). `--cap N` (default `CONCURRENCY_CAP`, 3) bounds the concurrent spokes: the shared usage window saturates past ~4.
 Never edit the coordinator's scripts while it runs.

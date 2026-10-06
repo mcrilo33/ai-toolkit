@@ -1,6 +1,6 @@
 ---
 name: coordinate
-description: "Run the Orca coordinator from this Claude session, in one of two modes: 'attended' (the coordinator.sh loop does the routine work out of sight and queues every real decision for the user, this session presents them one at a time and rings no routine event) or 'auto' (the loop answers everything itself, for when the user is away). Use on the main checkout for '/coordinate', '/coordinate attended', '/coordinate auto [--until HH:MM] [--drain]', or when the user asks what needs them."
+description: "Run the Orca coordinator from this Claude session, in one of two modes: 'attended' (the coordinator.sh loop does the routine work out of sight and queues every real decision for the user, this session presents them one at a time and rings only for a decision it has just written) or 'auto' (the loop answers everything itself, for when the user is away). Use on the main checkout for '/coordinate', '/coordinate attended', '/coordinate auto [--until HH:MM] [--drain]', or when the user asks what needs them."
 argument-hint: "[attended | auto [--until HH:MM] [--drain] | status]"
 ---
 # Coordinate
@@ -21,10 +21,9 @@ This session has the toolkit guards: `[ -f "${AI_TOOLKIT_DIR:-/nonexistent}/clau
 ## Start
 
 ```bash
-# attended: the loop rings its bell on THIS session's terminal (Orca stays silent while the user is looking at it)
-TTY=/dev/$(ps -o tty= -p $PPID | tr -d ' ')    # the agent has no /dev/tty: ask ps
+# attended: the loop types one line into THIS session's terminal when a decision arrives
 orca terminal create --worktree path:$PWD --title coordinator \
-  --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended --bell-tty $TTY [--cap N]"
+  --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended --session $ORCA_TERMINAL_HANDLE [--cap N]"
 # auto
 date -u +%FT%TZ        # the switch time: say it, it anchors the summary of what happened while away
 orca terminal create --worktree path:$PWD --title coordinator \
@@ -36,6 +35,10 @@ Without `--run` the loop creates a Run: find it with `orca orchestration run-lis
 Before switching to auto tell the user that gates are then answered by `answer.sh` under `afk-answering`, not by them.
 
 ## The queue (attended)
+
+**The bell, the one rule.** The loop never rings. It types one line into this session (`[coordinator loop] new decision waiting: <plan | permission request | blocked issue> <id>`) when a decision arrives on an empty queue, and for every permission request. On that line: read the item whole
+(a plan or permission request: `coordinator.sh --run <run> --show <id>`; a blocked issue: `--status` and `gh issue view`), present it with one recommendation (below), and only once that is on screen ring: `printf '\a' > /dev/$(ps -o tty= -p $PPID | tr -d ' ')` (the agent has no `/dev/tty`: ask ps). Ring at no other time.
+If you are in the middle of another decision with the user, hold the new item, no bell, until the current one is answered; a permission request is the exception (it expires in 9 minutes): write it at once, ahead of the current one, and ring. After relaying any answer run `--status` and present the next item: the loop sends no line for what waited behind another.
 
 When the user arrives, or asks what needs them, `coordinator.sh --status --run <run>` is the queue in the order to present it: open questions oldest first, then blocked issues, then dispatch requests. Present **one decision at a time**, stop for the answer, relay it,
 then the next; when it is empty, say so. Never show a heartbeat, a land, a retry or any other routine event; report what landed only when asked (below). Each item: the issue (`gh issue view <n>`, its `Scope:`/`Gate:` footer), what the
