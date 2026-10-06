@@ -592,7 +592,7 @@ def live_loop(tmp_path, mode, held):   # a live process whose command is coordin
     d.mkdir(parents=True, exist_ok=True)
     p = subprocess.Popen(["coordinator.sh", "60"], executable="/bin/sleep")
     (d / f"holder.{p.pid}").write_text(f"term_c {mode}\n")
-    (d / "held").write_text("".join(f"{i}\n" for i in held))
+    (d / "held").unlink(missing_ok=True) if held is None else (d / "held").write_text("".join(f"{i}\n" for i in held))   # None: no held file (a loop of an older version): every open question is the human's
     return p
 
 
@@ -670,7 +670,7 @@ def test_status_lists_the_queue_in_the_order_to_present_it_and_the_dispatch_requ
     C.stubs.reply("orca.orchestration_worker_list", "boom", rc=1, n=4)   # the first --status made two worker-list calls: Orca is silent for the second one's queue read, nothing is hidden
     assert "msg_ended" in C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
     assert "dispatch requests:" in out and re.search(r"#7 .*redo it.*waiting for a free slot \(cap 3\)", out) and re.search(r"#9 .*queued", out)
-    for mode, held, by_loop in (("attended until 23:00", ["msg_a"], "msg_b msg_c msg_oldplan"), ("auto", [], "msg_a msg_b msg_c msg_oldplan"), ("human", [], ""), (None, [], "")):   # a live attended/auto loop answers what it has not left open; a human-mode loop or none: every open question is the human's
+    for mode, held, by_loop in (("attended until 23:00", ["msg_a"], "msg_b msg_c msg_oldplan"), ("auto", [], "msg_a msg_b msg_c msg_oldplan"), ("human", [], ""), (None, [], ""), ("attended", None, "")):   # a live attended/auto loop answers what it has not left open; a human-mode loop or none: every open question is the human's
         loop = live_loop(tmp_path, mode, held) if mode else None
         try:
             out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout

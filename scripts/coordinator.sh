@@ -113,7 +113,7 @@ queue_ids() {   # the decisions waiting for the human, in the order to present t
   local q; q="$(open_q | jq -r '"\(if ((.payload // "{}" | if type == "string" then fromjson else . end).question // .body // "") | test("^\\s*PERMISSION REQUEST") then "p" else "q" end):\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
 }
 hold() { held="$held $1 "; printf '%s\n' "$1" >> "$sd/held"; }   # $1 message id: left open for the human, in the loop's memory and in the spool for --status (a plan outside it is the loop's to answer)
-by_loop() { case "${lm%% *}" in attended | auto) ! is_perm "$2" && ! grep -qxF "$1" "$(spool_dir "$run")/held" 2> /dev/null ;; *) false ;; esac; }   # $1 message id, $2 its question, $lm the live loop's mode (none or human: every open question is the human's)
+by_loop() { case "${lm%% *}" in attended | auto) ! is_perm "$2" && [ -f "$(spool_dir "$run")/held" ] && ! grep -qxF "$1" "$(spool_dir "$run")/held" ;; *) false ;; esac; }   # $1 message id, $2 its question, $lm the live loop's mode (none, human or no held file, e.g. an older loop: every open question is the human's)
 replycmd() { printf 'bash %s --run %s --reply %s %s' "$here/coordinator.sh" "$run" "$1" "${2:-approve}"; }
 if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to; --show: one of them whole
   [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"; if [ -n "$show_id" ]; then m="$(open_q | jq -c --arg i "$show_id" 'select(.id == $i)')" && [ -n "$m" ] || die "no open question $show_id on run $run"; show_q "$(question_of "$m")" 1000000; exit 0; fi
@@ -157,7 +157,7 @@ died() {   # the EXIT trap, $1 = the exit status, $2 = the last command: a plann
   log "exiting on an error: status $1, last command: ${2:0:100}"
   [ "$answer" != attended ] || [ -z "$session" ] || orca_json terminal send --terminal "$session" --text "[coordinator loop] stopped on an error: nothing coordinates Run $run, read its terminal and start it again." --enter > /dev/null 2>&1 || true
 }
-sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$BASH_COMMAND"' EXIT; (umask 077; mkdir -p "$sd"); printf '%s %s\n' "$H" "$mode" > "$hf"
+sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$BASH_COMMAND"' EXIT; (umask 077; mkdir -p "$sd"); rm -f "$sd/held"; printf '%s %s\n' "$H" "$mode" > "$hf"
 log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
 
 # ctx <dispatch>: sets disp task term wtp issue br (its Orca branch) from the worker's Orca row and the issue linked to its worktree.
@@ -378,7 +378,7 @@ notify_queue() {   # attended: tell the session of a decision that was not queue
     case " $seen " in *" $i "*) continue ;; esac; [ "$k" = p ] || [ "$first" = 1 ] || continue; [ "$k" = p ] || first=0; tell "$k" "${i#?:}" || fail=1
   done; [ "$fail" = 1 ] || seen="$now"
 }
-tick=0; empties=0; seen=""; bids=""; bdirty=1; held=" $(open_q | jq -r .id | tr '\n' ' ' || true)"; tr ' ' '\n' <<< "${held# }" | sed '/^$/d' > "$sd/held"; start="$(now_min)"; budget=0
+tick=0; empties=0; seen=""; bids=""; bdirty=1; held=""; if ids="$(open_q | jq -r .id | tr '\n' ' ')"; then held=" $ids"; tr ' ' '\n' <<< "$ids" | sed '/^$/d' > "$sd/held"; fi; start="$(now_min)"; budget=0
 [ -z "$until" ] || budget=$(((($(mins "$until") - start) + 1440) % 1440))
 while :; do
   tick=$((tick + 1)); yield
