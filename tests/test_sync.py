@@ -295,13 +295,14 @@ def test_a_host_synced_the_old_way_is_cleaned_up_from_its_manifest_only(sync, ta
     with (target / ".ai-toolkit" / "sync-manifest").open("a") as f:   # what the old sync recorded
         f.write(".claude/rules/security.md\n" + ("" if state == "not-the-syncs" else "CLAUDE.md\n"))
     if state == "tracked":
-        git(target, "add", "-f", "CLAUDE.md", ".claude/rules/security.md")
+        git(target, "add", "-f", "CLAUDE.md", ".claude/rules/security.md", ".claude/skills/land/SKILL.md")   # the last one is a toolkit file the project committed
     r = sync()
     claude = target / "CLAUDE.md"
     assert r.returncode == 0 and not (target / "CLAUDE.md.bak").exists()
     if state == "tracked":   # the host's history is the human's: reported, never rewritten, no deletion committed
         assert claude.read_text() == "generated\n" and (target / ".claude" / "rules" / "security.md").exists()
-        assert "CLAUDE.md is tracked" in r.stderr and "rules/security.md is tracked" in r.stderr
+        assert "CLAUDE.md is tracked" in r.stderr and "rules/security.md is tracked" in r.stderr and "CLAUDE.md.bak" in r.stderr
+        assert r.stderr.count("land/SKILL.md is tracked") == 1   # one report per file, not one from the write and one from the clean-up
         return
     assert not (target / ".claude" / "rules" / "security.md").exists()
     assert {"written": None, "with-bak": "the project's\n", "not-the-syncs": "mine\n"}[state] == (claude.read_text() if claude.exists() else None)

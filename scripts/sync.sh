@@ -42,7 +42,7 @@ trap 'rm -f "$NEW" "$TMP" "$PUT_TMP"' EXIT   # PUT_TMP: a put() cut short must n
 # The new file takes the destination's mode (cp -p of it, then its content) and a symlinked destination is written through, as an in-place cp did.
 put() {
   local d="$TARGET/$2"
-  case "$2" in .claude/*) if tracked "$2"; then warn "$2 is tracked by the project: left alone"; return 0; fi ;; esac   # a .claude/ file the project tracks is its own
+  case "$2" in .claude/*) if tracked "$2"; then grep -qxF "$2" "$OLD" 2> /dev/null || warn "$2 is tracked by the project: left alone"; return 0; fi ;; esac   # a .claude/ file the project tracks is its own; one a sync wrote is reported by drop()
   mkdir -p "$(dirname "$d")"
   if ! cmp -s "$1" "$d"; then
     if [ "${3:-}" = bak ] && [ -f "$d" ] && [ ! -e "$d.bak" ] && ! grep -qxF "$2" "$OLD" 2> /dev/null; then cp "$d" "$d.bak"; fi
@@ -95,7 +95,7 @@ EOF
 # never touched (a manifest is data in the target, not trusted).
 drop() {
   case "$1" in '' | /* | *..*) return 0 ;; esac
-  if tracked "$1"; then warn "$1 is tracked in $TARGET, so it stays: git rm it if it is the toolkit's"; return 0; fi
+  if tracked "$1"; then warn "$1 is tracked in $TARGET, so it stays ($1.bak, if there, is the project's original): git rm it if it is the toolkit's"; return 0; fi
   if [ "$1" = CLAUDE.md ] && [ -f "$TARGET/CLAUDE.md.bak" ]; then mv -f "$TARGET/CLAUDE.md.bak" "$TARGET/CLAUDE.md"; return 0; fi   # an earlier sync replaced the project's own
   rm -f "$TARGET/$1"
   (cd "$TARGET" && rmdir -p "$(dirname "$1")" 2> /dev/null) || true
