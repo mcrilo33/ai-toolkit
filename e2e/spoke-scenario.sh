@@ -63,11 +63,11 @@ else
   [ -n "$repo_id" ] || repo_id="$(orca_json repo add --path "$S" | jq -r '.result.repo.id')"
 fi
 [ -n "$repo_id" ] && [ "$repo_id" != null ] || fail "orca repo add"
-mkdir -p "$S/.ai-toolkit/bin" "$S/.ai-toolkit/scripts" "$S/.claude/hooks"   # the layout sync.sh will produce (06 section 6)
+mkdir -p "$S/.ai-toolkit/bin" "$S/.ai-toolkit/scripts" "$S/.claude/rules/ai-toolkit"   # the layout sync.sh will produce (06 section 6)
 cp "$V2"/scripts/*.sh "$S/.ai-toolkit/scripts/"; cp "$V2/bin/claude-spoke" "$S/.ai-toolkit/bin/"
 cp "$V2/settings/ai-toolkit.env" "$S/.ai-toolkit/ai-toolkit.env"
 echo '{"disableAllHooks":false,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"true"}]}]}}' > "$S/.ai-toolkit/claude-settings.json"   # a worker starts through the launcher only in a project that has the toolkit's guards file
-echo '#!/bin/sh' > "$S/.claude/hooks/guard.sh"
+echo '# G' > "$S/.claude/rules/ai-toolkit/guidelines.md"
 mkdir -p "$S/.claude/agents" "$S/.ai-toolkit/rules"   # what sync.sh will ship: the review agent and the answering rule
 SH="$V2/shared"; [ -d "$SH" ] || SH="$V2/../shared"   # shared/ sits beside v2/ until the cutover, inside the root after it
 cp "$SH/agents/code-review.md" "$S/.claude/agents/"; cp "$SH/rules/on-demand/afk-answering.md" "$S/.ai-toolkit/rules/"
@@ -99,7 +99,7 @@ step=4; say "provisioned by setup.sh, issue linked in-progress, agent working wi
 has_wt() { wt="$(orca_json worktree show --worktree issue:1 2> /dev/null | jq -r '.result.worktree.path // empty')"; [ -n "$wt" ]; }
 wait_for 300 has_wt || fail "no worktree for issue 1 within 5 min"
 wait_for 120 test -f "$wt/.ai-toolkit/setup-done" || fail "setup did not finish"
-[ -d "$wt/.claude/hooks" ] || fail ".claude/hooks missing: setup did not run"
+[ -f "$wt/.claude/rules/ai-toolkit/guidelines.md" ] || fail ".claude/rules/ai-toolkit missing: setup did not run"
 [ -s "$wt/.ai-toolkit/spoke-run-id" ] || fail "spoke-run-id missing"
 grep -q 'Add hello.txt' "$wt/.ai-toolkit/task.md" || fail "task.md has no issue"
 agent_working() { orca_json worktree ps | jq -e --arg p "$wt" '[.. | objects | select(.path? == $p) | .agents[]? | select(.state == "working")] | length > 0' > /dev/null; }

@@ -189,6 +189,7 @@ WRITE_DENY = [
     "cd ~ && echo x > tk/../x/.ai-toolkit/bin/claude-spoke", "echo x > ../../x/.ai-toolkit/scripts/land.sh", "echo x > R/.ai-toolkit/ai-toolkit.local.env",
     "echo x > .ai-toolkit/bin/claude-spoke", 'echo x > "$(printenv AI_TOOLKIT_DIR)/claude-settings.json"', "d=$AI_TOOLKIT_DIR; echo x > $d/hooks/claude/push-guard.sh",
     "python3 -c \"import os; open(os.environ['AI_TOOLKIT_DIR'] + '/x', 'w')\"",
+    "echo x > ../main/.ai-toolkit/setup.local.sh", "echo x > ../main/.ai-toolkit/rules/afk-answering.md", "cd .. && echo x > main/.ai-toolkit/sync-manifest",
 ]
 WRITE_ALLOW = [
     "touch sub/orca.yaml", "echo x > v2/orca.yaml", "cp a docs/.github/workflows/x.yml", "rm -rf .claude/cache", "ls .claude",
@@ -242,7 +243,7 @@ def test_danger_guard_reset_hard_asks_only_in_the_main_checkout(shared, where, c
     ("Write", "file_path", ".ai-toolkit/spoke-run-id"), ("Write", "file_path", "./orca.yaml"),
     ("Write", "file_path", "{tk}/claude-settings.json"), ("Edit", "file_path", "{tk}/hooks/claude/push-guard.sh"), ("Write", "file_path", ".ai-toolkit/claude-settings.json"),
     ("Write", "file_path", "{tk}/scripts/setup.sh"), ("Edit", "file_path", "{tk}/bin/claude-spoke"), ("Write", "file_path", "{tk}"), ("Write", "file_path", "~/tk/ai-toolkit.local.env"),
-    ("Write", "file_path", "{spoke}/nonexist/../../home/.ai-toolkit/coordinator/run_t/replies/msg_p"), ("Write", "file_path", "{spoke}/nonexist/../../home/tk/bin/claude-spoke"),
+    ("Write", "file_path", "{spoke}/nonexist/../../home/.ai-toolkit/coordinator/run_t/replies/msg_p"), ("Write", "file_path", "{spoke}/n/./../../home/tk/claude-settings.json"), ("Write", "file_path", "{spoke}/nonexist/../../home/tk/bin/claude-spoke"),
 ])
 def test_danger_guard_denies_protected_file_writes(shared, tool, key, path):
     check("danger-guard.sh", shared, "spoke", 2, tool=tool, **{key: path})

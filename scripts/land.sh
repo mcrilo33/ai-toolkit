@@ -11,7 +11,7 @@
 # otherwise: a sha the worker moved to meanwhile was never reviewed). gate_loop's own merge of origin/<base> stays allowed: it adds only
 # base commits, which are already landed and reviewed (it refuses first if the spoke HEAD is no longer the captured tip).
 # In the toolkit's own checkout (it carries scripts/sync.sh, shared/ and hooks/claude) the cleanup first re-runs `sync.sh` on it, so the
-# installed copies (.claude/{hooks,rules,skills,agents}, .ai-toolkit/scripts) are the landed tip's: the next dispatch, answer and land use
+# installed copies (.claude/{rules/ai-toolkit,skills,agents}, .ai-toolkit/{scripts,hooks,claude-settings.json}) are the landed tip's: the next dispatch, answer and land use
 # the landed code. Another repo (no sync sources) is untouched. sync replaces files by rename, so a running coordinator loop keeps its
 # own script intact (old code, consistent) while every script it launches next is the new copy. Workers live at that moment keep the
 # copies they started with; they get the new ones only when re-dispatched (dispatch.sh --address / --retry-of refresh the worktree).
