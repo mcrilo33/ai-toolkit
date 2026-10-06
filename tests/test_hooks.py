@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 from types import SimpleNamespace
@@ -31,8 +32,8 @@ def build(base):
     (base / "1-x/.ai-toolkit/spoke-run-id").write_text("rid\n")
     for d in ("home", "scratch"):
         (base / d).mkdir()
-    return {"root": root, "wt": base / "2-y", "spoke": base / "1-x", "home": base / "home", "tk": base / "tk",   # tk: the main checkout's .ai-toolkit, outside every worktree
-            "env": {"HOME": str(base / "home"), "TMPDIR": str(base / "scratch"), "AI_TOOLKIT_DIR": str(base / "tk"), **GIT_ENV}}
+    return {"root": root, "wt": base / "2-y", "spoke": base / "1-x", "home": base / "home", "tk": base / "home" / "tk",   # tk: the main checkout's .ai-toolkit, outside every worktree (under HOME, so ~ and $HOME spell it too)
+            "env": {"HOME": str(base / "home"), "TMPDIR": str(base / "scratch"), "AI_TOOLKIT_DIR": str(base / "home" / "tk"), **GIT_ENV}}
 
 
 @pytest.fixture(autouse=True)
@@ -179,6 +180,11 @@ WRITE_DENY = [
     # the toolkit's registrations and hook scripts: the worktree-relative spellings and the main checkout's copy a worker's session actually runs
     "rm .ai-toolkit/claude-settings.json", "echo x > $PWD/.ai-toolkit/claude-settings.json", "tee ./.ai-toolkit/claude-settings.json", "rm -rf .ai-toolkit/hooks",
     "echo x > {tk}/claude-settings.json", "rm {tk}/hooks/claude/push-guard.sh", "cp x {tk}/hooks/claude/danger-guard.sh",
+    # the whole main .ai-toolkit (guards, launcher, scripts, env files), in every spelling a worker can write it with
+    "echo x > $AI_TOOLKIT_DIR/hooks/claude/danger-guard.sh", "echo x > ${AI_TOOLKIT_DIR}/claude-settings.json", "tee $AI_TOOLKIT_DIR/bin/claude-spoke",
+    "cd $AI_TOOLKIT_DIR && echo x > hooks/claude/push-guard.sh", "cd {tk}",
+    "echo x > ~/tk/claude-settings.json", "echo x > $HOME/tk/hooks/claude/push-guard.sh", "echo x > {tk}/scripts/setup.sh",
+    "echo x >> {tk}/ai-toolkit.local.env",
 ]
 WRITE_ALLOW = [
     "touch sub/orca.yaml", "echo x > v2/orca.yaml", "cp a docs/.github/workflows/x.yml", "rm -rf .claude/cache", "ls .claude",
@@ -231,6 +237,7 @@ def test_danger_guard_reset_hard_asks_only_in_the_main_checkout(shared, where, c
     ("Write", "file_path", ".claude/hooks/push-guard.sh"), ("Write", "file_path", ".claude/hooks"),
     ("Write", "file_path", ".ai-toolkit/spoke-run-id"), ("Write", "file_path", "./orca.yaml"),
     ("Write", "file_path", "{tk}/claude-settings.json"), ("Edit", "file_path", "{tk}/hooks/claude/push-guard.sh"), ("Write", "file_path", ".ai-toolkit/claude-settings.json"),
+    ("Write", "file_path", "{tk}/scripts/setup.sh"), ("Edit", "file_path", "{tk}/bin/claude-spoke"), ("Write", "file_path", "{tk}"), ("Write", "file_path", "~/tk/ai-toolkit.local.env"),
 ])
 def test_danger_guard_denies_protected_file_writes(shared, tool, key, path):
     check("danger-guard.sh", shared, "spoke", 2, tool=tool, **{key: path})
@@ -657,7 +664,8 @@ def test_settings_register_the_hooks_at_the_synced_path(shared, tmp_path):
     seen = {}
     for e in cfg["hooks"]["PreToolUse"]:
         cmd = e["hooks"][0]["command"]
-        script = cmd.split("/")[-1].rstrip('"')
+        script = re.search(r"/([a-z-]+\.sh)", cmd)[1]
+        assert cmd.endswith(" || exit 2")  # a hook that cannot run (no AI_TOOLKIT_DIR, no script) must deny: any other non-zero code lets the call through
         seen[script] = e["matcher"].split("|")
         tool, ti = ("Bash", {"command": "git push --force"}) if script == "push-guard.sh" else ("Write", {"file_path": "orca.yaml", "content": AWS})
         r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, env={**os.environ, "CLAUDE_PROJECT_DIR": str(tmp_path / "wt"), "AI_TOOLKIT_DIR": str(tk)},

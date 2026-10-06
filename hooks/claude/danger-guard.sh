@@ -3,7 +3,7 @@
 # danger-guard: PreToolUse(Bash|Write|Edit|MultiEdit|NotebookEdit|AskUserQuestion). Yolo mode (D8) has no prompts of its own, so this is the brake.
 # The rule: everything is authorized except sensitive operations, which ASK the user when someone can answer and are DENIED when no one can.
 # Asks (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode), one per call whose reason names every sensitive segment: writes
-# to orca.yaml, ~/.claude/settings.json, .github/workflows/ and, in a worker, the project .claude/{settings*.json,hooks/}, .ai-toolkit/spoke-run-id and the launcher's guards ($AI_TOOLKIT_DIR/{claude-settings.json,hooks/});
+# to orca.yaml, ~/.claude/settings.json, .github/workflows/ and, in a worker, the project .claude/{settings*.json,hooks/}, .ai-toolkit/spoke-run-id and anything under the launcher's $AI_TOOLKIT_DIR (the main checkout's .ai-toolkit: the guards, the launcher, the scripts, the env files), in every spelling;
 # rm -r outside the worktree, of its root or home, of another git checkout, or with an unexpanded variable; git reset --hard in the main checkout (or
 # with --git-dir/--work-tree); git clean -x and git stash -a. Someone can answer when there is no worker marker (the human's own prompt) or when a worker
 # has the permission-relay hook installed and registered in the launcher's settings file (it puts the question to the Run: the user answers an attended one, the auto loop denies it);
@@ -48,7 +48,7 @@ canon() { local p="$1"; case "$p" in \~ | \~/*) p="$HOME${p#\~}";; esac; case "$
   local rest="" d="$p"; while [ ! -d "$d" ]; do rest="/${d##*/}$rest"; d="$(dirname "$d")"; done
   rest="$(printf '%s' "$rest" | sed -E -e ':a' -e 's#/[^/]+/\.\./#/#' -e 'ta')"; printf '%s%s' "$(phys "$d")" "$rest"; }
 prot() { case "$1" in "$root/orca.yaml" | "$home/.claude/settings.json") return 0;; esac
-  [ -n "$spoke" ] && case "$1" in "$root/.claude/settings.json" | "$root/.claude/settings.local.json" | "$root/.claude/hooks" | "$root/.claude/hooks/"* | "$root/.ai-toolkit/spoke-run-id" | "$root/.ai-toolkit/claude-settings.json" | "$root/.ai-toolkit/hooks/"* | "${AI_TOOLKIT_DIR:-/nonexistent}/claude-settings.json" | "${AI_TOOLKIT_DIR:-/nonexistent}/hooks" | "${AI_TOOLKIT_DIR:-/nonexistent}/hooks/"*) return 0;; esac
+  [ -n "$spoke" ] && case "$1" in "$root/.claude/settings.json" | "$root/.claude/settings.local.json" | "$root/.claude/hooks" | "$root/.claude/hooks/"* | "$root/.ai-toolkit/spoke-run-id" | "$root/.ai-toolkit/claude-settings.json" | "$root/.ai-toolkit/hooks/"* | "${AI_TOOLKIT_DIR:-/nonexistent}" | "${AI_TOOLKIT_DIR:-/nonexistent}/"*) return 0;; esac
   return 1; }
 fp="$(j '.tool_input.file_path // .tool_input.notebook_path')"
 spool="(~|HOME\}?|$home)/\.ai-toolkit/coordinator" # the human's reply spool: a file there is sent as the human's answer, so a worker never writes it
@@ -60,7 +60,7 @@ cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || finish
 c=" $(printf '%s' "$cmd" | sed -E "s/[\"'\\\\]//g; s/[0-9&]*>+ *(\/dev\/null|&[0-9])//g; s/[[:space:]>]/& /g")" # writes to a protected path
 pre="((^|[^[:alnum:]_./-])(\./)?|$root/|\\\$\{?(PWD|CLAUDE_PROJECT_DIR)\}?/|\\\$\(pwd\)/)"; e="([^[:alnum:]_./-]|$)" # project-root paths only: v2/orca.yaml is fine
 p="$pre(orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$home)/\.claude/settings\.json"
-if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e|\.ai-toolkit/(spoke-run-id|claude-settings\.json|hooks))|$pre$(printf '%s' "${AI_TOOLKIT_DIR:-/nonexistent}" | sed 's/[^[:alnum:]_\/-]/\\&/g')/(claude-settings\.json|hooks)"; fi
+if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e|\.ai-toolkit/(spoke-run-id|claude-settings\.json|hooks))|$pre($(printf '%s' "${AI_TOOLKIT_DIR:-/nonexistent}" | sed 's/[^[:alnum:]_\/-]/\\&/g')|(~|HOME\}?|$home)/$(printf '%s' "${AI_TOOLKIT_DIR#"$home"/}" | sed 's/[^[:alnum:]_\/-]/\\&/g')|\\\$\{?AI_TOOLKIT_DIR\}?)(/|$e)"; fi
 w="(>|[[:space:]](tee|cp|mv|rm|touch|ln|dd|install|rsync|truncate|patch|chmod|python[0-9.]*|perl|ruby|node)[[:space:]]|[[:space:]]sed[[:space:]][^;|&]*(-[a-z]*i|--in-place))"
 va="${w}[^;|&]*|[[:space:]](cd|pushd)[[:space:]][^;|&]*" # a verb before the path, or a cd into it
 if [ -n "$spoke" ] && [[ $c =~ ($va)($spool) ]]; then deny "write to the human's reply spool: $(printf '%.200s' "$cmd" | tr '\n' ' ')"; fi

@@ -397,7 +397,6 @@ def test_a_land_in_the_toolkit_checkout_refreshes_the_installed_copies(L, broken
     assert ("gh", "issue", "close", "9", "-c", f"landed in {sha}") in L.trail()
     if broken:
         assert r.returncode == 6 and "installed copies" in r.stderr and "scripts/sync.sh" in r.stderr   # distinct, visible, never a red land
-        assert not (L.root / ".ai-toolkit/hooks/claude/guard.sh").exists()   # nothing was installed
         (L.root / ".ai-toolkit").unlink()
         r = L.go("--cleanup-only", "9")   # the existing way to finish an exit-6 land also retries the refresh
     assert r.returncode == 0, r.stderr

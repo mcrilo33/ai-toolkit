@@ -43,16 +43,19 @@ def test_spoke_is_a_plain_claude_without_a_run_id_or_when_opted_out(run, stubs, 
     ("unsynced", True, ["-p", "x"], False, None),         # a worker with no settings file is refused, never started guardless
     ("synced", False, ["--settings", "mine.json"], False, None),    # two --settings do not merge (the last wins and the toolkit's hooks vanish): refused
     ("synced", False, ["--settings=mine.json"], False, None),
+    ("broken", False, ["-p", "x"], False, None),          # a file claude might skip with a warning would start a session without guards: refused
 ])
 def test_the_launcher_passes_the_settings_file_of_the_project_it_starts_in(run, stubs, repo, project, worker, args, ok, passed):
-    tk = synced(repo) if project == "synced" else None
-    r = run([SPOKE, *args], cwd=in_spoke(repo) if worker else repo.wt("w"))
+    tk = synced(repo) if project in ("synced", "broken") else None
+    if project == "broken":
+        (tk / "claude-settings.json").write_text("{not json")
+    r = run([SPOKE, *args], cwd=in_spoke(repo) if worker else repo.wt("w"), AI_TOOLKIT_DIR="/inherited")   # an inherited variable must never survive into a session that has no guards
     calls = stubs.calls("claude")
     assert (r.returncode == 0) == ok and len(calls) == int(ok), r.stderr
     if passed == "settings":
         assert calls == [["--settings", f"{tk}/claude-settings.json", *args]] and f"AI_TOOLKIT_DIR={tk}" in stubs.env("claude")
     if passed == "plain":
-        assert calls == [args] and "AI_TOOLKIT_DIR" not in stubs.env("claude")
+        assert calls == [args] and "AI_TOOLKIT_DIR" not in stubs.env("claude")   # not even the inherited one
     if not ok:
         assert "settings" in r.stderr
 

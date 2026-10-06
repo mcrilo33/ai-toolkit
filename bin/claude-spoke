@@ -17,10 +17,12 @@ top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 # gets plain claude; a worker with no file is refused, never started without guards. A second --settings would silently drop the first (the last wins): refused too.
 tk="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2> /dev/null || echo "$top/.git")")/.ai-toolkit"
 if [ -f "$tk/claude-settings.json" ]; then
+  jq -e . "$tk/claude-settings.json" > /dev/null 2>&1 || die "$tk/claude-settings.json is unreadable or not JSON: sync ai-toolkit again, never a session without its guards"
   for a in "$@"; do case "$a" in --settings | --settings=*) die "the launcher owns --settings (the toolkit's guards): do not pass one" ;; esac; done
   AI_TOOLKIT_DIR="$(cd "$tk" && pwd -P)"; export AI_TOOLKIT_DIR   # the hooks run from here, and /coordinate reads it to know its session has the guards
   set -- --settings "$AI_TOOLKIT_DIR/claude-settings.json" "$@"
-elif [ -s "$top/.ai-toolkit/spoke-run-id" ]; then die "no $tk/claude-settings.json: sync ai-toolkit into the main checkout, a worker never starts without its guards"; fi
+elif [ -s "$top/.ai-toolkit/spoke-run-id" ]; then die "no $tk/claude-settings.json: sync ai-toolkit into the main checkout, a worker never starts without its guards"
+else unset AI_TOOLKIT_DIR; fi   # an inherited one would tell /coordinate this session has guards it does not have
 if [ "${AI_TOOLKIT_OTEL:-1}" = 1 ] && [ -s "$top/.ai-toolkit/spoke-run-id" ]; then
   load_env
   repo="$(git remote get-url origin 2>/dev/null | sed -E 's#.*[/:]##; s#\.git$##' || true)"

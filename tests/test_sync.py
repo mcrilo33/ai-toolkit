@@ -284,14 +284,15 @@ def test_a_hosts_own_files_are_never_touched(sync, target):
     assert (target / ".claude" / "rules" / "ai-toolkit" / "security.md").is_file() and (target / ".ai-toolkit" / "claude-settings.json").is_file()
 
 
-@pytest.mark.parametrize("state", ["written", "with-bak", "not-the-syncs", "tracked"])
-def test_a_host_synced_the_old_way_is_cleaned_up_from_its_manifest_only(sync, target, state):
-    sync()
+@pytest.mark.parametrize("state", ["written", "with-bak", "not-the-syncs", "tracked", "toolkit-itself"])
+def test_a_host_synced_the_old_way_is_cleaned_up_from_its_manifest_only(sync, src, target, state):
+    target = src / "v2" if state == "toolkit-itself" else target   # the toolkit syncing itself: its .bak files are a v1 sync's output, never the project's own
+    sync(tgt=target)
     own = ["CLAUDE.md", ".claude/settings.json"]   # the project's files the old sync took over (each kept as <file>.bak when it existed)
     old = {".claude/rules/security.md": "old flat\n", ".claude/hooks/guard.sh": "old hook\n"}   # toolkit files the old layout wrote
     for rel in own:
         write(target / rel, "mine\n" if state == "not-the-syncs" else "generated\n")
-        if state == "with-bak":
+        if state in ("with-bak", "toolkit-itself"):
             write(target / f"{rel}.bak", "the project's\n")
     for rel, text in old.items():
         write(target / rel, text)
@@ -299,13 +300,13 @@ def test_a_host_synced_the_old_way_is_cleaned_up_from_its_manifest_only(sync, ta
         f.write("".join(f"{rel}\n" for rel in [*old, *([] if state == "not-the-syncs" else own)]))
     if state == "tracked":
         git(target, "add", "-f", *own, *old, ".claude/skills/land/SKILL.md")   # the last one is a toolkit file the project committed
-    r = sync()
-    assert r.returncode == 0 and not list(target.rglob("*.bak"))   # a .bak is restored over its file, never left behind
+    r = sync(tgt=target)
+    assert r.returncode == 0 and bool(list(target.rglob("*.bak"))) == (state == "toolkit-itself")   # a .bak is restored over its file, never left behind (but kept in the toolkit)
     if state == "tracked":   # the host's history is the human's: reported, never rewritten, no deletion committed
         assert all((target / rel).read_text() == "generated\n" and f"{rel} is tracked" in r.stderr for rel in own)
         assert all((target / rel).exists() and f"{rel} is tracked" in r.stderr for rel in old) and "CLAUDE.md.bak" in r.stderr
         assert r.stderr.count("land/SKILL.md is tracked") == 1   # one report per file, not one from the write and one from the clean-up
         return
     assert not any((target / rel).exists() for rel in old)
-    want = {"written": None, "with-bak": "the project's\n", "not-the-syncs": "mine\n"}[state]
+    want = {"written": None, "with-bak": "the project's\n", "not-the-syncs": "mine\n", "toolkit-itself": None}[state]
     assert [(target / rel).read_text() if (target / rel).exists() else None for rel in own] == [want, want]

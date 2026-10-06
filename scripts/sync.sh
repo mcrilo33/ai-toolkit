@@ -97,7 +97,7 @@ EOF
 drop() {
   case "$1" in '' | /* | *..*) return 0 ;; esac
   if tracked "$1"; then warn "$1 is tracked in $TARGET, so it stays ($1.bak, if there, is the project's original): git rm it if it is the toolkit's"; return 0; fi
-  case "$1" in CLAUDE.md | .claude/settings.json) if [ -f "$TARGET/$1.bak" ]; then mv -f "$TARGET/$1.bak" "$TARGET/$1"; return 0; fi ;; esac   # an earlier sync replaced the project's own
+  case "$1" in CLAUDE.md | .claude/settings.json) if [ "$TARGET" != "$V2" ] && [ -f "$TARGET/$1.bak" ]; then mv -f "$TARGET/$1.bak" "$TARGET/$1"; return 0; fi ;; esac   # an earlier sync replaced the project's own (never in the toolkit itself: its .bak is a v1 sync's output)
   rm -f "$TARGET/$1"
   (cd "$TARGET" && rmdir -p "$(dirname "$1")" 2> /dev/null) || true
 }

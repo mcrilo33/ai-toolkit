@@ -4,15 +4,15 @@
     "PreToolUse": [
       {
         "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/push-guard.sh\"" }]
+        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/push-guard.sh\" || exit 2" }]
       },
       {
         "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|AskUserQuestion",
-        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/danger-guard.sh\"" }]
+        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/danger-guard.sh\" || exit 2" }]
       },
       {
         "matcher": "Write|Edit|MultiEdit|NotebookEdit",
-        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/secrets-scan.sh\"" }]
+        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/secrets-scan.sh\" || exit 2" }]
       }
     ],
     "PermissionRequest": [
