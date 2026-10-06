@@ -78,7 +78,7 @@ When every acceptance criterion in `task.md` holds and the last subtask is pushe
 `worker_done --outcome succeeded` with a 3-sentence body: what you did, what you found, what is left.
 Then stop; do not poll and do not start new work.
 
-A question with no reply yet is not a blocker, and neither is a permission request nobody answered in time (the relay says so and lets you make the call again, up to 3 requests in total): resume the pending `ask` and keep waiting; never send `--outcome failed` for it.
+A question with no reply yet is not a blocker: resume the pending `ask` and keep waiting; never send `--outcome failed` for it. A permission request nobody answered in time is not final either: the relay says so, and you make the same call again, up to 3 requests in total; after the third, report it in `worker_done` or ask the coordinator, and that question waits like any other.
 
 If you are stuck (ambiguity you cannot resolve, a failing dependency you do not own, a scope breach), send
 `--outcome failed` with the blocker. The coordinator labels the issue `blocked` and tells the human.
