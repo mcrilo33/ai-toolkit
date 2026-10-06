@@ -13,6 +13,12 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 - The codebase stays simple and grows little; the test suite and the whole cycle stay fast. Growth (a raised line cap or budget, a new mechanism, more tests) must be justified against this goal.
 - The number of open issues stays small. An issue is opened only for a defect whose fix saves time (it has happened, or will often enough to cost more than the fix) or a change that really improves productivity; a rare or theoretical problem and a tidy-up are dropped, not filed.
 
+## Toolkit files and upstream
+
+- In a host project the toolkit's files (`.claude/`, `.ai-toolkit/`, `orca.yaml`) are synced copies: never edit them there, and never edit the toolkit's own checkout from a host session.
+- A defect in the toolkit, or a wish about it (a new or changed rule, skill, hook or script), is filed as an issue in the toolkit's repository (`UPSTREAM_REPO` in `.ai-toolkit/ai-toolkit.env`; in the toolkit's own checkout that is this repository), without asking the user first when it meets the filing bar: a defect through the `bug-scoper` agent, a wish through `followup-scoper`. The project picks the change up at its next sync.
+- The details (routing, the filing bar, an unset `UPSTREAM_REPO`) are in `bug-triage`; do not restate them.
+
 ## Agent Behavior
 
 ### Before Acting

@@ -1,5 +1,5 @@
 ---
-description: "Recurring mechanical traps a spoke hits on this host: merge origin/main before pushing, locale-sensitive system-tool output (LC_ALL=C), scratch files kept inside the worktree, and ship discipline. Teaches how to satisfy the guard hooks, never to bypass them."
+description: "Recurring mechanical traps a spoke hits on this host: merge origin/main before pushing, locale-sensitive system-tool output (LC_ALL=C), scratch files kept inside the worktree, restarting an expired gcloud login yourself, and ship discipline. Teaches how to satisfy the guard hooks, never to bypass them."
 paths:
   - '**'
 ---
@@ -40,6 +40,10 @@ Write probe output, repro scripts, and temp dirs under your own worktree (`mktem
 `/tmp` default), never `/tmp/...`, `$HOME/...`, or a sibling worktree. `danger-guard` denies destructive commands
 outside the worktree, so scratch elsewhere gets blocked for no benefit. In pytest, use the `tmp_path` fixture,
 not a hard-coded `/tmp/<name>` path.
+
+## Google Cloud: expired gcloud tokens
+
+Where interactive 2-step reauthentication is enforced, gcloud tokens expire and a refresh fails in a non-interactive shell with `Reauthentication failed. cannot prompt during non-interactive execution`. When that happens, or when `gcloud auth print-access-token --quiet` fails before a GCP task: run `gcloud auth login --update-adc` yourself in the background, poll `gcloud auth print-access-token --quiet` until it succeeds, then carry on. The user validates the browser prompt; do not ask them to run the command and do not stop to ask. `--update-adc` refreshes the Python ADC in the same flow. If the token is still invalid after about 5 minutes, stop polling and say so.
 
 ## Ship discipline
 
