@@ -46,7 +46,7 @@ fi
 canon() { local p="$1"; case "$p" in \~ | \~/*) p="$HOME${p#\~}";; esac; case "$p" in /*) ;; *) p="$cwd/$p";; esac
   while [ "$p" != / ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
   local rest="" d="$p"; while [ ! -d "$d" ]; do rest="/${d##*/}$rest"; d="$(dirname "$d")"; done
-  rest="$(printf '%s' "$rest" | sed -E -e 's#/\./#/#g' -e 's#/\.$##' -e ':a' -e 's#/([^/.][^/]*|\.[^/.][^/]*|\.\.[^/]+)/\.\./#/#' -e 'ta')"; while [ "$rest" = /.. ] || [ "${rest#/../}" != "$rest" ]; do d="$(dirname "$d")"; rest="${rest#/..}"; done; printf '%s%s' "$(phys "$d")" "$rest"; }
+  rest="$(printf '%s' "$rest" | sed -E -e 's#(/\.)+/#/#g' -e 's#/\.$##' -e ':a' -e 's#/([^/.][^/]*|\.[^/.][^/]*|\.\.[^/]+)/\.\./#/#' -e 'ta')"; while [ "$rest" = /.. ] || [ "${rest#/../}" != "$rest" ]; do d="$(dirname "$d")"; rest="${rest#/..}"; done; printf '%s%s' "$(phys "$d")" "$rest"; }
 prot() { case "$1" in "$root/orca.yaml" | "$home/.claude/settings.json") return 0;; esac
   [ -n "$spoke" ] && case "$1" in "$root/.claude/settings.json" | "$root/.claude/settings.local.json" | "$root/.claude/hooks" | "$root/.claude/hooks/"* | "$root/.ai-toolkit/spoke-run-id" | "$root/.ai-toolkit/claude-settings.json" | "$root/.ai-toolkit/hooks/"* | "${AI_TOOLKIT_DIR:-/nonexistent}" | "${AI_TOOLKIT_DIR:-/nonexistent}/"*) return 0;; esac
   return 1; }
