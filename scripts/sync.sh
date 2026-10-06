@@ -5,7 +5,8 @@
 #   rules/*.md (guidelines too)    -> .claude/rules/ai-toolkit/ (no paths: = always on; paths: = conditional)
 #   rules/on-demand/*.md           -> .ai-toolkit/rules/ (never auto-loaded). The project's own CLAUDE.md is never read, written or backed up.
 #   skills/ agents/ prompts/       -> .claude/{skills,agents,commands}
-#   {scripts,bin} (under v2/ until the cutover), hooks/git, ai-toolkit.env -> .ai-toolkit/   hooks/claude -> .claude/hooks   settings/claude/settings.json -> .claude/settings.json
+#   {scripts,bin}, hooks/{git,claude}, ai-toolkit.env -> .ai-toolkit/   settings/claude/settings.json -> .ai-toolkit/claude-settings.json (bin/claude-spoke passes it with --settings)
+#   The project's .claude/settings.json is never read or written; the hook scripts run from the main checkout's .ai-toolkit/hooks/claude, not from a worktree.
 #   orca.yaml generated (setup/archive run from $ORCA_ROOT_PATH, where a new worktree has no .ai-toolkit)
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -36,7 +37,7 @@ NEW="$(mktemp)"; TMP="$(mktemp)"; PUT_TMP=""
 trap 'rm -f "$NEW" "$TMP" "$PUT_TMP"' EXIT   # PUT_TMP: a put() cut short must not leave its half-written <dst>.new.<pid> behind
 
 # put <src> <dst-rel> [bak]: copy when different (no mtime churn) and record it. bak = a singleton
-# (settings.json, orca.yaml): an existing file this tool never wrote is kept once as <dst>.bak.
+# (orca.yaml): an existing file this tool never wrote is kept once as <dst>.bak.
 # The copy is a rename, never an in-place write: land.sh syncs under a live coordinator loop, and bash reads its script by offset,
 # so a truncate+write would corrupt the next line it reads. A renamed-over file leaves the loop's open inode complete (old code, consistent).
 # The new file takes the destination's mode (cp -p of it, then its content) and a symlinked destination is written through, as an in-place cp did.
@@ -72,7 +73,7 @@ put_md "$SHARED/agents" .claude/agents
 put_md "$SHARED/prompts" .claude/commands
 put_tree "$V2/scripts" .ai-toolkit/scripts otel.sh   # the collector is per-machine: it runs from the toolkit checkout
 put_tree "$V2/bin" .ai-toolkit/bin
-put_tree "$V2/hooks/claude" .claude/hooks   # setup.sh copies .claude/ and .ai-toolkit/rules/ into a new worktree
+put_tree "$V2/hooks/claude" .ai-toolkit/hooks/claude   # a worker runs the main checkout's copy (AI_TOOLKIT_DIR, set by the launcher), not one it could edit
 put_tree "$V2/hooks/git" .ai-toolkit/hooks/git
 # A host project files the toolkit's own defects to the toolkit's repo (UPSTREAM_REPO = its origin as owner/repo); the toolkit itself keeps it empty.
 up=""
@@ -81,8 +82,8 @@ if [ "$TARGET" != "$V2" ]; then
 fi
 sed "s|^UPSTREAM_REPO=.*|UPSTREAM_REPO=$up|" "$V2/settings/ai-toolkit.env" > "$TMP"
 put "$TMP" .ai-toolkit/ai-toolkit.env
-if [ -f "$V2/settings/claude/settings.json" ]; then put "$V2/settings/claude/settings.json" .claude/settings.json bak
-else warn "$V2/settings/claude/settings.json is missing: .claude/settings.json (hooks) not synced"; fi
+if [ -f "$V2/settings/claude/settings.json" ]; then put "$V2/settings/claude/settings.json" .ai-toolkit/claude-settings.json
+else warn "$V2/settings/claude/settings.json is missing: .ai-toolkit/claude-settings.json (hooks) not synced"; fi
 cat > "$TMP" << 'EOF'
 setupAgentStartupPolicy: wait-for-setup
 scripts:
@@ -96,7 +97,7 @@ EOF
 drop() {
   case "$1" in '' | /* | *..*) return 0 ;; esac
   if tracked "$1"; then warn "$1 is tracked in $TARGET, so it stays ($1.bak, if there, is the project's original): git rm it if it is the toolkit's"; return 0; fi
-  if [ "$1" = CLAUDE.md ] && [ -f "$TARGET/CLAUDE.md.bak" ]; then mv -f "$TARGET/CLAUDE.md.bak" "$TARGET/CLAUDE.md"; return 0; fi   # an earlier sync replaced the project's own
+  case "$1" in CLAUDE.md | .claude/settings.json) if [ -f "$TARGET/$1.bak" ]; then mv -f "$TARGET/$1.bak" "$TARGET/$1"; return 0; fi ;; esac   # an earlier sync replaced the project's own
   rm -f "$TARGET/$1"
   (cd "$TARGET" && rmdir -p "$(dirname "$1")" 2> /dev/null) || true
 }

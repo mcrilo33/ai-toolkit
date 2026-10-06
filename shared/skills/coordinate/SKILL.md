@@ -16,6 +16,8 @@ This session never binds the Run, `check`s or reads the inbox, never writes task
 
 Main checkout on the base branch, inside an Orca terminal, `orca status` ready, `gh auth status` green.
 
+This session has the toolkit guards: `[ -f "${AI_TOOLKIT_DIR:-/nonexistent}/claude-settings.json" ]` in Bash (`bin/claude-spoke` exports `AI_TOOLKIT_DIR`). If not, say plainly "no toolkit guards in this session: it was not started through bin/claude-spoke", give the fix (Orca > Settings > Agents > Claude command = `<toolkit>/bin/claude-spoke`, then restart this session) and stop.
+
 ## Start
 
 ```bash

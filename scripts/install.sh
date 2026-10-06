@@ -32,4 +32,4 @@ else
   warn "not in a git repository: run install.sh <repo> to wire its native git hooks"
 fi
 echo "ok. Dispatch launches spokes through $here/bin/claude-spoke (terminal create --command)."
-echo "Optional, to verify in WP1: Orca > Settings > Agents > Claude command = $here/bin/claude-spoke"
+echo "For every session of your own to have the toolkit guards (a synced project's hooks), set Orca > Settings > Agents > Claude command = $here/bin/claude-spoke: one path for all projects, plain claude in an unsynced one. A session not started through it has no guards."

@@ -1,23 +1,24 @@
 {
+  "disableAllHooks": false,
   "hooks": {
     "PreToolUse": [
       {
         "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/push-guard.sh\"" }]
+        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/push-guard.sh\"" }]
       },
       {
         "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|AskUserQuestion",
-        "hooks": [{ "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/danger-guard.sh\"" }]
+        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/danger-guard.sh\"" }]
       },
       {
         "matcher": "Write|Edit|MultiEdit|NotebookEdit",
-        "hooks": [{ "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/secrets-scan.sh\"" }]
+        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/secrets-scan.sh\"" }]
       }
     ],
     "PermissionRequest": [
       {
         "matcher": "*",
-        "hooks": [{ "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/permission-relay.sh\"", "timeout": 600 }]
+        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/permission-relay.sh\"", "timeout": 600 }]
       }
     ]
   }

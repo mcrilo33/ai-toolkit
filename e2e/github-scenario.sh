@@ -38,11 +38,11 @@ coord="$(orca_json terminal create --worktree "path:$G" --title coordinator --co
 wait_for 90 grep -q ' coordinator: run run_' "$E/coord.log" 2> /dev/null || fail "the coordinator did not start"
 run="$(sed -n 's/.* coordinator: run \(run_[0-9a-f]*\).*/\1/p' "$E/coord.log" | head -n 1)"
 if [ -n "$A" ]; then
-  step=4; say "issue #$A: worktree linked in-progress, setup ran (.claude/hooks, spoke-run-id, task.md), agent working"
+  step=4; say "issue #$A: worktree linked in-progress, setup ran (.claude/, spoke-run-id, task.md), agent working"
   has_wt() { wt="$(orca_json worktree show --worktree "issue:$A" 2> /dev/null | jq -r '.result.worktree.path // empty')"; [ -n "$wt" ]; }
   wait_for 300 has_wt || fail "no worktree for issue $A within 5 min"
   wait_for 120 test -f "$wt/.ai-toolkit/setup-done" || fail "setup did not finish (Orca runs the TRACKED orca.yaml of the new worktree)"
-  { [ -d "$wt/.claude/hooks" ] && [ -s "$wt/.ai-toolkit/spoke-run-id" ] && grep -q "#$A" "$wt/.ai-toolkit/task.md"; } || fail "worktree not provisioned"
+  { [ -d "$wt/.claude/skills" ] && [ -s "$wt/.ai-toolkit/spoke-run-id" ] && grep -q "#$A" "$wt/.ai-toolkit/task.md"; } || fail "worktree not provisioned"
   br="$(git -C "$wt" branch --show-current)"; sid="$(cat "$wt/.ai-toolkit/spoke-run-id")"
   working() { orca_json worktree ps | jq -e --arg p "$wt" '[.. | objects | select(.path? == $p) | .agents[]? | select(.state == "working" or .state == "waiting")] | length > 0' > /dev/null; }
   wait_for 180 working || fail "the agent never showed up in worktree ps"
