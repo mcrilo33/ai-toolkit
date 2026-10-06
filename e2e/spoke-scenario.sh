@@ -66,7 +66,7 @@ fi
 mkdir -p "$S/.ai-toolkit/bin" "$S/.ai-toolkit/scripts" "$S/.claude/hooks"   # the layout sync.sh will produce (06 section 6)
 cp "$V2"/scripts/*.sh "$S/.ai-toolkit/scripts/"; cp "$V2/bin/claude-spoke" "$S/.ai-toolkit/bin/"
 cp "$V2/settings/ai-toolkit.env" "$S/.ai-toolkit/ai-toolkit.env"
-echo '{}' > "$S/.ai-toolkit/claude-settings.json"   # a worker starts through the launcher only in a project that has the toolkit's guards file
+echo '{"disableAllHooks":false,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"true"}]}]}}' > "$S/.ai-toolkit/claude-settings.json"   # a worker starts through the launcher only in a project that has the toolkit's guards file
 echo '#!/bin/sh' > "$S/.claude/hooks/guard.sh"
 mkdir -p "$S/.claude/agents" "$S/.ai-toolkit/rules"   # what sync.sh will ship: the review agent and the answering rule
 SH="$V2/shared"; [ -d "$SH" ] || SH="$V2/../shared"   # shared/ sits beside v2/ until the cutover, inside the root after it

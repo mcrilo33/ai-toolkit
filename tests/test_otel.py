@@ -112,7 +112,7 @@ def test_compose_mounts_the_config_readonly_and_forwards_secrets_without_values(
 def test_the_shim_exports_to_the_collectors_receiver_ports(run, stubs, repo):
     wt = repo.wt("wp5")
     (repo.root / ".ai-toolkit").mkdir()
-    (repo.root / ".ai-toolkit/claude-settings.json").write_text("{}\n")   # a worker starts only in a synced project
+    (repo.root / ".ai-toolkit/claude-settings.json").write_text('{"disableAllHooks": false, "hooks": {"PreToolUse": [{}]}}\n')   # a worker starts only in a synced project
     (wt / ".ai-toolkit").mkdir()
     (wt / ".ai-toolkit/spoke-run-id").write_text("rid\n")
     assert run([str(V2 / "bin/claude-spoke")], cwd=wt).returncode == 0
