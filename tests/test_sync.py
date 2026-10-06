@@ -79,13 +79,14 @@ def test_layout_in_target(sync, target):
     assert (target / ".claude" / "skills" / "land" / "references" / "r.md").is_file()
     assert (target / ".claude" / "agents" / "debug.md").is_file()
     assert (target / ".claude" / "commands" / "commit-msg.md").is_file()
-    assert (target / ".claude" / "settings.json").read_text() == '{"hooks": {}}\n'
+    assert (target / ".ai-toolkit" / "claude-settings.json").read_text() == '{"hooks": {}}\n'   # the toolkit's own registrations; the project's .claude/settings.json is never written
+    assert not (target / ".claude" / "settings.json").exists()
     for p in ("scripts/sync.sh", "scripts/lib.sh", "bin/claude-spoke", "hooks/git/commit-msg", "ai-toolkit.env"):
         assert (target / ".ai-toolkit" / p).is_file(), p
-    # Claude hooks ship under .claude/ (setup.sh copies only .claude/ into a new worktree); modes survive the copy
-    assert os.access(target / ".claude" / "hooks" / "guard.sh", os.X_OK)
+    # the hook scripts are the toolkit's, not the project's .claude/: a worker runs the main checkout's copy; modes survive the copy
+    assert os.access(target / ".ai-toolkit" / "hooks" / "claude" / "guard.sh", os.X_OK)
     assert os.access(target / ".ai-toolkit" / "hooks" / "git" / "commit-msg", os.X_OK)
-    assert not (target / ".ai-toolkit" / "hooks" / "claude").exists()
+    assert not (target / ".claude" / "hooks").exists()
     assert not list(target.rglob("__pycache__")) and not list(target.rglob(".DS_Store"))
     assert not (target / ".claude" / "prompts").exists() and not (target / ".cursor").exists()
 
@@ -102,7 +103,7 @@ def test_manifest_is_sorted_relative_and_excludes_itself(sync, target):
     sync()
     m = manifest(target)
     assert m == sorted(set(m))
-    assert {".claude/rules/ai-toolkit/guidelines.md", "orca.yaml", ".claude/settings.json", ".claude/skills/land/SKILL.md"} <= set(m) and "CLAUDE.md" not in m
+    assert {".claude/rules/ai-toolkit/guidelines.md", "orca.yaml", ".ai-toolkit/claude-settings.json", ".claude/skills/land/SKILL.md"} <= set(m) and "CLAUDE.md" not in m
     assert ".ai-toolkit/sync-manifest" not in m and all(not p.startswith("/") for p in m)
 
 
@@ -133,13 +134,13 @@ def test_a_rewrite_keeps_the_destinations_mode_and_writes_through_a_symlink(sync
     rule = target / ".claude" / "rules" / "ai-toolkit" / "guidelines.md"
     rule.chmod(0o640)   # the source is a 0600 temp file: the existing mode must survive an update
     real = write(tmp_path / "elsewhere.json", "{}\n")
-    (target / ".claude" / "settings.json").unlink()
-    (target / ".claude" / "settings.json").symlink_to(real)
+    (target / ".ai-toolkit" / "claude-settings.json").unlink()
+    (target / ".ai-toolkit" / "claude-settings.json").symlink_to(real)
     write(src / "shared" / "rules" / "guidelines.md", "---\ndescription: g\n---\n# Changed\n")
     write(src / "v2" / "settings" / "claude" / "settings.json", '{"hooks": {"x": 1}}\n')
     sync()
     assert rule.read_text() == "---\ndescription: g\n---\n# Changed\n" and rule.stat().st_mode & 0o777 == 0o640
-    assert (target / ".claude" / "settings.json").is_symlink() and real.read_text() == '{"hooks": {"x": 1}}\n'
+    assert (target / ".ai-toolkit" / "claude-settings.json").is_symlink() and real.read_text() == '{"hooks": {"x": 1}}\n'
 
 
 def test_gc_removes_what_a_previous_sync_wrote_and_nothing_else(sync, src, target):
@@ -170,7 +171,7 @@ def test_every_sync_excludes_what_it_wrote_under_claude_and_only_local_only_also
     sync("--local-only")
     ex = exclude(target)
     assert ex.count("# >>> ai-toolkit sync") == 1 and ex.startswith("mine\n")
-    assert {"/.ai-toolkit/", "/.claude/settings.json", "/.claude/rules/ai-toolkit/security.md", "/orca.yaml"} <= set(ex.splitlines())
+    assert {"/.ai-toolkit/", "/.claude/skills/land/SKILL.md", "/.claude/rules/ai-toolkit/security.md", "/orca.yaml"} <= set(ex.splitlines())
     sync()
     lines = exclude(target).splitlines()   # a normal run keeps the .claude/ paths it wrote, one by one (never the whole folder), and drops orca.yaml
     assert {"/.ai-toolkit/", "/.claude/skills/land/SKILL.md", "mine"} <= set(lines) and not {"/.claude/", "/CLAUDE.md", "/orca.yaml"} & set(lines)
@@ -205,23 +206,20 @@ def test_a_host_records_the_toolkits_origin_as_upstream_and_the_toolkit_itself_s
     assert r.returncode == 0 and r.stderr.count("UPSTREAM_REPO") == 1 and value() == ["UPSTREAM_REPO="]
 
 
-def test_unmanaged_singletons_are_backed_up_once_then_owned(sync, target):
-    write(target / ".claude" / "settings.json", "hand written\n")
+def test_an_unmanaged_orca_yaml_is_backed_up_once_then_owned(sync, target):
     write(target / "orca.yaml", "scripts: {}\n")
     sync()
-    assert (target / ".claude" / "settings.json.bak").read_text() == "hand written\n"
-    assert (target / "orca.yaml.bak").read_text() == "scripts: {}\n"
-    assert (target / ".claude" / "settings.json").read_text() == '{"hooks": {}}\n'
-    (target / ".claude" / "settings.json").write_text("edited after sync\n")
+    assert (target / "orca.yaml.bak").read_text() == "scripts: {}\n" and (target / "orca.yaml").read_text().startswith("setupAgentStartupPolicy")
+    (target / "orca.yaml").write_text("edited after sync\n")
     sync()  # now managed: overwritten again, the original backup is kept
-    assert (target / ".claude" / "settings.json.bak").read_text() == "hand written\n"
+    assert (target / "orca.yaml.bak").read_text() == "scripts: {}\n" and (target / "orca.yaml").read_text().startswith("setupAgentStartupPolicy")
 
 
 def test_missing_settings_json_warns_but_syncs(sync, src, target):
     (src / "v2" / "settings" / "claude" / "settings.json").unlink()
     r = sync()
     assert r.returncode == 0 and "settings.json" in r.stderr
-    assert not (target / ".claude" / "settings.json").exists() and (target / "orca.yaml").exists()
+    assert not (target / ".ai-toolkit" / "claude-settings.json").exists() and (target / "orca.yaml").exists()
 
 
 def test_refuses_a_target_that_is_not_a_git_repo(sync, tmp_path):
@@ -257,9 +255,9 @@ def test_migrate_v1_removes_what_the_v1_manifest_listed_and_nothing_else(sync, t
     assert sync("--migrate-v1").returncode == 0
     assert not (target / ".cursor" / "rules").exists() and not (target / ".github").exists()
     assert not (target / ".claude" / "hooks" / "scripts").exists() and not (target / ".ai-toolkit-manifest.json").exists()
-    assert (target / ".claude" / "hooks" / "guard.sh").is_file()  # the v2 hook outlives the GC of v1 hooks
+    assert (target / ".ai-toolkit" / "hooks" / "claude" / "guard.sh").is_file()  # the v2 hook outlives the GC of v1 hooks
     assert (target / ".cursor" / "mine.json").read_text() == "user" and victim.read_text() == "keep"
-    assert (target / ".claude" / "settings.json").is_file()  # the v2 output survives the GC
+    assert (target / ".ai-toolkit" / "claude-settings.json").is_file()  # the v2 output survives the GC
 
 
 def test_otel_sh_stays_in_the_toolkit_checkout(sync, src, target):
@@ -274,35 +272,40 @@ def test_otel_sh_stays_in_the_toolkit_checkout(sync, src, target):
 
 
 def test_a_hosts_own_files_are_never_touched(sync, target):
-    own = {"CLAUDE.md": "the project's\n", ".claude/rules/security.md": "its own security\n", ".claude/agents/debug.md": "its own agent\n"}
+    own = {"CLAUDE.md": "the project's\n", ".claude/rules/security.md": "its own security\n", ".claude/agents/debug.md": "its own agent\n",
+           ".claude/settings.json": '{"hooks": {"mine": 1}}\n', ".claude/hooks/mine.sh": "#!/bin/sh\n"}
     for rel, text in own.items():
         write(target / rel, text)
-    git(target, "add", "-f", ".claude/agents/debug.md")   # a .claude/ file the project tracks itself
+    git(target, "add", "-f", ".claude/agents/debug.md", ".claude/settings.json")   # .claude/ files the project tracks itself
     r = sync()
     assert r.returncode == 0 and ".claude/agents/debug.md is tracked" in r.stderr
     assert {rel: (target / rel).read_text() for rel in own} == own and not list(target.rglob("*.bak"))   # byte for byte, no backup of what the sync never writes
     assert ".claude/agents/debug.md" not in manifest(target) and "/.claude/agents/debug.md" not in exclude(target).splitlines()
-    assert (target / ".claude" / "rules" / "ai-toolkit" / "security.md").is_file()
+    assert (target / ".claude" / "rules" / "ai-toolkit" / "security.md").is_file() and (target / ".ai-toolkit" / "claude-settings.json").is_file()
 
 
 @pytest.mark.parametrize("state", ["written", "with-bak", "not-the-syncs", "tracked"])
 def test_a_host_synced_the_old_way_is_cleaned_up_from_its_manifest_only(sync, target, state):
     sync()
-    write(target / ".claude" / "rules" / "security.md", "old flat\n")
-    write(target / "CLAUDE.md", "mine\n" if state == "not-the-syncs" else "generated\n")
-    if state == "with-bak":
-        write(target / "CLAUDE.md.bak", "the project's\n")
+    own = ["CLAUDE.md", ".claude/settings.json"]   # the project's files the old sync took over (each kept as <file>.bak when it existed)
+    old = {".claude/rules/security.md": "old flat\n", ".claude/hooks/guard.sh": "old hook\n"}   # toolkit files the old layout wrote
+    for rel in own:
+        write(target / rel, "mine\n" if state == "not-the-syncs" else "generated\n")
+        if state == "with-bak":
+            write(target / f"{rel}.bak", "the project's\n")
+    for rel, text in old.items():
+        write(target / rel, text)
     with (target / ".ai-toolkit" / "sync-manifest").open("a") as f:   # what the old sync recorded
-        f.write(".claude/rules/security.md\n" + ("" if state == "not-the-syncs" else "CLAUDE.md\n"))
+        f.write("".join(f"{rel}\n" for rel in [*old, *([] if state == "not-the-syncs" else own)]))
     if state == "tracked":
-        git(target, "add", "-f", "CLAUDE.md", ".claude/rules/security.md", ".claude/skills/land/SKILL.md")   # the last one is a toolkit file the project committed
+        git(target, "add", "-f", *own, *old, ".claude/skills/land/SKILL.md")   # the last one is a toolkit file the project committed
     r = sync()
-    claude = target / "CLAUDE.md"
-    assert r.returncode == 0 and not (target / "CLAUDE.md.bak").exists()
+    assert r.returncode == 0 and not list(target.rglob("*.bak"))   # a .bak is restored over its file, never left behind
     if state == "tracked":   # the host's history is the human's: reported, never rewritten, no deletion committed
-        assert claude.read_text() == "generated\n" and (target / ".claude" / "rules" / "security.md").exists()
-        assert "CLAUDE.md is tracked" in r.stderr and "rules/security.md is tracked" in r.stderr and "CLAUDE.md.bak" in r.stderr
+        assert all((target / rel).read_text() == "generated\n" and f"{rel} is tracked" in r.stderr for rel in own)
+        assert all((target / rel).exists() and f"{rel} is tracked" in r.stderr for rel in old) and "CLAUDE.md.bak" in r.stderr
         assert r.stderr.count("land/SKILL.md is tracked") == 1   # one report per file, not one from the write and one from the clean-up
         return
-    assert not (target / ".claude" / "rules" / "security.md").exists()
-    assert {"written": None, "with-bak": "the project's\n", "not-the-syncs": "mine\n"}[state] == (claude.read_text() if claude.exists() else None)
+    assert not any((target / rel).exists() for rel in old)
+    want = {"written": None, "with-bak": "the project's\n", "not-the-syncs": "mine\n"}[state]
+    assert [(target / rel).read_text() if (target / rel).exists() else None for rel in own] == [want, want]

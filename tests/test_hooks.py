@@ -31,8 +31,8 @@ def build(base):
     (base / "1-x/.ai-toolkit/spoke-run-id").write_text("rid\n")
     for d in ("home", "scratch"):
         (base / d).mkdir()
-    return {"root": root, "wt": base / "2-y", "spoke": base / "1-x", "home": base / "home",
-            "env": {"HOME": str(base / "home"), "TMPDIR": str(base / "scratch"), **GIT_ENV}}
+    return {"root": root, "wt": base / "2-y", "spoke": base / "1-x", "home": base / "home", "tk": base / "tk",   # tk: the main checkout's .ai-toolkit, outside every worktree
+            "env": {"HOME": str(base / "home"), "TMPDIR": str(base / "scratch"), "AI_TOOLKIT_DIR": str(base / "tk"), **GIT_ENV}}
 
 
 @pytest.fixture(autouse=True)
@@ -60,12 +60,11 @@ def judge(monkeypatch, tmp_path, link_script, shared):
         places, home, env = {**shared, "spoke": tmp_path / f"w{k}{sub}"}, tmp_path / f"home{k}", dict(env or {})
         home.mkdir()
         (tmp_path / "f").touch()
-        if where == "spoke":
-            install_relay(places["spoke"], how)
+        launched = install_relay(places["spoke"], how, tmp_path / f"tk{k}") if where == "spoke" else {}
         if env.pop("LINKLOG", None):
             (home / ".ai-toolkit").mkdir()
             (home / ".ai-toolkit/judge-cleared.log").symlink_to(tmp_path / "f")
-        env = {**shared["env"], "HOME": str(home), "JUDGE_ARGS": str(tmp_path / f"jargs{k}"), "JUDGE_REPLY": reply,
+        env = {**shared["env"], **launched, "HOME": str(home), "JUDGE_ARGS": str(tmp_path / f"jargs{k}"), "JUDGE_REPLY": reply,
                **{a: str(v).replace("{file}", str(tmp_path / "f")) for a, v in env.items()}}
         raw = json.dumps({"tool_name": tool, "cwd": str(places[where]), "session_id": "sess-123", "tool_input": ti})
         r = call("danger-guard.sh", places[where], tool, raw=raw, env=env)
@@ -177,6 +176,9 @@ WRITE_DENY = [
     "chmod -x .claude/hooks/push-guard.sh", "echo > {spoke}/.claude/hooks/x.sh", "cd x && echo y > orca.yaml",
     "cd .github/workflows && echo x > ci.yml", "python3 - <<EOF\nopen('orca.yaml','w')\nEOF", "cat y > .GITHUB/Workflows/ci.yml",
     "echo x > ORCA.YAML",
+    # the toolkit's registrations and hook scripts: the worktree-relative spellings and the main checkout's copy a worker's session actually runs
+    "rm .ai-toolkit/claude-settings.json", "echo x > $PWD/.ai-toolkit/claude-settings.json", "tee ./.ai-toolkit/claude-settings.json", "rm -rf .ai-toolkit/hooks",
+    "echo x > {tk}/claude-settings.json", "rm {tk}/hooks/claude/push-guard.sh", "cp x {tk}/hooks/claude/danger-guard.sh",
 ]
 WRITE_ALLOW = [
     "touch sub/orca.yaml", "echo x > v2/orca.yaml", "cp a docs/.github/workflows/x.yml", "rm -rf .claude/cache", "ls .claude",
@@ -185,7 +187,7 @@ WRITE_ALLOW = [
     "cat orca.yaml", "git add orca.yaml .github/workflows/ci.yml", "ls .github/workflows", "cat .claude/settings.json",
     "grep -n hooks .claude/settings.json", "echo hi > out.txt", "cat orca.yaml > /dev/null", "cat orca.yaml > out.txt",
     "cat .github/workflows/ci.yml 2>&1 | head", "git diff -- orca.yaml", "sed -n 1,5p orca.yaml",
-    "git commit -m 'update orca.yaml'", "echo x > .claude/rules/a.md",
+    "git commit -m 'update orca.yaml'", "echo x > .claude/rules/a.md", "cat {tk}/claude-settings.json", "grep -n hooks .ai-toolkit/claude-settings.json", "ls {tk}/hooks/claude",
 ]
 
 
@@ -228,6 +230,7 @@ def test_danger_guard_reset_hard_asks_only_in_the_main_checkout(shared, where, c
     ("Write", "file_path", ".claude/settings.json"), ("Edit", "file_path", ".claude/settings.local.json"),
     ("Write", "file_path", ".claude/hooks/push-guard.sh"), ("Write", "file_path", ".claude/hooks"),
     ("Write", "file_path", ".ai-toolkit/spoke-run-id"), ("Write", "file_path", "./orca.yaml"),
+    ("Write", "file_path", "{tk}/claude-settings.json"), ("Edit", "file_path", "{tk}/hooks/claude/push-guard.sh"), ("Write", "file_path", ".ai-toolkit/claude-settings.json"),
 ])
 def test_danger_guard_denies_protected_file_writes(shared, tool, key, path):
     check("danger-guard.sh", shared, "spoke", 2, tool=tool, **{key: path})
@@ -241,15 +244,15 @@ def test_danger_guard_allows_ordinary_file_writes(shared, path):
 def test_spoke_only_protections_do_not_bind_the_human_session(shared, tmp_path):
     def dg(where, want, tool="Write", **ti):
         check("danger-guard.sh", shared, where, want, tool=tool, **ti)
-    for p in (".claude/settings.json", ".claude/hooks/x.sh", ".claude/settings.local.json"):
+    for p in (".claude/settings.json", ".claude/hooks/x.sh", ".claude/settings.local.json", ".ai-toolkit/claude-settings.json", ".ai-toolkit/hooks/claude/x.sh"):
         dg("root", 0, file_path=p)
     dg("root", 0, "Bash", command="echo > .claude/settings.json")
     dg("root", 0, "Bash", command="rm -rf .claude")
     dg("root", 0, "AskUserQuestion", questions="[]")
     dg("wt", 0, "AskUserQuestion", questions="[]")
     dg("spoke", 2, "AskUserQuestion", questions="[]")
-    install_relay(tmp_path / "w", "installed")  # not a permission, so never an ask: denied in a worker even when someone could answer
-    r = call("danger-guard.sh", tmp_path / "w", "AskUserQuestion", env=shared["env"], questions="[]")
+    env = install_relay(tmp_path / "w", "installed", tmp_path / "tk")  # not a permission, so never an ask: denied in a worker even when someone could answer
+    r = call("danger-guard.sh", tmp_path / "w", "AskUserQuestion", env={**shared["env"], **env}, questions="[]")
     assert r.returncode == 2 and r.stdout == "" and "AskUserQuestion is off in a spoke" in r.stderr
 
 
@@ -263,6 +266,7 @@ WF_SCENARIOS = {
     "worker-whose-settings-lack-the-relay": ("spoke", "unregistered", False),
     "worker-without-the-relay-file": ("spoke", "nofile", False),
     "worker-without-any-claude-dir": ("spoke", "bare", False),
+    "worker-not-started-by-the-launcher": ("spoke", "unlaunched", False),   # relay file and registration exist, but no AI_TOOLKIT_DIR: nobody can answer
 }
 W = "worker-only"  # first element of a lane's names: the operation is sensitive in a worker only
 D = "hard-deny"  # a lane's name: denied in every scenario, never asked (the human's reply spool: an approved write would forge the human's reply)
@@ -284,6 +288,9 @@ WF_LANES = [
     ("Edit", {"file_path": ".claude/settings.local.json"}, (W, ".claude/settings.local.json")),
     ("Write", {"file_path": ".claude/hooks/push-guard.sh"}, (W, ".claude/hooks/push-guard.sh")),
     ("Write", {"file_path": ".ai-toolkit/spoke-run-id"}, (W, ".ai-toolkit/spoke-run-id")),
+    ("Write", {"file_path": "{tk}/claude-settings.json"}, (W, "claude-settings.json")), ("Edit", {"file_path": "{tk}/hooks/claude/push-guard.sh"}, (W, "push-guard.sh")),
+    ("Bash", {"command": "rm .ai-toolkit/claude-settings.json"}, (W, "rm .ai-toolkit/claude-settings.json")),
+    ("Bash", {"command": "echo x > {tk}/hooks/claude/danger-guard.sh"}, (W, "danger-guard.sh")),
     ("Bash", {"command": "rm .claude/settings.local.json"}, (W, "rm .claude/settings.local.json")),
     # the coordinator's reply spool: a worker writing there would answer its own gate or permission question as the human
     ("Write", {"file_path": "{home}/.ai-toolkit/coordinator/run_t/replies/msg_p"}, (W, D)),
@@ -306,16 +313,18 @@ WF_LANES = [
 ]
 
 
-def install_relay(spoke, how):
-    """A worker dir as sync leaves it: the marker, and per `how` the relay file and its registration in .claude/settings.json."""
+def install_relay(spoke, how, tk):
+    """A worker as the launcher leaves it: the marker in its worktree, and in the main checkout's .ai-toolkit (tk) per `how` the relay script and its
+    registration in claude-settings.json. Returns the env its hooks run with: AI_TOOLKIT_DIR, empty when the session was not started by the launcher."""
     (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
     (spoke / ".ai-toolkit/spoke-run-id").write_text("rid\n")
     if how != "bare":
-        (spoke / ".claude/hooks").mkdir(parents=True, exist_ok=True)
-        (spoke / ".claude/settings.json").write_text(json.dumps({"hooks": {"PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": (
-            'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/permission-relay.sh"' if how != "unregistered" else "true")}]}]}}))
-    if how in ("installed", "unregistered"):
-        (spoke / ".claude/hooks/permission-relay.sh").write_text("#!/bin/bash\n")
+        (tk / "hooks/claude").mkdir(parents=True, exist_ok=True)
+        (tk / "claude-settings.json").write_text(json.dumps({"hooks": {"PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": (
+            'bash "$AI_TOOLKIT_DIR/hooks/claude/permission-relay.sh"' if how != "unregistered" else "true")}]}]}}))
+    if how in ("installed", "unregistered", "unlaunched"):
+        (tk / "hooks/claude/permission-relay.sh").write_text("#!/bin/bash\n")
+    return {"AI_TOOLKIT_DIR": "" if how == "unlaunched" else str(tk)}
 
 
 # every lane is proven once, on the ask path (a worker with the relay installed); each other scenario is proven on one file lane and one Bash lane
@@ -333,12 +342,11 @@ def test_danger_guard_sensitive_operations_ask_only_where_the_prompt_reaches_som
         named = named[1:]
     if named[0] == D:
         asks, named = False, ()
-    places = {**shared, "spoke": tmp_path / "w"}
-    if where == "spoke":
-        install_relay(places["spoke"], how)
-    sub = lambda v: v.replace("{spoke}", str(places[where])).replace("{home}", str(shared["home"])).replace("{root}", str(shared["root"])).replace("{other}", str(shared["spoke"]))  # noqa: E731
+    places = {**shared, "spoke": tmp_path / "w", "tk": tmp_path / "tk"}
+    launched = install_relay(places["spoke"], how, places["tk"]) if where == "spoke" else {}
+    sub = lambda v: v.replace("{tk}", str(places["tk"])).replace("{spoke}", str(places[where])).replace("{home}", str(shared["home"])).replace("{root}", str(shared["root"])).replace("{other}", str(shared["spoke"]))  # noqa: E731
     ti, named = {k: sub(v) for k, v in ti.items()}, [sub(n) for n in named]
-    r = call("danger-guard.sh", places[where], tool, env=shared["env"], **ti)
+    r = call("danger-guard.sh", places[where], tool, env={**shared["env"], **launched}, **ti)
     if asks:
         out = json.loads(r.stdout)["hookSpecificOutput"]  # one object: a compound asks once
         assert (r.returncode, out["hookEventName"], out["permissionDecision"], r.stderr) == (0, "PreToolUse", "ask", "")
@@ -547,8 +555,8 @@ WF = {"file_path": ".github/workflows/ci.yml", "content": "x"}
 
 def record_reason(shared, relay, why=None, epoch=None):
     """Have danger-guard record its ask for WF in the worker (relay installed), optionally rewriting the stored why / epoch; returns nothing, the relay reads it."""
-    install_relay(relay.dir, "installed")
-    env = {**shared["env"], "PATH": f"{relay.shim}:{os.environ['PATH']}", "CLAUDE_PROJECT_DIR": str(relay.dir)}
+    launched = install_relay(relay.dir, "installed", relay.tmp / "tk")
+    env = {**shared["env"], **launched, "PATH": f"{relay.shim}:{os.environ['PATH']}", "CLAUDE_PROJECT_DIR": str(relay.dir)}
     g = call("danger-guard.sh", relay.dir, "Write", env=env, **WF)  # in a worker with the relay installed it asks and records why
     assert json.loads(g.stdout)["hookSpecificOutput"]["permissionDecision"] == "ask"
     for f in (relay.dir / ".ai-toolkit/ask-reasons").iterdir():
@@ -641,21 +649,23 @@ def test_unparseable_payload_or_missing_jq_is_a_deny(shared, tmp_path, script):
 def test_settings_register_the_hooks_at_the_synced_path(shared, tmp_path):
     cfg = json.loads((V2 / "settings/claude/settings.json").read_text())
     assert "permissions" not in cfg and set(cfg["hooks"]) == {"PreToolUse", "PermissionRequest"}  # no auto-allow, no TDD/plan hooks (D2/D8)
-    shutil.copytree(CLAUDE, tmp_path / "proj/.claude/hooks")  # what sync (WP4) puts in a target
-    (tmp_path / "proj/.ai-toolkit").mkdir()  # a worker whose settings do not register the relay: nobody can answer an ask, so danger-guard denies
-    (tmp_path / "proj/.ai-toolkit/spoke-run-id").write_text("rid\n")
+    assert cfg["disableAllHooks"] is False  # the --settings scope outranks a project's settings.local.json: without this key a project could switch every guard off
+    tk = tmp_path / "proj/.ai-toolkit"
+    shutil.copytree(CLAUDE, tk / "hooks/claude")  # what sync puts in a target, run from the main checkout's copy: a worker cannot edit the guards that judge it
+    (tmp_path / "wt/.ai-toolkit").mkdir(parents=True)  # a worker whose settings do not register the relay: nobody can answer an ask, so danger-guard denies
+    (tmp_path / "wt/.ai-toolkit/spoke-run-id").write_text("rid\n")
     seen = {}
     for e in cfg["hooks"]["PreToolUse"]:
         cmd = e["hooks"][0]["command"]
         script = cmd.split("/")[-1].rstrip('"')
         seen[script] = e["matcher"].split("|")
         tool, ti = ("Bash", {"command": "git push --force"}) if script == "push-guard.sh" else ("Write", {"file_path": "orca.yaml", "content": AWS})
-        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, env={**os.environ, "CLAUDE_PROJECT_DIR": str(tmp_path / "proj")},
-                           input=json.dumps({"tool_name": tool, "cwd": str(tmp_path / "proj"), "tool_input": ti}))
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, env={**os.environ, "CLAUDE_PROJECT_DIR": str(tmp_path / "wt"), "AI_TOOLKIT_DIR": str(tk)},
+                           input=json.dumps({"tool_name": tool, "cwd": str(tmp_path / "wt"), "tool_input": ti}))
         assert r.returncode == 2 and script.removesuffix(".sh") in r.stderr, (cmd, r.stderr)
     assert seen["push-guard.sh"] == ["Bash"] and "AskUserQuestion" in seen["danger-guard.sh"] and "Bash" not in seen["secrets-scan.sh"]
     (rel,) = cfg["hooks"]["PermissionRequest"]  # every tool-permission dialog, whatever raised it; the hook timeout outlasts the relay's own kill timer (570 s)
-    assert rel["matcher"] == "*" and rel["hooks"][0]["command"] == 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/permission-relay.sh"' and rel["hooks"][0]["timeout"] == 600
+    assert rel["matcher"] == "*" and rel["hooks"][0]["command"] == 'bash "$AI_TOOLKIT_DIR/hooks/claude/permission-relay.sh"' and rel["hooks"][0]["timeout"] == 600
 
 
 # --- native git hooks ---------------------------------------------------------------------------

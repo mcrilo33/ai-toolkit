@@ -28,7 +28,8 @@ def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
     "orca terminal create", "--answer attended", "--bell-tty", "ps -o tty= -p $PPID", "coordinator.sh --status", "--reply <message-id> approve", "'approve with: ", "'revise: ", "--dispatch <n>",
     "one decision at a time", "never binds the Run", "Never show a heartbeat", "/coordinate auto", "--answer auto", "--until HH:MM", "--drain", "/coordinate attended", "coordinator.sh --stop --run",
     "land.sh --review", "blocked", "hold", "PERMISSION REQUEST", "allow", "deny", "COORD_IDLE_MIN", "orca orchestration worker-show --dispatch", "observation.agentWait", "orca terminal read",
-    "orca orchestration run-list", "afk-answering", "Scope:", "git log --since", "worker-list"])
+    "orca orchestration run-list", "afk-answering", "Scope:", "git log --since", "worker-list",
+    "AI_TOOLKIT_DIR", "no toolkit guards", "bin/claude-spoke"])   # the guards precondition: a session not started through the launcher says so
 def test_the_skill_covers_each_mechanic_of_the_brief(needle):
     assert needle in SKILL
 
