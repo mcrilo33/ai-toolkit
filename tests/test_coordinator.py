@@ -571,6 +571,11 @@ def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply
 
 def queued(C, *, held=True):   # three open questions (the newer first, as Orca lists them) and a blocked issue; one parked on purpose with the hold label
     rows = [{**msg("question", i), "run_id": "run_t", "thread_id": i, "sequence": n} for i, n in (("msg_c", 9), ("msg_b", 7), ("msg_a", 5))]
+    ago = lambda m: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - m * 60))  # noqa: E731
+    perm = "PERMISSION REQUEST (not a plan gate)"   # kept: a fresh permission request, an old PLAN gate (live worker); left out: a permission request past the relay's 9 minutes, a question of an ended dispatch
+    rows += [{**msg("question", i, **kw), "run_id": "run_t", "thread_id": i, "sequence": n, "created_at": ago(m)} for i, n, m, kw in (
+        ("msg_fresh", 11, 2, dict(question=perm)), ("msg_oldplan", 12, 600, dict(question="PLAN?")),
+        ("msg_stale", 13, 10, dict(question=perm)), ("msg_ended", 14, 1, dict(dispatchId="ctx_9", question="PLAN?")))]
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
     issues = [{"number": 4, "title": "t4\x1b[2Kx", "labels": [{"name": "blocked"}]}] + ([{"number": 5, "title": "t5", "labels": [{"name": "blocked"}, {"name": "hold"}]}] if held else [])
     C.stubs.reply("gh.issue_list", json.dumps(issues))
@@ -649,6 +654,9 @@ def test_status_lists_the_queue_in_the_order_to_present_it_and_the_dispatch_requ
     assert [out.index(x) for x in ("msg_a", "msg_b", "blocked #4")] == sorted(out.index(x) for x in ("msg_a", "msg_b", "blocked #4"))   # waiting workers oldest first, then blocked issues
     assert "t4[2Kx" in out and "review still rejects after 2 rounds" in out and "#5" not in out and "a later note" not in out   # hold parks one on purpose; the reason is the loop's own last blocked: comment
     assert "pay me" not in out and "\x1b" not in out and "reply: allow" not in out   # a stranger's comment on a public repo, and a terminal escape in a title, never reach the human's feed
+    assert "msg_fresh" in out and "msg_oldplan" in out and "msg_stale" not in out and "msg_ended" not in out   # a stale permission request and an ended dispatch's question are not decisions
+    C.stubs.reply("orca.orchestration_worker_list", "boom", rc=1, n=4)   # the first --status made two worker-list calls: Orca is silent for the second one's queue read, nothing is hidden
+    assert "msg_ended" in C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
     assert "dispatch requests:" in out and re.search(r"#7 .*redo it.*waiting for a free slot \(cap 3\)", out) and re.search(r"#9 .*queued", out)
 
 
@@ -662,15 +670,15 @@ def test_attended_rings_once_for_each_new_queued_decision_on_its_terminal_and_ne
         return C.go("--answer", "attended", *args, **env)
 
     assert run(COORD_MAX_TICKS=2).returncode == 0
-    assert bell.read_text() == "\a\a\a\a"   # msg_a, msg_b, msg_c (open at the start: seeded, so a restart rings once for it) and #4 once each on the first pass; the unchanged queue rings nothing on the second; #5 is on hold
+    assert bell.read_text() == "\a" * 6   # msg_a, msg_b, msg_c (open at the start: seeded, so a restart rings once for it), the fresh permission request, the old plan gate and #4 once each on the first pass (a stale permission request and an ended dispatch's question never ring, nor are seeded); the unchanged queue rings nothing on the second; #5 is on hold
     bell.unlink()
     assert run("--bell-tty", "/dev/null").returncode == 0 and not bell.exists()   # --bell-tty is where it rings: a terminal, not the loop's own
     err = run("--bell-tty", str(tmp_path / "plain")).stderr
-    assert "not a terminal" in err and bell.read_text() == "\a\a\a\a" and not (tmp_path / "plain").exists()   # anything else falls back to this terminal, the decision is never lost
+    assert "not a terminal" in err and bell.read_text() == "\a" * 6 and not (tmp_path / "plain").exists()   # anything else falls back to this terminal, the decision is never lost
     bell.unlink(missing_ok=True); C.stubs.reply("gh.issue_list", "[]"); C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": []}})); C.stubs.reply("answer.sh", "approve\nWARN: touches CI\n")   # a routine approval, with a warning: a worktree comment and an issue comment, no bell (auto and human keep their per-event bell: tests above)
     C.mail([msg("question", "msg_q", question="PLAN?")])
     assert C.go("--answer", "attended").returncode == 0 and C.calls("orca worktree set") and not bell.exists()
-    C.stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": []}}))   # a question from a worker the loop cannot resolve is left for the human by hand: it rings too
+    C.workers(C.row(rec=None))   # a question from a live worker the loop cannot resolve (no dispatch record) is left for the human by hand: it rings too
     C.mail([msg("question", "msg_u", question="PLAN?")])
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_u"), "run_id": "run_t", "thread_id": "msg_u", "sequence": 1}]}}))
     assert C.go("--answer", "attended").returncode == 0 and bell.read_text() == "\a"

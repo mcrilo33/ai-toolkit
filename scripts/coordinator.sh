@@ -100,7 +100,13 @@ yield() {   # exit 0 when another terminal holds the Run. $1 set = Orca already 
   local h; h="$(holder)"; [ -n "$h" ] || h="${1:+another terminal}"
   [ -z "$h" ] || [ "$h" = "${H:-}" ] || { log "Run $run taken back by $h: exiting; an unfinished batch replays to it"; exit 0; }
 }
-open_q() { pending | jq -c '.open | sort_by(.sequence // 0)[]'; }   # the open questions, oldest first (Orca lists newest first, each with a sequence)
+open_q() {   # the open questions a human can still answer, oldest first (Orca lists newest first, each with a sequence). Left out, read from Orca only: a question whose dispatch is no longer live on the Run, and a
+  local o live; o="$(pending | jq -c '.open | sort_by(.sequence // 0)')" || return 1; [ "$o" != "[]" ] || return 0   # permission request older than the relay's 540 s wait (a plan gate never ages out). Orca silent: kept
+  live="$(wl 2> /dev/null | jq -c '[.result.workers[] | select(.dispatchStatus == "dispatched") | .dispatchId]' 2> /dev/null)" || live=null
+  jq -c --argjson live "${live:-null}" --argjson now "$(date +%s)" '.[] | (.payload // "{}" | if type == "string" then fromjson else . end) as $p
+    | select(($live == null or ($p.dispatchId // null) == null or ($live | index($p.dispatchId)) != null)
+      and ((($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") | not) or ((try ((.created_at | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)) catch $now) >= $now - 540)))' <<< "$o"
+}
 blocked_q() { gh issue list --label blocked --state open --limit 100 --json number,title,labels | jq -r '[.[] | select(.labels | map(.name) | index("hold") | not)] | sort_by(.number)[] | "\(.number)\t\(.title)"'; }   # hold = parked on purpose
 queue_ids() {   # the decisions waiting for the human, in the order to present them, one word each: q:<message id> (a worker waits, a slot is held), then b:<issue> (blocked; a review that kept rejecting is one)
   local q; q="$(open_q | jq -r '"q:\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
