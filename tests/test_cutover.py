@@ -119,8 +119,8 @@ def test_refuses_and_changes_nothing(cut, breakage):
     assert git(root, "rev-parse", "HEAD") == before and (root / "scripts" / "old.sh").is_file()
 
 
-def test_sync_into_itself_generates_claude_md_and_keeps_the_tracked_orca_yaml(tmp_path, run):
-    """After cutover the toolkit syncs into itself: CLAUDE.md is sync's output; the tracked root orca.yaml is not overwritten."""
+def test_sync_into_itself_puts_the_guidelines_under_claude_rules_and_keeps_the_tracked_orca_yaml(tmp_path, run):
+    """After cutover the toolkit syncs into itself: the guidelines are sync's output (no root CLAUDE.md); the tracked root orca.yaml is not overwritten."""
     root = tmp_path / "toolkit"
     for d in ("scripts", "bin", "hooks", "settings"):
         shutil.copytree(V2 / d, root / d)
@@ -129,7 +129,7 @@ def test_sync_into_itself_generates_claude_md_and_keeps_the_tracked_orca_yaml(tm
     git(root, "init", "-q", "--initial-branch=main")
     r = run(["bash", str(root / "scripts" / "sync.sh"), str(root)])
     assert r.returncode == 0, r.stderr
-    assert (root / "CLAUDE.md").read_text() == "# Guidelines\n"
+    assert (root / ".claude/rules/ai-toolkit/guidelines.md").read_text() == "---\ndescription: g\n---\n# Guidelines\n" and not (root / "CLAUDE.md").exists()
     assert (root / "orca.yaml").read_text() == "setup: ./scripts/setup.sh\n" and not (root / "orca.yaml.bak").exists()
     assert (root / ".ai-toolkit" / "scripts" / "setup.sh").is_file()
 

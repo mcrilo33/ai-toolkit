@@ -383,7 +383,7 @@ def toolkit_sources(L):
     git(L.wt, "commit", "-qm", "toolkit sources")
     git(L.wt, "push", "-q", "origin", BRANCH)
     return {".ai-toolkit/scripts/dispatch.sh": files["scripts/dispatch.sh"], ".claude/hooks/guard.sh": files["hooks/claude/guard.sh"],
-            ".claude/rules/security.md": files["shared/rules/security.md"], ".ai-toolkit/scripts/sync.sh": (L.wt / "scripts/sync.sh").read_text()}
+            ".claude/rules/ai-toolkit/security.md": files["shared/rules/security.md"], ".ai-toolkit/scripts/sync.sh": (L.wt / "scripts/sync.sh").read_text()}
 
 
 @pytest.mark.parametrize("broken", [False, True], ids=["refreshed", "refresh-fails-then-cleanup-only"])

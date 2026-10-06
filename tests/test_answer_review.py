@@ -13,7 +13,7 @@ LAYOUTS = ("checkout", "synced")   # the toolkit checkout (scripts/ at the root)
 AGENT_AT = {"checkout": "shared/agents/code-review.md", "synced": ".claude/agents/code-review.md"}
 RULE_AT = {"checkout": "shared/rules/on-demand/afk-answering.md", "synced": ".ai-toolkit/rules/afk-answering.md"}
 RULES = ("guidelines", "security", "code-quality", "python-style", "pytest-conventions")   # the rules the code-review agent cites
-RULE_PATH = {"checkout": lambda n: f"shared/rules/{n}.md", "synced": lambda n: "CLAUDE.md" if n == "guidelines" else f".claude/rules/{n}.md", "dir": lambda n: f"{n}.md"}
+RULE_PATH = {"checkout": lambda n: f"shared/rules/{n}.md", "synced": lambda n: f".claude/rules/ai-toolkit/{n}.md", "dir": lambda n: f"{n}.md"}
 ISSUE = '{"number":9,"title":"new","body":"new body"}'   # the live issue 9 the stub gh serves
 OK = {"verdict": "APPROVE", "blockers": [], "warnings": ["a.py:1 - nit"], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
 
@@ -167,11 +167,11 @@ def test_a_failing_claude_or_a_missing_rule_is_an_escalation_not_an_approve(A, t
         assert r.returncode == 0 and os.path.realpath(argv[argv.index("--append-system-prompt-file") + 1]) == os.path.realpath(root / RULE_AT[layout])
 
 
-def put_rules(root, layout, tag, skip=()):   # the coordinator-side rule files in <layout>'s place, each body "<tag> <name>"; CLAUDE.md is synced without frontmatter
+def put_rules(root, layout, tag, skip=()):   # the coordinator-side rule files in <layout>'s place, each body "<tag> <name>"
     for n in RULES:
         path = RULE_PATH[layout](n)
         if n not in skip:
-            put(root / path, ("" if path == "CLAUDE.md" else "---\ndescription: fm-junk\n---\n") + f"# {n}\n{tag} {n}\n")
+            put(root / path, f"---\ndescription: fm-junk\n---\n# {n}\n{tag} {n}\n")
 
 
 @pytest.fixture
@@ -214,7 +214,7 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     for layout in LAYOUTS:
         gate, root = install(tmp_path / layout, layout, "review.sh")
         put(root / AGENT_AT[layout], f"---\nname: x\n{FRONT.replace('medium', layout + '  ').replace('NotebookEdit', 'NotebookEdit, Bash')}---\n{layout} body\n")
-        put_rules(root, layout, layout)   # and its rules from the layout's own place: the checkout's shared/rules, a synced repo's CLAUDE.md and .claude/rules
+        put_rules(root, layout, layout)   # and its rules from the layout's own place: the checkout's shared/rules, a synced repo's .claude/rules/ai-toolkit
         assert sh(["bash", gate, "9"], R.root, ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0).returncode == 0
         argv = R.stubs.calls("claude")[-1]
         prompt = json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"]
