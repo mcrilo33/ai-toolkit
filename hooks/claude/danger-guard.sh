@@ -57,13 +57,12 @@ if [ -n "$fp" ]; then fc="$(canon "$fp")"; if prot "$fc"; then sens "write to a 
   case "$fc" in "$root/.github/workflows" | "$root/.github/workflows/"*) sens "write to .github/workflows ($fp)";; esac; fi
 cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || finish
 resolve() { # a leading `NAME=literal;` binds once before anything else runs: `$NAME`/`${NAME}` followed by / or a word end becomes the literal. Names are case-sensitive, hence nocasematch off
-  shopt -u nocasematch; local out="$1" n v w b q nl=$'\n' dq='"' bt='`' re x
-  x='\\\$|IFS|(^|[^<])<<([^<]|$)|(^|[^[:alnum:]_])(eval|source|declare|typeset|readonly|local|read|printf[[:space:]]+-v)([^[:alnum:]_]|$)|(^|[;&|[:space:]])\.[[:space:]]'; if [[ $out =~ \' || $out =~ $x ]]; then printf '%s' "$out"; return; fi # a quote or heredoc can hand a literal $S to a child shell that has no S; IFS re-splits the value; <<< is fine; eval/source/read... can build a name at run time
+  shopt -u nocasematch; local out="$1" n v w q nl=$'\n' dq='"' bt='`' re x
+  x='\\\$|IFS|(^|[^<])<<([^<]|$)|(^|[^[:alnum:]_])(eval|source)([^[:alnum:]_]|$)|(^|[;&|[:space:]])\.[[:space:]]'; if [[ $out =~ \' || $out =~ $x || ${out//[$dq\\]/} =~ $x ]]; then printf '%s' "$out"; return; fi # a quote or heredoc can hand a literal $S to a child shell that has no S; IFS re-splits the value; <<< is fine; eval/source run code this text does not show
   re="^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=([^[:space:]\$$bt()<>|&;$dq\\\\]+|${dq}[^\$$bt\\\\$dq$nl;|&()<>]+$dq)[[:blank:]]*(;|&&|$nl)"
   if [[ ! $out =~ $re ]]; then printf '%s' "$out"; return; fi; n="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]#\"}"; v="${v%\"}"; w="${out:${#BASH_REMATCH[0]}}" # w: the command minus the assignment
   case "$n" in HOME | TMPDIR | PWD | CLAUDE_PROJECT_DIR | AI_TOOLKIT_DIR | _ | OLDPWD | DIRSTACK | REPLY | OPTARG | OPTIND | RANDOM | SRANDOM | SECONDS | LINENO | UID | EUID | PPID | GROUPS | FUNCNAME | PIPESTATUS | SHELLOPTS | MAPFILE | COPROC | BASH* | EPOCH* | HIST*) printf '%s' "$out"; return;; esac # the guard's own names and the ones bash rewrites itself
-  b="(^|[^[:alnum:]_\${])$n([^[:alnum:]_]|\$)|\\\$\\{$n([^[:alnum:]_}]|\$)"; [[ ! $w =~ $b ]] || { printf '%s' "$out"; return; } # a bare word (read, for, unset, a second NAME=) or a ${NAME:=..} form
-  w="${w//\$\{$n\}/}"; w="${w//\$$n/}"; [[ $w != *[\$$bt{}]* ]] || { printf '%s' "$out"; return; } # any other expansion, backtick or brace can rebind the name (export $(..)=, export `..`=, export {S,T}=, unset $n)
+  w="${w//\$\{$n\}/}"; w="${w//\$$n/}"; w="${w//[$dq\\]/}"; [[ $w != *[\$$bt{}]* && $w != *"$n"* ]] || { printf '%s' "$out"; return; } # past the plain $NAME/${NAME} uses, no other expansion, backtick or brace, and the name nowhere else, even as a substring or split by quotes or backslashes (printf -vS, read S, for S, a second NAME=, ${NAME:=..}), so nothing can rebind it
   q="^(.*)\\\$(\\{$n\\}|$n)([/${dq}[:space:];&|)].*)?\$"; while [[ $out =~ $q ]]; do out="${BASH_REMATCH[1]}$v${BASH_REMATCH[3]}"; done; printf '%s' "$out"
 }
 sub="$(resolve "$cmd")"; texts=("$cmd"); [ "$sub" = "$cmd" ] || texts+=("$sub") # the write regex scans both; the rm lane only the resolved text (the original would re-raise the unexpanded-variable ask)
