@@ -4,7 +4,7 @@
 # The rule: everything is authorized except sensitive operations, which ASK the user when someone can answer and are DENIED when no one can.
 # Asks (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode), one per call whose reason names every sensitive segment: writes
 # to orca.yaml, ~/.claude/settings.json, .github/workflows/ and, in a worker, the project .claude/{settings*.json,hooks/}, .ai-toolkit/spoke-run-id and anything under the launcher's $AI_TOOLKIT_DIR (the main checkout's .ai-toolkit: the guards, the launcher, the scripts, the env files), in every spelling;
-# rm -r outside the worktree, of its root or home, of another git checkout, or with an unexpanded variable; git reset --hard in the main checkout (or
+# rm -r outside the worktree, of its root or home, of another git checkout, or with an unexpanded variable (a leading `NAME=literal;` of the same command is resolved first); git reset --hard in the main checkout (or
 # with --git-dir/--work-tree); git clean -x and git stash -a. Someone can answer when there is no worker marker (the human's own prompt) or when a worker
 # has the permission-relay hook installed and registered in the launcher's settings file (it puts the question to the Run: the user answers an attended one, the auto loop denies it);
 # else the ask is denied like a hard deny, since a local ask nobody sees would hang. Before either, a Bash hit goes to judge.sh (a ~4 s model call, so the regex stays the fast
@@ -56,17 +56,29 @@ if [ -n "$fp" ]; then fc="$(canon "$fp")"; if prot "$fc"; then sens "write to a 
   [ -z "$spoke" ] || case "$fc" in "$home/.ai-toolkit/coordinator" | "$home/.ai-toolkit/coordinator/"*) deny "write to the human's reply spool ($fp)";; esac
   case "$fc" in "$root/.github/workflows" | "$root/.github/workflows/"*) sens "write to .github/workflows ($fp)";; esac; fi
 cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || finish
+resolve() { # leading `NAME=literal;` statements bind once before anything else runs: `$NAME`/`${NAME}` followed by / or a word end becomes the literal. Names are case-sensitive, hence nocasematch off
+  shopt -u nocasematch; local rest="$1" out="$1" ns=() vs=() ms=() i j n v w b q nl=$'\n' dq='"' bt='`' re x
+  x='\\\$|IFS|(^|[^<])<<([^<]|$)|(^|[^[:alnum:]_])(eval|source|declare|typeset|readonly|local|read|printf[[:space:]]+-v)([^[:alnum:]_]|$)|(^|[;&|[:space:]])\.[[:space:]]'; if [[ $out =~ \' || $out =~ $x ]]; then printf '%s' "$out"; return; fi # a quote or heredoc can hand a literal $S to a child shell that has no S; IFS re-splits the value; <<< is fine; eval/source/read... can build a name at run time
+  re="^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=([^[:space:]\$$bt()<>|&;$dq\\\\]+|${dq}[^\$$bt\\\\$dq$nl;|&()<>]+$dq)[[:blank:]]*(;|&&|$nl)"
+  while [[ $rest =~ $re ]]; do ns+=("${BASH_REMATCH[1]}"); v="${BASH_REMATCH[2]}"; vs+=("${v#\"}"); ms+=("${BASH_REMATCH[0]}"); rest="${rest:${#BASH_REMATCH[0]}}"; done
+  for i in "${!ns[@]}"; do n="${ns[i]}"; v="${vs[i]%\"}"; w="$rest"; for j in "${!ms[@]}"; do [ "$j" = "$i" ] || w="$w ${ms[j]}"; done # w: the command minus this name's own assignment
+    case "$n" in HOME | TMPDIR | PWD | CLAUDE_PROJECT_DIR | AI_TOOLKIT_DIR | _ | OLDPWD | DIRSTACK | REPLY | OPTARG | OPTIND | RANDOM | SRANDOM | SECONDS | LINENO | UID | EUID | PPID | GROUPS | FUNCNAME | PIPESTATUS | SHELLOPTS | BASH* | EPOCH* | HIST*) continue;; esac # the guard's own names and the ones bash rewrites itself
+    b="(^|[^[:alnum:]_\${])$n([^[:alnum:]_]|\$)|\\\$\\{$n([^[:alnum:]_}]|\$)"; [[ ! $w =~ $b ]] || continue # a bare word (read, for, unset, a second NAME=) or a ${NAME:=..} form
+    q="^(.*)\\\$(\\{$n\\}|$n)([/${dq}[:space:];&|)].*)?\$"; while [[ $out =~ $q ]]; do out="${BASH_REMATCH[1]}$v${BASH_REMATCH[3]}"; done
+  done; printf '%s' "$out"
+}
+sub="$(resolve "$cmd")"; texts=("$cmd"); [ "$sub" = "$cmd" ] || texts+=("$sub") # the write regex scans both; the rm lane only the resolved text (the original would re-raise the unexpanded-variable ask)
 
-c=" $(printf '%s' "$cmd" | sed -E "s/[\"'\\\\]//g; s/[0-9&]*>+ *(\/dev\/null|&[0-9])//g; s/[[:space:]>]/& /g")" # writes to a protected path
+for txt in "${texts[@]}"; do c=" $(printf '%s' "$txt" | sed -E "s/[\"'\\\\]//g; s/[0-9&]*>+ *(\/dev\/null|&[0-9])//g; s/[[:space:]>]/& /g")" # writes to a protected path
 pre="((^|[^[:alnum:]_./-])(\./)?|$root/|\\\$\{?(PWD|CLAUDE_PROJECT_DIR)\}?/|\\\$\(pwd\)/)"; e="([^[:alnum:]_./-]|$)" # project-root paths only: v2/orca.yaml is fine
 p="$pre(orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$home)/\.claude/settings\.json"
 if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e)|[^[:space:]]*\.ai-toolkit/(spoke-run-id|claude-settings\.json|hooks|bin|scripts|rules|sync-manifest|setup\.local\.sh|[^/[:space:]]*\.env)|$pre($(printf '%s' "${AI_TOOLKIT_DIR:-/nonexistent}" | sed 's/[^[:alnum:]_\/-]/\\&/g')|(~|HOME\}?|$home)/$(printf '%s' "${AI_TOOLKIT_DIR:-/nonexistent}" | sed -e "s#^$home/##" -e 's/[^[:alnum:]_\/-]/\\&/g')|\\\$\{?AI_TOOLKIT_DIR\}?)(/|$e)"; fi
 w="(>|[[:space:]](tee|cp|mv|rm|touch|ln|dd|install|rsync|truncate|patch|chmod|python[0-9.]*|perl|ruby|node)[[:space:]]|[[:space:]]sed[[:space:]][^;|&]*(-[a-z]*i|--in-place))"
 va="${w}[^;|&]*|[[:space:]](cd|pushd)[[:space:]][^;|&]*" # a verb before the path, or a cd into it
-if [ -n "$spoke" ] && [[ $c =~ ($va)($spool) ]]; then deny "write to the human's reply spool: $(printf '%.200s' "$cmd" | tr '\n' ' ')"; fi
+if [ -n "$spoke" ] && [[ $c =~ ($va)($spool) ]]; then deny "write to the human's reply spool: $(printf '%.200s' "$txt" | tr '\n' ' ')"; fi
 bw=""; if [[ $c =~ ($va)($p) ]] || { [ -n "$spoke" ] && { [[ $c =~ $sy ]] || [[ $c =~ AI_TOOLKIT_ALLOW_BASE_COMMIT ]] || { [[ $c =~ AI_TOOLKIT_DIR ]] && [[ $c =~ $w ]]; }; }; }; then bw="a protected path, sync.sh or the base-commit switch (orca.yaml, claude settings/hooks, the toolkit's guards)"; fi
 if [[ $c =~ ($va)($pre\.github/workflows) ]]; then bw="${bw:+$bw and }.github/workflows"; fi
-[ -z "$bw" ] || sens "write to $bw: ${cmd:0:200}"
+[ -z "$bw" ] || sens "write to $bw: ${txt:0:200}"; done
 
 target() { # one `rm -r` target: inside the worktree, or strictly below a temp root
   local p="$1" v; for v in HOME TMPDIR; do p="${p/#\$$v/${!v:-}}"; p="${p/#\$\{$v\}/${!v:-}}"; done
@@ -96,6 +108,6 @@ check() { # the words of one command segment
 }
 # quotes dropped (pu""sh, "$TMPDIR"/x), then quotes glued between a word and a letter turned into a space (bash -c'rm ..')
 for sc in "s/[\"'\\\\]//g" "s/([^[:space:]])[\"'\\\\]+([[:alnum:]])/\\1 \\2/g; s/[\"'\\\\]//g"; do
-  while IFS= read -r seg; do check $seg; done < <(printf '%s\n' "$cmd" | sed -E "$sc" | tr ';|&()`<>' '\n')
+  while IFS= read -r seg; do check $seg; done < <(printf '%s\n' "$sub" | sed -E "$sc" | tr ';|&()`<>' '\n')
 done
 finish

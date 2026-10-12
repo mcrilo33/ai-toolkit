@@ -158,11 +158,18 @@ RM_DENY = [
     "echo hi && rm -rf /usr", "rm -rf /tmp", "rm -rf /private/tmp", 'rm -rf "$HOME"/x', "bash -c'rm -rf /usr'", "'r'm -rf /usr", 'r""m -rf /usr',
     "git stash -a", "git stash --all", "git stash push -a", "git stash push -au", "git -C . stash -a", "rm -rf /etc/absent/", "git clean -fdx", "git clean -xdf", "git clean -fdX",
     "git clean -f -x", "git -C . clean -fdx", "bash -c 'git clean -fdx'", "rm -rf $UNSET_TMP/x", "rm -rf ~root/x", "RM -rf /usr",
+    # a leading NAME=literal is resolved only where bash binds that one value before the rm: every other shape still asks
+    "S=/tmp/x; S=/usr; rm -rf $S", "false && S=/tmp/x; rm -rf $S/", "S=/tmp/x true; rm -rf $S", "(S=/tmp/x); rm -rf $S", "S=/tmp/x; for S in /usr; do rm -rf $S; done",
+    "S=/tmp/x; unset S; rm -rf $S/", "S=/tmp/x; rm -rf ${S:-/usr}", "S=/tmp/x; rm -rf $SX/y", "S=$(pwd)/x; rm -rf $S", "ls; S=/tmp/x; rm -rf $S", "S=/usr; rm -rf $S", "S=~; rm -rf $S",
+    "S=/tmp/x; bash -c 'rm -rf $S/build'", "S=; : ${S:=/usr}; rm -rf $S", "S=/tmp/x; n=S; printf -v $n %s /usr; rm -rf $S", "IFS=_; S=/tmp/a_/usr; rm -rf $S",
+    'S=/tmp/x; bash <<"EOF"\nrm -rf $S/\nEOF', "S=/tmp/x; rm -rf $s/usr",
+    'S="/tmp/x;/y /usr"; rm -rf $S', "OLDPWD=/tmp/x; cd /usr; rm -rf $OLDPWD", 'S=/tmp/x; eval "$(printf "\\x53=/usr")"; rm -rf $S/',
 ]
 RM_ALLOW = [
     "rm -rf build", 'rm -rf "$TMPDIR"/x', 'rm -rf "${TMPDIR}"/x', 'rm -rf "$TMPDIR"/claude-*', "rm -rf build/ dist/ .venv/ node_modules/", "rm -rf ./build/", "rm -rf /tmp/absent-x/",
     "rm -rf $TMPDIR/absent-x/", "rm -rf ./dist node_modules", "rm file.txt", "rm -rf /tmp/xyz", "rm -rf $TMPDIR/xyz",
     "rm -rf {spoke}/sub", "rm -rf src/*.pyc", "rm -rf build 2>/dev/null", "ls /etc",
+    "S=/tmp/x/p; rm -rf $S; mkdir -p $S", 'S=/private/tmp/x/p && rm -rf "$S" && mkdir -p "$S"', "S=/tmp/x; rm -rf ${S}/sub", "S=build; rm -rf $S",
 ]
 WRITE_DENY = [
     "echo x > .github/workflows/ci.yml", "echo x >> {spoke}/.github/workflows/ci.yml", "tee orca.yaml",
@@ -177,6 +184,7 @@ WRITE_DENY = [
     "chmod -x .claude/hooks/push-guard.sh", "echo > {spoke}/.claude/hooks/x.sh", "cd x && echo y > orca.yaml",
     "cd .github/workflows && echo x > ci.yml", "python3 - <<EOF\nopen('orca.yaml','w')\nEOF", "cat y > .GITHUB/Workflows/ci.yml",
     "echo x > ORCA.YAML",
+    "S=.claude/hooks; rm -rf $S", "S=.ai-toolkit; rm -rf $S",
     # the toolkit's registrations and hook scripts: the worktree-relative spellings and the main checkout's copy a worker's session actually runs
     "rm .ai-toolkit/claude-settings.json", "echo x > $PWD/.ai-toolkit/claude-settings.json", "tee ./.ai-toolkit/claude-settings.json", "rm -rf .ai-toolkit/hooks",
     "echo x > {tk}/claude-settings.json", "rm {tk}/hooks/claude/push-guard.sh", "cp x {tk}/hooks/claude/danger-guard.sh",
@@ -746,5 +754,5 @@ def test_pre_commit_allows_the_first_commit_of_a_repo(tmp_path):
 
 def test_hook_line_budgets():
     n = lambda *g: sum(len(f.read_text().splitlines()) for q in g for f in HOOKS.glob(q))  # noqa: E731
-    assert n("claude/*.sh") <=      235 and n("git/*") <= 40
+    assert n("claude/*.sh") <=      247 and n("git/*") <= 40
     assert len((V2 / "settings/claude/settings.json").read_text().splitlines()) <= 40
