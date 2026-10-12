@@ -56,16 +56,15 @@ if [ -n "$fp" ]; then fc="$(canon "$fp")"; if prot "$fc"; then sens "write to a 
   [ -z "$spoke" ] || case "$fc" in "$home/.ai-toolkit/coordinator" | "$home/.ai-toolkit/coordinator/"*) deny "write to the human's reply spool ($fp)";; esac
   case "$fc" in "$root/.github/workflows" | "$root/.github/workflows/"*) sens "write to .github/workflows ($fp)";; esac; fi
 cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || finish
-resolve() { # leading `NAME=literal;` statements bind once before anything else runs: `$NAME`/`${NAME}` followed by / or a word end becomes the literal. Names are case-sensitive, hence nocasematch off
-  shopt -u nocasematch; local rest="$1" out="$1" ns=() vs=() ms=() i j n v w b q nl=$'\n' dq='"' bt='`' re x
+resolve() { # a leading `NAME=literal;` binds once before anything else runs: `$NAME`/`${NAME}` followed by / or a word end becomes the literal. Names are case-sensitive, hence nocasematch off
+  shopt -u nocasematch; local out="$1" n v w b q nl=$'\n' dq='"' bt='`' re x
   x='\\\$|IFS|(^|[^<])<<([^<]|$)|(^|[^[:alnum:]_])(eval|source|declare|typeset|readonly|local|read|printf[[:space:]]+-v)([^[:alnum:]_]|$)|(^|[;&|[:space:]])\.[[:space:]]'; if [[ $out =~ \' || $out =~ $x ]]; then printf '%s' "$out"; return; fi # a quote or heredoc can hand a literal $S to a child shell that has no S; IFS re-splits the value; <<< is fine; eval/source/read... can build a name at run time
   re="^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=([^[:space:]\$$bt()<>|&;$dq\\\\]+|${dq}[^\$$bt\\\\$dq$nl;|&()<>]+$dq)[[:blank:]]*(;|&&|$nl)"
-  while [[ $rest =~ $re ]]; do ns+=("${BASH_REMATCH[1]}"); v="${BASH_REMATCH[2]}"; vs+=("${v#\"}"); ms+=("${BASH_REMATCH[0]}"); rest="${rest:${#BASH_REMATCH[0]}}"; done
-  for i in "${!ns[@]}"; do n="${ns[i]}"; v="${vs[i]%\"}"; w="$rest"; for j in "${!ms[@]}"; do [ "$j" = "$i" ] || w="$w ${ms[j]}"; done # w: the command minus this name's own assignment
-    case "$n" in HOME | TMPDIR | PWD | CLAUDE_PROJECT_DIR | AI_TOOLKIT_DIR | _ | OLDPWD | DIRSTACK | REPLY | OPTARG | OPTIND | RANDOM | SRANDOM | SECONDS | LINENO | UID | EUID | PPID | GROUPS | FUNCNAME | PIPESTATUS | SHELLOPTS | BASH* | EPOCH* | HIST*) continue;; esac # the guard's own names and the ones bash rewrites itself
-    b="(^|[^[:alnum:]_\${])$n([^[:alnum:]_]|\$)|\\\$\\{$n([^[:alnum:]_}]|\$)"; [[ ! $w =~ $b ]] || continue # a bare word (read, for, unset, a second NAME=) or a ${NAME:=..} form
-    q="^(.*)\\\$(\\{$n\\}|$n)([/${dq}[:space:];&|)].*)?\$"; while [[ $out =~ $q ]]; do out="${BASH_REMATCH[1]}$v${BASH_REMATCH[3]}"; done
-  done; printf '%s' "$out"
+  if [[ $out =~ \' || $out =~ $x || ! $out =~ $re ]]; then printf '%s' "$out"; return; fi; n="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]#\"}"; v="${v%\"}"; w="${out:${#BASH_REMATCH[0]}}" # w: the command minus the assignment
+  case "$n" in HOME | TMPDIR | PWD | CLAUDE_PROJECT_DIR | AI_TOOLKIT_DIR | _ | OLDPWD | DIRSTACK | REPLY | OPTARG | OPTIND | RANDOM | SRANDOM | SECONDS | LINENO | UID | EUID | PPID | GROUPS | FUNCNAME | PIPESTATUS | SHELLOPTS | BASH* | EPOCH* | HIST*) printf '%s' "$out"; return;; esac # the guard's own names and the ones bash rewrites itself
+  b="(^|[^[:alnum:]_\${])$n([^[:alnum:]_]|\$)|\\\$\\{$n([^[:alnum:]_}]|\$)"; [[ ! $w =~ $b ]] || { printf '%s' "$out"; return; } # a bare word (read, for, unset, a second NAME=) or a ${NAME:=..} form
+  w="${w//\$\{$n\}/}"; w="${w//\$$n/}"; [[ $w != *\$* ]] || { printf '%s' "$out"; return; } # any other expansion can rebind the name (export $(..)=, unset $n)
+  q="^(.*)\\\$(\\{$n\\}|$n)([/${dq}[:space:];&|)].*)?\$"; while [[ $out =~ $q ]]; do out="${BASH_REMATCH[1]}$v${BASH_REMATCH[3]}"; done; printf '%s' "$out"
 }
 sub="$(resolve "$cmd")"; texts=("$cmd"); [ "$sub" = "$cmd" ] || texts+=("$sub") # the write regex scans both; the rm lane only the resolved text (the original would re-raise the unexpanded-variable ask)
 
