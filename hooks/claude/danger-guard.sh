@@ -60,10 +60,10 @@ resolve() { # a leading `NAME=literal;` binds once before anything else runs: `$
   shopt -u nocasematch; local out="$1" n v w b q nl=$'\n' dq='"' bt='`' re x
   x='\\\$|IFS|(^|[^<])<<([^<]|$)|(^|[^[:alnum:]_])(eval|source|declare|typeset|readonly|local|read|printf[[:space:]]+-v)([^[:alnum:]_]|$)|(^|[;&|[:space:]])\.[[:space:]]'; if [[ $out =~ \' || $out =~ $x ]]; then printf '%s' "$out"; return; fi # a quote or heredoc can hand a literal $S to a child shell that has no S; IFS re-splits the value; <<< is fine; eval/source/read... can build a name at run time
   re="^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=([^[:space:]\$$bt()<>|&;$dq\\\\]+|${dq}[^\$$bt\\\\$dq$nl;|&()<>]+$dq)[[:blank:]]*(;|&&|$nl)"
-  if [[ $out =~ \' || $out =~ $x || ! $out =~ $re ]]; then printf '%s' "$out"; return; fi; n="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]#\"}"; v="${v%\"}"; w="${out:${#BASH_REMATCH[0]}}" # w: the command minus the assignment
-  case "$n" in HOME | TMPDIR | PWD | CLAUDE_PROJECT_DIR | AI_TOOLKIT_DIR | _ | OLDPWD | DIRSTACK | REPLY | OPTARG | OPTIND | RANDOM | SRANDOM | SECONDS | LINENO | UID | EUID | PPID | GROUPS | FUNCNAME | PIPESTATUS | SHELLOPTS | BASH* | EPOCH* | HIST*) printf '%s' "$out"; return;; esac # the guard's own names and the ones bash rewrites itself
+  if [[ ! $out =~ $re ]]; then printf '%s' "$out"; return; fi; n="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]#\"}"; v="${v%\"}"; w="${out:${#BASH_REMATCH[0]}}" # w: the command minus the assignment
+  case "$n" in HOME | TMPDIR | PWD | CLAUDE_PROJECT_DIR | AI_TOOLKIT_DIR | _ | OLDPWD | DIRSTACK | REPLY | OPTARG | OPTIND | RANDOM | SRANDOM | SECONDS | LINENO | UID | EUID | PPID | GROUPS | FUNCNAME | PIPESTATUS | SHELLOPTS | MAPFILE | COPROC | BASH* | EPOCH* | HIST*) printf '%s' "$out"; return;; esac # the guard's own names and the ones bash rewrites itself
   b="(^|[^[:alnum:]_\${])$n([^[:alnum:]_]|\$)|\\\$\\{$n([^[:alnum:]_}]|\$)"; [[ ! $w =~ $b ]] || { printf '%s' "$out"; return; } # a bare word (read, for, unset, a second NAME=) or a ${NAME:=..} form
-  w="${w//\$\{$n\}/}"; w="${w//\$$n/}"; [[ $w != *\$* ]] || { printf '%s' "$out"; return; } # any other expansion can rebind the name (export $(..)=, unset $n)
+  w="${w//\$\{$n\}/}"; w="${w//\$$n/}"; [[ $w != *[\$$bt{}]* ]] || { printf '%s' "$out"; return; } # any other expansion, backtick or brace can rebind the name (export $(..)=, export `..`=, export {S,T}=, unset $n)
   q="^(.*)\\\$(\\{$n\\}|$n)([/${dq}[:space:];&|)].*)?\$"; while [[ $out =~ $q ]]; do out="${BASH_REMATCH[1]}$v${BASH_REMATCH[3]}"; done; printf '%s' "$out"
 }
 sub="$(resolve "$cmd")"; texts=("$cmd"); [ "$sub" = "$cmd" ] || texts+=("$sub") # the write regex scans both; the rm lane only the resolved text (the original would re-raise the unexpanded-variable ask)

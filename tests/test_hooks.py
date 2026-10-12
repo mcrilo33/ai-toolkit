@@ -164,6 +164,7 @@ RM_DENY = [
     "S=/tmp/x; bash -c 'rm -rf $S/build'", "S=; : ${S:=/usr}; rm -rf $S", "S=/tmp/x; n=S; printf -v $n %s /usr; rm -rf $S", "IFS=_; S=/tmp/a_/usr; rm -rf $S",
     'S=/tmp/x; bash <<"EOF"\nrm -rf $S/\nEOF', "S=/tmp/x; rm -rf $s/usr",
     "S=/tmp/x; export $(echo s | tr a-z A-Z)=/usr; rm -rf $S/", "S=/tmp/x; unset $(echo s | tr a-z A-Z); rm -rf $S/", "S=/tmp/x; let $(echo s | tr a-z A-Z)=1; rm -rf $S/", "S=/tmp/x; n=S; export $n=/usr; rm -rf $S/",
+    "S=/tmp/x; export `echo s | tr a-z A-Z`=/usr; rm -rf $S/", "S=/tmp/x; export {S,T}=/usr; rm -rf $S/", "S=/tmp/x; unset {S,T}; rm -rf $S/", "MAPFILE=/tmp/x; mapfile < /dev/null; rm -rf $MAPFILE/",
     'S="/tmp/x;/y /usr"; rm -rf $S', "OLDPWD=/tmp/x; cd /usr; rm -rf $OLDPWD", 'S=/tmp/x; eval "$(printf "\\x53=/usr")"; rm -rf $S/',
 ]
 RM_ALLOW = [
