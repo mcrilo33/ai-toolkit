@@ -28,11 +28,12 @@ if [ "${AI_TOOLKIT_OTEL:-1}" = 1 ] && [ -s "$top/.ai-toolkit/spoke-run-id" ]; th
   load_env
   repo="$(git remote get-url origin 2>/dev/null | sed -E 's#.*[/:]##; s#\.git$##' || true)"
   id="$(cat "$top/.ai-toolkit/spoke-run-id")"
+  issue="$(sed -nE '1s/^# #([0-9]+)( .*)?$/\1/p' "$top/.ai-toolkit/task.md" 2> /dev/null || true)"   # a telemetry label only: no file, or a first line that is not "# #<n> ...", leaves it out
   export CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 ENABLE_BETA_TRACING_DETAILED=1
   export OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp OTEL_EXPORTER_OTLP_PROTOCOL=grpc
   export OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false
   export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_ENDPOINT:-http://localhost:4317}"
   export BETA_TRACING_ENDPOINT="${OTEL_BETA_ENDPOINT:-http://localhost:4418}"
-  export OTEL_RESOURCE_ATTRIBUTES="spoke_run_id=$id${repo:+,repo=$repo}"
+  export OTEL_RESOURCE_ATTRIBUTES="spoke_run_id=$id${repo:+,repo=$repo}${issue:+,issue=$issue}"
 fi
 exec "$real" "$@"
