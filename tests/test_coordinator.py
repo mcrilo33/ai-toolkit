@@ -442,6 +442,14 @@ def test_a_land_that_the_worker_cannot_fix_blocks_at_once(C, rc, out):
     assert C.blocked() and not C.stubs.calls("claude")   # nothing landed, nothing to route
 
 
+def test_a_worker_done_from_a_dispatch_that_another_live_one_replaced_is_ignored_not_landed_or_blocked(C):
+    C.workers(C.row("ctx_1", st="completed"), C.row("ctx_2"))
+    C.mail([msg("worker_done", dispatchId="ctx_1", outcome="succeeded")])
+    r = C.go()
+    assert not C.stubs.calls("land.sh") and not C.calls("gh issue edit") and len(C.calls("orca orchestration check ack")) == 1
+    assert "ctx_1" in r.stderr and "ctx_2" in r.stderr and "ignored" in r.stderr
+
+
 @pytest.mark.parametrize("cleanup_rc, mode", [(0, "orca"), (6, "orca"), (6, "switched"), (6, "nobranch")])   # the branch is Orca's, never the worker's HEAD; none from Orca = block, not a guess
 def test_landed_but_cleanup_incomplete_finishes_once_and_parks_a_still_open_issue(C, cleanup_rc, mode):
     C.stubs.reply(key("land.sh", "--review", "1"), f"{W}x\nland.sh: landed abc but cleanup is incomplete\n", rc=6)
@@ -617,12 +625,12 @@ def issue_json(state="OPEN", scope="a.py", labels=()):
 
 
 BLOCKED = issue_json(labels=["blocked"])
-DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed; one that cannot keeps its file with the reason on line 2 (only a closed issue is dropped)
+DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed; one that cannot keeps its file with the reason on line 2 (only a closed issue and an already running one are dropped)
     "plain": {}, "fresh-with-message": dict(text="do it test-first", v7=BLOCKED, why="no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"),
     "kept-worktree-with-message": dict(text="do it test-first", v7=BLOCKED, kept=True, expect=("--address", "do it test-first", "7"), label=True), "kept-worktree-default-message": dict(kept=True, expect="default"),
     "cap": dict(cap=1, why="waiting for a free slot (cap 1)"), "refused": dict(refuses=True, why="dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"), "closed": dict(v7=issue_json(state="CLOSED"), dropped=True),
     "hold": dict(v7=issue_json(labels=["hold"]), why="on hold: remove the hold label to start it"), "blocked-no-message": dict(v7=BLOCKED, why="blocked: remove the label, or give a message to re-dispatch it"),
-    "running": dict(kept=True, running=True, why="already running (dispatch ctx_7)"), "unreadable": dict(unreadable=True, why="cannot read the issue (unknown, or GitHub did not answer)"),
+    "running": dict(kept=True, running=True, dropped=True), "unreadable": dict(unreadable=True, why="cannot read the issue (unknown, or GitHub did not answer)"),
     "worktrees": dict(no_worktrees=True, why="cannot read the worktrees"), "dispatch-fails": dict(fails=True, why="dispatch failed: boom"),
 }
 
@@ -639,7 +647,8 @@ def test_a_queued_dispatch_request_runs_ahead_of_the_automatic_pick_within_the_c
         C.workers(C.row(), {**C.row("ctx_7"), "resource": {"worktreeId": "r::/k7"}})
     C.stubs.reply("gh.issue_view", "boom" if c.get("unreadable") else c["v7"], rc=1 if c.get("unreadable") else 0)
     C.stubs.reply("dispatch.sh", "boom" if c.get("fails") else "dispatch: #7 is not ready: Scope overlaps #1" if c.get("refuses") else '{"issue":7}', rc=1 if c.get("fails") else 3 if c.get("refuses") else 0)
-    assert C.go("--answer", "attended", "--cap", str(c["cap"])).returncode == 0
+    go = C.go("--answer", "attended", "--cap", str(c["cap"]))
+    assert go.returncode == 0
     ran = lambda: [a for a in C.stubs.calls("dispatch.sh") if a != ["--next", "--dry-run"]]   # noqa: E731  (the fill's own pick is not a request)
     if "why" not in c and not c.get("dropped"):   # dispatch.sh (the existing script) starts it; a blocked issue loses its label only after that; the request is consumed
         want, r = c.get("expect", ("--next", "7")), ran()   # a fresh issue goes through dispatch.sh --next <n>: its ready rule decides
@@ -647,7 +656,7 @@ def test_a_queued_dispatch_request_runs_ahead_of_the_automatic_pick_within_the_c
         edits = [a[3:] for a in C.calls("gh issue edit")]
         assert (["--remove-label", "blocked"] in edits) == c.get("label", False) and (not c.get("label") or in_order(C.kinds(), "dispatch.sh", "gh issue edit") is None)
     elif c.get("dropped"):
-        assert not ran() and not req.exists()
+        assert not ran() and not req.exists() and ("dropped: already running (dispatch ctx_7)" in go.stdout) == bool(c.get("running"))
     else:
         asked = c.get("fails") or c.get("refuses")   # dispatch.sh was asked and said no: its own last line (and exit code, when it is a refusal) is the reason
         assert len(ran()) == int(bool(asked)) and req.read_text().splitlines() == [c["text"], c["why"]]   # line 2 is the reason, --status shows it

@@ -273,6 +273,8 @@ triage() {   # $1 = land output, $2 = the worker's report: after a land, hand wh
 on_done() {
   local out rc=0 bl last
   ctx "$(pj "$1" dispatchId)" || return 1
+  out="$(wl | jq -r --arg p "::$wtp" --arg d "$disp" '[.result.workers[] | select(.dispatchStatus == "dispatched" and .dispatchId != $d and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty')" || return 1
+  [ -z "$out" ] || { warn "#$issue: worker_done from $disp ignored: dispatch $out is live on $wtp"; return 0; }   # a stale or duplicate dispatch never lands the worktree its live worker is editing
   [ "$(pj "$1" outcome)" = succeeded ] || { block "worker_done failed: $(jq -r '.body // ""' <<< "$1")"; return 0; }
   [ "$(gh issue view "$issue" --json state --jq .state 2> /dev/null)" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; return 0; }
   # No --dispatch: land finds and releases EVERY dispatch of the worktree, earlier address rounds included.
@@ -303,7 +305,7 @@ handle() {
 }
 
 named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of the automatic pick: dispatch.sh runs them, within the cap and the Scope rule. One that cannot run keeps its file, the reason on line 2 (--status shows it)
-  local f n spec v why live wts all path r out rc   # (a closed issue is the one drop; a failed dispatch is not retried until the human asks again or cancels)
+  local f n spec v why live wts all path r out rc   # (a closed issue and an already running one are the drops; a failed dispatch is not retried until the human asks again or cancels)
   for f in "$sd/requests"/*; do
     [ -f "$f" ] || continue; n="${f##*/}"; spec="$(head -n 1 "$f")"; why=""; path=""
     case "$(sed -n 2p "$f")" in "dispatch failed"*) continue ;; esac
@@ -316,7 +318,7 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
     else
       path="$(jq -r --argjson n "$n" '[.[] | select(.linkedIssue == $n)][0].path // empty' <<< "$wts")"
       r="$(jq -r --arg p "::$path" '[.result.workers[] | select(.dispatchStatus == "dispatched" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty' <<< "$all")"; live="$(nlive <<< "$all")"
-      if [ -n "$path" ] && [ -n "$r" ]; then why="already running (dispatch $r)"
+      if [ -n "$path" ] && [ -n "$r" ]; then log "dispatch request for #$n dropped: already running (dispatch $r)"; rm -f "$f"; continue   # met: the issue runs, whoever started it
       elif [ "$live" -ge "$cap" ]; then why="waiting for a free slot (cap $cap)"; fi
     fi
     [ -n "$why" ] || [ -n "$path" ] || [ -z "$spec" ] || why="no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"
