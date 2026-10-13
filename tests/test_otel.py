@@ -100,6 +100,8 @@ def test_logs_and_metrics_land_as_rotated_jsonl_in_the_mounted_raw_dir():
         cfg = COLLECTOR["exporters"][exp]
         assert exp.startswith("file/") and cfg["path"].startswith("/raw/") and cfg["rotation"]["max_megabytes"] and cfg["rotation"]["max_backups"]
     assert "${AITK_OTEL_RAW_DIR:?}:/raw" in COMPOSE["services"]["collector"]["volumes"]
+    rot = COLLECTOR["exporters"]["file/logs"]["rotation"]
+    assert rot["max_megabytes"] * (rot["max_backups"] + 1) >= 1000, "the evaluator back-fills from these files; a smaller cap quietly shrinks the window"
 
 
 def test_compose_mounts_the_config_readonly_and_forwards_secrets_without_values():

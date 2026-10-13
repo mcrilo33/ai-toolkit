@@ -3,6 +3,9 @@
 # (host dir AITK_OTEL_RAW_DIR, outside any worktree) for later analysis. Langfuse reads usage only
 # from gen_ai.usage.*, so tokens are remapped (else cost reads $0). Every spoke trace carries the
 # spoke_run_id resource attribute (bin/claude-spoke) and becomes one Langfuse session.
+# Retention: logs keep 11 x 100MB = 1.1GB at most (and nothing older than 30 days), the only copy of what
+# Langfuse lacks. That is 2-4 weeks at the normal ~17MB/day with bursty /afk drain days, but only ~4 days
+# of sustained peak (~260MB/day). The files hold prompts and tool output in plaintext, so the cap is deliberate.
 receivers:
   otlp:  # claude-spoke: OTEL_EXPORTER_OTLP_ENDPOINT (gRPC)
     protocols: {grpc: {endpoint: "0.0.0.0:4317"}, http: {endpoint: "0.0.0.0:4318"}}
@@ -39,7 +42,7 @@ exporters:
   otlp_http/langfuse:
     endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
     headers: {Authorization: "${env:LANGFUSE_BASIC_AUTH}"}
-  file/logs: {path: /raw/logs.jsonl, rotation: {max_megabytes: 25, max_backups: 5}}
+  file/logs: {path: /raw/logs.jsonl, rotation: {max_megabytes: 100, max_backups: 10, max_days: 30}}
   file/metrics: {path: /raw/metrics.jsonl, rotation: {max_megabytes: 25, max_backups: 5}}
 service:
   pipelines:
