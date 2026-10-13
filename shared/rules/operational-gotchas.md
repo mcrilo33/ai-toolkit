@@ -37,9 +37,11 @@ force `LC_ALL=C`:
 ## Keep debug scratch inside the worktree
 
 Write probe output, repro scripts, and temp dirs under your own worktree (`mktemp -d ./tmp.XXXXXX`, not the
-`/tmp` default), never `/tmp/...`, `$HOME/...`, or a sibling worktree. `danger-guard` denies destructive commands
-outside the worktree, so scratch elsewhere gets blocked for no benefit. In pytest, use the `tmp_path` fixture,
-not a hard-coded `/tmp/<name>` path.
+`/tmp` default) or in the session scratchpad the system prompt names, never a hard-coded `/tmp/<name>`, `$HOME/...`,
+or a sibling worktree. When removing the scratchpad (or any temp dir) with `rm -r`, write the path literally, copied
+from the system prompt, never through a shell variable (`S=...; rm -rf "$S"`): `danger-guard` asks on an unexpanded
+`rm -r` target, and in auto mode that ask blocks the issue. In pytest, use the `tmp_path` fixture, not a hard-coded
+`/tmp/<name>` path.
 
 ## Google Cloud: expired gcloud tokens
 
