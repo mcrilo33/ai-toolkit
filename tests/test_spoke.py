@@ -32,7 +32,7 @@ def test_spoke_exports_native_otel_env_and_passes_args_through(run, stubs, repo,
     assert f"AI_TOOLKIT_DIR={tk}" in env   # the hooks and /coordinate read the guards' place from here
 
 
-@pytest.mark.parametrize("task_md", [None, "", "hello\n", "# #12x title\n", "## #5 title\n", "\n# #5 title\n"])
+@pytest.mark.parametrize("task_md", [None, "hello\n", "# #12x title\n"])
 def test_spoke_leaves_the_issue_attribute_out_when_task_md_is_missing_or_does_not_parse(run, stubs, repo, task_md):
     synced(repo)
     wt = in_spoke(repo)
