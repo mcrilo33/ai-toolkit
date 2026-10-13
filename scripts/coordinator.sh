@@ -273,7 +273,7 @@ triage() {   # $1 = land output, $2 = the worker's report: after a land, hand wh
 on_done() {
   local out rc=0 bl last
   ctx "$(pj "$1" dispatchId)" || return 1
-  out="$(wl | jq -r --arg p "::$wtp" --arg d "$disp" '[.result.workers[] | select(.dispatchStatus == "dispatched" and .dispatchId != $d and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty')" || return 1
+  out="$(wl | jq -r --arg p "::$wtp" --arg d "$disp" '[.result.workers[] | select(.dispatchStatus == "dispatched" and .dispatchId != $d and .projection.liveness.verdict != "exited" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty')" || return 1
   [ -z "$out" ] || { warn "#$issue: worker_done from $disp ignored: dispatch $out is live on $wtp"; return 0; }   # a stale or duplicate dispatch never lands the worktree its live worker is editing
   [ "$(pj "$1" outcome)" = succeeded ] || { block "worker_done failed: $(jq -r '.body // ""' <<< "$1")"; return 0; }
   [ "$(gh issue view "$issue" --json state --jq .state 2> /dev/null)" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; return 0; }
