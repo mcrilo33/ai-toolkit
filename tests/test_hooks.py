@@ -171,7 +171,7 @@ RM_ALLOW = [
     "rm -rf build", 'rm -rf "$TMPDIR"/x', 'rm -rf "${TMPDIR}"/x', 'rm -rf "$TMPDIR"/claude-*', "rm -rf build/ dist/ .venv/ node_modules/", "rm -rf ./build/", "rm -rf /tmp/absent-x/",
     "rm -rf $TMPDIR/absent-x/", "rm -rf ./dist node_modules", "rm file.txt", "rm -rf /tmp/xyz", "rm -rf $TMPDIR/xyz",
     "rm -rf {spoke}/sub", "rm -rf src/*.pyc", "rm -rf build 2>/dev/null", "ls /etc",
-    "S=/tmp/x/p; rm -rf $S; mkdir -p $S", 'S=/private/tmp/x/p && rm -rf "$S" && mkdir -p "$S"', "S=/tmp/x; rm -rf ${S}/sub", "S=build; rm -rf $S",
+    "S=/tmp/x/p; rm -rf $S; mkdir -p $S", 'S=/tmp/x/p && rm -rf "$S" && mkdir -p "$S"', "S=/tmp/x; rm -rf ${S}/sub", "S=build; rm -rf $S",
 ]
 WRITE_DENY = [
     "echo x > .github/workflows/ci.yml", "echo x >> {spoke}/.github/workflows/ci.yml", "tee orca.yaml",
