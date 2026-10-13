@@ -163,7 +163,7 @@ RM_DENY = [
     "S=/tmp/x; unset S; rm -rf $S/", "S=/tmp/x; rm -rf ${S:-/usr}", "S=/tmp/x; rm -rf $SX/y", "S=$(pwd)/x; rm -rf $S", "ls; S=/tmp/x; rm -rf $S", "S=/usr; rm -rf $S", "S=~; rm -rf $S",
     "S=/tmp/x; bash -c 'rm -rf $S/build'", "S=; : ${S:=/usr}; rm -rf $S", "S=/tmp/x; n=S; printf -v $n %s /usr; rm -rf $S", "IFS=_; S=/tmp/a_/usr; rm -rf $S",
     'S=/tmp/x; bash <<"EOF"\nrm -rf $S/\nEOF', "S=/tmp/x; rm -rf $s/usr",
-    "S=/tmp/x; export $(echo s | tr a-z A-Z)=/usr; rm -rf $S/", "S=/tmp/x; unset $(echo s | tr a-z A-Z); rm -rf $S/", "S=/tmp/x; let $(echo s | tr a-z A-Z)=1; rm -rf $S/", "S=/tmp/x; n=S; export $n=/usr; rm -rf $S/",
+    "S=/tmp/x; export $(echo s | tr a-z A-Z)=/usr; rm -rf $S/", "S=/tmp/x; n=S; export $n=/usr; rm -rf $S/", "S=S; export $S=/usr; rm -rf $S", "xx=x; export $xx$xx=/usr; rm -rf $xx", "AB=/tmp/x; A\\\nB=/usr; rm -rf $AB",
     "S=/tmp/x; export `echo s | tr a-z A-Z`=/usr; rm -rf $S/", "S=/tmp/x; export {S,T}=/usr; rm -rf $S/", "S=/tmp/x; unset {S,T}; rm -rf $S/", "MAPFILE=/tmp/x; mapfile < /dev/null; rm -rf $MAPFILE/", "S=/tmp/x; printf -vS %s /usr; rm -rf $S", "SX=/tmp/x; declare S\"\"X=/usr; rm -rf $SX", "SX=/tmp/x; read S\\X <<< /usr; rm -rf $SX", "SX=/tmp/x; IF\"\"S=_; rm -rf $SX",
     'S="/tmp/x;/y /usr"; rm -rf $S', "OLDPWD=/tmp/x; cd /usr; rm -rf $OLDPWD", 'S=/tmp/x; eval "$(printf "\\x53=/usr")"; rm -rf $S/',
 ]
