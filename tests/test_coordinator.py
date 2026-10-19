@@ -728,13 +728,15 @@ def held_ids(tmp_path):   # the spool file --status reads: what the loop left op
 
 
 def test_attended_tells_the_session_with_one_fixed_line_for_a_queue_open_at_the_start(C, tmp_path):
-    queued(C); C.stubs.reply("answer.sh", WHY + "\n", rc=3)
+    queued(C)
+    C.stubs.reply("answer.sh", WHY + "\n", rc=3)
     assert sent(C) == [line("plan", "msg_a"), line("permission request", "msg_fresh")]   # five questions and a blocked issue open at the start: one line for the queue, one for the permission request
     assert held_ids(tmp_path) == ["msg_a", "msg_b", "msg_c", "msg_fresh", "msg_oldplan"]   # what was open at the start, oldest first
 
 
 def test_attended_without_a_session_types_nothing_and_leaves_the_decision_in_the_queue(C):
-    queued(C); C.stubs.reply("answer.sh", WHY + "\n", rc=3)
+    queued(C)
+    C.stubs.reply("answer.sh", WHY + "\n", rc=3)
     assert sent(C, "--session", "") == []
 
 

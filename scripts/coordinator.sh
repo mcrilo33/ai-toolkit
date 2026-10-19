@@ -124,7 +124,7 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
     read -r age how <<< "$(silent "$d")" || true; echo "  $d $w $v $a, silent ${age:-?}m$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done || echo "  (Orca did not answer)"
   echo "queue (the order to present it):"
   oq="$(open_q)"; mine=""; nl=$'\n'   # one jq for the whole queue: id, payload question, body, each NUL-ended (a spawn per question and field is what made --status slow)
-  while IFS= read -r -d '' id && IFS= read -r -d '' q && IFS= read -r -d '' b; do q="${q%"${q##*[!$nl]}"}"; b="${b%"${b##*[!$nl]}"}"; [ -n "$q" ] || q="$b"   # question_of's rule: the payload question, else the body, trailing newlines dropped
+  while IFS= read -r -d '' id && IFS= read -r -d '' q && IFS= read -r -d '' b; do q="${q%"${q##*[!"$nl"]}"}"; b="${b%"${b##*[!"$nl"]}"}"; [ -n "$q" ] || q="$b"   # question_of's rule: the payload question, else the body, trailing newlines dropped
     if by_loop "$id" "$q"; then mine="$mine $id"; continue; fi; echo "  $id"; show_q "$q"
     if is_perm "$q"; then echo "    reply: $(replycmd "$id" allow)   (or deny)"; else echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; fi
   done < <(jq -j '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | [.id, ($p.question // ""), (.body // "")] | map(tostring | gsub("\u0000"; "") + "\u0000") | add' <<< "$oq")
