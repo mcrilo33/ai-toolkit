@@ -50,16 +50,16 @@ canon() { local p="$1"; case "$p" in \~ | \~/*) p="$HOME${p#\~}";; esac; case "$
 prot() { case "$1" in "$root/orca.yaml" | "$home/.claude/settings.json") return 0;; esac
   [ -n "$spoke" ] && case "$1" in "$root/.claude/settings.json" | "$root/.claude/settings.local.json" | "$root/.claude/hooks" | "$root/.claude/hooks/"* | "$root/.ai-toolkit/spoke-run-id" | "$root/.ai-toolkit/claude-settings.json" | "$root/.ai-toolkit/hooks/"* | "${AI_TOOLKIT_DIR:-/nonexistent}" | "${AI_TOOLKIT_DIR:-/nonexistent}/"*) return 0;; esac
   return 1; }
-fp="$(j '.tool_input.file_path // .tool_input.notebook_path')"
-spool="(~|HOME\}?|$home)/\.ai-toolkit/coordinator"; sy='(^|[;&|(]|[[:cntrl:]])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((env|time|nohup|exec|bash|sh|zsh|source|\.)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?[^[:space:];&|]*sync\.sh([[:space:]]|$)' # spool: a file there is sent as the human's answer, so a worker never writes it; sy: a sync.sh run commits and pushes the base branch inside the script, where push-guard cannot see
+fp="$(j '.tool_input.file_path // .tool_input.notebook_path')"; re() { printf '%s' "$1" | sed 's/[^[:alnum:]_\/-]/\\&/g'; }; rr="$(re "$root")"; rh="$(re "$home")" # re: a path as a literal inside an ERE, so a "[" or "(" in it is not read as syntax
+spool="(~|HOME\}?|$rh)/\.ai-toolkit/coordinator"; sy='(^|[;&|(]|[[:cntrl:]])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((env|time|nohup|exec|bash|sh|zsh|source|\.)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?[^[:space:];&|]*sync\.sh([[:space:]]|$)' # spool: a file there is sent as the human's answer, so a worker never writes it; sy: a sync.sh run commits and pushes the base branch inside the script, where push-guard cannot see
 if [ -n "$fp" ]; then fc="$(canon "$fp")"; if prot "$fc"; then sens "write to a protected path ($fp)"; fi
   [ -z "$spoke" ] || case "$fc" in "$home/.ai-toolkit/coordinator" | "$home/.ai-toolkit/coordinator/"*) deny "write to the human's reply spool ($fp)";; esac
   case "$fc" in "$root/.github/workflows" | "$root/.github/workflows/"*) sens "write to .github/workflows ($fp)";; esac; fi
 cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || finish
 
 c=" $(printf '%s' "$cmd" | sed -E "s/[\"'\\\\]//g; s/[0-9&]*>+ *(\/dev\/null|&[0-9])//g; s/[[:space:]>]/& /g")" # writes to a protected path
-pre="((^|[^[:alnum:]_./-])(\./)?|$root/|\\\$\{?(PWD|CLAUDE_PROJECT_DIR)\}?/|\\\$\(pwd\)/)"; e="([^[:alnum:]_./-]|$)" # project-root paths only: v2/orca.yaml is fine
-p="$pre(orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$home)/\.claude/settings\.json"
+pre="((^|[^[:alnum:]_./-])(\./)?|$rr/|\\\$\{?(PWD|CLAUDE_PROJECT_DIR)\}?/|\\\$\(pwd\)/)"; e="([^[:alnum:]_./-]|$)" # project-root paths only: v2/orca.yaml is fine
+p="$pre(orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$rh)/\.claude/settings\.json"
 if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e)|[^[:space:]]*\.ai-toolkit/(spoke-run-id|claude-settings\.json|hooks|bin|scripts|rules|sync-manifest|setup\.local\.sh|[^/[:space:]]*\.env)|$pre($(printf '%s' "${AI_TOOLKIT_DIR:-/nonexistent}" | sed 's/[^[:alnum:]_\/-]/\\&/g')|(~|HOME\}?|$home)/$(printf '%s' "${AI_TOOLKIT_DIR:-/nonexistent}" | sed -e "s#^$home/##" -e 's/[^[:alnum:]_\/-]/\\&/g')|\\\$\{?AI_TOOLKIT_DIR\}?)(/|$e)"; fi
 w="(>|[[:space:]](tee|cp|mv|rm|touch|ln|dd|install|rsync|truncate|patch|chmod|python[0-9.]*|perl|ruby|node)[[:space:]]|[[:space:]]sed[[:space:]][^;|&]*(-[a-z]*i|--in-place))"
 va="${w}[^;|&]*|[[:space:]](cd|pushd)[[:space:]][^;|&]*" # a verb before the path, or a cd into it
