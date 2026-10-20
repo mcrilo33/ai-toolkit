@@ -88,6 +88,9 @@ def test_transform_keeps_session_and_token_mapping_and_drops_the_bridge_machiner
     for usage in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
         assert f"gen_ai.usage.{usage}" in stmts
     assert "Concat([\"tool:\"" in stmts
+    assert 'set(attributes["langfuse.environment"], resource.attributes["repo"]) where resource.attributes["repo"] != nil' in stmts
+    env_sets = [s for s in stmts.splitlines() if "langfuse.environment" in s]
+    assert env_sets and all(s.endswith('where resource.attributes["repo"] != nil') for s in env_sets), "a session without repo stays on Langfuse's default, never a guessed value"
     raw = (V2 / "langfuse/otelcol.yaml").read_text().lower()
     assert "bridge" not in raw and "prometheus" not in raw and "8889" not in raw
 
