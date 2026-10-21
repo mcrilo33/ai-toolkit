@@ -163,10 +163,11 @@ fi
 if [ "$stop" = 1 ] && [ -z "${ORCA_TERMINAL_HANDLE:-}" ]; then   # a chat session has no terminal to fence the loop from: run --stop in one that has a handle. Its shell stays open and Orca gives no exit status, so the status comes back through a file
   sd="$(spool_dir "$run")"; (umask 077; mkdir -p "$sd"); rcf="$sd/stop.rc"; rm -f "$rcf"
   t="$(orca_json terminal create --worktree "path:$PWD" --title coordinator-stop \
-    --command "bash $(printf %q "$here/coordinator.sh") --stop --run $run; echo \$? > $(printf %q "$rcf")" | jq -r '.result.terminal.handle // empty')"
+    --command "bash $(printf %q "$here/coordinator.sh") --stop --run $run; echo \$? > $(printf %q "$rcf")" | jq -r '.result.terminal.handle // empty')" || t=""
   [ -n "$t" ] || die "terminal create returned no handle"
+  trap 'rm -f "$rcf"; orca_json terminal close --terminal "$t" > /dev/null 2>&1 || true' EXIT   # also when the caller's tool timeout kills this wait
   for ((i = 0; i < ${COORD_STOP_TRIES:-900} + 30; i++)); do [ -s "$rcf" ] && break; sleep "${COORD_STOP_POLL:-1}"; done   # the inner --stop gives up after COORD_STOP_TRIES polls: its verdict arrives first
-  s="$(cat "$rcf" 2> /dev/null || true)"; rm -f "$rcf"; orca_json terminal close --terminal "$t" > /dev/null 2>&1 || true
+  s="$(cat "$rcf" 2> /dev/null || true)"
   [ -n "$s" ] || die "terminal $t reported no exit status"
   log "run $run: --stop in terminal $t exited $s"; exit "$s"
 fi

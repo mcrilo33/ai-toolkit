@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -142,19 +143,23 @@ def test_a_second_stop_while_the_loop_is_still_landing_does_not_return_0(C, tmp_
     assert r.returncode == 1 and "still" in r.stderr
 
 
-def chat_stop(C, repo, tmp_path, *, handle="term_stop", **env):   # --stop from a chat session (no terminal handle): the "terminal" it creates is simulated by running its --command, with a handle of its own, 0.3 s later
+def chat_stop(C, repo, tmp_path, *, handle="term_stop", **env):   # --stop from a chat session (no terminal handle): the "terminal" it creates is simulated by running its --command, with a handle of its own, as soon as the create call is logged
     C.stubs.reply("orca.terminal_create", json.dumps({"result": {"terminal": {"handle": handle}}}) if handle else "{}")
 
     def terminal():
-        cmd = arg(C.calls("orca terminal create")[0], "--command")
-        subprocess.run(["bash", "-c", cmd], cwd=repo.root, env={**os.environ, "ORCA_TERMINAL_HANDLE": "term_stop", "AITK_STATE_DIR": str(tmp_path / "state"), "COORD_STOP_TRIES": "1", "COORD_STOP_POLL": "0"}, capture_output=True, text=True)
+        end, made = time.time() + 20, []
+        while not made and time.time() < end:
+            time.sleep(0.02)
+            made = [a for a in C.calls("orca terminal create") if "--command" in a[:-1]] if (tmp_path / "stubs/calls.log").exists() else []   # the stub logs a call argument by argument: wait for the whole line
+        if made and handle:
+            subprocess.run(["bash", "-c", arg(made[0], "--command")], cwd=repo.root, env={**os.environ, "ORCA_TERMINAL_HANDLE": "term_stop", "AITK_STATE_DIR": str(tmp_path / "state"), "COORD_STOP_TRIES": "1", "COORD_STOP_POLL": "0"}, capture_output=True, text=True)
 
-    t = threading.Timer(0.3, terminal)
+    t = threading.Thread(target=terminal)
     t.start()
     try:
-        return C.go("--stop", ORCA_TERMINAL_HANDLE="", COORD_STOP_TRIES=100, COORD_STOP_POLL=0.05, **env)
+        return C.go("--stop", ORCA_TERMINAL_HANDLE="", COORD_STOP_TRIES=400, COORD_STOP_POLL=0.05, **env)
     finally:
-        t.cancel(); t.join()
+        t.join()
 
 
 def test_stop_from_a_chat_session_runs_in_a_terminal_of_its_own_and_returns_its_exit(C, repo, tmp_path):
