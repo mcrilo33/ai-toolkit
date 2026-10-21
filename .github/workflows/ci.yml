@@ -30,8 +30,8 @@ jobs:
         run: pytest -n auto tests
       - name: sync idempotency (sync twice into a temp repo, no drift)
         run: |
-          t="$(mktemp -d)"; git -C "$t" init -q
+          t="$(mktemp -d)"; o="$(mktemp -d)"; git -C "$t" init -q
           snap() { (cd "$t" && find . -path ./.git -prune -o -type f -exec cksum {} + | LC_ALL=C sort); }
-          bash scripts/sync.sh "$t" --no-commit > /dev/null; snap > first.txt
-          bash scripts/sync.sh "$t" --no-commit > /dev/null; snap > second.txt
-          diff first.txt second.txt
+          bash scripts/sync.sh "$t" --no-commit > /dev/null; snap > "$o/first.txt"
+          bash scripts/sync.sh "$t" --no-commit > /dev/null; snap > "$o/second.txt"
+          diff "$o/first.txt" "$o/second.txt"
