@@ -146,7 +146,7 @@ watch_queue() {   # $1 poll number: one look at the queue (#473). Sets $found to
   if [ "$bok" = 0 ] || [ $(($1 % ${COORD_WATCH_GH_EVERY:-12})) -eq 0 ]; then b="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 1; bids="$b"; bok=1; fi   # gh is read every COORD_WATCH_GH_EVERY polls, not every poll
   all="$(queue_ids | tr '\n' ' ')" || return 1
   for f in "$(spool_dir "$run")/requests"/*; do [ ! -f "$f" ] || [ -z "$(sed -n 2p "$f")" ] || all="$all r:${f##*/} "; done   # a dispatch request with a refusal reason
-  all=" $all"; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || all="${all/ ?:${f##*/} / }"; done   # a decision answered with --reply stays open in Orca until the loop's next wake: it is no longer waiting
+  all=" $all"; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || all="${all/ [qp]:${f##*/} / }"; done   # a decision answered with --reply stays open in Orca until the loop's next wake: it is no longer waiting
   if [ -z "$started" ]; then started=1; seen="$all"; [ "$seen_given" = 0 ] || { seen=""; for i in $all; do case " $seen_arg " in *" ${i#?:} "*) seen="$seen$i " ;; esac; done; }; fi
   for i in $seen; do case " $all " in *" $i "*) first=0 ;; esac; done
   for i in $all; do case "$i" in p:*) case " $seen " in *" $i "*) ;; *) found="${i#?:}"; return 0 ;; esac ;; esac; done   # a permission request first: it expires in 9 minutes
