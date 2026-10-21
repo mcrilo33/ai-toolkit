@@ -96,6 +96,8 @@ def test_a_chat_session_decision_is_alerted_by_a_mandatory_ask_user_question_car
     assert "AskUserQuestion" in chat and "optionally" not in chat and "permission request" in chat
     assert "no bell" not in chat.lower() and "afplay" not in chat and "PushNotification" in chat
     assert re.search(r"permission request .{0,40}card is open", chat)   # a request waking the watcher behind an open card
+    assert "restates the decision on its own" in chat and re.search(r"option.s description says what", chat)   # the text above the card may not be seen (mobile)
+    assert "inline chat visuals" in chat and "one-line choice" in chat and "stands alone" in chat   # a condensed visual before the card, text when enough
 
 
 def test_hub_lands_with_the_review():
