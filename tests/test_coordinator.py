@@ -994,18 +994,21 @@ def T(C, tmp_path, link_script):   # the loop installed in a project (inst/.ai-t
         f = tmp_path / "stubs/sync.args"
         return f.read_text().splitlines() if f.exists() else []
 
-    log = tmp_path / "state/run_t/loop.log"
-    return SimpleNamespace(C=C, go=go, inst=inst, tk=tk, stamp=stamp, sha=git(tk, "rev-parse", "--short=12", "HEAD"), syncs=syncs,
-                           log=lambda: log.read_text() if log.exists() else "")
+    def log(run_id="run_t"):
+        f = tmp_path / f"state/{run_id}/loop.log"
+        return f.read_text() if f.exists() else ""
+    return SimpleNamespace(C=C, go=go, inst=inst, tk=tk, stamp=stamp, sha=git(tk, "rev-parse", "--short=12", "HEAD"), syncs=syncs, log=log)
 
 
-def test_a_loop_behind_the_toolkit_syncs_its_project_and_re_execs_with_its_run_and_arguments(T):
+@pytest.mark.parametrize("run_id, loop_run", [("run_t", "run_t"), (None, "run_new")])
+def test_a_loop_behind_the_toolkit_syncs_its_project_and_re_execs_with_its_run_and_arguments(T, run_id, loop_run):
     T.stamp.write_text("0123456789ab\n")
-    r = T.go("--answer", "attended", "--cap", "2", COORD_MAX_TICKS=1)
-    log = T.log()
+    r = T.go("--answer", "attended", "--cap", "2", COORD_MAX_TICKS=1, run_id=run_id)
+    log = T.log(loop_run)
     assert r.returncode == 0 and T.syncs() == [str(T.inst.resolve())]   # the project's own path, no flag: the sync's refusals stay in force
-    assert f"toolkit 0123456789ab -> {T.sha}: re-exec" in log and log.count("run run_t, cap 2, answer attended") == 2   # one loop, restarted: the same Run and arguments
-    assert not T.C.calls("orca orchestration run-create") and len(T.C.calls("orca orchestration run-use")) == 2
+    assert f"toolkit 0123456789ab -> {T.sha}: re-exec" in log and log.count(f"run {loop_run}, cap 2, answer attended") == 2   # one loop, restarted: the same Run and arguments
+    assert len(T.C.calls("orca orchestration run-create")) == (run_id is None)   # a loop that created its Run re-binds it, never creates a second
+    assert len(T.C.calls("orca orchestration run-use")) == 2 - (run_id is None)
 
 
 @pytest.mark.parametrize("stamp, env", [
@@ -1021,19 +1024,22 @@ def test_a_loop_that_is_current_or_opted_out_neither_syncs_nor_re_execs(T, stamp
     assert r.returncode == 0 and not T.syncs() and "re-exec" not in T.log()
 
 
-def test_a_refused_sync_is_one_warning_one_attempt_per_toolkit_sha_and_the_loop_keeps_running(T):
+def test_a_refused_sync_is_one_warning_one_attempt_per_toolkit_sha_and_the_loop_keeps_running(T, link_script):
     T.stamp.write_text("0123456789ab\n")
-    r = T.go(COORD_MAX_TICKS=3, SYNC_RC=1)
-    assert r.returncode == 0 and len(T.syncs()) == 1 and len(T.C.calls("orca orchestration check")) == 3   # not retried until the toolkit moves, never forced
-    assert re.findall(r"warning: toolkit sync to \w+ refused.*not on its base branch main", T.log()) != [] and T.log().count("warning: toolkit") == 1
+    link_script(T.tk / "scripts/sync.sh", '#!/bin/bash\necho "$*" >> "$STUB_DIR/sync.args"\n[ -e "$STUB_DIR/moved" ] || { touch "$STUB_DIR/moved"; git -C "$TK" commit -q --allow-empty -m next; }\n'
+                'echo "sync.sh: $1 is not on its base branch main" >&2; exit 1\n')   # refused, and the toolkit moves on after the first attempt
+    r = T.go(COORD_MAX_TICKS=4)
+    assert r.returncode == 0 and len(T.syncs()) == 2 and len(T.C.calls("orca orchestration check")) == 4   # once per sha over four wakes, never forced
+    assert len(set(re.findall(r"warning: toolkit sync to (\w+) refused.*not on its base branch main", T.log()))) == 2 and T.log().count("warning: toolkit") == 2
     assert "re-exec" not in T.log()
 
 
-def test_a_toolkit_land_that_synced_the_project_itself_re_execs_the_loop_without_a_second_sync(T, link_script):
+@pytest.mark.parametrize("auto, execs", [(1, True), (0, False)])
+def test_a_toolkit_land_that_synced_the_project_itself_re_execs_the_loop_without_a_second_sync_unless_it_is_manual(T, link_script, auto, execs):
     T.stamp.write_text(T.sha + "\n")
     land = link_script(T.inst.parent / "land_sync.sh", '#!/bin/bash\n[ "$1" = --next ] && [ ! -e "$STAMP.done" ] && { touch "$STAMP.done"; git -C "$TK" commit -q --allow-empty -m land; git -C "$TK" rev-parse --short=12 HEAD > "$STAMP"; exit 3; }\n')   # a land fast-forwards the toolkit and its self-sync stamps the project, between two wakes
-    r = T.go(COORD_MAX_TICKS=2, DISPATCH_CMD=land, STAMP=T.stamp)
-    assert r.returncode == 0 and not T.syncs() and f"toolkit {T.sha} -> " in T.log() and ": re-exec" in T.log()
+    r = T.go(COORD_MAX_TICKS=2, DISPATCH_CMD=land, STAMP=T.stamp, AUTO_SYNC=auto)
+    assert r.returncode == 0 and not T.syncs() and (f"toolkit {T.sha} -> " in T.log() and ": re-exec" in T.log()) == execs
 
 
 def test_a_synced_coordinator_that_does_not_parse_is_not_exec_d_and_warns_once(T, link_script):

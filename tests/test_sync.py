@@ -236,7 +236,7 @@ def test_a_host_records_the_toolkits_origin_as_upstream_and_the_toolkit_itself_s
     write(target / ".ai-toolkit" / "ai-toolkit.local.env", "UPSTREAM_REPO=me/fork\n")  # the per-target override still wins
     probe = f'. "{target}/.ai-toolkit/scripts/lib.sh"; ORCA_ROOT_PATH="{target}" load_env; echo "$UPSTREAM_REPO"'
     assert run(["bash", "-c", probe]).stdout.strip() == "me/fork"
-    assert sync(tgt=src / "v2").returncode == 0  # the toolkit syncing into itself: nothing to point at
+    assert sync(tgt=src / "v2").returncode == 0  # the toolkit syncing into itself: no upstream, and its own path as TOOLKIT_DIR
     assert (src / "v2" / ".ai-toolkit" / "ai-toolkit.env").read_text() == (src / "v2" / "settings" / "ai-toolkit.env").read_text().replace("TOOLKIT_DIR=", f"TOOLKIT_DIR={(src / 'v2').resolve()}")
     git(src / "v2", "remote", "remove", "origin")
     r = sync()

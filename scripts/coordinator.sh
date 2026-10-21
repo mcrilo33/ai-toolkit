@@ -427,14 +427,14 @@ notify_queue() {   # attended: tell the session of a decision that was not queue
 tv() { local f="$here/../toolkit-version" s=""; [ ! -f "$f" ] || read -r s < "$f" || true; printf '%s' "${s%-dirty}"; }   # the sha of the toolkit this project is synced from (-dirty ignored: an unchanged sha is no new version)
 tv0="$(tv)"; tried=""; bad=""
 autosync() {   # at a wake, where no land, dispatch or answer is under way: sync this project once per newer toolkit sha (AUTO_SYNC=1, TOOLKIT_DIR a git checkout), then re-exec on a new installed version (ours, a toolkit land's self-sync, or a manual one)
-  local now new o; now="$(tv)"
-  if [ "${AUTO_SYNC:-0}" = 1 ] && [ -n "$now" ] && new="$(git -C "${TOOLKIT_DIR:-/nonexistent}" rev-parse --short=12 HEAD 2> /dev/null)" && [ "$new" != "$now" ] && [ "$new" != "$tried" ]; then
+  local now new o; [ "${AUTO_SYNC:-0}" = 1 ] || return 0; now="$(tv)"
+  if [ -n "$now" ] && new="$(git -C "${TOOLKIT_DIR:-/nonexistent}" rev-parse --short=12 HEAD 2> /dev/null)" && [ "$new" != "$now" ] && [ "$new" != "$tried" ]; then
     tried="$new"; o="$(bash "$TOOLKIT_DIR/scripts/sync.sh" "$(cd "$here/../.." && pwd -P)" 2>&1)" || warn "toolkit sync to $new refused, not retried until the toolkit moves: ${o##*$'\n'}"
     now="$(tv)"
   fi
   { [ -n "$now" ] && [ "$now" != "$tv0" ]; } || return 0
-  if ! bash -n "$here/coordinator.sh" 2> /dev/null; then   # an exec of a script that does not parse would end the loop silently
-    [ "$bad" = "$now" ] || warn "the synced coordinator.sh does not parse: the loop keeps running its old code"; bad="$now"; return 0; fi
+  if ! { bash -n "$here/coordinator.sh" && bash -n "$here/lib.sh"; } 2> /dev/null; then   # an exec of a script that does not parse would end the loop silently
+    [ "$bad" = "$now" ] || warn "the synced coordinator.sh or lib.sh does not parse: the loop keeps running its old code"; bad="$now"; return 0; fi
   log "toolkit $tv0 -> $now: re-exec"; rm -f "$errf"   # the EXIT trap does not run on exec; holder.$$ stays valid, the pid is the same
   exec bash "$here/coordinator.sh" ${orig[@]+"${orig[@]}"} --run "$run"   # --run last wins: a loop started without one keeps the Run it created
 }

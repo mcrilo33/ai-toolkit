@@ -108,7 +108,7 @@ up=""
 if [ "$TARGET" != "$V2" ]; then
   up="$(owner_repo "$(git -C "$V2" remote get-url origin 2> /dev/null)")" || { up=""; warn "the toolkit checkout has no usable origin: UPSTREAM_REPO left empty in $TARGET, so the scopers will draft, not file, a toolkit defect"; }
 fi
-sed -e "s|^UPSTREAM_REPO=.*|UPSTREAM_REPO=$up|" -e "s|^TOOLKIT_DIR=.*|TOOLKIT_DIR=$V2|" "$V2/settings/ai-toolkit.env" > "$TMP"
+sed -e "s|^UPSTREAM_REPO=.*|UPSTREAM_REPO=$up|" -e "s|^TOOLKIT_DIR=.*|TOOLKIT_DIR=$(printf '%s' "$V2" | sed 's/[\\&|]/\\&/g')|" "$V2/settings/ai-toolkit.env" > "$TMP"
 put "$TMP" .ai-toolkit/ai-toolkit.env
 # The toolkit commit this host is synced from (bin/claude-spoke tags a spoke's telemetry with it, the loop compares it with the toolkit's HEAD): -dirty when the checkout has uncommitted edits; no git checkout, no stamp.
 if tv="$(git -C "$V2" rev-parse --short=12 HEAD 2> /dev/null)"; then
