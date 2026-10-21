@@ -630,6 +630,8 @@ DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed
     "kept-worktree-with-message": dict(text="do it test-first", v7=BLOCKED, kept=True, expect=("--address", "do it test-first", "7"), label=True), "kept-worktree-default-message": dict(kept=True, expect="default"),
     "cap": dict(cap=1, why="waiting for a free slot (cap 1)"), "refused": dict(refuses=True, why="dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"), "closed": dict(v7=issue_json(state="CLOSED"), dropped=True),
     "hold": dict(v7=issue_json(labels=["hold"]), why="on hold: remove the hold label to start it"), "blocked-no-message": dict(v7=BLOCKED, why="blocked: remove the label, or give a message to re-dispatch it"),
+    "no-toolkit-label": dict(v7=issue_json(labels=["bug"]), env={"DISPATCH_LABEL": "ai-toolkit"}, why="not a toolkit issue: it lacks the ai-toolkit label"),
+    "toolkit-label": dict(v7=issue_json(labels=["ai-toolkit"]), env={"DISPATCH_LABEL": "ai-toolkit"}),
     "running": dict(kept=True, running=True, dropped=True), "unreadable": dict(unreadable=True, why="cannot read the issue (unknown, or GitHub did not answer)"),
     "worktrees": dict(no_worktrees=True, why="cannot read the worktrees"), "dispatch-fails": dict(fails=True, why="dispatch failed: boom"),
 }
@@ -647,7 +649,7 @@ def test_a_queued_dispatch_request_runs_ahead_of_the_automatic_pick_within_the_c
         C.workers(C.row(), {**C.row("ctx_7"), "resource": {"worktreeId": "r::/k7"}})
     C.stubs.reply("gh.issue_view", "boom" if c.get("unreadable") else c["v7"], rc=1 if c.get("unreadable") else 0)
     C.stubs.reply("dispatch.sh", "boom" if c.get("fails") else "dispatch: #7 is not ready: Scope overlaps #1" if c.get("refuses") else '{"issue":7}', rc=1 if c.get("fails") else 3 if c.get("refuses") else 0)
-    go = C.go("--answer", "attended", "--cap", str(c["cap"]))
+    go = C.go("--answer", "attended", "--cap", str(c["cap"]), **c.get("env", {}))
     assert go.returncode == 0
     ran = lambda: [a for a in C.stubs.calls("dispatch.sh") if a != ["--next", "--dry-run"]]   # noqa: E731  (the fill's own pick is not a request)
     if "why" not in c and not c.get("dropped"):   # dispatch.sh (the existing script) starts it; a blocked issue loses its label only after that; the request is consumed
@@ -764,6 +766,22 @@ def test_attended_sends_nothing_behind_a_waiting_decision_but_a_permission_reque
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)
     C.mail([msg("question", "msg_a", question="PLAN?")], [msg("question", "msg_b", question="PLAN?")], [msg("question", "msg_pc", question=PQ)], [], [msg("question", "msg_e", question="PLAN?")])
     assert sent(C, COORD_MAX_TICKS=5, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b waits behind msg_a and is the session's to present once msg_a is answered, not the loop's
+
+
+def test_the_blocked_queue_reads_only_the_dispatch_label_when_one_is_set(C):
+    watched(C, ([], [4]), DISPATCH_LABEL="ai-toolkit")
+    watched(C, ([], [4]))
+    reads = [a for a in C.calls("gh issue list") if "blocked" in a]
+    assert reads[0].count("--label") == 2 and "ai-toolkit" in reads[0] and reads[1].count("--label") == 1
+
+
+def test_the_triage_prompt_and_allowlist_carry_the_dispatch_label_when_one_is_set(C):
+    C.stubs.reply("land.sh", f"{W}x\nlanded #1 in abc\n")
+    C.stubs.reply("claude", "filed #9\n")
+    C.mail([{**msg("worker_done", "msg_d", outcome="succeeded"), "body": "the body"}])
+    C.go(DISPATCH_LABEL="ai-toolkit")
+    p, tools = C.stdin("claude"), set(arg(C.stubs.calls("claude")[0], "--allowedTools").split(","))
+    assert "ai-toolkit" in p and "not to issues filed upstream" in p and tools == TOOLS | {"Bash(gh label create ai-toolkit:*)"}
 
 
 def watched(C, *polls, seen=None, fail=None, **env):   # --wait with no terminal handle: each poll is (open question ids, blocked issue numbers), read once per poll; "msg_p*" ids are permission requests

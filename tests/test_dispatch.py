@@ -225,6 +225,30 @@ def test_next_picks_the_first_ready_issue(d, name, nodes, busy, want):
         assert (r.returncode, r.stdout.strip()) == ((0, str(i)) if i in ready else (3, "")) and (i in ready or f"#{i} is not ready" in r.stderr), r.stderr
 
 
+LABELLED = [issue(3, "Scope: a.py"), issue(4, "Scope: b.py", ["ai-toolkit"]), issue(6, "Scope: c.py", ["ai-toolkit"])]
+
+
+def test_a_dispatch_label_restricts_the_pick_to_issues_that_carry_it(d):
+    stub_board(d, LABELLED, [])
+    assert d.go("--next", "--dry-run").stdout.strip() == "3"   # no label set: every ready issue is a candidate
+    assert d.go("--next", "--dry-run", DISPATCH_LABEL="ai-toolkit").stdout.strip() == "4"
+    r = d.go("--next", "--dry-run", "3", DISPATCH_LABEL="ai-toolkit")
+    assert (r.returncode, r.stdout.strip()) == (3, "") and "#3 is not ready" in r.stderr and "lacks the ai-toolkit label" in r.stderr
+    assert d.go("--next", "--dry-run", "6", DISPATCH_LABEL="ai-toolkit").stdout.strip() == "6"
+    stub_board(d, LABELLED[:1], [])
+    r = d.go("--next", "--dry-run", DISPATCH_LABEL="ai-toolkit")
+    assert r.returncode == 3 and "nothing ready" in r.stderr
+
+
+def test_a_fresh_dispatch_of_an_issue_without_the_dispatch_label_starts_nothing(d):
+    d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "labels": [{"name": "bug"}]}))
+    r = d.go("7", DISPATCH_LABEL="ai-toolkit")
+    assert r.returncode == 1 and "issue 7 lacks the ai-toolkit label" in r.stderr
+    assert d.orca() == [] and not d.record.exists()
+    d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "labels": [{"name": "bug"}, {"name": "ai-toolkit"}]}))
+    assert d.go("7", DISPATCH_LABEL="ai-toolkit").returncode == 0
+
+
 def test_next_dispatches_the_pick(d):
     stub_board(d, [issue(5, "Scope: b.py"), issue(3, "Scope: a.py")], [])
     r = d.go("--next")

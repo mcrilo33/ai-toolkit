@@ -124,7 +124,8 @@ Gate: plan
 ## Phase 6: Labels
 
 Always `enhancement` and `hold`, whatever the `Scope:` (the `bug-triage` rule says why; create the
-label if the repo lacks it, and never file without it). Say in your report that you applied `hold`.
+label if the repo lacks it, and never file without it). Say in your report that you applied `hold`. When `DISPATCH_LABEL` is set (`bug-triage` rule), add it too on an
+issue filed to this repo, not on one filed upstream.
 
 ## Phase 7: File or draft
 

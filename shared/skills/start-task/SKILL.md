@@ -32,7 +32,7 @@ The footer is the dispatch contract (see `.ai-toolkit/rules/issue-hygiene.md`):
 | `Gate:` | `plan` (always, unless told otherwise: the worker `ask`s for approval of its plan). `none` is the light lane (no PLAN gate, no in-worker review): write it only when the user asked for light on this issue, never because the work looks small |
 | `Model:` | optional override of `SPOKE_MODEL`; reasoning-heavy work gets an Opus id |
 
-Labels: `priority` (dispatched first), `hold` (never dispatched). **Blocked-by**: answer "does this depend on
+Labels: `priority` (dispatched first), `hold` (never dispatched), and `DISPATCH_LABEL` when set (create it if missing; see `bug-triage`). **Blocked-by**: answer "does this depend on
 open work?" for every issue and declare a real native edge if yes (`github-issues/references/dependencies.md`);
 never use one to encode file overlap. A chain with colliding `Scope:` is one issue with subtasks.
 

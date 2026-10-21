@@ -44,6 +44,7 @@ PICK='def scope: [(.body // "") | split("\n")[] | select(test("^\\s*[Ss]cope:"))
   | [.[] | . as $i | scope as $s
       | select($only == null or $i.number == $only)
       | select(($busy | index($i.number)) == null)
+      | select($label == "" or (names | index($label)) != null)
       | select(names | any(. == "hold" or . == "blocked") | not)
       | select([$i.blockedBy.nodes[] | select(.state != "CLOSED")] | length == 0)
       | select($held | all(clash($s; .) | not))
@@ -56,7 +57,7 @@ pick_next() {   # $only: restrict the pick to that issue (--next <issue>)
     query($owner:String!, $name:String!, $limit:Int!) { repository(owner:$owner, name:$name) { issues(states: OPEN, first: $limit, orderBy: {field: CREATED_AT, direction: ASC}) {
       nodes { number body labels(first: 20) { nodes { name } } blockedBy(first: 50) { nodes { number state } } } } } }')" || die "gh api graphql failed"
   busy="$(orca_json worktree list --repo "path:$main" | jq -c '[.result.worktrees[].linkedIssue | select(. != null)]')" || die "worktree list failed"
-  printf '%s' "$nodes" | jq -r --argjson busy "$busy" --argjson only "${only:-null}" "$PICK"
+  printf '%s' "$nodes" | jq -r --argjson busy "$busy" --argjson only "${only:-null}" --arg label "${DISPATCH_LABEL:-}" "$PICK"
 }
 
 seed() {   # $1 = gate: plan = full cycle; none = light lane (no PLAN gate, no in-worker review)
@@ -122,7 +123,9 @@ dispatch() {
 
 if [ "$next" = 1 ]; then
   only="$n"; n="$(pick_next)"
-  [ -n "$n" ] || { if [ -n "$only" ]; then echo "dispatch: #$only is not ready (on hold, blocked, in flight, an open blocker, or a Scope that overlaps an in-flight issue)" >&2; else echo "dispatch: nothing ready" >&2; fi; exit 3; }
+  [ -n "$n" ] || { if [ -n "$only" ]; then echo "dispatch: #$only is not ready (on hold, blocked, in flight, an open blocker, or a Scope that overlaps an in-flight issue${DISPATCH_LABEL:+, or lacks the $DISPATCH_LABEL label})" >&2; else echo "dispatch: nothing ready" >&2; fi; exit 3; }
   [ "$dry" = 0 ] || { echo "$n"; exit 0; }
+elif [ -n "${DISPATCH_LABEL:-}" ] && [ -z "$retry_of$address" ]; then   # an explicit dispatch bypasses the pick: it still refuses an issue the toolkit did not file
+  gh issue view "$n" --json labels | jq -e --arg l "$DISPATCH_LABEL" '.labels | map(.name) | index($l)' > /dev/null || die "issue $n lacks the $DISPATCH_LABEL label: not a toolkit issue"
 fi
 dispatch "$n"
