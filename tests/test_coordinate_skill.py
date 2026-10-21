@@ -87,6 +87,7 @@ def test_the_architecture_doc_describes_both_modes_the_switch_and_the_attended_f
 def test_between_stop_and_its_exit_the_session_handles_nothing():
     attended = section("Switching")
     assert re.search(r"Never start the other loop", attended) and re.search(r"exits? 0", attended)
+    assert "chat session" in attended and "coordinator-stop" in attended   # --stop needs no terminal handle of its own
 
 
 def test_hub_lands_with_the_review():

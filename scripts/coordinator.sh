@@ -15,7 +15,7 @@
 # --run R --wait [--seen '<ids>'] (a chat session, #473): read-only, needs no terminal; polls every COORD_WATCH_SEC (5) and exits 0 printing the id of a decision that was not waiting when it started (nor in --seen), by notify_queue's rule; a failed read retries.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
 # consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
-# the Run from this terminal, then wait until the loop is gone.
+# the Run from this terminal, then wait until the loop is gone. Without a terminal handle (a chat session) --stop runs itself in a coordinator-stop terminal and exits with that run's status.
 # A failed Orca read is one warning naming the call and its error code, retried at the next wake; an exit on an error is logged with its status and the failing command (attended: typed into the session), and --status says when no loop runs.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -160,6 +160,16 @@ if [ "$watch" = 1 ]; then   # read-only, no terminal handle, never binds the Run
   for ((n = 0; n < ${COORD_WATCH_MAX:-100000000}; n++)); do ! watch_queue "$n" || { echo "$found"; exit 0; }; sleep "${COORD_WATCH_SEC:-5}"; done; exit 1
 fi
 
+if [ "$stop" = 1 ] && [ -z "${ORCA_TERMINAL_HANDLE:-}" ]; then   # a chat session has no terminal to fence the loop from: run --stop in one that has a handle. Its shell stays open and Orca gives no exit status, so the status comes back through a file
+  sd="$(spool_dir "$run")"; (umask 077; mkdir -p "$sd"); rcf="$sd/stop.rc"; rm -f "$rcf"
+  t="$(orca_json terminal create --worktree "path:$PWD" --title coordinator-stop \
+    --command "bash $(printf %q "$here/coordinator.sh") --stop --run $run; echo \$? > $(printf %q "$rcf")" | jq -r '.result.terminal.handle // empty')"
+  [ -n "$t" ] || die "terminal create returned no handle"
+  for ((i = 0; i < ${COORD_STOP_TRIES:-900} + 30; i++)); do [ -s "$rcf" ] && break; sleep "${COORD_STOP_POLL:-1}"; done   # the inner --stop gives up after COORD_STOP_TRIES polls: its verdict arrives first
+  s="$(cat "$rcf" 2> /dev/null || true)"; rm -f "$rcf"; orca_json terminal close --terminal "$t" > /dev/null 2>&1 || true
+  [ -n "$s" ] || die "terminal $t reported no exit status"
+  log "run $run: --stop in terminal $t exited $s"; exit "$s"
+fi
 : "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal on the main checkout}"
 H="$ORCA_TERMINAL_HANDLE"
 prev=""; [ -z "$run" ] || prev="$(holder)"

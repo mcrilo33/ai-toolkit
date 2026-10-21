@@ -142,6 +142,47 @@ def test_a_second_stop_while_the_loop_is_still_landing_does_not_return_0(C, tmp_
     assert r.returncode == 1 and "still" in r.stderr
 
 
+def chat_stop(C, repo, tmp_path, *, handle="term_stop", **env):   # --stop from a chat session (no terminal handle): the "terminal" it creates is simulated by running its --command, with a handle of its own, 0.3 s later
+    C.stubs.reply("orca.terminal_create", json.dumps({"result": {"terminal": {"handle": handle}}}) if handle else "{}")
+
+    def terminal():
+        cmd = arg(C.calls("orca terminal create")[0], "--command")
+        subprocess.run(["bash", "-c", cmd], cwd=repo.root, env={**os.environ, "ORCA_TERMINAL_HANDLE": "term_stop", "AITK_STATE_DIR": str(tmp_path / "state"), "COORD_STOP_TRIES": "1", "COORD_STOP_POLL": "0"}, capture_output=True, text=True)
+
+    t = threading.Timer(0.3, terminal)
+    t.start()
+    try:
+        return C.go("--stop", ORCA_TERMINAL_HANDLE="", COORD_STOP_TRIES=100, COORD_STOP_POLL=0.05, **env)
+    finally:
+        t.cancel(); t.join()
+
+
+def test_stop_from_a_chat_session_runs_in_a_terminal_of_its_own_and_returns_its_exit(C, repo, tmp_path):
+    show(C, "term_c")
+    r = chat_stop(C, repo, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert C.calls("orca orchestration run-use")[0][2:6] == ["--id", "run_t", "--from", "term_stop"]   # the new terminal takes the Run, not the chat session
+    create = C.calls("orca terminal create")[0]
+    assert arg(create, "--title") == "coordinator-stop" and arg(create, "--worktree") == f"path:{repo.root}"
+    assert arg(C.calls("orca terminal close")[0], "--terminal") == "term_stop"
+
+
+def test_stop_from_a_chat_session_exits_1_while_the_loop_is_still_finishing_a_step(C, repo, tmp_path):
+    show(C, "term_c")
+    p = fake_coordinator()
+    try:
+        hold_file(tmp_path, p.pid)
+        r = chat_stop(C, repo, tmp_path)
+    finally:
+        reap(p)
+    assert r.returncode == 1 and C.calls("orca terminal close")
+
+
+def test_stop_from_a_chat_session_dies_when_no_terminal_could_be_created(C, repo, tmp_path):
+    r = chat_stop(C, repo, tmp_path, handle="")
+    assert r.returncode != 0 and "no handle" in r.stderr and not C.calls("orca orchestration run-use")
+
+
 def test_a_holder_file_whose_pid_is_now_some_other_process_is_stale(C, tmp_path):
     show(C, "term_c")
     hold_file(tmp_path, os.getpid())   # alive, but its command is not coordinator.sh: a recycled pid
