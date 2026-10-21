@@ -54,8 +54,8 @@ A script that still reads a worker-controlled source, or a worker that can still
 7. **Gate on tests.** `land.sh`: CI must be green for the EXACT tip (`gh run list --commit <sha>`); if the base moved, merge it on the spoke, push,
    gate again. `LOCAL_GATE=1` runs `CHECK_CMD` in the spoke instead (repos without CI).
 8. **Land.** fast-forward the main checkout to the gated tip, push, `gh issue close -c "landed in <sha>"`, delete the remote branch (lease-guarded),
-   `worker-release` every dispatch, `worktree rm --run-hooks`. In the toolkit's own checkout the cleanup first re-runs `sync.sh` on it, so the toolkit's self-sync is automatic after a land;
-   a running loop keeps its own `coordinator.sh` until it is restarted (sync replaces files by rename).
+   `worker-release` every dispatch, `worktree rm --run-hooks`. In the toolkit's own checkout the cleanup first re-runs `sync.sh` on it, so the toolkit's self-sync is automatic after a land.
+   A running loop updates itself (pull, `AUTO_SYNC=1`): at each wake, before `fill`, when `TOOLKIT_DIR` (set by `sync.sh`) is a git checkout whose HEAD sha differs from the installed `.ai-toolkit/toolkit-version` (a `-dirty` suffix is ignored), it runs that checkout's `sync.sh` on its project once per toolkit sha (a refusal is one warning, never forced), and when the installed sha differs from the one it started with (its own sync, or the self-sync above) it `exec`s `coordinator.sh` again with its original arguments and `--run`: same pid and Run, new code. `AUTO_SYNC=0` in `.ai-toolkit/ai-toolkit.local.env` keeps a project manual.
 9. **Rounds.** A rejected review (max 2 rounds), red CI or a merge conflict (1 round) goes back to the worker as a fresh dispatch whose spec starts with
    `address:`. Still failing, a timeout, a `failed` completion or an escalation: label `blocked` + comment + the Orca surface (worktree comment), the worker is released,
    the **worktree is kept** for the human.

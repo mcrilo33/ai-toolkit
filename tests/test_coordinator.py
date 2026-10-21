@@ -1,10 +1,12 @@
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from conftest import STUB_TEE, V2, git
@@ -91,9 +93,9 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     workers(row())
     mail()
 
-    def go(*args, run_id="run_t", **env):
+    def go(*args, run_id="run_t", co=CO, **env):
         cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh")}
-        return run(["bash", CO, *(["--run", run_id] if run_id else []), "--session", "term_s", *args], cwd=repo.root,
+        return run(["bash", co, *(["--run", run_id] if run_id else []), "--session", "term_s", *args], cwd=repo.root,
                    **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", **cmd_env, **env})
 
     def trail():   # [("orca orchestration check ack", argv), ("gh issue edit", argv), ("land.sh", argv)...] in call order
@@ -968,3 +970,74 @@ def test_a_re_dispatch_for_a_worker_with_no_terminal_closes_none_rather_than_the
     C.mail([msg("worker_done", outcome="succeeded")])
     C.go()
     assert C.stubs.calls("dispatch.sh") and not C.calls("orca terminal close")
+
+
+@pytest.fixture
+def T(C, tmp_path, link_script):   # the loop installed in a project (inst/.ai-toolkit) beside a toolkit checkout whose sync.sh is a stub that stamps the project with the toolkit's HEAD
+    inst, tk = tmp_path / "inst", tmp_path / "tk"
+    (inst / ".ai-toolkit/scripts").mkdir(parents=True)
+    for n in ("coordinator.sh", "lib.sh"):
+        shutil.copy(V2 / "scripts" / n, inst / ".ai-toolkit/scripts" / n)
+    (tk / "scripts").mkdir(parents=True)
+    git(tk, "init", "-q")
+    (tk / "f").write_text("x")
+    git(tk, "add", "f")
+    git(tk, "commit", "-qm", "init")
+    link_script(tk / "scripts/sync.sh", '#!/bin/bash\necho "$*" >> "$STUB_DIR/sync.args"\n[ -z "$SYNC_RC" ] || { echo "sync.sh: $1 is not on its base branch main" >&2; exit "$SYNC_RC"; }\n'
+                'git -C "$TK" rev-parse --short=12 HEAD > "$1/.ai-toolkit/toolkit-version"\n')
+    stamp = inst / ".ai-toolkit/toolkit-version"
+
+    def go(*args, **env):
+        return C.go(*args, co=inst / ".ai-toolkit/scripts/coordinator.sh", **{"TK": tk, "TOOLKIT_DIR": tk, "AUTO_SYNC": 1, **env})
+
+    def syncs():
+        f = tmp_path / "stubs/sync.args"
+        return f.read_text().splitlines() if f.exists() else []
+
+    log = tmp_path / "state/run_t/loop.log"
+    return SimpleNamespace(C=C, go=go, inst=inst, tk=tk, stamp=stamp, sha=git(tk, "rev-parse", "--short=12", "HEAD"), syncs=syncs,
+                           log=lambda: log.read_text() if log.exists() else "")
+
+
+def test_a_loop_behind_the_toolkit_syncs_its_project_and_re_execs_with_its_run_and_arguments(T):
+    T.stamp.write_text("0123456789ab\n")
+    r = T.go("--answer", "attended", "--cap", "2", COORD_MAX_TICKS=1)
+    log = T.log()
+    assert r.returncode == 0 and T.syncs() == [str(T.inst.resolve())]   # the project's own path, no flag: the sync's refusals stay in force
+    assert f"toolkit 0123456789ab -> {T.sha}: re-exec" in log and log.count("run run_t, cap 2, answer attended") == 2   # one loop, restarted: the same Run and arguments
+    assert not T.C.calls("orca orchestration run-create") and len(T.C.calls("orca orchestration run-use")) == 2
+
+
+@pytest.mark.parametrize("stamp, env", [
+    pytest.param("{sha}-dirty", {}, id="same sha, dirty stamp"),
+    pytest.param("0123456789ab", {"AUTO_SYNC": 0}, id="AUTO_SYNC=0"),
+    pytest.param("0123456789ab", {"TOOLKIT_DIR": "/nonexistent"}, id="not a git checkout"),
+    pytest.param(None, {}, id="no stamp"),
+])
+def test_a_loop_that_is_current_or_opted_out_neither_syncs_nor_re_execs(T, stamp, env):
+    if stamp:
+        T.stamp.write_text(stamp.format(sha=T.sha) + "\n")
+    r = T.go(**env)
+    assert r.returncode == 0 and not T.syncs() and "re-exec" not in T.log()
+
+
+def test_a_refused_sync_is_one_warning_one_attempt_per_toolkit_sha_and_the_loop_keeps_running(T):
+    T.stamp.write_text("0123456789ab\n")
+    r = T.go(COORD_MAX_TICKS=3, SYNC_RC=1)
+    assert r.returncode == 0 and len(T.syncs()) == 1 and len(T.C.calls("orca orchestration check")) == 3   # not retried until the toolkit moves, never forced
+    assert re.findall(r"warning: toolkit sync to \w+ refused.*not on its base branch main", T.log()) != [] and T.log().count("warning: toolkit") == 1
+    assert "re-exec" not in T.log()
+
+
+def test_a_toolkit_land_that_synced_the_project_itself_re_execs_the_loop_without_a_second_sync(T, link_script):
+    T.stamp.write_text(T.sha + "\n")
+    land = link_script(T.inst.parent / "land_sync.sh", '#!/bin/bash\n[ "$1" = --next ] && [ ! -e "$STAMP.done" ] && { touch "$STAMP.done"; git -C "$TK" commit -q --allow-empty -m land; git -C "$TK" rev-parse --short=12 HEAD > "$STAMP"; exit 3; }\n')   # a land fast-forwards the toolkit and its self-sync stamps the project, between two wakes
+    r = T.go(COORD_MAX_TICKS=2, DISPATCH_CMD=land, STAMP=T.stamp)
+    assert r.returncode == 0 and not T.syncs() and f"toolkit {T.sha} -> " in T.log() and ": re-exec" in T.log()
+
+
+def test_a_synced_coordinator_that_does_not_parse_is_not_exec_d_and_warns_once(T, link_script):
+    T.stamp.write_text("0123456789ab\n")
+    link_script(T.tk / "scripts/sync.sh", '#!/bin/bash\nprintf "if\n" > "$1/.ai-toolkit/scripts/c.new"; mv -f "$1/.ai-toolkit/scripts/c.new" "$1/.ai-toolkit/scripts/coordinator.sh"; echo ff0000000000 > "$1/.ai-toolkit/toolkit-version"\n')   # a rename, as sync.sh does
+    r = T.go(COORD_MAX_TICKS=3)
+    assert r.returncode == 0 and len(T.C.calls("orca orchestration check")) == 3 and "re-exec" not in T.log() and T.log().count("does not parse") == 1

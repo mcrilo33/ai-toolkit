@@ -232,14 +232,27 @@ def test_a_host_records_the_toolkits_origin_as_upstream_and_the_toolkit_itself_s
     def value():
         return [ln for ln in (target / ".ai-toolkit" / "ai-toolkit.env").read_text().splitlines() if ln.startswith("UPSTREAM_REPO=")]
     assert sync().returncode == 0 and value() == ["UPSTREAM_REPO=acme/toolkit"]
+    assert (target / ".ai-toolkit" / "ai-toolkit.env").read_text().splitlines().count(f"TOOLKIT_DIR={(src / 'v2').resolve()}") == 1   # where a host's loop finds the newer toolkit
     write(target / ".ai-toolkit" / "ai-toolkit.local.env", "UPSTREAM_REPO=me/fork\n")  # the per-target override still wins
     probe = f'. "{target}/.ai-toolkit/scripts/lib.sh"; ORCA_ROOT_PATH="{target}" load_env; echo "$UPSTREAM_REPO"'
     assert run(["bash", "-c", probe]).stdout.strip() == "me/fork"
     assert sync(tgt=src / "v2").returncode == 0  # the toolkit syncing into itself: nothing to point at
-    assert (src / "v2" / ".ai-toolkit" / "ai-toolkit.env").read_text() == (src / "v2" / "settings" / "ai-toolkit.env").read_text()
+    assert (src / "v2" / ".ai-toolkit" / "ai-toolkit.env").read_text() == (src / "v2" / "settings" / "ai-toolkit.env").read_text().replace("TOOLKIT_DIR=", f"TOOLKIT_DIR={(src / 'v2').resolve()}")
     git(src / "v2", "remote", "remove", "origin")
     r = sync()
     assert r.returncode == 0 and r.stderr.count("UPSTREAM_REPO") == 1 and value() == ["UPSTREAM_REPO="]
+
+
+def test_a_toolkit_that_moves_during_the_copy_leaves_the_stamp_stale_so_the_next_sync_copies_again(sync, src, target, run, tmp_path):
+    v2, stamp = src / "v2", target / ".ai-toolkit" / "toolkit-version"
+    git(v2, "add", "-A")
+    git(v2, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+    write(stamp, "old\n")
+    real = shutil.which("git")
+    shim = write(tmp_path / "shim" / "git", f'#!/bin/bash\n[[ "$*" == *--short=12* ]] && [ -e "$TMP_SEEN" ] && {{ echo ffffffffffff; exit 0; }}\n[[ "$*" == *--short=12* ]] && touch "$TMP_SEEN"\nexec {real} "$@"\n')   # the second read of HEAD names another commit
+    shim.chmod(0o755)
+    r = run(["bash", str(v2 / "scripts" / "sync.sh"), str(target), "--no-commit"], PATH=f"{shim.parent}:{os.environ['PATH']}", TMP_SEEN=tmp_path / "seen")
+    assert r.returncode == 0 and stamp.read_text() == "old\n" and "moved during the copy" in r.stderr
 
 
 @pytest.mark.parametrize("state", ["clean", "dirty", "not-git"])

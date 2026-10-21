@@ -22,6 +22,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
+orig=("$@")   # the arguments the re-exec on a new toolkit version starts again with
 run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; watch=0; seen_arg=""; seen_given=0; reply=0; reply_id=""; reply_body=""; stop=0; session=""; show_id=""; dreq=0; dreq_n=""; dreq_text=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -423,13 +424,27 @@ notify_queue() {   # attended: tell the session of a decision that was not queue
     case " $seen " in *" $i "*) continue ;; esac; [ "$k" = p ] || [ "$first" = 1 ] || continue; [ "$k" = p ] || first=0; tell "$k" "${i#?:}" || fail=1
   done; [ "$fail" = 1 ] || seen="$now"
 }
+tv() { local f="$here/../toolkit-version" s=""; [ ! -f "$f" ] || read -r s < "$f" || true; printf '%s' "${s%-dirty}"; }   # the sha of the toolkit this project is synced from (-dirty ignored: an unchanged sha is no new version)
+tv0="$(tv)"; tried=""; bad=""
+autosync() {   # at a wake, where no land, dispatch or answer is under way: sync this project once per newer toolkit sha (AUTO_SYNC=1, TOOLKIT_DIR a git checkout), then re-exec on a new installed version (ours, a toolkit land's self-sync, or a manual one)
+  local now new o; now="$(tv)"
+  if [ "${AUTO_SYNC:-0}" = 1 ] && [ -n "$now" ] && new="$(git -C "${TOOLKIT_DIR:-/nonexistent}" rev-parse --short=12 HEAD 2> /dev/null)" && [ "$new" != "$now" ] && [ "$new" != "$tried" ]; then
+    tried="$new"; o="$(bash "$TOOLKIT_DIR/scripts/sync.sh" "$(cd "$here/../.." && pwd -P)" 2>&1)" || warn "toolkit sync to $new refused, not retried until the toolkit moves: ${o##*$'\n'}"
+    now="$(tv)"
+  fi
+  { [ -n "$now" ] && [ "$now" != "$tv0" ]; } || return 0
+  if ! bash -n "$here/coordinator.sh" 2> /dev/null; then   # an exec of a script that does not parse would end the loop silently
+    [ "$bad" = "$now" ] || warn "the synced coordinator.sh does not parse: the loop keeps running its old code"; bad="$now"; return 0; fi
+  log "toolkit $tv0 -> $now: re-exec"; rm -f "$errf"   # the EXIT trap does not run on exec; holder.$$ stays valid, the pid is the same
+  exec bash "$here/coordinator.sh" ${orig[@]+"${orig[@]}"} --run "$run"   # --run last wins: a loop started without one keeps the Run it created
+}
 tick=0; empties=0; seen=""; bids=""; bdirty=1; held=""; if ids="$(open_q | jq -r .id | tr '\n' ' ')"; then held=" $ids"; tr ' ' '\n' <<< "$ids" | sed '/^$/d' > "$sd/held"; fi; start="$(now_min)"; budget=0
 [ -z "$until" ] || budget=$(((($(mins "$until") - start) + 1440) % 1440))
 while :; do
   tick=$((tick + 1)); yield
   if [ -n "$until" ] && [ $((($(now_min) - start + 1440) % 1440)) -ge "$budget" ]; then log "reached $until"; break; fi
   [ -z "${COORD_MAX_TICKS:-}" ] || [ "$tick" -le "$COORD_MAX_TICKS" ] || break
-  fill
+  autosync; fill
   if [ "$drain" = 1 ] && [ "$ready" = 0 ] && [ "$(wl | nlive)" = 0 ]; then log "drained"; break; fi
   drain_replies
   rc=0; wait_ms="${COORD_WAIT_MS:-300000}"   # 30 s while a question waits for the human: its reply is picked up soon

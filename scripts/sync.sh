@@ -93,6 +93,7 @@ put_tree() { # put_tree <src-dir> <dst-rel-dir> [skip-name]: everything below it
   while IFS= read -r f; do put "$1/$f" "$2/$f"; done < <(cd "$1" && find . -type f ! -name .DS_Store ! -name "${3:-.DS_Store}" ! -name '*.pyc' ! -path '*/__pycache__/*' | sed 's|^\./||' | LC_ALL=C sort)
 }
 
+tv0="$(git -C "$V2" rev-parse --short=12 HEAD 2> /dev/null || true)"   # the toolkit commit before the copy: a land that moves it mid-copy must not leave a stamp naming files this run did not all copy
 put_md "$SHARED/rules" .claude/rules/ai-toolkit
 put_md "$SHARED/rules/on-demand" .ai-toolkit/rules
 put_tree "$SHARED/skills" .claude/skills
@@ -107,12 +108,15 @@ up=""
 if [ "$TARGET" != "$V2" ]; then
   up="$(owner_repo "$(git -C "$V2" remote get-url origin 2> /dev/null)")" || { up=""; warn "the toolkit checkout has no usable origin: UPSTREAM_REPO left empty in $TARGET, so the scopers will draft, not file, a toolkit defect"; }
 fi
-sed "s|^UPSTREAM_REPO=.*|UPSTREAM_REPO=$up|" "$V2/settings/ai-toolkit.env" > "$TMP"
+sed -e "s|^UPSTREAM_REPO=.*|UPSTREAM_REPO=$up|" -e "s|^TOOLKIT_DIR=.*|TOOLKIT_DIR=$V2|" "$V2/settings/ai-toolkit.env" > "$TMP"
 put "$TMP" .ai-toolkit/ai-toolkit.env
-# The toolkit commit this host is synced from (bin/claude-spoke tags a spoke's telemetry with it): -dirty when the checkout has uncommitted edits; no git checkout, no stamp.
+# The toolkit commit this host is synced from (bin/claude-spoke tags a spoke's telemetry with it, the loop compares it with the toolkit's HEAD): -dirty when the checkout has uncommitted edits; no git checkout, no stamp.
 if tv="$(git -C "$V2" rev-parse --short=12 HEAD 2> /dev/null)"; then
-  if [ -n "$(git -C "$V2" status --porcelain 2> /dev/null)" ]; then tv="$tv-dirty"; fi
-  echo "$tv" > "$TMP"; put "$TMP" .ai-toolkit/toolkit-version
+  if [ "$tv" != "$tv0" ]; then warn "the toolkit moved during the copy: toolkit-version left as it was, the next sync copies again"
+  else
+    if [ -n "$(git -C "$V2" status --porcelain 2> /dev/null)" ]; then tv="$tv-dirty"; fi
+    echo "$tv" > "$TMP"; put "$TMP" .ai-toolkit/toolkit-version
+  fi
 fi
 if [ -f "$V2/settings/claude/settings.json" ]; then put "$V2/settings/claude/settings.json" .ai-toolkit/claude-settings.json
 else warn "$V2/settings/claude/settings.json is missing: .ai-toolkit/claude-settings.json (hooks) not synced"; fi
