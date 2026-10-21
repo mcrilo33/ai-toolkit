@@ -2,6 +2,7 @@
 # Claude Code launcher. In a project synced by ai-toolkit it passes the toolkit's guards (--settings, below). In a spoke worktree (.ai-toolkit/spoke-run-id,
 # written by setup.sh) it also exports Claude's native OTel to the collector with a spoke_run_id resource attribute, then execs the real claude. In an unsynced
 # project it is a plain claude, so it is safe to point Orca's agentCmdOverrides.claude at it. AI_TOOLKIT_OTEL=0 opts out of the OTel. No auth header here.
+# To use Orca's Chat UI, put --settings ai-toolkit in Orca's Claude arguments: the launcher swaps it for the project's guard file (Orca's own --settings would switch every hook off).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=../scripts/lib.sh
@@ -16,6 +17,11 @@ top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 # passed with --settings, so the project's own settings cannot replace or switch them off. Orca's Claude command is one path for every project: an unsynced project
 # gets plain claude; a worker with no file is refused, never started without guards. A second --settings would silently drop the first (the last wins): refused too.
 tk="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2> /dev/null || echo "$top/.git")")/.ai-toolkit"
+kept=()   # drop the sentinel (the saved Claude arguments are global, the guard file is per project): the checks below see only what is left
+while [ $# -gt 0 ]; do
+  if [ "$1" = --settings=ai-toolkit ]; then shift; elif [ "$1" = --settings ] && [ "${2:-}" = ai-toolkit ]; then shift 2; else kept+=("$1"); shift; fi
+done
+set -- ${kept[@]+"${kept[@]}"}
 if [ -f "$tk/claude-settings.json" ]; then
   jq -e '.disableAllHooks == false and ((.hooks.PreToolUse // []) | length) > 0' "$tk/claude-settings.json" > /dev/null 2>&1 \
     || die "$tk/claude-settings.json is unreadable or does not register the guards (disableAllHooks false, PreToolUse hooks): sync ai-toolkit again, never a session without them"

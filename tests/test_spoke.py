@@ -50,16 +50,23 @@ def test_spoke_is_a_plain_claude_without_a_run_id_or_when_opted_out(run, stubs, 
     assert [c[2:] for c in stubs.calls("claude")[1:]] == [[]] and stubs.calls("claude")[0] == ["-p", "hi"] and "TELEMETRY" not in stubs.env("claude")
 
 
-@pytest.mark.parametrize("project,worker,args,ok,passed", [
-    ("synced", False, ["-p", "x"], True, "settings"),     # the project the session starts in has the toolkit's file: the guards ride along
-    ("unsynced", False, ["-p", "x"], True, "plain"),      # Orca's one Claude command serves every project: an unsynced one gets plain Claude, no error
-    ("unsynced", True, ["-p", "x"], False, None),         # a worker with no settings file is refused, never started guardless
-    ("synced", False, ["--settings", "mine.json"], False, None),    # two --settings do not merge (the last wins and the toolkit's hooks vanish): refused
-    ("synced", False, ["--settings=mine.json"], False, None),
-    ("broken", False, ["-p", "x"], False, None),          # a file claude might skip with a warning, or one that registers nothing, would start a session without guards: refused
-    ("empty", False, ["-p", "x"], False, None),
+@pytest.mark.parametrize("project,worker,args,ok,passed,fwd", [
+    ("synced", False, ["-p", "x"], True, "settings", ["-p", "x"]),     # the project the session starts in has the toolkit's file: the guards ride along
+    ("unsynced", False, ["-p", "x"], True, "plain", ["-p", "x"]),      # Orca's one Claude command serves every project: an unsynced one gets plain Claude, no error
+    ("unsynced", True, ["-p", "x"], False, None, None),                # a worker with no settings file is refused, never started guardless
+    ("synced", False, ["--settings", "mine.json"], False, None, None),    # two --settings do not merge (the last wins and the toolkit's hooks vanish): refused
+    ("synced", False, ["--settings=mine.json"], False, None, None),
+    ("synced", False, ["--settings", '{"disableAllHooks":true}'], False, None, None),   # what Orca's Chat UI adds on its own: every hook off
+    ("synced", False, ['--settings={"disableAllHooks":true}'], False, None, None),
+    ("synced", False, ["--settings", "ai-toolkit", "--settings", "mine.json"], False, None, None),   # the sentinel does not license a second --settings
+    ("synced", False, ["-p", "--settings", "ai-toolkit", "--verbose"], True, "settings", ["-p", "--verbose"]),   # the sentinel (Orca's Claude arguments) resolves to this project's guard file
+    ("synced", False, ["--settings=ai-toolkit", "-p"], True, "settings", ["-p"]),
+    ("unsynced", False, ["--settings", "ai-toolkit", "-p"], True, "plain", ["-p"]),   # unsynced: the sentinel is dropped, chat still starts
+    ("unsynced", True, ["--settings=ai-toolkit"], False, None, None),                 # a worker without its guard file is never started, sentinel or not
+    ("broken", False, ["-p", "x"], False, None, None),          # a file claude might skip with a warning, or one that registers nothing, would start a session without guards: refused
+    ("empty", False, ["-p", "x"], False, None, None),
 ])
-def test_the_launcher_passes_the_settings_file_of_the_project_it_starts_in(run, stubs, repo, project, worker, args, ok, passed):
+def test_the_launcher_passes_the_settings_file_of_the_project_it_starts_in(run, stubs, repo, project, worker, args, ok, passed, fwd):
     tk = synced(repo) if project in ("synced", "broken", "empty") else None
     if project in ("broken", "empty"):
         (tk / "claude-settings.json").write_text("{not json" if project == "broken" else "{}")
@@ -67,9 +74,9 @@ def test_the_launcher_passes_the_settings_file_of_the_project_it_starts_in(run, 
     calls = stubs.calls("claude")
     assert (r.returncode == 0) == ok and len(calls) == int(ok), r.stderr
     if passed == "settings":
-        assert calls == [["--settings", f"{tk}/claude-settings.json", *args]] and f"AI_TOOLKIT_DIR={tk}" in stubs.env("claude")
+        assert calls == [["--settings", f"{tk}/claude-settings.json", *fwd]] and f"AI_TOOLKIT_DIR={tk}" in stubs.env("claude")
     if passed == "plain":
-        assert calls == [args] and "AI_TOOLKIT_DIR" not in stubs.env("claude")   # not even the inherited one
+        assert calls == [fwd] and "AI_TOOLKIT_DIR" not in stubs.env("claude")   # not even the inherited one
     if not ok:
         assert "settings" in r.stderr
 
