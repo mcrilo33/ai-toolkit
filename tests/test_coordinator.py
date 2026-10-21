@@ -936,3 +936,35 @@ def test_a_loop_that_ends_on_an_error_names_its_status_tells_the_session_and_sta
         "[coordinator loop] stopped on an error: nothing coordinates Run run_t, read its terminal and start it again."]
     out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
     assert "no coordinator.sh loop is running for this Run" in out and re.search(r"replies queued.*msg_q", out)
+
+
+def test_a_loop_whose_terminal_is_closed_leaves_its_exit_in_loop_log_tells_the_session_and_status_prints_it(C, tmp_path, link_script):
+    log = tmp_path / "state/run_t/loop.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("".join(f"old line {i}\n" for i in range(300)))
+    hup = link_script(tmp_path / "hup.sh", '#!/bin/bash\n[ "$1" = --next ] && kill -HUP "$(ls "$AITK_STATE_DIR"/run_t/holder.* | sed "s/.*\\.//")"\n')   # the loop's own pane closed: a hang-up
+    r = C.go("--answer", "attended", DISPATCH_CMD=hup)
+    last = log.read_text().splitlines()
+    assert r.returncode == 129 and len(last) < 210 and last[0] == "old line 100"   # the log keeps the last 200 lines of the earlier loops
+    assert re.search(r"coordinator: exiting: status 129 = SIGHUP \(its terminal was closed\), last command: ", last[-1]) and "run run_t" in "".join(last)
+    assert [arg(a, "--text") for a in C.calls("orca terminal send") if arg(a, "--terminal") == "term_s"] == [
+        f"[coordinator loop] stopped by SIGHUP (its terminal was closed): nothing coordinates Run run_t, see {log} and start it again."]
+    out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
+    assert "no coordinator.sh loop is running for this Run" in out and "its last log lines:" in out and "status 129" in out
+
+
+def test_the_triage_session_does_not_inherit_the_loops_orca_pane_identity(C, monkeypatch):
+    monkeypatch.delenv("STUB_NOENV")   # this test reads the stub's env
+    C.stubs.reply("land.sh", f"{W}x\nlanded #1 in abc\n")
+    C.mail([{**msg("worker_done", "msg_d", outcome="succeeded"), "body": "DEFERRED: tidy x"}])
+    C.go(ORCA_PANE_KEY="p", ORCA_TAB_ID="t", ORCA_WORKTREE_ID="w", ORCA_AGENT_HOOK_ENDPOINT="e", ORCA_AGENT_HOOK_TOKEN="k")
+    env = C.stubs.env("claude")
+    assert C.stubs.calls("claude") and not re.search(r"^ORCA_(PANE_KEY|TAB_ID|WORKTREE_ID|TERMINAL_HANDLE|AGENT_HOOK_\w+)=", env, re.M) and "PATH=" in env
+
+
+def test_a_re_dispatch_for_a_worker_with_no_terminal_closes_none_rather_than_the_callers_active_one(C):
+    C.stubs.reply("land.sh", f"{W}x\nland.sh: CI is red for abc\n", rc=4)
+    C.workers({**C.row(), "agentTerminalHandle": None})
+    C.mail([msg("worker_done", outcome="succeeded")])
+    C.go()
+    assert C.stubs.calls("dispatch.sh") and not C.calls("orca terminal close")
