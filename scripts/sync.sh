@@ -109,6 +109,11 @@ if [ "$TARGET" != "$V2" ]; then
 fi
 sed "s|^UPSTREAM_REPO=.*|UPSTREAM_REPO=$up|" "$V2/settings/ai-toolkit.env" > "$TMP"
 put "$TMP" .ai-toolkit/ai-toolkit.env
+# The toolkit commit this host is synced from (bin/claude-spoke tags a spoke's telemetry with it): -dirty when the checkout has uncommitted edits; no git checkout, no stamp.
+if tv="$(git -C "$V2" rev-parse --short=12 HEAD 2> /dev/null)"; then
+  if [ -n "$(git -C "$V2" status --porcelain 2> /dev/null)" ]; then tv="$tv-dirty"; fi
+  echo "$tv" > "$TMP"; put "$TMP" .ai-toolkit/toolkit-version
+fi
 if [ -f "$V2/settings/claude/settings.json" ]; then put "$V2/settings/claude/settings.json" .ai-toolkit/claude-settings.json
 else warn "$V2/settings/claude/settings.json is missing: .ai-toolkit/claude-settings.json (hooks) not synced"; fi
 orca_yaml > "$TMP"

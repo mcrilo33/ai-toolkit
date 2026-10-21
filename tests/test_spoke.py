@@ -43,6 +43,19 @@ def test_spoke_leaves_the_issue_attribute_out_when_task_md_is_missing_or_does_no
     assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=abc-123,repo=origin\n" in stubs.env("claude") + "\n" and "issue=" not in stubs.env("claude")
 
 
+@pytest.mark.parametrize("stamp,suffix", [
+    ("abcdef012345\n", ",toolkit_version=abcdef012345"), ("abcdef012345-dirty\n", ",toolkit_version=abcdef012345-dirty"), ("abcdef0", ",toolkit_version=abcdef0"),
+    (None, ""), ("abc,x=y\n", ""), ("abcdef\n", ""), ("ABCDEF012345\n", ""), ("abcdef012345\nabcdef012345\n", ""), ("abcdef012345-dirty,x=y\n", ""),
+])
+def test_spoke_tags_the_toolkit_version_only_from_a_well_formed_stamp(run, stubs, repo, stamp, suffix):
+    tk = synced(repo)
+    if stamp is not None:
+        (tk / "toolkit-version").write_text(stamp)
+    r = run([SPOKE], cwd=in_spoke(repo))
+    assert r.returncode == 0, r.stderr
+    assert f"OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=abc-123,repo=origin{suffix}\n" in stubs.env("claude") + "\n"
+
+
 def test_spoke_is_a_plain_claude_without_a_run_id_or_when_opted_out(run, stubs, repo):
     assert run([SPOKE, "-p", "hi"], cwd=repo.wt("plain")).returncode == 0
     synced(repo)

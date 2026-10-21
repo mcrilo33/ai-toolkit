@@ -242,6 +242,25 @@ def test_a_host_records_the_toolkits_origin_as_upstream_and_the_toolkit_itself_s
     assert r.returncode == 0 and r.stderr.count("UPSTREAM_REPO") == 1 and value() == ["UPSTREAM_REPO="]
 
 
+@pytest.mark.parametrize("state", ["clean", "dirty", "not-git"])
+def test_the_toolkit_commit_is_stamped_so_telemetry_can_name_the_version_a_host_runs(sync, src, target, state):
+    v2 = src / "v2"
+    stamp = target / ".ai-toolkit" / "toolkit-version"
+    if state == "not-git":
+        shutil.rmtree(v2 / ".git")
+    else:
+        git(v2, "add", "-A")
+        git(v2, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+    if state == "dirty":
+        write(v2 / "scripts" / "extra.sh")
+    sha = "" if state == "not-git" else git(v2, "rev-parse", "--short=12", "HEAD")
+    assert sync().returncode == 0
+    if state == "not-git":
+        assert not stamp.exists() and ".ai-toolkit/toolkit-version" not in manifest(target)
+    else:
+        assert stamp.read_text() == sha + ("-dirty" if state == "dirty" else "") + "\n" and ".ai-toolkit/toolkit-version" in manifest(target)
+
+
 def test_an_unmanaged_orca_yaml_is_backed_up_once_then_owned(sync, target):
     write(target / "orca.yaml", "scripts: {}\n")
     sync()
