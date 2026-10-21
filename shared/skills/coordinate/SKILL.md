@@ -14,7 +14,7 @@ This session never binds the Run, `check`s or reads the inbox, never writes task
 
 ## Preconditions
 
-Main checkout on the base branch, inside an Orca terminal, `orca status` ready, `gh auth status` green.
+Main checkout on the base branch, `orca status` ready, `gh auth status` green, and either an Orca terminal (`$ORCA_TERMINAL_HANDLE` set) or an Orca chat session (unset: no terminal handle, no tty).
 
 This session has the toolkit guards: `[ -f "${AI_TOOLKIT_DIR:-/nonexistent}/claude-settings.json" ]` in Bash (`bin/claude-spoke` exports `AI_TOOLKIT_DIR`). If not, say plainly "no toolkit guards in this session: it was not started through bin/claude-spoke", give the fix (Orca > Settings > Agents > Claude command = `<toolkit>/bin/claude-spoke`, then restart this session) and stop.
 
@@ -24,6 +24,9 @@ This session has the toolkit guards: `[ -f "${AI_TOOLKIT_DIR:-/nonexistent}/clau
 # attended: the loop types one line into THIS session's terminal when a decision arrives
 orca terminal create --worktree path:$PWD --title coordinator \
   --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended --session $ORCA_TERMINAL_HANDLE [--cap N]"
+# attended, chat session: no --session (its warning is expected), then arm the watcher: ONE Bash call with run_in_background
+orca terminal create --worktree path:$PWD --title coordinator --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended [--cap N]"
+.ai-toolkit/scripts/coordinator.sh --run <run> --wait [--seen '<ids still waiting>']   # exits 0 printing the id of a new decision; polls every COORD_WATCH_SEC (5) s
 # auto
 date -u +%FT%TZ        # the switch time: say it, it anchors the summary of what happened while away
 orca terminal create --worktree path:$PWD --title coordinator \
@@ -36,9 +39,10 @@ Before switching to auto tell the user that gates are then answered by `answer.s
 
 ## The queue (attended)
 
-**The bell, the one rule.** The loop never rings. It types one line into this session (`[coordinator loop] new decision waiting: <plan | permission request | blocked issue> <id>`) when a decision arrives on an empty queue, and for every permission request. On that line: read the item whole
+**The bell, the one rule** (terminal session; a chat session: see below). The loop never rings. It types one line into this session (`[coordinator loop] new decision waiting: <plan | permission request | blocked issue> <id>`) when a decision arrives on an empty queue, and for every permission request. On that line: read the item whole
 (a plan or permission request: `coordinator.sh --run <run> --show <id>`; a blocked issue: `--status` and `gh issue view`), present it with one recommendation (below), and only once that is on screen ring: `printf '\a' > /dev/$(ps -o tty= -p $PPID | tr -d ' ')` (the agent has no `/dev/tty`: ask ps). Right after the bell send one `PushNotification` (when the tool is available) naming the item, always, since you cannot tell whether the user is away: `<kind> <id> on #<n>: <one-line ask>`, a permission request adding `expires in 9 minutes`. Ring and notify at no other time.
 If you are in the middle of another decision with the user, hold the new item, no bell, no notification, until the current one is answered; a permission request is the exception (it expires in 9 minutes, and an expired one can come back, up to 3 requests in total): write it at once, ahead of the current one, and ring and notify. After relaying any answer run `--status` and present the next item: the loop sends no line for what waited behind another.
+**Chat session.** The background `--wait` exiting replaces the typed line (it wakes for a plan the loop handed over, a permission request, a blocked issue or a refused dispatch request, by the same rule): read the printed id as above, write the decision in the chat (optionally an `AskUserQuestion` card: approve / approve with / revise), no bell, and send the same `PushNotification`. Re-arm `--wait --seen '<ids still waiting>'` after presenting or relaying each decision and at the end of every turn in which it is not running, with one `ScheduleWakeup` of about 30 minutes that re-arms it if it is lost.
 
 When the user arrives, or asks what needs them, `coordinator.sh --status --run <run>` is the queue in the order to present it: open questions oldest first, then blocked issues, then dispatch requests. Present **one decision at a time**, stop for the answer, relay it,
 then the next; when it is empty, say so. A `being answered by the loop: <id>` line after the queue is not a decision and is not presented (the loop is still answering that plan; if it stays there, the answerer is stuck: say so, nothing more). Never show a heartbeat, a land, a retry or any other routine event; report what landed only when asked (below). Each item: the issue (`gh issue view <n>`, its `Scope:`/`Gate:` footer), what the

@@ -12,6 +12,7 @@
 # --answer attended (the /coordinate attended loop, #450): the routine work out of sight, the human only for a decision. A routine plan is approved by answer.sh; a plan it hands over (exit 3, a reason) and every permission
 # request stay OPEN (the loop never approves one), queued for the human with the other open questions and the blocked issues; the session is told by ONE line typed into its terminal (--session <handle>, orca terminal send) when a decision arrives on an empty queue, and for every permission request; the loop rings nothing. --show <message-id> prints one open question whole. --dispatch <issue> [message]
 # queues a dispatch request the loop runs ahead of its own pick (cap and Scope rule apply). auto and human are unchanged.
+# --run R --wait [--seen '<ids>'] (a chat session, #473): read-only, needs no terminal; polls every COORD_WATCH_SEC (5) and exits 0 printing the id of a decision that was not waiting when it started (nor in --seen), by notify_queue's rule; a failed read retries.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
 # consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
 # the Run from this terminal, then wait until the loop is gone.
@@ -21,19 +22,20 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; reply=0; reply_id=""; reply_body=""; stop=0; session=""; show_id=""; dreq=0; dreq_n=""; dreq_text=""
+run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; watch=0; seen_arg=""; seen_given=0; reply=0; reply_id=""; reply_body=""; stop=0; session=""; show_id=""; dreq=0; dreq_n=""; dreq_text=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;; --answer) answer="${2:-}"; shift ;;
     --cap) cap="${2:-}"; shift ;; --until) until="${2:-}"; shift ;;
-    --drain) drain=1 ;; --status) status=1 ;; --stop) stop=1 ;; --session) session="${2:-}"; shift ;; --show) show_id="${2:-}"; shift ;;
+    --drain) drain=1 ;; --status) status=1 ;; --wait) watch=1 ;; --seen) seen_arg="${2:-}"; seen_given=1; shift ;; --stop) stop=1 ;; --session) session="${2:-}"; shift ;; --show) show_id="${2:-}"; shift ;;
     --dispatch) dreq=1; dreq_n="${2:-}"; dreq_text="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
     --reply) reply=1; reply_id="${2:-}"; reply_body="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
-    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|attended|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny | --run R --dispatch <issue> [message] | --run R --show <message-id> (--session <terminal-handle> with the loop)" ;;
+    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|attended|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --wait [--seen '<ids>'] | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny | --run R --dispatch <issue> [message] | --run R --show <message-id> (--session <terminal-handle> with the loop)" ;;
   esac; shift
 done
 case "$answer" in auto | attended | human) ;; *) usage_exit "--answer takes auto, attended or human" ;; esac
 [ "$stop" = 0 ] || [ -n "$run" ] || usage_exit "--stop needs --run <run-id>"
+[ "$watch" = 0 ] || [ -n "$run" ] || usage_exit "--wait needs --run <run-id>"
 [ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"; [[ -z $session || $session =~ ^term_[A-Za-z0-9_-]+$ ]] || usage_exit "--session takes an Orca terminal handle"; [ "$answer" != attended ] || [ -n "$session" ] || warn "attended without --session: the loop cannot tell the session of a decision, only --status shows the queue"
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
 [ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid> and held: the ids the loop left open for the human)
@@ -137,6 +139,24 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
   echo "dispatch requests:"
   for f in "$(spool_dir "$run")/requests"/*; do [ -f "$f" ] && echo "  #${f##*/} $(head -n 1 "$f"): $(sed -n 2p "$f" | grep . || echo queued)"; done
   exit 0
+fi
+
+watch_queue() {   # $1 poll number: one look at the queue (#473). Sets $found to the id of a decision that is new since the last look, by notify_queue's rule (a permission request always; the rest only when nothing seen is still waiting). Status 1 = nothing new or a read failed: a failed read learns nothing, it is no empty baseline
+  local all="" i k f b first=1 now=""; lm="$(live_hold ne "")" || lm=""
+  if [ "$bok" = 0 ] || [ $(($1 % ${COORD_WATCH_GH_EVERY:-12})) -eq 0 ]; then b="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 1; bids="$b"; bok=1; fi   # gh is read every COORD_WATCH_GH_EVERY polls, not every poll
+  all="$(queue_ids | tr '\n' ' ')" || return 1
+  for f in "$(spool_dir "$run")/requests"/*; do [ ! -f "$f" ] || [ -z "$(sed -n 2p "$f")" ] || all="$all r:${f##*/} "; done   # a dispatch request with a refusal reason
+  if [ -z "$started" ]; then started=1; seen="$all"; [ "$seen_given" = 0 ] || { seen=""; for i in $all; do case " $seen_arg " in *" ${i#?:} "*) seen="$seen$i " ;; esac; done; }; fi
+  for i in $seen; do case " $all " in *" $i "*) first=0 ;; esac; done
+  for i in $all; do case "$i" in p:*) case " $seen " in *" $i "*) ;; *) found="${i#?:}"; return 0 ;; esac ;; esac; done   # a permission request first: it expires in 9 minutes
+  for i in $all; do k="${i%%:*}"; [ "$k" != q ] || ! by_loop "${i#?:}" x || continue; now="$now$i "   # a plan the loop still answers is not a decision
+    case " $seen " in *" $i "*) continue ;; esac; [ "$first" = 1 ] || continue; first=0
+    found="${i#?:}"; return 0
+  done; seen="$now"; return 1
+}
+if [ "$watch" = 1 ]; then   # read-only, no terminal handle, never binds the Run: a chat session has no terminal to type into, so its background watcher exits (printing the id) when a decision arrives
+  started=""; seen=""; found=""; bids=""; bok=0
+  for ((n = 0; n < ${COORD_WATCH_MAX:-100000000}; n++)); do ! watch_queue "$n" || { echo "$found"; exit 0; }; sleep "${COORD_WATCH_SEC:-5}"; done; exit 1
 fi
 
 : "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal on the main checkout}"

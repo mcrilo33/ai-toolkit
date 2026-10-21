@@ -766,6 +766,77 @@ def test_attended_sends_nothing_behind_a_waiting_decision_but_a_permission_reque
     assert sent(C, COORD_MAX_TICKS=5, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b waits behind msg_a and is the session's to present once msg_a is answered, not the loop's
 
 
+def watched(C, *polls, seen=None, fail=None, **env):   # --wait with no terminal handle: each poll is (open question ids, blocked issue numbers), read once per poll; "msg_p*" ids are permission requests
+    for n, (ids, blocked) in enumerate(polls, 1):
+        rows = [{**msg("question", q, question=PQ if q.startswith("msg_p") else "PLAN?"), "run_id": "run_t", "thread_id": q, "sequence": ord(q[-1])} for q in ids]
+        C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}), n=n)
+        C.stubs.reply("gh.issue_list", json.dumps([{"number": b, "title": "t", "labels": [{"name": "blocked"}]} for b in blocked]), n=n)
+    fail and C.stubs.reply(fail[0], "boom", rc=1, n=fail[1])   # (stub, call number) that errors
+    r = C.go("--wait", *(["--seen", seen] if seen is not None else []), ORCA_TERMINAL_HANDLE="", COORD_WATCH_SEC=0, COORD_WATCH_GH_EVERY=env.pop("every", 1), COORD_WATCH_MAX=len(polls), **env)
+    assert not C.calls("orca terminal send") and not C.calls("orca orchestration run-use") and not C.calls("orca orchestration check")   # it types nothing and never binds the Run
+    return r
+
+
+@pytest.mark.parametrize(("polls", "seen", "woken_by"), [
+    pytest.param([([], []), (["msg_a"], [])], None, "msg_a", id="plan"),
+    pytest.param([(["msg_a"], []), (["msg_a", "msg_pc"], [])], None, "msg_pc", id="permission-behind-a-waiting-plan"),
+    pytest.param([([], []), ([], [4])], None, "4", id="blocked-issue"),
+    pytest.param([(["msg_a", "msg_b"], [])], "msg_z", "msg_a", id="plan-not-in-seen"),
+    pytest.param([(["msg_a", "msg_pc"], [])], "", "msg_pc", id="permission-request-before-a-plan-that-sorts-ahead"),
+    pytest.param([([], []), (["msg_a"], [])], "", "msg_a", id="plan-with-an-empty-seen"),
+])
+def test_wait_prints_the_id_of_a_decision_that_was_not_waiting_and_exits_0(C, polls, seen, woken_by):
+    r = watched(C, *polls, seen=seen)
+    assert r.returncode == 0 and r.stdout.split() == [woken_by]
+
+
+def test_wait_wakes_for_a_dispatch_request_refused_after_it_started(C, tmp_path, link_script):
+    req = tmp_path / "state/run_t/requests"
+    req.mkdir(parents=True)
+    (req / "7").write_text("redo it\n")   # queued, no reason yet
+    link_script(tmp_path / "stubs/bin/sleep", f"#!/bin/bash\nprintf 'redo it\\nno free slot\\n' > {req}/7\n")   # the loop refuses it while the watcher sleeps
+    r = watched(C, ([], []), ([], []))
+    assert r.returncode == 0 and r.stdout.split() == ["7"]
+
+
+@pytest.mark.parametrize(("polls", "mode", "held", "fail"), [
+    pytest.param([(["msg_a"], [4]), (["msg_a"], [4])], None, None, None, id="already-waiting-at-start"),
+    pytest.param([([], []), (["msg_a"], [])], "attended", [], None, id="plan-being-answered-by-the-loop"),
+    pytest.param([(["msg_a"], []), (["msg_a"], [])], None, None, "orca.orchestration_inbox", id="inbox-read-failed-first-is-no-empty-baseline"),
+    pytest.param([([], [4]), ([], [4])], None, None, "gh.issue_list", id="gh-read-failed-first-is-no-empty-baseline"),
+])
+def test_wait_keeps_polling_without_exiting_for_a_decision_already_waiting_one_the_loop_answers_or_a_failed_read(C, tmp_path, polls, mode, held, fail):
+    (tmp_path / "state/run_t/requests").mkdir(parents=True)
+    (tmp_path / "state/run_t/requests/9").write_text("redo\nno free slot\n")   # refused before it started: not new
+    if fail:
+        C.stubs.reply(fail, "boom", rc=1, n=1)
+    loop = live_loop(tmp_path, mode, held) if mode else None
+    try:
+        r = watched(C, *polls)
+    finally:
+        loop and (loop.kill(), loop.wait())
+    assert r.returncode == 1 and r.stdout == ""
+
+
+def test_wait_wakes_for_a_plan_the_attended_loop_handed_over_not_one_it_answers(C, tmp_path):
+    loop = live_loop(tmp_path, "attended", ["msg_a"])   # msg_a left open for the human, msg_b is the loop's to answer
+    try:
+        r = watched(C, ([], []), (["msg_b"], []), (["msg_b", "msg_a"], []))
+    finally:
+        loop.kill(), loop.wait()
+    assert r.returncode == 0 and r.stdout.split() == ["msg_a"]
+
+
+def test_wait_does_not_lose_a_waiting_blocked_issue_when_a_later_blocked_list_read_fails(C):
+    r = watched(C, *[([], [4])] * 6, every=2, fail=("gh.issue_list", 2))   # read 1 sets the baseline, read 2 (poll 2) fails, read 3 (poll 4) succeeds
+    assert r.returncode == 1 and r.stdout == ""
+
+
+def test_wait_reads_the_blocked_list_less_often_than_the_questions(C):
+    r = watched(C, *[([], [])] * 6, every=3)
+    assert r.returncode == 1 and len(C.calls("orca orchestration inbox")) == 6 and len(C.calls("gh issue list")) == 2
+
+
 def test_status_shows_each_open_question_text_above_its_reply_command_and_show_prints_one_whole(C, tmp_path):
     plan = "PLAN: add hello.py first\n\x1b[2Jthen\n" + "\n".join(f"step {i}: do the thing" for i in range(300))
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question=plan), "run_id": "run_t", "thread_id": "msg_q"}]}}))
