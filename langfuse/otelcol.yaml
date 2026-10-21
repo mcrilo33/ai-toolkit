@@ -34,6 +34,7 @@ processors:
           - set(attributes["langfuse.observation.metadata.repo"], resource.attributes["repo"]) where resource.attributes["repo"] != nil
           - set(attributes["langfuse.environment"], resource.attributes["repo"]) where resource.attributes["repo"] != nil
           - set(attributes["langfuse.observation.metadata.issue"], resource.attributes["issue"]) where resource.attributes["issue"] != nil
+          - set(attributes["langfuse.observation.metadata.toolkit_version"], resource.attributes["toolkit_version"]) where resource.attributes["toolkit_version"] != nil
           # content (needs the OTEL_LOG_* opt-ins that claude-spoke sets)
           - set(attributes["langfuse.observation.input"], attributes["user_prompt"]) where attributes["user_prompt"] != nil
           - set(attributes["langfuse.observation.input"], attributes["full_command"]) where attributes["full_command"] != nil
