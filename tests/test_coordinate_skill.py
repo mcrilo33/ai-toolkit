@@ -90,5 +90,12 @@ def test_between_stop_and_its_exit_the_session_handles_nothing():
     assert "chat session" in attended and "coordinator-stop" in attended   # --stop needs no terminal handle of its own
 
 
+def test_a_chat_session_decision_is_alerted_by_a_mandatory_ask_user_question_card():
+    chat = SKILL[SKILL.index("**Chat session.**"):].split("\n")[0]   # no terminal to ring: the card is the alert, so it cannot be optional
+    assert "AskUserQuestion" in chat and "optionally" not in chat and "permission request" in chat
+    assert "no bell" not in chat.lower() and "afplay" not in chat and "PushNotification" in chat
+    assert re.search(r"permission request .{0,40}card is open", chat)   # a request waking the watcher behind an open card
+
+
 def test_hub_lands_with_the_review():
     assert "land.sh --review" in (SHARED / "skills/hub/SKILL.md").read_text()
