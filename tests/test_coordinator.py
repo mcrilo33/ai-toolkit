@@ -799,22 +799,35 @@ def test_wait_wakes_for_a_dispatch_request_refused_after_it_started(C, tmp_path,
     assert r.returncode == 0 and r.stdout.split() == ["7"]
 
 
-@pytest.mark.parametrize(("polls", "mode", "held", "fail"), [
-    pytest.param([(["msg_a"], [4]), (["msg_a"], [4])], None, None, None, id="already-waiting-at-start"),
-    pytest.param([([], []), (["msg_a"], [])], "attended", [], None, id="plan-being-answered-by-the-loop"),
-    pytest.param([(["msg_a"], []), (["msg_a"], [])], None, None, "orca.orchestration_inbox", id="inbox-read-failed-first-is-no-empty-baseline"),
-    pytest.param([([], [4]), ([], [4])], None, None, "gh.issue_list", id="gh-read-failed-first-is-no-empty-baseline"),
+@pytest.mark.parametrize(("polls", "mode", "held"), [
+    pytest.param([(["msg_a"], [4]), (["msg_a"], [4])], None, None, id="already-waiting-at-start"),
+    pytest.param([([], []), (["msg_a"], [])], "attended", [], id="plan-being-answered-by-the-loop"),
 ])
-def test_wait_keeps_polling_without_exiting_for_a_decision_already_waiting_one_the_loop_answers_or_a_failed_read(C, tmp_path, polls, mode, held, fail):
+def test_wait_keeps_polling_without_exiting_for_a_decision_already_waiting_or_one_the_loop_answers(C, tmp_path, polls, mode, held):
     (tmp_path / "state/run_t/requests").mkdir(parents=True)
     (tmp_path / "state/run_t/requests/9").write_text("redo\nno free slot\n")   # refused before it started: not new
-    if fail:
-        C.stubs.reply(fail, "boom", rc=1, n=1)
     loop = live_loop(tmp_path, mode, held) if mode else None
     try:
         r = watched(C, *polls)
     finally:
         loop and (loop.kill(), loop.wait())
+    assert r.returncode == 1 and r.stdout == ""
+
+
+@pytest.mark.parametrize(("polls", "fail"), [
+    pytest.param([(["msg_a"], []), (["msg_a"], [])], "orca.orchestration_inbox", id="inbox"),
+    pytest.param([([], [4]), ([], [4])], "gh.issue_list", id="gh"),
+])
+def test_wait_does_not_take_a_failed_first_read_for_an_empty_baseline(C, polls, fail):   # no other waiting item here: a baseline that held one would hide the failure
+    r = watched(C, *polls, fail=(fail, 1))
+    assert r.returncode == 1 and r.stdout == ""
+
+
+@pytest.mark.parametrize("answered", ["msg_a", "msg_pc"])
+def test_wait_ignores_a_decision_whose_reply_is_queued_in_the_spool_until_the_loop_sends_it(C, tmp_path, answered):
+    (tmp_path / "state/run_t/replies").mkdir(parents=True)
+    (tmp_path / "state/run_t/replies" / answered).write_text("approve\n")   # relayed with --reply, still open in Orca until the loop's next wake
+    r = watched(C, ([], []), ([answered], []), ([answered], []))
     assert r.returncode == 1 and r.stdout == ""
 
 
