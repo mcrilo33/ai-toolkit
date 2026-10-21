@@ -51,10 +51,11 @@ PICK='def scope: [(.body // "") | split("\n")[] | select(test("^\\s*[Ss]cope:"))
       | {n: $i.number, p: (if (names | index("priority")) == null then 1 else 0 end)}]
   | sort_by([.p, .n]) | (.[0].n // empty)'
 pick_next() {   # $only: restrict the pick to that issue (--next <issue>)
-  local nodes busy
+  local nodes busy by_label=()
+  [ -z "${DISPATCH_LABEL:-}" ] || by_label=(-f "labels[]=$DISPATCH_LABEL")   # filtered server-side: foreign issues must not fill the 100-issue window
   # shellcheck disable=SC2016
-  nodes="$(gh api graphql -F owner='{owner}' -F name='{repo}' -F limit=100 --jq '.data.repository.issues.nodes' -f query='
-    query($owner:String!, $name:String!, $limit:Int!) { repository(owner:$owner, name:$name) { issues(states: OPEN, first: $limit, orderBy: {field: CREATED_AT, direction: ASC}) {
+  nodes="$(gh api graphql -F owner='{owner}' -F name='{repo}' -F limit=100 ${by_label[@]+"${by_label[@]}"} --jq '.data.repository.issues.nodes' -f query='
+    query($owner:String!, $name:String!, $limit:Int!, $labels:[String!]) { repository(owner:$owner, name:$name) { issues(states: OPEN, labels: $labels, first: $limit, orderBy: {field: CREATED_AT, direction: ASC}) {
       nodes { number body labels(first: 20) { nodes { name } } blockedBy(first: 50) { nodes { number state } } } } } }')" || die "gh api graphql failed"
   busy="$(orca_json worktree list --repo "path:$main" | jq -c '[.result.worktrees[].linkedIssue | select(. != null)]')" || die "worktree list failed"
   printf '%s' "$nodes" | jq -r --argjson busy "$busy" --argjson only "${only:-null}" --arg label "${DISPATCH_LABEL:-}" "$PICK"
@@ -126,6 +127,7 @@ if [ "$next" = 1 ]; then
   [ -n "$n" ] || { if [ -n "$only" ]; then echo "dispatch: #$only is not ready (on hold, blocked, in flight, an open blocker, or a Scope that overlaps an in-flight issue${DISPATCH_LABEL:+, or lacks the $DISPATCH_LABEL label})" >&2; else echo "dispatch: nothing ready" >&2; fi; exit 3; }
   [ "$dry" = 0 ] || { echo "$n"; exit 0; }
 elif [ -n "${DISPATCH_LABEL:-}" ] && [ -z "$retry_of$address" ]; then   # an explicit dispatch bypasses the pick: it still refuses an issue the toolkit did not file
-  gh issue view "$n" --json labels | jq -e --arg l "$DISPATCH_LABEL" '.labels | map(.name) | index($l)' > /dev/null || die "issue $n lacks the $DISPATCH_LABEL label: not a toolkit issue"
+  v="$(gh issue view "$n" --json labels)" || die "cannot read issue $n"
+  jq -e --arg l "$DISPATCH_LABEL" '.labels | map(.name) | index($l)' <<< "$v" > /dev/null || die "issue $n lacks the $DISPATCH_LABEL label: not a toolkit issue"
 fi
 dispatch "$n"

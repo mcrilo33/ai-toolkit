@@ -235,6 +235,8 @@ def test_a_dispatch_label_restricts_the_pick_to_issues_that_carry_it(d):
     r = d.go("--next", "--dry-run", "3", DISPATCH_LABEL="ai-toolkit")
     assert (r.returncode, r.stdout.strip()) == (3, "") and "#3 is not ready" in r.stderr and "lacks the ai-toolkit label" in r.stderr
     assert d.go("--next", "--dry-run", "6", DISPATCH_LABEL="ai-toolkit").stdout.strip() == "6"
+    boards = [c for c in d.stubs.calls("gh") if c[:2] == ["api", "graphql"]]   # the label filters on the server too, so foreign issues cannot fill the 100-issue window
+    assert ["labels[]=ai-toolkit" in c for c in boards] == [False, True, True, True]
     stub_board(d, LABELLED[:1], [])
     r = d.go("--next", "--dry-run", DISPATCH_LABEL="ai-toolkit")
     assert r.returncode == 3 and "nothing ready" in r.stderr
