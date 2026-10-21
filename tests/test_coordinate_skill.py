@@ -88,6 +88,7 @@ def test_between_stop_and_its_exit_the_session_handles_nothing():
     attended = section("Switching")
     assert re.search(r"Never start the other loop", attended) and re.search(r"exits? 0", attended)
     assert "chat session" in attended and "coordinator-stop" in attended   # --stop needs no terminal handle of its own
+    assert "run_in_background" in attended and "7200000" in attended   # a foreground Bash call is killed at 600 s, before the exit 0/1 can return
 
 
 def test_a_chat_session_decision_is_alerted_by_a_mandatory_ask_user_question_card():

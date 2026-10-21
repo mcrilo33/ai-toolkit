@@ -81,5 +81,5 @@ Only on the user's explicit word. Stop the running loop, then start the other on
 .ai-toolkit/scripts/coordinator.sh --stop --run <run>
 ```
 
-This terminal (from a chat session, a `coordinator-stop` terminal it opens) takes the Run (Orca fences the loop, which exits 0 with "taken back by") and the command waits until the loop is gone; exit 1 = still finishing a step (a land): run it again until it exits 0. Never start the other loop before it does: the first may be mid-land and a second land would race it.
+This terminal (from a chat session, a `coordinator-stop` terminal it opens) takes the Run (Orca fences the loop, which exits 0 with "taken back by") and the command waits until the loop is gone; exit 1 = still finishing a step (a land): run it again until it exits 0. A land takes minutes, longer than a foreground Bash call lives: from either kind of session run `--stop` as ONE Bash call with `run_in_background` and `timeout: 7200000` (as Start arms `--wait`), and read its exit when the call returns. Never start the other loop before it exits 0: the first may be mid-land and a second land would race it.
 Nothing is lost: state lives in Orca, git and the issue labels, live workers keep running, and the new loop replays what the old one left unacked. Going back to attended after auto, summarize from "What landed" since the switch time, blocked issues first.
