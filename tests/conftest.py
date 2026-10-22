@@ -33,7 +33,7 @@ def link_script(tmp_path_factory):   # (path, text) -> path: a script is written
         if text not in made:
             made[text] = d / str(len(made))
             made[text].write_text(text)
-            made[text].chmod(0o755)
+            made[text].chmod(0o555)   # read-only: a write through any link raises in the test that does it, instead of corrupting the script for every later test
         path.unlink(missing_ok=True)
         path.symlink_to(made[text])
         return path
