@@ -12,7 +12,9 @@ SECURITY = "security.find_generic_password__a"   # find-generic-password -a
 
 
 @pytest.fixture
-def J(stubs, tmp_path, link_script, run):
+def J(stubs, tmp_path, link_script, run, monkeypatch):
+    for k in ("JIRA_SITE", "JIRA_EMAIL", "JIRA_LAND_TRANSITION"):
+        monkeypatch.delenv(k, raising=False)   # the caller env would win over the local env file under test
     link_script(tmp_path / "stubs/bin/curl", STUB_TEE + "# jira\n")   # a text of its own: no other test shares, and so can rewrite, this file
     link_script(tmp_path / "stubs/bin/security", STUB)
     stubs.reply(SECURITY, TOKEN + "\n")
@@ -21,7 +23,7 @@ def J(stubs, tmp_path, link_script, run):
         local = tmp_path / "local.env"   # land.sh does not export what load_env reads, so the script must read it itself
         local.write_text(cfg)
         return run(["bash", POST_LAND, *(args or ("12", "PM-17", "abc1234"))], cwd=cwd or tmp_path,
-                   AI_TOOLKIT_LOCAL_ENV=local, BASE_BRANCH="mc/ai-develop", **env)
+                   AI_TOOLKIT_LOCAL_ENV=local, **{"BASE_BRANCH": "mc/ai-develop", **env})
 
     def curl():   # (argv words, stdin) of every curl call
         return stubs.calls("curl")
@@ -91,15 +93,17 @@ def test_an_http_error_fails_with_a_reason(J):
     assert len(r.stderr.strip().splitlines()) == 1
 
 
-@pytest.mark.parametrize("key", ["pm-17", "PM-17;x", "PM-1/../2", "PM-", "$(id)-1", "PM-17 "])
-def test_a_bad_key_is_refused_before_any_call(J, key):
-    r = J.go("12", key, "abc1234")
+@pytest.mark.parametrize("issue,key,sha", [("12", k, "abc1234") for k in ["pm-17", "PM-17;x", "PM-1/../2", "PM-", "$(id)-1", "PM-17 "]]
+                         + [("1x", "PM-17", "abc1234"), ("12", "PM-17", "XYZ"), ("12", "PM-17", "abc;1234")])
+def test_a_bad_argument_is_refused_before_any_call(J, issue, key, sha):
+    r = J.go(issue, key, sha)
     assert r.returncode != 0
     assert J.curl() == [] and J.stubs.calls("security") == []
 
 
-@pytest.mark.parametrize("cfg", ["JIRA_EMAIL=dev@acme.test\n", "JIRA_SITE=acme.atlassian.net\n", "JIRA_SITE=a.b/x\nJIRA_EMAIL=dev@acme.test\n"])
-def test_missing_or_malformed_config_fails_before_any_call(J, cfg):
-    r = J.go(cfg=cfg)
-    assert r.returncode != 0 and "JIRA_" in r.stderr
+@pytest.mark.parametrize("cfg,base", [("JIRA_EMAIL=dev@acme.test\n", "b"), ("JIRA_SITE=acme.atlassian.net\n", "b"), ("JIRA_SITE=a.b/x\nJIRA_EMAIL=dev@acme.test\n", "b"),
+                                      (CONFIG, "")])
+def test_missing_or_malformed_config_fails_before_any_call(J, cfg, base):
+    r = J.go(cfg=cfg, BASE_BRANCH=base)
+    assert r.returncode != 0 and ("JIRA_" in r.stderr or "BASE_BRANCH" in r.stderr)
     assert J.curl() == [] and J.stubs.calls("security") == []
