@@ -30,7 +30,7 @@ LINE_CAPS = {"skills/solo-cycle/SKILL.md": 120, "skills/coordinate/SKILL.md": 13
              "skills/land/SKILL.md": 30, "skills/start-task/SKILL.md": 60,
              "rules/on-demand/workflow.md": 100, "rules/on-demand/planning-hub.md": 50,
              "rules/on-demand/afk-answering.md": 120, "agents/code-review.md": 110}
-VERDICT_KEYS = ("verdict", "blockers", "warnings", "tdd_followed", "tests_weakened", "summary")
+VERDICT_KEYS = ("verdict", "blockers", "warnings", "tdd_followed", "tests_weakened", "summary", "text", "rule")
 
 
 def frontmatter(path):

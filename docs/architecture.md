@@ -51,7 +51,7 @@ A script that still reads a worker-controlled source, or a worker that can still
 5. **Work.** Policy only inside the spoke: RED, GREEN, REFACTOR, in-spoke `code-review` (not in the light lane), `git push -u origin HEAD`. Hooks deny base-branch
    pushes, force pushes, `--no-verify`, and the destructive shapes of D8. Then `worker_done --outcome succeeded` (or `failed`).
 6. **Review.** `review.sh <n>`: a fresh read-only Opus runs the `code-review` agent on `origin/<base>...<branch>`; its last message is one JSON
-   verdict `{verdict, blockers, warnings, tdd_followed, tests_weakened, summary}`. `tests_weakened`, `tdd_followed: false` or any blocker beats an APPROVE.
+   verdict `{verdict, blockers, warnings, tdd_followed, tests_weakened, summary}`, each blocker and warning `{text, rule}` with `rule` one name of the rule inventory in its prompt, or `none`. Every valid verdict is also recorded as one `review-verdict: {...}` issue comment (sha, verdict, the two booleans, the rule names; never a finding text). `tests_weakened`, `tdd_followed: false` or any blocker beats an APPROVE.
 7. **Gate on tests.** `land.sh`: CI must be green for the EXACT tip (`gh run list --commit <sha>`); if the base moved, merge it on the spoke, push,
    gate again. `LOCAL_GATE=1` runs `CHECK_CMD` in the spoke instead (repos without CI).
 8. **Land.** fast-forward the main checkout to the gated tip, push, `gh issue close -c "landed in <sha>"`, delete the remote branch (lease-guarded),

@@ -73,7 +73,9 @@ Involve the human only for a decision you cannot make from the issue, the code a
 
 ## Findings
 
-Each finding is one string: `<file>:<line> — <summary>. <why it is a problem>. Fix: <approach>`.
+Each finding is an object `{"text": "<file>:<line> — <summary>. <why it is a problem>. Fix: <approach>", "rule": "<name>|none"}`.
+`rule` is the one rule the finding breaks, named as in the `--- rule inventory ---` block of your prompt (in an in-spoke run, a rule
+you were given), or `none` when no rule covers it. `none` is a valid, useful answer: never stretch a rule to fit.
 
 | Level | Meaning | Goes in |
 |-------|---------|---------|
@@ -86,13 +88,13 @@ Each finding is one string: `<file>:<line> — <summary>. <why it is a problem>.
 Your **final message is exactly one JSON object**: no prose before or after, no code fence. The coordinator parses it.
 
 ```json
-{"verdict": "APPROVE", "blockers": [], "warnings": ["src/a.py:12 — ..."], "tdd_followed": true,
- "tests_weakened": false, "summary": "0 blockers, 1 warning; key concern: none"}
+{"verdict": "APPROVE", "blockers": [], "warnings": [{"text": "src/a.py:12 — ...", "rule": "code-quality"}],
+ "tdd_followed": true, "tests_weakened": false, "summary": "0 blockers, 1 warning; key concern: none"}
 ```
 
 - `"verdict"`: `APPROVE` or `REQUEST_CHANGES`. Any blocker, `tests_weakened: true`, or Stage 1 failure means
   `REQUEST_CHANGES`; otherwise `APPROVE`. Never output a third value; uncertainty about correctness is a blocker.
-- `"blockers"` and `"warnings"`: arrays of finding strings (empty arrays, not null).
+- `"blockers"` and `"warnings"`: arrays of `{"text", "rule"}` findings (empty arrays, not null).
 - `"tdd_followed"` and `"tests_weakened"`: booleans as defined above.
 - `"summary"`: one or two sentences: counts, any raised cap, net code and test growth, and the key concern, or "none".
 

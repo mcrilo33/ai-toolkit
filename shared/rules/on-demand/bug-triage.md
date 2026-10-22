@@ -131,11 +131,14 @@ The filing agent decides the issue's dispatch outcome, and this is the only plac
 - **`bug-scoper`** files an ordinary dispatchable issue. A confirmed bug may be dispatched automatically,
   except one whose fix touches the coordinator's own scripts: those carry `hold` and land attended.
 - **`followup-scoper`** files the issue with the `hold` label, which keeps it out of dispatch until
-  the human removes the label. A follow-up waits for the human's go.
+  the human removes the label. A follow-up waits for the human's go, except when the human already gave it: the
+  caller's own instruction says explicitly that the human approved filing it (e.g. "the human approved: no hold"), an
+  attended caller on the main checkout (never a spoke's linked worktree, nor an unattended loop: neither can relay an approval). Then `hold` is dropped, unless `Scope:` touches
+  `coordinator.sh`, `dispatch.sh` or `land.sh`, which keep it and land attended. Nothing said or ambiguous means `hold`.
 
 Both agents file with the `gh` CLI when no GitHub MCP is available. When neither works they
-draft instead, and report it loudly with the finding text preserved. A follow-up is never filed
-without `hold`: if the label is missing from the repo, create it first.
+draft instead, and report it loudly with the finding text preserved. If `hold` applies and
+the label is missing from the repo, create it first.
 
 When `DISPATCH_LABEL` is set (read like `UPSTREAM_REPO`: `.ai-toolkit/ai-toolkit.local.env`, then `ai-toolkit.env`), every
 issue filed to *this* repo carries that label too, because the loop dispatches only labelled issues. An issue filed
