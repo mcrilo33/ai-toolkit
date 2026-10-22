@@ -62,10 +62,11 @@ pick_next() {   # $only: restrict the pick to that issue (--next <issue>)
 }
 
 seed() {   # $1 = gate: plan = full cycle; none = light lane (no PLAN gate, no in-worker review)
-  local s="Read .ai-toolkit/task.md." review=" -> in-spoke code-review"
+  local s="Read .ai-toolkit/task.md." review=" -> in-spoke code-review" key=""
+  [ -z "$tracker" ] || key="Put the tracker key in every commit subject, keeping the #$n anchor: type(scope): subject ($tracker, #$n). "
   [ "$1" = none ] || s="$s Gate: plan. Explore, write the plan, then run your preamble's ask command with the plan as the question and options approve,revise; do not edit code before approve. The reply is one of: approve (start work); approve with: <change> (apply the change and start work, do NOT ask again; if you cannot apply it without altering the approach, say so in your worker_done report instead of re-asking); revise: <change>, amend the plan and ask again (max 2 rounds)."
   [ "$1" != none ] || review=""
-  printf '%s' "$s A confirmed defect or deliberately deferred follow-up found outside the issue's Scope is handed to its scoper agent to file, per .ai-toolkit/rules/bug-triage.md, not just mentioned in worker_done. Anything you deliberately leave unfiled goes in worker_done on its own line, \"DEFERRED: <item>\", one item per line: only those lines are routed after the land, so never mark one you already filed. Send no heartbeat messages: report only with worker_done, a question, or an escalation. An ask that times out is still pending: resume it with orca orchestration ask --resume <message id> and keep waiting; never send worker_done --outcome failed because a question got no reply yet (also for a question raised after a permission request nobody answered). In a recursive delete, write the target as a literal path inside the worktree or the scratch directory, never a variable or a command substitution: the guard allows the first and asks for the second. Cycle per subtask: RED -> GREEN -> REFACTOR${review} -> git push -u origin HEAD. When the acceptance criteria hold: push, then send worker_done --outcome succeeded with a 3-sentence summary. Never merge or push the base branch."
+  printf '%s' "$s A confirmed defect or deliberately deferred follow-up found outside the issue's Scope is handed to its scoper agent to file, per .ai-toolkit/rules/bug-triage.md, not just mentioned in worker_done. Anything you deliberately leave unfiled goes in worker_done on its own line, \"DEFERRED: <item>\", one item per line: only those lines are routed after the land, so never mark one you already filed. Send no heartbeat messages: report only with worker_done, a question, or an escalation. An ask that times out is still pending: resume it with orca orchestration ask --resume <message id> and keep waiting; never send worker_done --outcome failed because a question got no reply yet (also for a question raised after a permission request nobody answered). In a recursive delete, write the target as a literal path inside the worktree or the scratch directory, never a variable or a command substitution: the guard allows the first and asks for the second. ${key}Cycle per subtask: RED -> GREEN -> REFACTOR${review} -> git push -u origin HEAD. When the acceptance criteria hold: push, then send worker_done --outcome succeeded with a 3-sentence summary. Never merge or push the base branch."
 }
 
 start_worker() {   # worker-start with the common flags; $@ = placement flags. Sets $disp.
@@ -112,6 +113,8 @@ dispatch() {
   model="${model:-$SPOKE_MODEL}"; effort="${effort:-$SPOKE_EFFORT}"
   # The model/effort end up in a shell command typed into a terminal: allow nothing but id characters.
   case "$model$effort" in *[!A-Za-z0-9._-]*) die "issue $n: bad Model footer '$model $effort'" ;; esac
+  tracker="$(issue_footer "$body" Tracker)"
+  case "$tracker" in *[!A-Za-z0-9._/#-]*) die "issue $n: bad Tracker footer '$tracker'" ;; esac
   slug="$(printf '%s' "$title" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
   name="$n-${slug:-issue}"
   if [ -n "$retry_of$address" ]; then launch_retry; else "launch_${DISPATCH_LAUNCH:-twostep}"; fi

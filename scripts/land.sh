@@ -18,6 +18,8 @@
 # copies they started with; they get the new ones only when re-dispatched (dispatch.sh --address / --retry-of refresh the worktree).
 # A loop keeps its OLD coordinator.sh but calls the NEW dispatch/land/answer/lib: restart it after a land that changed coordinator.sh
 # or lib.sh (or any contract between them), since the loop does not re-exec itself.
+# POST_LAND_CMD (a project's own command, empty by default) runs right after the base push, once and never under --cleanup-only, when the issue
+# carries `Tracker: <KEY>`: `<cmd> <issue> <key> <sha>` with BASE_BRANCH in its environment. A failure warns and comments on the issue; it never changes the exit code.
 # Exit: 0 landed, 1 error, 2 refused (precondition), 3 review not approved, 4 gate red/timeout, 5 merge conflict,
 #       6 landed but a cleanup step failed, a failed refresh of the installed copies included (main is already pushed; finish by hand,
 #         --cleanup-only retries the refresh too).
@@ -108,6 +110,16 @@ land() {   # ff main to the gated tip and push it; anything else on main is refu
     die "push of $BASE_BRANCH was rejected; local $BASE_BRANCH restored, nothing closed"
   fi
 }
+post_land() {   # a project's tracker update: the key is validated as one token and passed as argv, never interpolated
+  local body key
+  [ -n "${POST_LAND_CMD:-}" ] || return 0
+  body="$(gh_issue "$n" | jq -r '.body // ""')" || { warn "cannot read issue $n: POST_LAND_CMD skipped"; return 0; }
+  key="$(issue_footer "$body" Tracker)"; [ -n "$key" ] || return 0
+  case "$key" in *[!A-Za-z0-9._/#-]*) warn "bad Tracker footer '$key' on issue $n: POST_LAND_CMD skipped"; return 0 ;; esac
+  BASE_BRANCH="$BASE_BRANCH" bash -c "$POST_LAND_CMD \"\$@\"" post-land "$n" "$key" "$tip" >&2 && return 0
+  warn "POST_LAND_CMD failed for $key"
+  gh issue comment "$n" -b "tracker update failed, do it by hand: $key $tip" > /dev/null || warn "cannot comment on #$n"
+}
 test_files_only_in_test_commits() {   # exit 2 on the first pushed commit that changes a test file without being a test: commit; the hook's rule, so the commit and land checks cannot drift
   local c out hook="$here/../hooks/git/commit-msg"
   if [ -z "${TEST_PATHS+x}" ]; then warn "TEST_PATHS is set nowhere: the test-file check is off"; return 0; fi
@@ -129,6 +141,7 @@ if [ "$co" = 0 ]; then
   fi
   gate_loop
   land
+  post_land
 fi
 
 # --- cleanup: main is the source of truth from here on, so a failure is reported (exit 6), not fatal
