@@ -113,6 +113,12 @@ def test_a_tracker_footer_puts_its_key_in_the_seed_for_every_commit_subject_and_
     assert seeds(d)[1] == tracked.replace(f" {sentence}.", "", 1)
 
 
+@pytest.mark.parametrize("tail", ["\r", " "])
+def test_a_tracker_footer_with_a_trailing_cr_or_space_still_names_the_key(d, tail):   # a body edited in the GitHub web UI comes back with CRLF
+    d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": f"x\nScope: a\nTracker: PM-17{tail}\n"}))
+    assert d.go("7").returncode == 0 and "(PM-17, #7)" in seeds(d)[0]
+
+
 @pytest.mark.parametrize("key", ["PM 17", "PM-17;touch x", "PM-$(id)"])
 def test_a_tracker_key_that_is_not_one_token_starts_no_worker(d, key):
     d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": f"x\nScope: a\nTracker: {key}\n"}))

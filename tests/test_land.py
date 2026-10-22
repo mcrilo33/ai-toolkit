@@ -486,6 +486,12 @@ def test_a_failing_post_land_cmd_comments_on_the_issue_and_never_changes_the_exi
     assert ("gh", "issue", "close", "9", "-c", f"landed in {L.tip}") in t and ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks") in t
 
 
+@pytest.mark.parametrize("tail", ["\r", " "])
+def test_a_tracker_footer_with_a_trailing_cr_or_space_still_runs_the_command_with_the_key(L, tracked, tail):
+    assert L.go("9", POST_LAND_CMD=tracked(f"Scope: a\nTracker: PM-17{tail}\n")).returncode == 0
+    assert [t[:3] for t in post_land_calls(L)] == [("post-land", "9", "PM-17")]
+
+
 @pytest.mark.parametrize("key", ["PM 17", "PM-17;touch x", "PM-$(id)"])
 def test_a_tracker_key_that_is_not_one_token_is_refused_with_a_warning_and_no_call(L, tracked, key):
     r = L.go("9", POST_LAND_CMD=tracked(f"Scope: a\nTracker: {key}\n"))
