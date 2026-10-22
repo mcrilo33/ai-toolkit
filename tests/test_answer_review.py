@@ -290,6 +290,12 @@ def test_every_valid_verdict_is_recorded_once_as_rule_names_only_and_a_failing_g
         rec = json.loads(body[0].removeprefix("review-verdict: "))
         assert rec == {"v": 1, "sha": sha, "verdict": verdict["verdict"], "tdd_followed": True, "tests_weakened": False,
                        "blockers": [f["rule"] for f in verdict["blockers"]], "warnings": [f["rule"] for f in verdict["warnings"]]}
+    for bad in ({**OK, "tests_weakened": True}, {**OK, "tdd_followed": False}, {**OK, "blockers": [finding("a.py:3 - bug")]}):   # an APPROVE the exit rejects is recorded as the rejection it is
+        before = len(comments(R))
+        assert R.go(bad).returncode == 3
+        rec = json.loads(comments(R)[before:][0].removeprefix("review-verdict: "))
+        assert rec == {"v": 1, "sha": sha, "verdict": "REQUEST_CHANGES", "tdd_followed": bad["tdd_followed"], "tests_weakened": bad["tests_weakened"],
+                       "blockers": [f["rule"] for f in bad["blockers"]], "warnings": [f["rule"] for f in bad["warnings"]]}
     assert R.stubs.calls("gh")[-1][:3] == ["issue", "comment", "9"]
     R.stubs.reply("gh.issue_comment", "boom", rc=1)   # a GitHub outage must not turn an approve into a rejection
     r = R.go(OK)
