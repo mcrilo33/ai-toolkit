@@ -62,8 +62,6 @@ Issue a broad first query using the tools available in this toolkit:
 - `SemanticSearch` for meaning-based questions ("where do we validate auth tokens?")
 - `Grep` for known symbols or exact strings
 - `Glob` for file-name patterns
-- `codebase-memory` graph tools (`search_graph`, `trace_call_path`) when the question is
-  about call chains or structure — far cheaper than repeated grep/read cycles
 
 Start wide. Do not over-specify the first query; its main job is to reveal the codebase's
 vocabulary.
@@ -112,10 +110,10 @@ Cycle 1
 Cycle 2
   Dispatch:  Grep "throttle"; Glob "**/middleware/*.ts"
   Evaluate:  throttle.ts (0.9), middleware/index.ts (0.7); gap: how routes register it
-  Refine:    trace_call_path from router registration
+  Refine:    grep for where the router registers middleware
 
 Cycle 3
-  Dispatch:  codebase-memory trace_call_path on router setup
+  Dispatch:  Grep "use(" in router setup
   Evaluate:  router-setup.ts (0.8) — registration point found, no gaps
   Stop:      proceed with throttle.ts, middleware/index.ts, router-setup.ts
 ```
@@ -136,8 +134,6 @@ This keeps the subagent's starting context tight and grounded, which is the whol
 - **Track gaps explicitly** — a named gap is what makes refinement non-random
 - **Exclude confidently** — low-relevance files rarely become relevant later
 - **Respect the budget** — see `context-map` scope limits; do not exceed ~20 files
-- **Prefer the graph for structure** — `codebase-memory` beats grep/read loops for call
-  chains and impact questions
 
 ## Related
 
