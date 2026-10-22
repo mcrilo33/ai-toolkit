@@ -58,6 +58,19 @@ in the conversation; no filer, agent, template or `answer.sh` ever writes or app
 records *which* gate, not *who* answers it: `coordinator.sh --answer auto` (`answer.sh`) or
 `--answer human`, chosen per run.
 
+## The optional `Tracker:` line
+
+A project whose tickets live in an external tracker may add a plain `Key: value` line carrying the ticket key:
+
+```
+Tracker: PM-17
+```
+
+The key is one token (`[A-Za-z0-9._/#-]+`). `dispatch.sh` tells the worker to put it in every commit subject
+(`feat(x): subject (PM-17, #12)`, the `#<n>` anchor stays), and `land.sh` hands it to the project's `POST_LAND_CMD`
+after the land. The toolkit knows no tracker: it reads the line and nothing else. An issue filed upstream never
+carries a host project's key.
+
 ## Programmatic filers emit the footer too
 
 The convention binds **any** path that files issues, not just a human typing them into the

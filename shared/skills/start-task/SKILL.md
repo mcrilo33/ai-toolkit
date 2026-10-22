@@ -1,7 +1,7 @@
 ---
 name: start-task
 description: "Dispatch a planned task from the hub into a running Orca worker: draft and file the GitHub issue with its Scope:/Gate:/Model: footer and blocked-by edges, then run dispatch.sh. Use in the hub session when the user says 'start this work', 'spin it up', or 'let's build X' after scope is clear."
-argument-hint: "[issue number, or the task to file]"
+argument-hint: "[issue number, external ticket key, or the task to file]"
 ---
 # Start Task
 
@@ -12,7 +12,9 @@ Hub to spoke: the **issue is the contract**. The worker starts with a fresh cont
 
 Restate the task as a draft issue: **title**, **body** (problem, proposal, acceptance criteria drawn from the
 conversation). Get an OK before filing; do not invent scope. If the work falls into independent file groups,
-draft one issue per group (`issue-hygiene`, Split what does not collide) and tell the user.
+draft one issue per group (`issue-hygiene`, Split what does not collide) and tell the user. An external ticket key
+as the argument (e.g. `PM-17`): read the ticket with the project's own tool (e.g. the Atlassian connector), draft from
+it, and add `Tracker: <KEY>` to the footer.
 
 ## 2. File the issue
 
@@ -31,6 +33,7 @@ The footer is the dispatch contract (see `.ai-toolkit/rules/issue-hygiene.md`):
 | `Scope:` | mandatory, concrete files/globs; missing or `*` runs the issue alone. Overlap with an in-flight issue serializes it |
 | `Gate:` | `plan` (always, unless told otherwise: the worker `ask`s for approval of its plan). `none` is the light lane (no PLAN gate, no in-worker review): write it only when the user asked for light on this issue, never because the work looks small |
 | `Model:` | optional override of `SPOKE_MODEL`; reasoning-heavy work gets an Opus id |
+| `Tracker:` | optional external ticket key; the worker puts it in every commit subject |
 
 Labels: `priority` (dispatched first), `hold` (never dispatched), and `DISPATCH_LABEL` when set (create it if missing; see `bug-triage`). **Blocked-by**: answer "does this depend on
 open work?" for every issue and declare a real native edge if yes (`github-issues/references/dependencies.md`);

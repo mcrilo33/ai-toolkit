@@ -13,6 +13,7 @@ argument-hint: "[issue number]"
    (no CI yet).
 3. Base moved? merge it into the spoke branch and push, then wait for CI again.
 4. `git merge --ff-only`, `git push origin <base>`, `gh issue close -c "landed in <sha>"`, delete the remote branch.
+   With `POST_LAND_CMD` set and a `Tracker:` footer, `<cmd> <n> <key> <sha>` runs right after the push (never on `--cleanup-only`); a failure only comments.
 5. `orca orchestration worker-release`, then `orca worktree rm --worktree issue:<n> --run-hooks`.
 
 Run it on the main worktree only (it refuses elsewhere). The coordinator calls it itself on

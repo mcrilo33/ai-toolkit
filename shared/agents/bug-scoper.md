@@ -83,6 +83,9 @@ Scope: <real paths + their tests>
 Gate: plan
 ```
 
+Add a caller-supplied `Tracker: <KEY>` line to the footer of an issue filed to this repo, and never to one filed
+upstream: a host project's ticket key must not leak into the toolkit's tracker.
+
 ## Phase 4: Labels
 
 Always `bug`. Add, by heuristic:
