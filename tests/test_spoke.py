@@ -106,6 +106,7 @@ def test_the_launcher_passes_the_settings_file_of_the_project_it_starts_in(run, 
     (None, ["--mcp-config", "mine.json"], False, None),               # the launcher owns the list: a caller's own would add servers
     (None, ["--mcp-config=mine.json"], False, None),
     (None, ["--strict-mcp-config"], False, None),
+    (None, ["--chrome"], False, None),                                # a later --chrome would switch the Chrome tools back on
     ("missing", ["-p"], False, None),                                 # no list file: refused, never every server of the host user
     ("empty", ["-p"], False, None),
     ("broken", ["-p"], False, None),                                  # a list that is not {"mcpServers": {...}} is refused
