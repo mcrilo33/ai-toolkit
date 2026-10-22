@@ -250,7 +250,7 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     claude = len(R.stubs.calls("claude"))
     r = R.go(OK)
     assert r.returncode == 1 and r.stdout == "" and "issue 9" in r.stderr and "cannot read" in r.stderr and "unparseable" not in r.stderr
-    assert len(R.stubs.calls("claude")) == claude and len(R.stubs.calls("gh")) == gh + 6
+    assert len(R.stubs.calls("claude")) == claude and len(R.stubs.calls("gh")) == gh + 7   # the verdict recorded above, then three failed views
 
 
 @pytest.mark.parametrize("patch, word", [({"verdict": "REQUEST_CHANGES", "blockers": [finding("a.py:3 - off by one", "code-quality")]}, "BLOCKER: [code-quality] a.py:3 - off by one"),
