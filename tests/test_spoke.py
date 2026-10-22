@@ -4,6 +4,11 @@ from conftest import V2
 SPOKE = str(V2 / "bin/claude-spoke")
 
 
+def MCP(tk, *local):
+    """What the launcher puts in front of a worker's arguments: only the toolkit's server list (and the host's own), no Chrome."""
+    return ["--strict-mcp-config", "--mcp-config", f"{tk}/mcp.json", *[a for f in local for a in ("--mcp-config", f"{tk}/{f}")], "--no-chrome"]
+
+
 def in_spoke(repo, run_id="abc-123"):
     wt = repo.wt("wp0")
     (wt / ".ai-toolkit").mkdir()
@@ -12,8 +17,9 @@ def in_spoke(repo, run_id="abc-123"):
 
 
 def synced(repo):
-    """What sync.sh leaves in the main checkout: the toolkit's hook registrations. Returns the physical .ai-toolkit dir."""
+    """What sync.sh leaves in the main checkout: the toolkit's hook registrations and MCP server list. Returns the physical .ai-toolkit dir."""
     (repo.root / ".ai-toolkit").mkdir(exist_ok=True)
+    (repo.root / ".ai-toolkit/mcp.json").write_text('{"mcpServers": {}}\n')
     (repo.root / ".ai-toolkit/claude-settings.json").write_text('{"disableAllHooks": false, "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": []}]}}\n')
     return repo.root.resolve() / ".ai-toolkit"
 
@@ -25,7 +31,7 @@ def test_spoke_exports_native_otel_env_and_passes_args_through(run, stubs, repo,
     (wt / ".ai-toolkit/task.md").write_text("# #464 feat(otel): tag spoke telemetry\n\nbody mentioning # #7\n")
     r = run([SPOKE, "--model", "m"], cwd=wt, OTEL_ENDPOINT="http://collector:4317", AI_TOOLKIT_LOCAL_ENV=tmp_path / "l.env")
     env = stubs.env("claude")
-    assert r.returncode == 0 and stubs.calls("claude") == [["--settings", f"{tk}/claude-settings.json", "--model", "m"]], r.stderr   # main's file, from a worker's worktree
+    assert r.returncode == 0 and stubs.calls("claude") == [[*MCP(tk), "--settings", f"{tk}/claude-settings.json", "--model", "m"]], r.stderr   # main's files, from a worker's worktree
     assert "CLAUDE_CODE_ENABLE_TELEMETRY=1" in env and "OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317" in env
     assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=abc-123,repo=origin,issue=464" in env and "OTLP_HEADERS" not in env
     assert "SECRET_PROBE" not in env and "s3cret" not in env
@@ -92,6 +98,40 @@ def test_the_launcher_passes_the_settings_file_of_the_project_it_starts_in(run, 
         assert calls == [fwd] and "AI_TOOLKIT_DIR" not in stubs.env("claude")   # not even the inherited one
     if not ok:
         assert "settings" in r.stderr
+
+
+@pytest.mark.parametrize("local,args,ok,fwd", [
+    (None, ["-p", "x"], True, ["-p", "x"]),
+    ("mcp.local.json", ["-p", "x"], True, ["-p", "x"]),               # the host's own list rides along after the toolkit's
+    (None, ["--mcp-config", "mine.json"], False, None),               # the launcher owns the list: a caller's own would add servers
+    (None, ["--mcp-config=mine.json"], False, None),
+    (None, ["--strict-mcp-config"], False, None),
+    ("missing", ["-p"], False, None),                                 # no list file: refused, never every server of the host user
+    ("empty", ["-p"], False, None),
+    ("broken", ["-p"], False, None),                                  # a list that is not {"mcpServers": {...}} is refused
+    ("noservers", ["-p"], False, None),
+    ("broken-local", ["-p"], False, None),                            # the same rule for the host's own list
+])
+def test_a_worker_starts_with_only_the_toolkit_mcp_list(run, stubs, repo, local, args, ok, fwd):
+    tk = synced(repo)
+    bad = {"empty": "", "broken": "{not json", "noservers": "{}"}
+    if local == "missing":
+        (tk / "mcp.json").unlink()
+    elif local in bad:
+        (tk / "mcp.json").write_text(bad[local])
+    elif local == "broken-local":
+        (tk / "mcp.local.json").write_text("{not json")
+    elif local:
+        (tk / local).write_text('{"mcpServers": {"mine": {"command": "true"}}}\n')
+    r = run([SPOKE, *args], cwd=in_spoke(repo))
+    assert (r.returncode == 0) == ok, r.stderr
+    assert stubs.calls("claude") == ([[*MCP(tk, *[local] * bool(local)), "--settings", f"{tk}/claude-settings.json", *fwd]] if ok else []) and (ok or "mcp" in r.stderr)
+
+
+def test_a_human_session_keeps_its_own_mcp_servers(run, stubs, repo):
+    tk = synced(repo)
+    assert run([SPOKE, "--mcp-config", "mine.json", "-p"], cwd=repo.wt("h")).returncode == 0
+    assert stubs.calls("claude") == [["--settings", f"{tk}/claude-settings.json", "--mcp-config", "mine.json", "-p"]]   # no run id: nothing added, nothing refused
 
 
 def test_install_checks_prerequisites_then_prints_the_orca_override_without_a_path_shim(run, stubs, tmp_path):
