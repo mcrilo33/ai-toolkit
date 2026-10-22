@@ -407,7 +407,7 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
     if routed:   # one headless session after the land: the findings (three at most), the two scopers to use, nothing else
         in_order(C.kinds(), "land.sh", "claude")
         p = C.stdin("claude")
-        assert "bug-scoper" in p and "followup-scoper" in p
+        assert "bug-scoper" in p and "followup-scoper (filed with the hold label)" in p   # a rewording must not drop the hold request
         assert all(t in p for t in re.findall(r"w\d|cache the lookup|zeta|x", routed)) and ("w4" not in p) and "#420" not in p
         assert set(arg(C.stubs.calls("claude")[0], "--allowedTools").split(",")) == TOOLS
         head, _, data = p.partition("<findings>\n")   # the findings come last, as data the session is told never to obey
