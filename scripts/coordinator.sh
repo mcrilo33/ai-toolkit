@@ -39,7 +39,7 @@ case "$answer" in auto | attended | human) ;; *) usage_exit "--answer takes auto
 [ "$watch" = 0 ] || [ -n "$run" ] || usage_exit "--wait needs --run <run-id>"
 [ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"; [[ -z $session || $session =~ ^term_[A-Za-z0-9_-]+$ ]] || usage_exit "--session takes an Orca terminal handle"; [ "$answer" != attended ] || [ -n "$session" ] || warn "attended without --session: the loop cannot tell the session of a decision, only --status shows the queue"
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
-[ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid> and held: the ids the loop left open for the human)
+[ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid>, held: the ids the loop left open for the human, and landing: the land under way)
 if [ "$dreq" = 1 ]; then   # a dispatch request: <issue> = its one-line message (empty = a plain dispatch), queued in the reply spool's shape for the loop's next wake
   [ -n "$run" ] || usage_exit "--dispatch needs --run <run-id>"; [[ $dreq_n =~ ^[0-9]+$ ]] || usage_exit "--dispatch takes an issue number and an optional one-line message"
   d="$(spool_dir "$run")/requests"; (umask 077; mkdir -p "$d"); chmod 700 "$d"
@@ -314,7 +314,7 @@ triage() {   # $1 = land output, $2 = the worker's report: after a land, hand wh
     ! grep -qi 'drafted' <<< "$out" || comment "$issue" "A scoper drafted instead of filing, file by hand: ${out//$'\n'/ }"
   else warn "#$issue: routing the leftover findings failed (exit $rc, after at most ${t}s), they are kept in a comment: $routed"; comment "$issue" "Routing to the scopers failed, file by hand: $routed"; fi
 }
-landing() { log "#$issue: worker_done from $disp, landing"; printf '%s %s %s\n' "$issue" "$disp" "$(date +%H:%M)" > "$sd/landing"; }   # a land takes minutes, its dispatch is already completed: loop.log and --status say it is under way
+landing() { printf '%s %s %s\n' "$issue" "$disp" "$(date +%H:%M)" > "$sd/landing"; log "#$issue: worker_done from $disp, landing"; }   # a land takes minutes, its dispatch is already completed: loop.log and --status say it is under way
 on_done() {
   local out rc=0 bl last
   ctx "$(pj "$1" dispatchId)" || return 1
