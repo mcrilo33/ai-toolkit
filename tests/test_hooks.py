@@ -32,7 +32,8 @@ def build(base):
     (base / "1-x/.ai-toolkit/spoke-run-id").write_text("rid\n")
     for d in ("home", "scratch"):
         (base / d).mkdir()
-    return {"root": root, "wt": base / "2-y", "spoke": base / "1-x", "home": base / "home", "tk": base / "home" / "tk",   # tk: the main checkout's .ai-toolkit, outside every worktree (under HOME, so ~ and $HOME spell it too)
+    (base / "link").symlink_to(base / "1-x")
+    return {"link": base / "link", "root": root, "wt": base / "2-y", "spoke": base / "1-x", "home": base / "home", "tk": base / "home" / "tk",   # tk: the main checkout's .ai-toolkit, outside every worktree (under HOME, so ~ and $HOME spell it too)
             "env": {"HOME": str(base / "home"), "TMPDIR": str(base / "scratch"), "AI_TOOLKIT_DIR": str(base / "home" / "tk"), **GIT_ENV}}
 
 
@@ -193,6 +194,10 @@ WRITE_DENY = [
     "echo x > .ai-toolkit/bin/claude-spoke", 'echo x > "$(printenv AI_TOOLKIT_DIR)/claude-settings.json"', "d=$AI_TOOLKIT_DIR; echo x > $d/hooks/claude/push-guard.sh",
     "python3 -c \"import os; open(os.environ['AI_TOOLKIT_DIR'] + '/x', 'w')\"",
     "echo x > ../main/.ai-toolkit/setup.local.sh", "echo x > ../main/.ai-toolkit/rules/afk-answering.md", "cd .. && echo x > main/.ai-toolkit/sync-manifest",
+    # an absolute literal outside the worktree and the launcher's .ai-toolkit is a mention; every other spelling, and one real write after a mention, still asks
+    "python3 - <<EOF\nx='/w/.ai-toolkit/rules/a.md'\nopen('.ai-toolkit/hooks/x','w')\nEOF", "echo x > {spoke}/.ai-toolkit/rules/a.md", "echo x > {tk}/rules/a.md",
+    "echo x > /w/$D/.ai-toolkit/hooks/x", "echo x > /w/../{spoke}/.ai-toolkit/hooks/x", "echo x > {link}/.ai-toolkit/hooks/x",
+    "echo x > */.ai-toolkit/hooks/x", "echo x > {spoke}{,/.ai-toolkit/hooks/x}",
 ]
 WRITE_ALLOW = [
     "touch sub/orca.yaml", "echo x > v2/orca.yaml", "cp a docs/.github/workflows/x.yml", "rm -rf .claude/cache", "ls .claude",
@@ -202,6 +207,9 @@ WRITE_ALLOW = [
     "grep -n hooks .claude/settings.json", "echo hi > out.txt", "cat orca.yaml > /dev/null", "cat orca.yaml > out.txt",
     "cat .github/workflows/ci.yml 2>&1 | head", "git diff -- orca.yaml", "sed -n 1,5p orca.yaml",
     "git commit -m 'update orca.yaml'", "echo x > .claude/rules/a.md", "cat scripts/sync.sh", "grep -n sync scripts/sync.sh", "pytest tests/test_sync.py", "git commit -m 'document sync.sh (#1)'", "cat {tk}/claude-settings.json", "grep -n hooks .ai-toolkit/claude-settings.json", "ls {tk}/hooks/claude",
+    "python3 - <<'EOF'\np='tests/test_x.py'\ns=open(p).read()+'f = \"/w/.ai-toolkit/rules/bug-triage.md\"'\nopen(p,'w').write(s)\nEOF",
+    "python - <<'EOF'\np='tests/test_e.py'\ns=make_obs('tool:Read', 1, 2, file_path='/w/.ai-toolkit/rules/bug-triage.md')\nopen(p,'w').write(s)\nEOF",
+    'python -m pytest tests -k "/w/.ai-toolkit/rules"', 'cat > tests/fix.json <<EOF\n{"p": "/w/.ai-toolkit/hooks/x.sh"}\nEOF',
 ]
 
 
@@ -746,5 +754,5 @@ def test_pre_commit_allows_the_first_commit_of_a_repo(tmp_path):
 
 def test_hook_line_budgets():
     n = lambda *g: sum(len(f.read_text().splitlines()) for q in g for f in HOOKS.glob(q))  # noqa: E731
-    assert n("claude/*.sh") <=      235 and n("git/*") <= 40
+    assert n("claude/*.sh") <=      239 and n("git/*") <= 40
     assert len((V2 / "settings/claude/settings.json").read_text().splitlines()) <= 40

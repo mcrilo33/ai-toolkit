@@ -3,7 +3,7 @@
 # danger-guard: PreToolUse(Bash|Write|Edit|MultiEdit|NotebookEdit|AskUserQuestion). Yolo mode (D8) has no prompts of its own, so this is the brake.
 # The rule: everything is authorized except sensitive operations, which ASK the user when someone can answer and are DENIED when no one can.
 # Asks (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode), one per call whose reason names every sensitive segment: writes
-# to orca.yaml, ~/.claude/settings.json, .github/workflows/ and, in a worker, the project .claude/{settings*.json,hooks/}, .ai-toolkit/spoke-run-id and anything under the launcher's $AI_TOOLKIT_DIR (the main checkout's .ai-toolkit: the guards, the launcher, the scripts, the env files), in every spelling;
+# to orca.yaml, ~/.claude/settings.json, .github/workflows/ and, in a worker, the project .claude/{settings*.json,hooks/}, .ai-toolkit/spoke-run-id and anything under the launcher's $AI_TOOLKIT_DIR (the main checkout's .ai-toolkit: the guards, the launcher, the scripts, the env files), in every spelling (an absolute literal path outside the worktree and that .ai-toolkit only mentions it);
 # rm -r outside the worktree, of its root or home, of another git checkout, or with an unexpanded variable; git reset --hard in the main checkout (or
 # with --git-dir/--work-tree); git clean -x and git stash -a. Someone can answer when there is no worker marker (the human's own prompt) or when a worker
 # has the permission-relay hook installed and registered in the launcher's settings file (it puts the question to the Run: the user answers an attended one, the auto loop denies it);
@@ -59,12 +59,16 @@ cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || finish
 
 c=" $(printf '%s' "$cmd" | sed -E "s/[\"'\\\\]//g; s/[0-9&]*>+ *(\/dev\/null|&[0-9])//g; s/[[:space:]>]/& /g")" # writes to a protected path
 pre="((^|[^[:alnum:]_./-])(\./)?|$rr/|\\\$\{?(PWD|CLAUDE_PROJECT_DIR)\}?/|\\\$\(pwd\)/)"; e="([^[:alnum:]_./-]|$)" # project-root paths only: v2/orca.yaml is fine
-p="$pre(orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$rh)/\.claude/settings\.json"
-if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e)|[^[:space:]]*\.ai-toolkit/(spoke-run-id|claude-settings\.json|hooks|bin|scripts|rules|sync-manifest|setup\.local\.sh|[^/[:space:]]*\.env)|$pre($(re "${AI_TOOLKIT_DIR:-/nonexistent}")|(~|HOME\}?|$rh)/$(t="${AI_TOOLKIT_DIR:-/nonexistent}"; re "${t#"$home"/}")|\\\$\{?AI_TOOLKIT_DIR\}?)(/|$e)"; fi
+p="$pre(orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$rh)/\.claude/settings\.json"; ft='[^[:space:]]*\.ai-toolkit/(spoke-run-id|claude-settings\.json|hooks|bin|scripts|rules|sync-manifest|setup\.local\.sh|[^/[:space:]]*\.env)'
+if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e)|$pre($(re "${AI_TOOLKIT_DIR:-/nonexistent}")|(~|HOME\}?|$rh)/$(t="${AI_TOOLKIT_DIR:-/nonexistent}"; re "${t#"$home"/}")|\\\$\{?AI_TOOLKIT_DIR\}?)(/|$e)"; fi
 w="(>|[[:space:]](tee|cp|mv|rm|touch|ln|dd|install|rsync|truncate|patch|chmod|python[0-9.]*|perl|ruby|node)[[:space:]]|[[:space:]]sed[[:space:]][^;|&]*(-[a-z]*i|--in-place))"
 va="${w}[^;|&]*|[[:space:]](cd|pushd)[[:space:]][^;|&]*" # a verb before the path, or a cd into it
 if [ -n "$spoke" ] && [[ $c =~ ($va)($spool) ]]; then deny "write to the human's reply spool: $(printf '%.200s' "$cmd" | tr '\n' ' ')"; fi
-bw=""; if [[ $c =~ ($va)($p) ]] || { [ -n "$spoke" ] && { [[ $c =~ $sy ]] || [[ $c =~ AI_TOOLKIT_ALLOW_BASE_COMMIT ]] || { [[ $c =~ AI_TOOLKIT_DIR ]] && [[ $c =~ $w ]]; }; }; }; then bw="a protected path, sync.sh or the base-commit switch (orca.yaml, claude settings/hooks, the toolkit's guards)"; fi
+cw="$c"; wl='[[:alnum:]_./+@%:-]'; ta='([^[:alnum:]_./+@%:$`*?[{~-]|$)' # cw: c minus the absolute literal paths that prot() would not protect (outside $root and $AI_TOOLKIT_DIR); the lead/tail check leaves $d/.. */.. {a,/w}/.. ../w/.. in
+[ -z "$spoke" ] || while IFS= read -r t; do case "$t" in *..*) continue;; esac
+  case "$(canon "$t")" in "$root"/* | "${AI_TOOLKIT_DIR:-/nonexistent}"/*) ;; *) cw="$(printf '%s' "$cw" | sed -E "s#(^|[[:space:]=([])$(re "$t")$ta#\1 \2#g")";; esac
+done < <(printf '%s\n' "$c" | grep -oE "/$wl*\.ai-toolkit/$wl*" || :)
+bw=""; if [[ $c =~ ($va)($p) ]] || { [ -n "$spoke" ] && { [[ $cw =~ ($va)($ft) ]] || [[ $c =~ $sy ]] || [[ $c =~ AI_TOOLKIT_ALLOW_BASE_COMMIT ]] || { [[ $c =~ AI_TOOLKIT_DIR ]] && [[ $c =~ $w ]]; }; }; }; then bw="a protected path, sync.sh or the base-commit switch (orca.yaml, claude settings/hooks, the toolkit's guards)"; fi
 if [[ $c =~ ($va)($pre\.github/workflows) ]]; then bw="${bw:+$bw and }.github/workflows"; fi
 [ -z "$bw" ] || sens "write to $bw: ${cmd:0:200}"
 
