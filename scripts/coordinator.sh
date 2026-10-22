@@ -125,6 +125,7 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
   echo "live workers:"   # verdict, the agent's activity and the silence: `unverifiable` for a long run tells a stuck worker from a working one
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "\(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict) \(.projection.stage.activity // "-")"' | while read -r d w v a; do
     read -r age how <<< "$(silent "$d")" || true; echo "  $d $w $v $a, silent ${age:-?}m$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done || echo "  (Orca did not answer)"
+  { [ -z "$lm" ] || ! read -r li _ lt 2> /dev/null < "$(spool_dir "$run")/landing"; } || echo "landing #$li since $lt"   # only a live loop can be landing: a file left by a killed one is not shown
   echo "queue (the order to present it):"
   oq="$(open_q)"; mine=""; nl=$'\n'   # one jq for the whole queue: id, payload question, body, each NUL-ended (a spawn per question and field is what made --status slow)
   while IFS= read -r -d '' id && IFS= read -r -d '' q && IFS= read -r -d '' b; do q="${q%"${q##*[!"$nl"]}"}"; b="${b%"${b##*[!"$nl"]}"}"; [ -n "$q" ] || q="$b"   # question_of's rule: the payload question, else the body, trailing newlines dropped
@@ -195,7 +196,7 @@ died() {   # the EXIT trap, $1 = the exit status, $2 = the last command: every e
   [ -z "$sig" ] || { how="by $sig"; rd="see $lf"; }
   { [ "$1" = 0 ] || [ "$1" = 130 ] || [ "$answer" != attended ] || [ -z "$session" ]; } || orca_json terminal send --terminal "$session" --text "[coordinator loop] stopped $how: nothing coordinates Run $run, $rd and start it again." --enter > /dev/null 2>&1 || true
 }
-sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$BASH_COMMAND"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (umask 077; mkdir -p "$sd"); lf="$sd/loop.log"; rm -f "$sd/held"; printf '%s %s\n' "$H" "$mode" > "$hf"
+sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$BASH_COMMAND"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (umask 077; mkdir -p "$sd"); lf="$sd/loop.log"; rm -f "$sd/held" "$sd/landing"; printf '%s %s\n' "$H" "$mode" > "$hf"
 [ ! -f "$lf" ] || { tail -n 200 "$lf" > "$lf.t" && mv "$lf.t" "$lf"; }   # the loop's own record, kept when its pane is gone: the last 200 lines of the earlier loops, then this one's; written before the pane (a closed pty fails the print)
 log() { local t; t="$(date '+%F %T')"; printf '%s coordinator: %s\n' "$t" "$*" >> "$lf" || true; printf '%s coordinator: %s\n' "${t#* }" "$*" || true; }
 warn() { local t; t="$(date '+%F %T')"; printf '%s coordinator: warning: %s\n' "$t" "$*" >> "$lf" || true; printf '%s: warning: %s\n' "${0##*/}" "$*" >&2 || true; }
@@ -313,6 +314,7 @@ triage() {   # $1 = land output, $2 = the worker's report: after a land, hand wh
     ! grep -qi 'drafted' <<< "$out" || comment "$issue" "A scoper drafted instead of filing, file by hand: ${out//$'\n'/ }"
   else warn "#$issue: routing the leftover findings failed (exit $rc, after at most ${t}s), they are kept in a comment: $routed"; comment "$issue" "Routing to the scopers failed, file by hand: $routed"; fi
 }
+landing() { log "#$issue: worker_done from $disp, landing"; printf '%s %s %s\n' "$issue" "$disp" "$(date +%H:%M)" > "$sd/landing"; }   # a land takes minutes, its dispatch is already completed: loop.log and --status say it is under way
 on_done() {
   local out rc=0 bl last
   ctx "$(pj "$1" dispatchId)" || return 1
@@ -321,7 +323,7 @@ on_done() {
   [ "$(pj "$1" outcome)" = succeeded ] || { block "worker_done failed: $(jq -r '.body // ""' <<< "$1")"; return 0; }
   [ "$(gh issue view "$issue" --json state --jq .state 2> /dev/null)" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; return 0; }
   # No --dispatch: land finds and releases EVERY dispatch of the worktree, earlier address rounds included.
-  out="$(RUN="$run" "$LAND_CMD" --review "$issue" 2>&1)" || rc=$?
+  landing; out="$(RUN="$run" "$LAND_CMD" --review "$issue" 2>&1)" || rc=$?
   printf '%s\n' "$out"; last="$(tail -n 1 <<< "$out")"
   case $rc in
     0) log "#$issue landed" ;;
@@ -333,10 +335,10 @@ on_done() {
         *) redispatch 1 "address: the land was refused ($last). Fix it on your branch (merge origin/$BASE_BRANCH and resolve conflicts, or fix the failing checks), push, then send worker_done again." "$last" ;;
       esac ;;
     6) if [ -z "$br" ]; then block "landed, but Orca gives no branch for worktree $wtp, so cleanup cannot name it (finish with land.sh --cleanup-only --branch <name> $issue); blocked so the still-open issue is not dispatched again"
-       else RUN="$run" "$LAND_CMD" --cleanup-only --branch "$br" --tip "$(git rev-parse HEAD)" --dispatch "$disp" "$issue" \
+       else landing; RUN="$run" "$LAND_CMD" --cleanup-only --branch "$br" --tip "$(git rev-parse HEAD)" --dispatch "$disp" "$issue" \
          || block "landed, but cleanup is incomplete (finish with land.sh --cleanup-only $issue); blocked so the still-open issue is not dispatched again"; fi ;;
     *) block "land.sh exited $rc: $last" ;;
-  esac
+  esac; rm -f "$sd/landing"
   case $rc in 0 | 6) triage "$out" "$(jq -r '.body // ""' <<< "$1")" || true ;; esac   # landed: what is left over goes to the scopers, after the land's own work
 }
 handle() {
