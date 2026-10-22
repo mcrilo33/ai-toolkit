@@ -96,8 +96,10 @@ def test_a_chat_session_decision_is_alerted_by_a_mandatory_ask_user_question_car
     assert "AskUserQuestion" in chat and "optionally" not in chat and "permission request" in chat
     assert "no bell" not in chat.lower() and "afplay" not in chat and "PushNotification" in chat
     assert re.search(r"permission request .{0,40}card is open", chat)   # a request waking the watcher behind an open card
-    assert "restates the decision on its own" in chat and re.search(r"option.s description says what", chat)   # the text above the card may not be seen (mobile)
-    assert "inline chat visuals" in chat and "one-line choice" in chat and "stands alone" in chat   # a condensed visual before the card, text when enough
+    assert "**quick decision**" in chat and "**technical detail**" in chat   # two levels in the chat before the card: decide fast, or deep-dive
+    assert "holds only the question" in chat and "#<n>: <choice>?" in chat and "no `preview`" in chat   # a short card question; Orca renders no option preview
+    assert re.search(r"option.s description says what", chat)
+    assert "inline chat visuals" in chat and "one-line choice" in chat   # a condensed visual in the technical level, none when a line is enough
 
 
 def test_hub_lands_with_the_review():
