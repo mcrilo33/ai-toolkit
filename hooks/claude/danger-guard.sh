@@ -65,7 +65,8 @@ w="(>|[[:space:]](tee|cp|mv|rm|touch|ln|dd|install|rsync|truncate|patch|chmod|py
 va="${w}[^;|&]*|[[:space:]](cd|pushd)[[:space:]][^;|&]*" # a verb before the path, or a cd into it
 if [ -n "$spoke" ] && [[ $c =~ ($va)($spool) ]]; then deny "write to the human's reply spool: $(printf '%.200s' "$cmd" | tr '\n' ' ')"; fi
 cw="$c"; wl='[[:alnum:]_./+@%:-]'; ta='([^[:alnum:]_./+@%:$`*?[{~-]|$)' # cw: c minus the absolute literal paths that prot() would not protect (outside $root and $AI_TOOLKIT_DIR); the lead/tail check leaves $d/.. */.. {a,/w}/.. ../w/.. in
-[ -z "$spoke" ] || while IFS= read -r t; do case "$t" in *..*) continue;; esac
+[ -z "$spoke" ] || while IFS= read -r t; do case "$t" in *..*) continue;; esac; h="${t%/.ai-toolkit/*}" # a head that ends $root or the launcher's parent is the tail of a concatenation (cwd + "/.ai-toolkit/..")
+  tk="${AI_TOOLKIT_DIR:-/nonexistent}"; [[ $root == *"$h" || ${tk%/.ai-toolkit} == *"$h" ]] && continue
   case "$(canon "$t")" in "$root"/* | "${AI_TOOLKIT_DIR:-/nonexistent}"/*) ;; *) cw="$(printf '%s' "$cw" | sed -E "s#(^|[[:space:]=([])$(re "$t")$ta#\1 \2#g")";; esac
 done < <(printf '%s\n' "$c" | grep -oE "/$wl*\.ai-toolkit/$wl*" || :)
 bw=""; if [[ $c =~ ($va)($p) ]] || { [ -n "$spoke" ] && { [[ $cw =~ ($va)($ft) ]] || [[ $c =~ $sy ]] || [[ $c =~ AI_TOOLKIT_ALLOW_BASE_COMMIT ]] || { [[ $c =~ AI_TOOLKIT_DIR ]] && [[ $c =~ $w ]]; }; }; }; then bw="a protected path, sync.sh or the base-commit switch (orca.yaml, claude settings/hooks, the toolkit's guards)"; fi

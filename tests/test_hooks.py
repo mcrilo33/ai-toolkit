@@ -198,6 +198,9 @@ WRITE_DENY = [
     "python3 - <<EOF\nx='/w/.ai-toolkit/rules/a.md'\nopen('.ai-toolkit/hooks/x','w')\nEOF", "echo x > {spoke}/.ai-toolkit/rules/a.md", "echo x > {tk}/rules/a.md",
     "echo x > /w/$D/.ai-toolkit/hooks/x", "echo x > /w/../{spoke}/.ai-toolkit/hooks/x", "echo x > {link}/.ai-toolkit/hooks/x",
     "echo x > */.ai-toolkit/hooks/x", "echo x > {spoke}{,/.ai-toolkit/hooks/x}",
+    # a foreign-looking tail of a concatenation: the head is the end of the worktree or of the launcher's parent
+    "python3 - <<EOF\nimport os\nopen(os.getcwd() + '/.ai-toolkit/hooks/x', 'w')\nEOF", "node -e \"require('fs').writeFileSync(process.cwd() + '/.ai-toolkit/hooks/x', 'x')\"",
+    "python3 - <<EOF\nopen(os.path.dirname(os.getcwd()) + '/1-x/.ai-toolkit/hooks/x', 'w')\nEOF", "echo x > {spoke}\\\n/.ai-toolkit/hooks/x",
 ]
 WRITE_ALLOW = [
     "touch sub/orca.yaml", "echo x > v2/orca.yaml", "cp a docs/.github/workflows/x.yml", "rm -rf .claude/cache", "ls .claude",
@@ -221,6 +224,13 @@ def test_danger_guard_denies_bash(shared, cmd):
 @pytest.mark.parametrize("cmd", RM_ALLOW + WRITE_ALLOW)
 def test_danger_guard_allows_bash(shared, cmd):
     check("danger-guard.sh", shared, "spoke", 0, command=cmd)
+
+
+def test_danger_guard_a_symlink_into_the_launchers_toolkit_still_asks(shared):
+    h = shared["home"]
+    (h / "m/.ai-toolkit").mkdir(parents=True)
+    (h / "ml").symlink_to(h / "m")
+    check("danger-guard.sh", shared, "spoke", 2, env={"AI_TOOLKIT_DIR": str(h / "m/.ai-toolkit")}, command=f"echo x > {h}/ml/.ai-toolkit/hooks/x")
 
 
 def test_danger_guard_a_home_inside_a_temp_root_is_still_protected(shared):
@@ -754,5 +764,5 @@ def test_pre_commit_allows_the_first_commit_of_a_repo(tmp_path):
 
 def test_hook_line_budgets():
     n = lambda *g: sum(len(f.read_text().splitlines()) for q in g for f in HOOKS.glob(q))  # noqa: E731
-    assert n("claude/*.sh") <=      239 and n("git/*") <= 40
+    assert n("claude/*.sh") <=      240 and n("git/*") <= 40
     assert len((V2 / "settings/claude/settings.json").read_text().splitlines()) <= 40
