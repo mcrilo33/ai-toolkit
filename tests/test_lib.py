@@ -6,10 +6,12 @@ def lib(run, code, **env):
 
 
 def test_env_precedence_is_caller_then_local_then_defaults(run, tmp_path):
-    (tmp_path / "d.env").write_text('A=default\nB=default\nC="two words"\n# c\n')
-    (tmp_path / "l.env").write_text("B=local\n")
-    r = lib(run, 'load_env; echo "$A|$B|$C"', AI_TOOLKIT_ENV=tmp_path / "d.env", AI_TOOLKIT_LOCAL_ENV=tmp_path / "l.env", A="caller")
-    assert r.stdout.strip() == "caller|local|two words"
+    (tmp_path / "d.env").write_text('A=default\nB=default\nC="two words"\nD=default\n# c\n')
+    (tmp_path / "l.env").write_text("B=local\nD=\n")
+    r = lib(run, 'load_env; echo "$A|$B|$C|$D"', AI_TOOLKIT_ENV=tmp_path / "d.env", AI_TOOLKIT_LOCAL_ENV=tmp_path / "l.env", A="caller")
+    assert r.stdout.strip() == "caller|local|two words|"   # an empty local value opts out of a non-empty default
+    shipped = lib(run, 'unset DISPATCH_LABEL; load_env; echo "$DISPATCH_LABEL"', AI_TOOLKIT_LOCAL_ENV=tmp_path / "none.env")
+    assert shipped.stdout.strip() == "ai-toolkit"   # the dispatch label is on by default
     assert len(lib(run, 'load_env; echo "$SPOKE_MODEL $BASE_BRANCH $OTEL_ENDPOINT"').stdout.split()) == 3
 
 

@@ -93,7 +93,7 @@ Always `bug`. Add, by heuristic:
 - **`hold`** — (dispatch outcome: `bug-triage` rule) when `Scope:` touches `coordinator.sh`, `dispatch.sh`, or `land.sh`. These are
   self-modify hazards that must land attended, so the issue is held out of the
   autonomous drain.
-- **`DISPATCH_LABEL`** — when set (`bug-triage` rule), on every issue filed to this repo, not on one filed upstream; create the label first if missing.
+- **`DISPATCH_LABEL`** — when set, on every issue filed to this repo; an issue filed upstream carries `ai-toolkit` instead (`bug-triage` rule); create the label first if missing.
 
 ## Phase 5: File or draft
 

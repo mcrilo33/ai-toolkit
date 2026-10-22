@@ -39,8 +39,9 @@ orca.yaml                  Orca hooks of THIS repo (setup/archive); a synced tar
 A script that still reads a worker-controlled source, or a worker that can still rewrite these facts through its own `orca` CLI, is an open bug, not design.
 
 1. **Issue.** `gh issue create` with a footer: `Scope: <paths>` (disjointness is the parallelism contract), `Gate: plan` (default, the full cycle) or `none` (the light lane: no PLAN gate, no in-worker review; only the user sets it), optional
-   `Model: <id> [effort]`; labels `priority`, `hold`, `blocked`. Blocked-by relations are GitHub's own.
-2. **Pick.** `dispatch.sh --next`: open, not `hold`/`blocked`, all blockers closed, not already linked to a worktree of this repo, `Scope`
+   `Model: <id> [effort]`; labels `priority`, `hold`, `blocked`. Blocked-by relations are GitHub's own. An issue also carries `DISPATCH_LABEL` (default `ai-toolkit`; the loop's own
+   filings add it): one filed by hand must carry it too, and one opened before the default needs `gh issue edit <n> --add-label ai-toolkit` once. An issue filed upstream carries `ai-toolkit`.
+2. **Pick.** `dispatch.sh --next`: open, carrying `DISPATCH_LABEL` (`DISPATCH_LABEL=` in `.ai-toolkit/ai-toolkit.local.env` opts out: every issue is picked), not `hold`/`blocked`, all blockers closed, not already linked to a worktree of this repo, `Scope`
    disjoint from the in-flight ones (a missing or `*` scope is exclusive); `priority` first, then the lowest number. Exit 3 = nothing ready.
 3. **Dispatch.** `dispatch.sh <n>`: `worktree create` (Orca runs `scripts/setup.sh` first: `.claude/` copied from the main checkout, `spoke-run-id`,
    `task.md` from the issue), a `claude-spoke` terminal (the two-step launch: Orca's own agent launch cannot carry the per-spoke OTel env), then `worker-start --terminal` with the seed prompt, then `worktree set --issue n

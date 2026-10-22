@@ -376,7 +376,7 @@ def test_a_failed_or_escalating_worker_blocks_the_issue(C, kind, extra, link):
 W = "WARNING: a.py:3 - "   # a review warning as land.sh prints it
 
 
-TOOLS = {"Agent", "Read", "Grep", "Glob", "Bash(gh issue create:*)", "Bash(gh issue list:*)", "Bash(gh issue view:*)", "Bash(gh issue comment:*)", "Bash(gh label create hold:*)"}   # what the scopers' documented steps use
+TOOLS = {"Agent", "Read", "Grep", "Glob", "Bash(gh issue create:*)", "Bash(gh issue list:*)", "Bash(gh issue view:*)", "Bash(gh issue comment:*)", "Bash(gh label create hold:*)", "Bash(gh label create ai-toolkit:*)"}   # what the scopers' documented steps use
 HANG = "hang"   # a claude that never answers: the watchdog must end it
 
 
@@ -781,9 +781,9 @@ def test_the_triage_prompt_and_allowlist_carry_the_dispatch_label_when_one_is_se
     C.stubs.reply("land.sh", f"{W}x\nlanded #1 in abc\n")
     C.stubs.reply("claude", "filed #9\n")
     C.mail([{**msg("worker_done", "msg_d", outcome="succeeded"), "body": "the body"}])
-    C.go(DISPATCH_LABEL="ai-toolkit")
+    C.go(DISPATCH_LABEL="acme")
     p, tools = C.stdin("claude"), set(arg(C.stubs.calls("claude")[0], "--allowedTools").split(","))
-    assert "ai-toolkit" in p and "not to issues filed upstream" in p and tools == TOOLS | {"Bash(gh label create ai-toolkit:*)"}
+    assert "acme label to every issue it files to this repo" in p and "ai-toolkit label to every issue it files upstream" in p and tools == TOOLS | {"Bash(gh label create acme:*)"}
 
 
 def watched(C, *polls, seen=None, fail=None, **env):   # --wait with no terminal handle: each poll is (open question ids, blocked issue numbers), read once per poll; "msg_p*" ids are permission requests

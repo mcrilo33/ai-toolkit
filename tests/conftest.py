@@ -84,6 +84,7 @@ def isolated_env(monkeypatch, tmp_path):
     for k in [k for k in os.environ if k.startswith(("GIT_", "OTEL_", "ORCA_", "CLAUDE_CODE_", "AI_TOOLKIT_"))]:
         monkeypatch.delenv(k)
     monkeypatch.delenv("CLAUDE_REAL", raising=False)
+    monkeypatch.setenv("DISPATCH_LABEL", "")  # the shipped default is "ai-toolkit": an empty caller value keeps every test on the unlabelled path
     monkeypatch.chdir(tmp_path)  # no test may read the real checkout's local env
     (tmp_path / "gitconfig").write_text("[user]\n\tname = t\n\temail = t@t\n[init]\n\tdefaultBranch = main\n")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))

@@ -138,8 +138,10 @@ draft instead, and report it loudly with the finding text preserved. A follow-up
 without `hold`: if the label is missing from the repo, create it first.
 
 When `DISPATCH_LABEL` is set (read like `UPSTREAM_REPO`: `.ai-toolkit/ai-toolkit.local.env`, then `ai-toolkit.env`), every
-issue filed to *this* repo carries that label too, created first if the repo lacks it, because the loop dispatches only
-labelled issues. An issue filed upstream to `UPSTREAM_REPO` does not carry it: that repo has its own setting.
+issue filed to *this* repo carries that label too, because the loop dispatches only labelled issues. An issue filed
+upstream to `UPSTREAM_REPO` carries `ai-toolkit` (the shipped default, which the toolkit repo runs on), whatever the host's
+value, also when the host opted out: a host cannot read the target's setting. Either label is created first if the target
+repo lacks it.
 
 ## What this does not cover
 
