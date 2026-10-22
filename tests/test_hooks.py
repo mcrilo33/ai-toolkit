@@ -752,6 +752,7 @@ def test_commit_msg_rejects(hooked, msg, why):
     ("feat: x #1", ["tests/test_a.py"], {"TEST_PATHS": ""}, True), ("fixup! test: x", ["tests/test_a.py"], {}, True),
     ("fixup! feat: x", ["tests/test_a.py"], {}, False), ("refactor: move #1", ["mv:tests/t.py:src/t.py"], {}, False),
     ("revert: x #1", ["tests/test_a.py"], {}, True), ("feat: x #1", ["test_root.py"], {}, False),
+    ("feat: x #1", ["tests/café.py"], {}, False), ("feat: x #1", ["tests/test_a.py"], {"TEST_PATHS": " "}, True),
 ])
 def test_commit_msg_only_a_test_commit_changes_test_files(hooked, tmp_path, msg, files, env, ok):
     wt = hooked["wt"]

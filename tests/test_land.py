@@ -246,13 +246,18 @@ def test_review_runs_first_and_a_non_approval_exits_3(L, tmp_path, link_script):
     assert reviewed == ("gh", "review", "9", L.tip) and L.trail()[n + 2][4] == L.tip and main_sha(L) == L.tip
 
 
-def test_a_non_test_commit_that_changes_a_test_file_is_refused_before_the_review(L, tmp_path, link_script):
-    commit(L.wt, "tests/test_a.py", msg="feat: green #9", push=BRANCH)
+@pytest.mark.parametrize("msg", ["feat: green #9", "Merge sneaky #9"])   # a single-parent commit titled Merge is no merge
+def test_a_non_test_commit_that_changes_a_test_file_is_refused_before_the_review(L, tmp_path, link_script, msg):
+    commit(L.wt, "tests/test_a.py", msg=msg, push=BRANCH)
     before = main_sha(L)
     r = L.go("--review", "9", REVIEW_CMD=review_script(tmp_path, link_script))
-    assert r.returncode == 2 and "feat: green #9" in r.stderr and "tests/test_a.py" in r.stderr and "test(<scope>)" in r.stderr, r.stderr
+    assert r.returncode == 2 and msg in r.stderr and "tests/test_a.py" in r.stderr and "test(<scope>)" in r.stderr, r.stderr
     assert not [t for t in L.trail() if t[:2] in (("gh", "review"), ("gh", "run"))]
     no_side_effects(L, before)
+    if msg[0] == "f":   # a host that sets TEST_PATHS nowhere is told the check is off
+        (L.tmp / "bare.env").write_text("BASE_BRANCH=main\n")
+        r = L.go("9", AI_TOOLKIT_ENV=str(L.tmp / "bare.env"))
+        assert r.returncode == 0 and "TEST_PATHS is set nowhere" in r.stderr, r.stderr
 
 
 def test_red_test_then_green_feat_lands_and_a_test_change_commit_lands_with_a_warning(L):
@@ -264,19 +269,14 @@ def test_red_test_then_green_feat_lands_and_a_test_change_commit_lands_with_a_wa
     assert {"src/a.py", "tests/test_a.py", "tests/test_b.py"} <= set(git(L.origin, "ls-tree", "--name-only", "-r", "main").split())
 
 
-def test_the_merge_of_main_that_gate_loop_makes_still_lands_when_main_carries_test_changes(L):
+def test_the_merge_of_main_a_worker_makes_still_lands_when_main_carries_test_changes(L):
     L.other_push("tests/test_main.py")
+    git(L.wt, "fetch", "-q")
+    git(L.wt, "merge", "-q", "--no-edit", "origin/main")
+    git(L.wt, "push", "-q", "origin", BRANCH)
     r = L.go("9")
     assert r.returncode == 0, r.stderr
     assert "tests/test_main.py" in git(L.origin, "ls-tree", "--name-only", "-r", "main").split()
-    assert git(L.origin, "log", "--merges", "--format=%s", "-1", "main").startswith("Merge")   # the branch landed through gate_loop's merge commit
-
-
-def test_land_says_when_the_test_file_check_is_off(L):
-    commit(L.wt, "tests/test_a.py", msg="feat: green #9", push=BRANCH)
-    (L.tmp / "bare.env").write_text("BASE_BRANCH=main\n")
-    r = L.go("9", AI_TOOLKIT_ENV=str(L.tmp / "bare.env"))
-    assert r.returncode == 0 and "TEST_PATHS is set nowhere" in r.stderr, r.stderr
 
 
 @pytest.mark.parametrize("push", ["1", ""])   # the worker pushed a new commit, or only committed locally, while the review ran
