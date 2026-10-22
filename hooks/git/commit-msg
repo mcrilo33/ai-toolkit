@@ -5,7 +5,7 @@ set -euo pipefail
 chk=0; [ "${1:-}" != --check ] || { chk=1; shift; }
 msg="$(grep -vE '^#([[:space:]]|$)' "$1" || true)" # drop the editor's comment lines
 first="$(printf '%s\n' "$msg" | head -n 1)"; sub="$first"; fx='^(fixup|squash|amend)! (.*)'
-case "$first" in Merge\ * | Revert\ *) exit 0 ;; esac
+case "$chk$first" in 0Merge\ * | ?Revert\ *) exit 0 ;; esac   # land.sh skips real merges by parent count, so a --check "Merge" subject is judged
 [[ $first =~ $fx ]] && sub="${BASH_REMATCH[2]}"
 re='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([A-Za-z0-9._/-]+\))?!?: .+'
 if [ "$chk$sub" = "0$first" ]; then
@@ -20,11 +20,11 @@ if [ -z "${TEST_PATHS+x}" ]; then # caller env > local env > shipped default; no
   done
 fi
 [ -n "${TEST_PATHS+x}" ] || { echo "commit-msg: TEST_PATHS is set nowhere: the test-file check is off" >&2; exit 0; }
-[ -n "$TEST_PATHS" ] || exit 0 # an explicit empty value turns the check off
+[ -n "${TEST_PATHS// /}" ] || exit 0 # an explicit empty value turns the check off
 set -f; read -ra globs <<< "$TEST_PATHS"; bad=""
 while IFS= read -r p; do # '*' spans '/', and a leading '**/' also matches at the repo root
   for g in "${globs[@]}"; do [[ $p == $g || $p == ${g#\*\*/} ]] && { bad+=" $p"; break; }; done
-done < <({ if [ "$chk" = 1 ]; then cat; else git diff --cached --name-status -M; fi; } | cut -f2- | tr '\t' '\n')
+done < <({ if [ "$chk" = 1 ]; then cat; else git -c core.quotePath=false diff --cached --name-status -M; fi; } | cut -f2- | tr '\t' '\n')
 [ -n "$bad" ] || exit 0
 printf '%s\n' "$msg" | grep -qE '^Test-Change: .*[^[:space:]]' && { echo "commit-msg: Test-Change commit touches test files:$bad" >&2; exit 0; }
 echo "commit-msg: only a test: commit may change test files:$bad; split the test change into its own 'test(<scope>): ... #<n>' commit (or add a 'Test-Change: <why>' line)" >&2; exit 1

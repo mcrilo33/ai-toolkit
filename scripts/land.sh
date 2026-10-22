@@ -113,7 +113,7 @@ test_files_only_in_test_commits() {   # exit 2 on the first pushed commit that c
   if [ -z "${TEST_PATHS+x}" ]; then warn "TEST_PATHS is set nowhere: the test-file check is off"; return 0; fi
   export TEST_PATHS
   for c in $(git rev-list --no-merges "origin/$BASE_BRANCH..$tip"); do
-    out="$(git diff-tree --no-commit-id -r --name-status -M "$c" | bash "$hook" --check <(git log -1 --format=%B "$c") 2>&1)" \
+    out="$(git -c core.quotePath=false diff-tree --no-commit-id -r --name-status -M "$c" | bash "$hook" --check <(git log -1 --format=%B "$c") 2>&1)" \
       || bail 2 "refused: commit $(git log -1 --format='%h %s' "$c"): ${out#commit-msg: }"
     [ -z "$out" ] || warn "commit $(git log -1 --format=%h "$c"): ${out#commit-msg: }"
   done
