@@ -113,7 +113,7 @@ dispatch() {
   model="${model:-$SPOKE_MODEL}"; effort="${effort:-$SPOKE_EFFORT}"
   # The model/effort end up in a shell command typed into a terminal: allow nothing but id characters.
   case "$model$effort" in *[!A-Za-z0-9._-]*) die "issue $n: bad Model footer '$model $effort'" ;; esac
-  tracker="$(issue_footer "$body" Tracker)"
+  tracker="$(issue_footer "$body" Tracker)"; tracker="${tracker%"${tracker##*[![:space:]]}"}"   # a body edited on GitHub comes back with CRLF
   case "$tracker" in *[!A-Za-z0-9._/#-]*) die "issue $n: bad Tracker footer '$tracker'" ;; esac
   slug="$(printf '%s' "$title" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
   name="$n-${slug:-issue}"

@@ -114,7 +114,7 @@ post_land() {   # a project's tracker update: the key is validated as one token 
   local body key
   [ -n "${POST_LAND_CMD:-}" ] || return 0
   body="$(gh_issue "$n" | jq -r '.body // ""')" || { warn "cannot read issue $n: POST_LAND_CMD skipped"; return 0; }
-  key="$(issue_footer "$body" Tracker)"; [ -n "$key" ] || return 0
+  key="$(issue_footer "$body" Tracker)"; key="${key%"${key##*[![:space:]]}"}"; [ -n "$key" ] || return 0
   case "$key" in *[!A-Za-z0-9._/#-]*) warn "bad Tracker footer '$key' on issue $n: POST_LAND_CMD skipped"; return 0 ;; esac
   BASE_BRANCH="$BASE_BRANCH" bash -c "$POST_LAND_CMD \"\$@\"" post-land "$n" "$key" "$tip" >&2 && return 0
   warn "POST_LAND_CMD failed for $key"
