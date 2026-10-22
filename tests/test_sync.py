@@ -23,6 +23,7 @@ def src(tmp_path):
     (root / "v2" / "settings").mkdir(parents=True)
     shutil.copy(V2 / "settings" / "ai-toolkit.env", root / "v2" / "settings")
     write(root / "v2" / "settings" / "claude" / "settings.json", '{"hooks": {}}\n')
+    write(root / "v2" / "settings" / "claude" / "mcp.json", '{"mcpServers": {}}\n')
     write(root / "v2" / "hooks" / "claude" / "guard.sh", "#!/bin/sh\n").chmod(0o755)
     write(root / "v2" / "hooks" / "git" / "commit-msg", "#!/bin/sh\n").chmod(0o755)
     sh = root / "shared"
@@ -116,6 +117,7 @@ def test_layout_in_target(sync, target):
     assert (target / ".claude" / "agents" / "debug.md").is_file()
     assert (target / ".claude" / "commands" / "commit-msg.md").is_file()
     assert (target / ".ai-toolkit" / "claude-settings.json").read_text() == '{"hooks": {}}\n'   # the toolkit's own registrations; the project's .claude/settings.json is never written
+    assert (target / ".ai-toolkit" / "mcp.json").read_text() == '{"mcpServers": {}}\n'   # the workers' server list (bin/claude-spoke passes it with --mcp-config)
     assert not (target / ".claude" / "settings.json").exists()
     for p in ("scripts/sync.sh", "scripts/lib.sh", "bin/claude-spoke", "hooks/git/commit-msg", "ai-toolkit.env"):
         assert (target / ".ai-toolkit" / p).is_file(), p
@@ -190,6 +192,14 @@ def test_gc_removes_what_a_previous_sync_wrote_and_nothing_else(sync, src, targe
     assert not (target / ".claude" / "rules" / "security.md").exists()
     assert mine.read_text() == "user file" and other.read_text() == "user rule"
     assert (target / ".claude" / "skills" / "hub" / "SKILL.md").is_file()
+
+
+def test_a_sync_never_writes_or_removes_the_hosts_own_mcp_list(sync, src, target):
+    sync()
+    mine = write(target / ".ai-toolkit" / "mcp.local.json", '{"mcpServers": {"mine": {}}}\n')
+    write(src / "v2" / "settings" / "claude" / "mcp.json", '{"mcpServers": {"x": {"command": "x"}}}\n')
+    assert sync().returncode == 0 and sync().returncode == 0
+    assert mine.read_text() == '{"mcpServers": {"mine": {}}}\n' and "x" in (target / ".ai-toolkit" / "mcp.json").read_text()
 
 
 def test_gc_ignores_manifest_entries_that_escape_the_target(sync, target, tmp_path):

@@ -56,15 +56,10 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 - Do not hallucinate APIs, functions, imports, signatures, or parameters — verify before use (mechanics in `code-quality` → External API Verification; `library-research` for fetching docs)
 
 ### Tool Unavailability
-- If a task requires a specific tool (MCP server, API, CLI) that is unavailable or inaccessible, **stop immediately**
+- If a task requires a specific tool (API, CLI, or an MCP server the toolkit lists in `.ai-toolkit/mcp.json`) that is unavailable or inaccessible, **stop immediately**; an MCP server that is not listed is not a stop condition
 - State the blocker: which tool is missing and why
 - Do NOT produce a workaround, manual steps, or alternative content unless the user explicitly asks for one
 - Do NOT attempt the task with a different approach without asking first
-
-### MCP Tool Preferences
-- **Codebase structure questions** (call chains, architecture, impact analysis, "what calls X?", "where is X defined?"): use `codebase-memory` graph tools (`search_graph`, `trace_call_path`, `get_architecture`, `detect_changes`) instead of grep/read cycles — 120× fewer tokens. If the graph is not yet built for the repo, run `index_repository` first, then query.
-- **Durable facts vs. code navigation** — don't confuse the two memory servers: use `codebase-memory` for *code* (auto-derived, disposable graph of symbols/calls); use `mempalace` for *persistent notes and facts* the agent or user wrote (decisions, context, diaries) that are **not** in the code.
-- **Binary/office file reading** (PDF, DOCX, PPTX, XLSX, HTML, images, audio): use `markitdown` (`convert_to_markdown`) instead of attempting to read binary files directly
 
 ### Self-Correction
 - If you realize a mistake mid-response, stop and correct immediately

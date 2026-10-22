@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Claude Code launcher. In a project synced by ai-toolkit it passes the toolkit's guards (--settings, below). In a spoke worktree (.ai-toolkit/spoke-run-id,
-# written by setup.sh) it also exports Claude's native OTel to the collector with a spoke_run_id resource attribute, then execs the real claude. In an unsynced
+# written by setup.sh) it also limits MCP to the toolkit's list (.ai-toolkit/mcp.json) and exports Claude's native OTel to the collector with a spoke_run_id resource attribute, then execs the real claude. In an unsynced
 # project it is a plain claude, so it is safe to point Orca's agentCmdOverrides.claude at it. AI_TOOLKIT_OTEL=0 opts out of the OTel. No auth header here.
 # To use Orca's Chat UI, put --settings ai-toolkit in Orca's Claude arguments: the launcher swaps it for the project's guard file (Orca's own --settings would switch every hook off).
 set -euo pipefail
@@ -30,6 +30,18 @@ if [ -f "$tk/claude-settings.json" ]; then
   set -- --settings "$AI_TOOLKIT_DIR/claude-settings.json" "$@"
 elif [ -s "$top/.ai-toolkit/spoke-run-id" ]; then die "no $tk/claude-settings.json: sync ai-toolkit into the main checkout, a worker never starts without its guards"
 else unset AI_TOOLKIT_DIR; fi   # an inherited one would tell /coordinate this session has guards it does not have
+if [ -s "$top/.ai-toolkit/spoke-run-id" ]; then   # a worker has only the servers on the toolkit's list (plus the host's own mcp.local.json), never the human's connectors, and no Chrome
+  for a in "$@"; do case "$a" in --mcp-config | --mcp-config=* | --strict-mcp-config | --chrome) die "the launcher owns the MCP servers (.ai-toolkit/mcp.json, no Chrome): do not pass $a" ;; esac; done
+  lists=("$AI_TOOLKIT_DIR/mcp.json")
+  [ ! -f "$AI_TOOLKIT_DIR/mcp.local.json" ] || lists+=("$AI_TOOLKIT_DIR/mcp.local.json")
+  mcp=()
+  for f in "${lists[@]}"; do
+    jq -e '(.mcpServers | type) == "object"' "$f" > /dev/null 2>&1 \
+      || die "$f is missing or is not {\"mcpServers\": {...}}: sync ai-toolkit again (mcp.local.json is the host's own: fix or remove it), a worker never starts with every MCP server"
+    mcp+=(--mcp-config "$f")
+  done
+  set -- --strict-mcp-config "${mcp[@]}" --no-chrome "$@"
+fi
 if [ "${AI_TOOLKIT_OTEL:-1}" = 1 ] && [ -s "$top/.ai-toolkit/spoke-run-id" ]; then
   load_env
   repo="$(git remote get-url origin 2>/dev/null | sed -E 's#.*[/:]##; s#\.git$##' || true)"
