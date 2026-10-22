@@ -4,6 +4,7 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -472,6 +473,25 @@ def test_landed_but_cleanup_incomplete_finishes_once_and_parks_a_still_open_issu
         assert co[:3] == ["--cleanup-only", "--branch", "1-x"] and arg(co, "--tip") and co[-1] == "1" and len(C.stubs.calls("land.sh")) == 2
         assert bool(C.calls("gh issue edit")) == (cleanup_rc == 6)   # else `--next` would pick the open issue again
     assert len(C.stubs.calls("claude")) == 1   # landed either way: the review's warning is routed after the cleanup, whatever its result
+
+
+def test_a_land_under_way_is_logged_and_shown_by_status_until_it_returns(C, tmp_path, link_script):   # else a correct land looks like a lost worker_done
+    stub, release, log = tmp_path / "cmds/land.sh", Path(os.environ["STUB_DIR"]) / "release", tmp_path / "state/run_t/loop.log"
+    link_script(stub, '#!/bin/bash\nwhile [ ! -f "$STUB_DIR/release" ]; do sleep 0.05; done\necho "landed #1 in abc"\n')   # a land that blocks until released
+    C.mail([msg("worker_done", outcome="succeeded")])
+    loop = threading.Thread(target=C.go)
+    loop.start()
+    try:
+        for _ in range(200):   # at most 10 s for the loop to reach the land
+            if log.exists() and "#1: worker_done from ctx_1, landing" in log.read_text():
+                break
+            time.sleep(0.05)
+        assert "#1: worker_done from ctx_1, landing" in log.read_text()
+        assert re.search(r"landing #1 since \d\d:\d\d", C.go("--status", ORCA_TERMINAL_HANDLE="").stdout)   # the loop is mid-land: its dispatch is completed, yet --status says so
+    finally:
+        release.touch()
+        loop.join()
+    assert "landing" not in C.go("--status", ORCA_TERMINAL_HANDLE="").stdout and not (tmp_path / "state/run_t/landing").exists()
 
 
 SWEEP = dict(COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=2)   # the sweep runs on every 2nd empty wait here (2 by default): two ticks reach it
