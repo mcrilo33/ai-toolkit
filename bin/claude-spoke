@@ -31,7 +31,7 @@ if [ -f "$tk/claude-settings.json" ]; then
 elif [ -s "$top/.ai-toolkit/spoke-run-id" ]; then die "no $tk/claude-settings.json: sync ai-toolkit into the main checkout, a worker never starts without its guards"
 else unset AI_TOOLKIT_DIR; fi   # an inherited one would tell /coordinate this session has guards it does not have
 if [ -s "$top/.ai-toolkit/spoke-run-id" ]; then   # a worker has only the servers on the toolkit's list (plus the host's own mcp.local.json), never the human's connectors, and no Chrome
-  for a in "$@"; do case "$a" in --mcp-config | --mcp-config=* | --strict-mcp-config | --chrome) die "the launcher owns the MCP servers (the toolkit's list, no Chrome): do not pass $a" ;; esac; done
+  for a in "$@"; do case "$a" in --mcp-config | --mcp-config=* | --strict-mcp-config | --chrome) die "the launcher owns the MCP servers (.ai-toolkit/mcp.json, no Chrome): do not pass $a" ;; esac; done
   lists=("$AI_TOOLKIT_DIR/mcp.json")
   [ ! -f "$AI_TOOLKIT_DIR/mcp.local.json" ] || lists+=("$AI_TOOLKIT_DIR/mcp.local.json")
   mcp=()
