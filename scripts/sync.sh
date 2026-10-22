@@ -5,7 +5,7 @@
 #   rules/*.md (guidelines too)    -> .claude/rules/ai-toolkit/ (no paths: = always on; paths: = conditional)
 #   rules/on-demand/*.md           -> .ai-toolkit/rules/ (never auto-loaded). The project's own CLAUDE.md is never read, written or backed up.
 #   skills/ agents/ prompts/       -> .claude/{skills,agents,commands}
-#   {scripts,bin}, hooks/{git,claude}, ai-toolkit.env -> .ai-toolkit/   settings/claude/settings.json -> .ai-toolkit/claude-settings.json (bin/claude-spoke passes it with --settings)
+#   {scripts,bin}, hooks/{git,claude}, ai-toolkit.env -> .ai-toolkit/   settings/claude/settings.json -> .ai-toolkit/claude-settings.json (bin/claude-spoke passes it with --settings), settings/claude/mcp.json -> .ai-toolkit/mcp.json (--mcp-config; the host's own mcp.local.json is never written)
 #   The project's .claude/settings.json is never read or written; the hook scripts run from the main checkout's .ai-toolkit/hooks/claude, not from a worktree.
 #   orca.yaml generated (setup/archive run from $ORCA_ROOT_PATH, where a new worktree has no .ai-toolkit)
 # On a host (not the toolkit itself, not --local-only, not --no-commit) orca.yaml, the one tracked file, is committed alone and pushed to BASE_BRANCH; a refused push keeps
@@ -120,6 +120,8 @@ if tv="$(git -C "$V2" rev-parse --short=12 HEAD 2> /dev/null)"; then
 fi
 if [ -f "$V2/settings/claude/settings.json" ]; then put "$V2/settings/claude/settings.json" .ai-toolkit/claude-settings.json
 else warn "$V2/settings/claude/settings.json is missing: .ai-toolkit/claude-settings.json (hooks) not synced"; fi
+if [ -f "$V2/settings/claude/mcp.json" ]; then put "$V2/settings/claude/mcp.json" .ai-toolkit/mcp.json
+else warn "$V2/settings/claude/mcp.json is missing: .ai-toolkit/mcp.json (the workers' MCP servers) not synced"; fi
 orca_yaml > "$TMP"
 [ "$TARGET" = "$V2" ] || put "$TMP" orca.yaml bak   # the toolkit syncing into itself keeps its tracked ./scripts/setup.sh orca.yaml
 
