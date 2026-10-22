@@ -15,7 +15,12 @@ RULE_AT = {"checkout": "shared/rules/on-demand/afk-answering.md", "synced": ".ai
 RULES = ("guidelines", "security", "code-quality", "python-style", "pytest-conventions")   # the rules the code-review agent cites
 RULE_PATH = {"checkout": lambda n: f"shared/rules/{n}.md", "synced": lambda n: f".claude/rules/ai-toolkit/{n}.md", "dir": lambda n: f"{n}.md"}
 ISSUE = '{"number":9,"title":"new","body":"new body"}'   # the live issue 9 the stub gh serves
-OK = {"verdict": "APPROVE", "blockers": [], "warnings": ["a.py:1 - nit"], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
+OK = {"verdict": "APPROVE", "blockers": [], "warnings": [{"text": "a.py:1 - nit", "rule": "none"}], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
+ON_DEMAND_AT = {"checkout": "shared/rules/on-demand/workflow.md", "synced": ".ai-toolkit/rules/workflow.md"}   # a rule the reviewer is only told about, never given in full
+
+
+def finding(text, rule="none"):
+    return {"text": text, "rule": rule}
 
 
 def sh(argv, cwd, input="", **env):
@@ -167,11 +172,11 @@ def test_a_failing_claude_or_a_missing_rule_is_an_escalation_not_an_approve(A, t
         assert r.returncode == 0 and os.path.realpath(argv[argv.index("--append-system-prompt-file") + 1]) == os.path.realpath(root / RULE_AT[layout])
 
 
-def put_rules(root, layout, tag, skip=()):   # the coordinator-side rule files in <layout>'s place, each body "<tag> <name>"
+def put_rules(root, layout, tag, skip=()):   # the coordinator-side rule files in <layout>'s place, each body "<tag> <name>" and description "about <tag> <name>"
     for n in RULES:
         path = RULE_PATH[layout](n)
         if n not in skip:
-            put(root / path, f"---\ndescription: fm-junk\n---\n# {n}\n{tag} {n}\n")
+            put(root / path, f'---\ndescription: "about {tag} {n}"\n---\n# {n}\n{tag} {n}\n')
 
 
 @pytest.fixture
@@ -197,7 +202,7 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     argv = R.stubs.calls("claude")[0]
     assert argv[:3] == ["-p", "--model", "fable-x"] and argv[argv.index("--agent") + 1] == "code-review"
     spec = json.loads(argv[argv.index("--agents") + 1])["code-review"]   # the coordinator's body, frontmatter stripped; never resolved from the cwd
-    assert spec["prompt"].startswith("# Reviewer\nthe coordinator body") and all(f"coordinator {n}" in spec["prompt"] for n in RULES) and "fm-junk" not in spec["prompt"]   # the coordinator's rules ride in its prompt, frontmatter stripped
+    assert spec["prompt"].startswith("# Reviewer\nthe coordinator body") and all(f"coordinator {n}" in spec["prompt"] for n in RULES) and "about coordinator guidelines\n" not in spec["prompt"].split("--- rule inventory ---")[0]   # the coordinator's rules ride in its prompt, frontmatter stripped
     assert argv[argv.index("--setting-sources") + 1] == "" and "--strict-mcp-config" in argv
     assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit" and argv[argv.index("--effort") + 1] == "medium"   # the definition's own read-only block and effort, not copies
     assert json.loads(argv[argv.index("--settings") + 1]) == {"autoMemoryEnabled": False}   # the flags (this, --setting-sources, --strict-mcp-config) are the pin: the stub loads no file
@@ -215,10 +220,15 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
         gate, root = install(tmp_path / layout, layout, "review.sh")
         put(root / AGENT_AT[layout], f"---\nname: x\n{FRONT.replace('medium', layout + '  ').replace('NotebookEdit', 'NotebookEdit, Bash')}---\n{layout} body\n")
         put_rules(root, layout, layout)   # and its rules from the layout's own place: the checkout's shared/rules, a synced repo's .claude/rules/ai-toolkit
+        put(root / ON_DEMAND_AT[layout], f'---\ndescription: "about {layout} workflow"\n---\n# workflow\nfull {layout} workflow text\n')
+        put(R.wt / "rules/ghost.md", '---\ndescription: "ghost"\n---\n')   # the worktree is the worker's: never listed
         assert sh(["bash", gate, "9"], R.root, ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0).returncode == 0
         argv = R.stubs.calls("claude")[-1]
         prompt = json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"]
-        assert prompt.startswith(f"{layout} body") and all(f"{layout} {n}" in prompt for n in RULES) and "fm-junk" not in prompt and argv[argv.index("--effort") + 1] == layout
+        head, _, inventory = prompt.partition("--- rule inventory ---")
+        assert head.startswith(f"{layout} body") and all(f"{layout} {n}" in head for n in RULES) and f"full {layout} workflow text" not in prompt and argv[argv.index("--effort") + 1] == layout
+        assert inventory.strip().splitlines() == sorted([f"{n} — about {layout} {n}" for n in RULES] + [f"workflow — about {layout} workflow"])   # one line per rule file of both dirs, the cited five included
+        assert "ghost" not in prompt
         assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit,Bash"   # read from the file, not the old literal
     n = len(R.stubs.calls("claude"))
     r = R.go(OK, sha="0" * 40)
@@ -232,9 +242,10 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     assert R.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and "# #9 new\n\nnew body" in p and "forged" not in p and "own contract" not in p and "stale" not in p
     assert task.read_text() == "# #9 forged\n\nthe worker's own contract\n"
     gh, claude = len(R.stubs.calls("gh")), len(R.stubs.calls("claude"))
-    R.stubs.reply("gh.issue_view", "boom", rc=1, n=gh + 1)   # a few failed polls, then GitHub answers: judged normally
-    R.stubs.reply("gh.issue_view", "boom", rc=1, n=gh + 2)
-    assert R.go(OK).returncode == 0 and "new body" in R.stdin() and len(R.stubs.calls("gh")) == gh + 3
+    views = len([c for c in R.stubs.calls("gh") if c[:2] == ["issue", "view"]])   # the stub counts replies per subcommand: the verdict comment is not an issue view
+    R.stubs.reply("gh.issue_view", "boom", rc=1, n=views + 1)   # a few failed polls, then GitHub answers: judged normally
+    R.stubs.reply("gh.issue_view", "boom", rc=1, n=views + 2)
+    assert R.go(OK).returncode == 0 and "new body" in R.stdin() and len(R.stubs.calls("gh")) == gh + 4   # three views and the recorded verdict
     R.stubs.reply("gh", "boom", rc=1)   # past the bound: no verdict (exit 1, which land.sh refuses), never an approve, and no claude
     claude = len(R.stubs.calls("claude"))
     r = R.go(OK)
@@ -242,20 +253,46 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     assert len(R.stubs.calls("claude")) == claude and len(R.stubs.calls("gh")) == gh + 6
 
 
-@pytest.mark.parametrize("patch, word", [({"verdict": "REQUEST_CHANGES", "blockers": ["a.py:3 - off by one"]}, "off by one"), ({"tests_weakened": True}, "tests_weakened"),
-                                         ({"tdd_followed": False}, "tdd_followed"), ({"blockers": ["x.py:1 - bug"]}, "bug")])
+@pytest.mark.parametrize("patch, word", [({"verdict": "REQUEST_CHANGES", "blockers": [finding("a.py:3 - off by one", "code-quality")]}, "BLOCKER: [code-quality] a.py:3 - off by one"),
+                                         ({"tests_weakened": True}, "tests_weakened"), ({"tdd_followed": False}, "tdd_followed"),
+                                         ({"blockers": [finding("x.py:1 - bug\nsecond line", "none")]}, "BLOCKER: [none] x.py:1 - bug second line")])
 def test_request_changes_exits_3_with_blocker_lines_and_an_approve_that_contradicts_its_own_fields_is_rejected(R, patch, word):
     r = R.go({**OK, **patch})
-    assert r.returncode == 3 and "BLOCKER:" in r.stdout and word in r.stdout
+    assert r.returncode == 3 and word in r.stdout and "WARNING: [none] a.py:1 - nit" in r.stdout
 
 
 @pytest.mark.parametrize("out", [
     "", "Looks good to me!", "```json\nnot json\n```", json.dumps({**OK, "verdict": "MAYBE"}), json.dumps({**OK, "blockers": None}),
     json.dumps({k: v for k, v in OK.items() if k != "summary"}), json.dumps({**OK, "tdd_followed": "yes"}), "[1]", "{} trailing",
+    json.dumps({**OK, "warnings": ["a.py:1 - bare string"]}), json.dumps({**OK, "blockers": [finding("a.py:1 - x", "workflow")]}),   # a tag outside the inventory (the flat rules dir of this layout holds only the five)
+    json.dumps({**OK, "warnings": [{"text": "a.py:1 - no tag"}]}), json.dumps({**OK, "warnings": [{"text": 3, "rule": "none"}]}), json.dumps({**OK, "warnings": [finding("a.py:1 - x", None)]}),
 ])
-def test_an_unparseable_verdict_exits_1_after_one_retry_and_is_never_an_approve(R, out):
-    r = R.go(out)
-    assert r.returncode == 1 and "unparseable" in r.stderr and len(R.stubs.calls("claude")) == 2
+def test_an_unparseable_verdict_exits_1_after_one_retry_and_is_never_an_approve(R, out, tmp_path):
+    put_rules(tmp_path / "rules", "dir", "x")
+    r = R.go(out, REVIEW_RULES_DIR=tmp_path / "rules")
+    assert r.returncode == 1 and "unparseable" in r.stderr and len(R.stubs.calls("claude")) == 2 and not comments(R)   # a review error is no verdict: nothing is recorded
+
+
+def comments(R):   # the bodies of the issue comments review.sh posted
+    return [c[c.index("-b") + 1] for c in R.stubs.calls("gh") if c[:2] == ["issue", "comment"]]
+
+
+def test_every_valid_verdict_is_recorded_once_as_rule_names_only_and_a_failing_gh_keeps_the_exit_code(R, tmp_path):
+    secret = "AKIAFAKEKEY1234 leaked in a.py"
+    sha = git(R.wt, "rev-parse", "HEAD")
+    reject = {**OK, "verdict": "REQUEST_CHANGES", "blockers": [finding(f"a.py:3 - {secret}", "security")], "warnings": [finding("b.py:1 - nit", "code-quality"), finding("c.py:2 - gap")]}
+    for verdict, rc, pinned in ((OK, 0, sha), (reject, 3, None)):   # an APPROVE and a REQUEST_CHANGES, pinned and not (the branch tip)
+        before = len(comments(R))
+        assert R.go(verdict, sha=pinned).returncode == rc
+        body = comments(R)[before:]
+        assert len(body) == 1 and body[0].startswith("review-verdict: ") and secret not in body[0] and "nit" not in body[0]
+        rec = json.loads(body[0].removeprefix("review-verdict: "))
+        assert rec == {"v": 1, "sha": sha, "verdict": verdict["verdict"], "tdd_followed": True, "tests_weakened": False,
+                       "blockers": [f["rule"] for f in verdict["blockers"]], "warnings": [f["rule"] for f in verdict["warnings"]]}
+    assert R.stubs.calls("gh")[-1][:3] == ["issue", "comment", "9"]
+    R.stubs.reply("gh.issue_comment", "boom", rc=1)   # a GitHub outage must not turn an approve into a rejection
+    r = R.go(OK)
+    assert r.returncode == 0 and "SUMMARY: fine" in r.stdout and "warning" in r.stderr and "#9" in r.stderr
 
 
 def test_a_fenced_object_is_accepted_and_a_garbled_first_try_is_retried_once(R):
