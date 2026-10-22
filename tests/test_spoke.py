@@ -64,9 +64,9 @@ def test_spoke_tags_the_toolkit_version_only_from_a_well_formed_stamp(run, stubs
 
 def test_spoke_is_a_plain_claude_without_a_run_id_or_when_opted_out(run, stubs, repo):
     assert run([SPOKE, "-p", "hi"], cwd=repo.wt("plain")).returncode == 0
-    synced(repo)
+    tk = synced(repo)
     run([SPOKE], cwd=in_spoke(repo), AI_TOOLKIT_OTEL=0)
-    assert [c[2:] for c in stubs.calls("claude")[1:]] == [[]] and stubs.calls("claude")[0] == ["-p", "hi"] and "TELEMETRY" not in stubs.env("claude")
+    assert [c[len(MCP(tk)) + 2:] for c in stubs.calls("claude")[1:]] == [[]] and stubs.calls("claude")[0] == ["-p", "hi"] and "TELEMETRY" not in stubs.env("claude")
 
 
 @pytest.mark.parametrize("project,worker,args,ok,passed,fwd", [
