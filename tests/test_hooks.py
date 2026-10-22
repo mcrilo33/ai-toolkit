@@ -744,6 +744,50 @@ def test_commit_msg_rejects(hooked, msg, why):
     assert r.returncode != 0 and "commit-msg" in r.stderr and why in r.stderr
 
 
+@pytest.mark.parametrize("msg,files,env,ok", [
+    ("feat: x #1", ["tests/test_a.py"], {}, False), ("test(a): x #1", ["tests/test_a.py"], {}, True), ("feat: x #1", ["src/a.py"], {}, True),
+    ("Merge branch 'main'", ["tests/test_a.py"], {}, True), ("refactor: rename #1\n\nTest-Change: rename", ["tests/test_a.py"], {}, True),
+    ("refactor: x #1\n\nTest-Change: ", ["tests/test_a.py"], {}, False), ("feat: x #1", ["src/a.py", "pkg/b.test.ts"], {}, False),
+    ("feat: x #1", ["tests/test_a.py"], {"TEST_PATHS": "docs/**"}, True), ("feat: x #1", ["docs/a.md"], {"TEST_PATHS": "docs/**"}, False),
+    ("feat: x #1", ["tests/test_a.py"], {"TEST_PATHS": ""}, True), ("fixup! test: x", ["tests/test_a.py"], {}, True),
+    ("fixup! feat: x", ["tests/test_a.py"], {}, False), ("refactor: move #1", ["mv:tests/t.py:src/t.py"], {}, False),
+    ("revert: x #1", ["tests/test_a.py"], {}, True), ("feat: x #1", ["test_root.py"], {}, False),
+])
+def test_commit_msg_only_a_test_commit_changes_test_files(hooked, tmp_path, msg, files, env, ok):
+    wt = hooked["wt"]
+    for f in files:
+        if f.startswith("mv:"):
+            old, new = f[3:].split(":")
+            (wt / old).parent.mkdir(exist_ok=True), (wt / new).parent.mkdir(exist_ok=True)
+            (wt / old).write_text("x")
+            git(wt, "add", old)
+            assert commit(wt, "test: seed #1").returncode == 0
+            git(wt, "mv", old, new)
+        else:
+            (wt / f).parent.mkdir(exist_ok=True)
+            (wt / f).write_text("x")
+            git(wt, "add", f)
+    r = commit(wt, msg, **env)
+    assert (r.returncode == 0) == ok, r.stderr
+    if not ok:   # the offending path is the last one staged (for a rename, its old side)
+        assert "commit-msg" in r.stderr and files[-1].removeprefix("mv:").split(":")[0] in r.stderr and "test(<scope>)" in r.stderr
+
+
+def test_commit_msg_reads_test_paths_from_the_local_env_and_says_when_it_is_set_nowhere(hooked, tmp_path):
+    wt, local = hooked["wt"], tmp_path / "local.env"
+    (wt / "docs").mkdir()
+    (wt / "docs/a.md").write_text("x")
+    git(wt, "add", "docs/a.md")
+    local.write_text('TEST_PATHS="docs/**"\n')
+    assert "docs/a.md" in commit(wt, "feat: x #1", AI_TOOLKIT_LOCAL_ENV=str(local)).stderr
+    local.write_text("TEST_PATHS=\n")
+    assert commit(wt, "feat: x #1", AI_TOOLKIT_LOCAL_ENV=str(local)).stderr == ""
+    nowhere = tmp_path / "nowhere.env"
+    nowhere.write_text("")
+    r = commit(wt, "feat: x #1", AI_TOOLKIT_LOCAL_ENV=str(nowhere), AI_TOOLKIT_ENV=str(nowhere))
+    assert r.returncode == 0 and "TEST_PATHS is set nowhere" in r.stderr
+
+
 def test_pre_commit_blocks_the_base_branch_only_in_the_main_checkout(hooked):
     root, wt, msg = hooked["root"], hooked["wt"], "chore: x #1"
     r = commit(root, msg)
