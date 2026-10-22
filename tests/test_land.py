@@ -15,6 +15,10 @@ while read old new ref; do
   printf 'git\\037%s\\037%s\\n' "$k" "${ref#refs/heads/}" >> "$STUB_DIR/calls.log"
 done
 """
+POST_LAND = """#!/bin/bash
+printf 'post-land' >> "$STUB_DIR/calls.log"; for a in "$@"; do printf '\\037%s' "$a" >> "$STUB_DIR/calls.log"; done
+printf '\\037BASE_BRANCH=%s\\n' "$BASE_BRANCH" >> "$STUB_DIR/calls.log"; exit "${PL_RC:-0}"
+"""
 
 
 def commit(cwd, name, text="x", push=None, msg=None):
@@ -435,3 +439,55 @@ def test_a_land_in_the_toolkit_checkout_refreshes_the_installed_copies(L, broken
         r = L.go("--cleanup-only", "9")   # the existing way to finish an exit-6 land also retries the refresh
     assert r.returncode == 0, r.stderr
     assert {rel: (L.root / rel).read_text() for rel in want} == want
+
+
+@pytest.fixture
+def tracked(L, link_script):   # POST_LAND_CMD for an issue whose footer says `Tracker: PM-17` (or `body`)
+    def setup(body="Scope: a\nTracker: PM-17\n"):
+        L.stubs.reply("gh.issue_view", json.dumps({"number": 9, "title": "t", "body": body}))
+        return link_script(L.tmp / "post-land.sh", POST_LAND)
+    return setup
+
+
+def post_land_calls(L):
+    return [t for t in L.trail() if t[0] == "post-land"]
+
+
+def test_post_land_cmd_runs_once_after_the_base_push_with_the_issue_the_key_and_the_sha(L, tracked):
+    r = L.go("9", POST_LAND_CMD=tracked())
+    assert r.returncode == 0, r.stderr
+    t = L.trail()
+    assert post_land_calls(L) == [("post-land", "9", "PM-17", L.tip, "BASE_BRANCH=main")]
+    assert t.index(("git", "push", "main")) < t.index(post_land_calls(L)[0]) < t.index(("gh", "issue", "close", "9", "-c", f"landed in {L.tip}"))
+
+
+@pytest.mark.parametrize("cmd,body", [(False, "Scope: a\nTracker: PM-17\n"), (True, "Scope: a\n")])
+def test_post_land_cmd_does_not_run_without_the_command_or_without_a_tracker_footer(L, tracked, cmd, body):
+    script = tracked(body)
+    r = L.go("9", **({"POST_LAND_CMD": script} if cmd else {}))
+    assert r.returncode == 0, r.stderr
+    assert post_land_calls(L) == [] and main_sha(L) == L.tip
+
+
+def test_post_land_cmd_does_not_run_again_on_the_cleanup_only_retry(L, tracked):
+    script = tracked()
+    L.stubs.reply("gh.issue_close", "boom", rc=1)
+    assert L.go("9", POST_LAND_CMD=script).returncode == 6
+    L.stubs.reply("gh.issue_close", "")
+    assert L.go("--cleanup-only", "9", POST_LAND_CMD=script).returncode == 0
+    assert len(post_land_calls(L)) == 1
+
+
+def test_a_failing_post_land_cmd_comments_on_the_issue_and_never_changes_the_exit_code(L, tracked):
+    r = L.go("9", POST_LAND_CMD=tracked(), PL_RC=3)
+    assert r.returncode == 0 and "warning" in r.stderr
+    t = L.trail()
+    assert ("gh", "issue", "comment", "9", "-b", f"tracker update failed, do it by hand: PM-17 {L.tip}") in t
+    assert ("gh", "issue", "close", "9", "-c", f"landed in {L.tip}") in t and ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks") in t
+
+
+@pytest.mark.parametrize("key", ["PM 17", "PM-17;touch x", "PM-$(id)"])
+def test_a_tracker_key_that_is_not_one_token_is_refused_with_a_warning_and_no_call(L, tracked, key):
+    r = L.go("9", POST_LAND_CMD=tracked(f"Scope: a\nTracker: {key}\n"))
+    assert r.returncode == 0 and "warning" in r.stderr and "Tracker" in r.stderr
+    assert post_land_calls(L) == [] and main_sha(L) == L.tip

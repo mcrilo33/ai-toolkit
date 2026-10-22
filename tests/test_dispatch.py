@@ -98,6 +98,29 @@ def test_gate_none_and_model_footer_override_the_defaults(d):
     assert "In a recursive delete, write the target as a literal path inside the worktree or the scratch directory, never a variable or a command substitution: the guard allows the first and asks for the second." in seed  # the guard allows a literal-path recursive delete and asks for a variable one (#452): both lanes tell the worker which form passes
 
 
+def seeds(d):
+    return [c[c.index("--spec") + 1] for c in d.orca() if c[:2] == ["orchestration", "worker-start"]]
+
+
+def test_a_tracker_footer_puts_its_key_in_the_seed_for_every_commit_subject_and_without_one_the_seed_is_unchanged(d):
+    d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": ISSUE["body"] + "Tracker: PM-17\n"}))
+    d.go("7")
+    [tracked] = seeds(d)
+    sentence = next(s for s in tracked.split(". ") if "PM-17" in s)
+    assert "every commit subject" in sentence and "#7" in sentence and "(PM-17, #7)" in sentence
+    d.stubs.reply("gh.issue_view", json.dumps(ISSUE))
+    d.go("7")
+    assert seeds(d)[1] == tracked.replace(f" {sentence}.", "", 1)
+
+
+@pytest.mark.parametrize("key", ["PM 17", "PM-17;touch x", "PM-$(id)"])
+def test_a_tracker_key_that_is_not_one_token_starts_no_worker(d, key):
+    d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": f"x\nScope: a\nTracker: {key}\n"}))
+    r = d.go("7")
+    assert r.returncode == 1 and "bad Tracker footer" in r.stderr
+    assert not any(c[:2] in (["terminal", "create"], ["orchestration", "worker-start"]) for c in d.orca())
+
+
 def test_missing_gate_footer_falls_back_to_the_env_default(d):
     d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": "no footer"}))
     d.go("7")
