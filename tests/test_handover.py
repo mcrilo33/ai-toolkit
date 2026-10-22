@@ -87,8 +87,8 @@ def test_run_use_never_fences_the_new_holder_a_failure_is_just_an_error(C):
     assert r.returncode == 1 and "run-use failed" in r.stderr and not C.calls("orca orchestration check")
 
 
-def test_the_holder_file_names_the_handle_and_mode_while_running_and_is_gone_after_exit(C, tmp_path):
-    (tmp_path / "cmds/dispatch.sh").write_text('#!/bin/sh\ncat "$AITK_STATE_DIR"/run_t/holder.* > "$AITK_STATE_DIR/seen" 2>&1\nexit 3\n')
+def test_the_holder_file_names_the_handle_and_mode_while_running_and_is_gone_after_exit(C, tmp_path, link_script):
+    link_script(tmp_path / "cmds/dispatch.sh", '#!/bin/sh\ncat "$AITK_STATE_DIR"/run_t/holder.* > "$AITK_STATE_DIR/seen" 2>&1\nexit 3\n')
     assert C.go("--answer", "human", "--until", "23:59", "--drain", AI_TOOLKIT_NOW="10:00").returncode == 0
     assert (tmp_path / "state/seen").read_text() == "term_c human until 23:59 drain\n"
     assert not list((tmp_path / "state/run_t").glob("holder.*"))
