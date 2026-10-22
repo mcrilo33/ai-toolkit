@@ -202,7 +202,7 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     argv = R.stubs.calls("claude")[0]
     assert argv[:3] == ["-p", "--model", "fable-x"] and argv[argv.index("--agent") + 1] == "code-review"
     spec = json.loads(argv[argv.index("--agents") + 1])["code-review"]   # the coordinator's body, frontmatter stripped; never resolved from the cwd
-    assert spec["prompt"].startswith("# Reviewer\nthe coordinator body") and all(f"coordinator {n}" in spec["prompt"] for n in RULES) and "about coordinator guidelines\n" not in spec["prompt"].split("--- rule inventory ---")[0]   # the coordinator's rules ride in its prompt, frontmatter stripped
+    assert spec["prompt"].startswith("# Reviewer\nthe coordinator body") and all(f"coordinator {n}" in spec["prompt"] for n in RULES) and "description:" not in spec["prompt"].split("--- rule inventory ---")[0]   # the coordinator's rules ride in its prompt, frontmatter stripped
     assert argv[argv.index("--setting-sources") + 1] == "" and "--strict-mcp-config" in argv
     assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit" and argv[argv.index("--effort") + 1] == "medium"   # the definition's own read-only block and effort, not copies
     assert json.loads(argv[argv.index("--settings") + 1]) == {"autoMemoryEnabled": False}   # the flags (this, --setting-sources, --strict-mcp-config) are the pin: the stub loads no file
@@ -221,14 +221,15 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
         put(root / AGENT_AT[layout], f"---\nname: x\n{FRONT.replace('medium', layout + '  ').replace('NotebookEdit', 'NotebookEdit, Bash')}---\n{layout} body\n")
         put_rules(root, layout, layout)   # and its rules from the layout's own place: the checkout's shared/rules, a synced repo's .claude/rules/ai-toolkit
         put(root / ON_DEMAND_AT[layout], f'---\ndescription: "about {layout} workflow"\n---\n# workflow\nfull {layout} workflow text\n')
-        put(R.wt / "rules/ghost.md", '---\ndescription: "ghost"\n---\n')   # the worktree is the worker's: never listed
+        for at in (".ai-toolkit/rules", ".claude/rules/ai-toolkit", "shared/rules/on-demand"):
+            put(R.wt / at / "ghost.md", '---\ndescription: "ghost"\n---\n')   # the worktree is the worker's: never listed
         assert sh(["bash", gate, "9"], R.root, ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0).returncode == 0
         argv = R.stubs.calls("claude")[-1]
         prompt = json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"]
         head, _, inventory = prompt.partition("--- rule inventory ---")
         assert head.startswith(f"{layout} body") and all(f"{layout} {n}" in head for n in RULES) and f"full {layout} workflow text" not in prompt and argv[argv.index("--effort") + 1] == layout
         assert inventory.strip().splitlines() == sorted([f"{n} — about {layout} {n}" for n in RULES] + [f"workflow — about {layout} workflow"])   # one line per rule file of both dirs, the cited five included
-        assert "ghost" not in prompt
+        assert "ghost" not in prompt and "description:" not in head
         assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit,Bash"   # read from the file, not the old literal
     n = len(R.stubs.calls("claude"))
     r = R.go(OK, sha="0" * 40)
