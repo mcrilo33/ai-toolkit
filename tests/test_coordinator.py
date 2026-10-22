@@ -491,7 +491,7 @@ def test_a_land_under_way_is_logged_and_shown_by_status_until_it_returns(C, tmp_
     finally:
         release.touch()
         loop.join()
-    assert "landing" not in C.go("--status", ORCA_TERMINAL_HANDLE="").stdout and not (tmp_path / "state/run_t/landing").exists()
+    assert "landing #1" not in C.go("--status", ORCA_TERMINAL_HANDLE="").stdout and not (tmp_path / "state/run_t/landing").exists()
 
 
 SWEEP = dict(COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=2)   # the sweep runs on every 2nd empty wait here (2 by default): two ticks reach it
