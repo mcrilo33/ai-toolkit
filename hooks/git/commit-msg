@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# commit-msg: a conventional type on line 1 and an issue anchor (#N) in the message; only a test: commit may change a test file (TEST_PATHS globs).
-# Merge/revert/fixup commits skip the type and anchor check; a fixup is judged by the type it targets. 'Test-Change: <why>' lets one commit through. land.sh reuses the test-file rule on pushed commits: 'commit-msg --check <msgfile>' with 'git diff --name-status -M' lines on stdin.
+# commit-msg: a conventional type on line 1 and an issue anchor (#N) in the message; only a test: commit may change a test file (TEST_PATHS globs). Merge/revert/fixup commits skip the type and anchor check; a fixup is judged by the type it targets. 'Test-Change: <why>' lets one commit through. land.sh reuses the test-file rule on pushed commits: 'commit-msg --check <msgfile>' with 'git diff --name-status -M' lines on stdin.
 set -euo pipefail
 chk=0; [ "${1:-}" != --check ] || { chk=1; shift; }
 msg="$(grep -vE '^#([[:space:]]|$)' "$1" || true)" # drop the editor's comment lines
@@ -23,6 +22,7 @@ fi
 [ -n "${TEST_PATHS// /}" ] || exit 0 # an explicit empty value turns the check off
 set -f; read -ra globs <<< "$TEST_PATHS"; bad=""
 while IFS= read -r p; do # '*' spans '/', and a leading '**/' also matches at the repo root
+  # shellcheck disable=SC2053 # the glob match is intended
   for g in "${globs[@]}"; do [[ $p == $g || $p == ${g#\*\*/} ]] && { bad+=" $p"; break; }; done
 done < <({ if [ "$chk" = 1 ]; then cat; else git -c core.quotePath=false diff --cached --name-status -M; fi; } | cut -f2- | tr '\t' '\n')
 [ -n "$bad" ] || exit 0
