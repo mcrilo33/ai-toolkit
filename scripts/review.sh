@@ -80,10 +80,11 @@ for _ in 1 2; do
   [ -z "$v" ] || break
 done
 [ -n "$v" ] || die "unparseable review verdict for issue $n"
-rec="$(printf '%s' "$v" | jq -c --arg sha "$tip" '{v: 1, sha: $sha, verdict, tdd_followed, tests_weakened, blockers: [.blockers[].rule], warnings: [.warnings[].rule]}')"   # enums, booleans and rule names: a finding text may quote a secret from the diff
+eff="$(printf '%s' "$v" | jq -r 'if .verdict == "APPROVE" and (.blockers | length == 0) and (.tests_weakened | not) and .tdd_followed then "APPROVE" else "REQUEST_CHANGES" end')"   # the enforced outcome: recorded and exited on, so the two cannot drift
+rec="$(printf '%s' "$v" | jq -c --arg sha "$tip" --arg eff "$eff" '{v: 1, sha: $sha, verdict: $eff, tdd_followed, tests_weakened, blockers: [.blockers[].rule], warnings: [.warnings[].rule]}')"   # enums, booleans and rule names: a finding text may quote a secret from the diff
 gh issue comment "$n" -b "review-verdict: $rec" > /dev/null || warn "cannot record the review verdict on #$n"   # an outage must not turn an approve into a rejection
 printf '%s' "$v" | jq -r '(.blockers[] | "BLOCKER: [" + .rule + "] " + (.text | gsub("\n"; " "))), (.warnings[] | "WARNING: [" + .rule + "] " + (.text | gsub("\n"; " "))), "SUMMARY: " + .summary'
 extra="$(printf '%s' "$v" | jq -r 'if .tests_weakened then "BLOCKER: tests_weakened: the diff weakens or skips tests" else empty end,
   if .tdd_followed | not then "BLOCKER: tdd_followed is false: add the failing test that proves the behavior change" else empty end')"
 [ -z "$extra" ] || printf '%s\n' "$extra"
-printf '%s' "$v" | jq -e '.verdict == "APPROVE" and (.blockers | length == 0)' > /dev/null && [ -z "$extra" ] || exit 3
+[ "$eff" = APPROVE ] || exit 3
