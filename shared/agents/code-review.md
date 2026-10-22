@@ -58,6 +58,9 @@ Two fields in the verdict are checked on every review, because TDD is policy and
   change can turn it red). A test this diff turns red is by definition not never-red, and is not flaky on the
   strength of that failure: removing it is `tests_weakened`.
 
+Only `test:` commits may change test files (`commit-msg` and `land.sh` enforce it). A commit carrying a
+`Test-Change: <why>` line is the exception: read its diff as possible weakening, and judge the stated reason.
+
 New code paths without tests are a **WARNING**, or a **blocker** when `tdd_followed` is false for a behavior
 change. Redundant tests (a new function where a case on an existing test would do, a test no plausible change
 turns red, an end-to-end test where a unit test proves it) are a **WARNING** (`pytest-conventions`, Test economy).

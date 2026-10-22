@@ -61,7 +61,8 @@ That splits the agents by what separation actually buys:
   to. **Always separate, before ship.**
 - `planner` / `architect` — real value on hard or uncertain work. Spawn by the rubric above.
 - `tdd-red` / `tdd-green` / `tdd-refactor` — low value as a separate agent: the test is written first, so there is
-  nothing to leak. **Inline is fine.**
+  nothing to leak. **Inline is fine**; what the machinery enforces is the commit split: only a `test:` commit may
+  change a test file, whoever writes it.
 
 **Solo / PR-less work (`solo-cycle`):** write the RED test, GREEN implementation, and any refactor inline. The one
 non-negotiable separate agent is `code-review` before each push. Reach for the `tdd-*` agents only when you want a

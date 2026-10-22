@@ -21,7 +21,7 @@ git, and GitHub labels. The only files ai-toolkit keeps are the human-reply spoo
 scripts/   lib.sh dispatch.sh land.sh review.sh answer.sh coordinator.sh reply.sh setup.sh archive.sh sync.sh install.sh otel.sh cutover.sh
 bin/claude-spoke           launcher: the project's guards (--settings .ai-toolkit/claude-settings.json), OTel env + spoke_run_id in a spoke, then exec claude (plain claude in an unsynced project)
 hooks/claude/              push-guard.sh danger-guard.sh judge.sh secrets-scan.sh permission-relay.sh (synced to .ai-toolkit/hooks/claude/, registered by settings/claude/settings.json; judge.sh is danger-guard's second stage)
-hooks/git/                 commit-msg (conventional type + #N anchor), pre-commit (no commit on the base branch in the main checkout)
+hooks/git/                 commit-msg (conventional type + #N anchor; only a test: commit may change a test file, rechecked by land.sh), pre-commit (no commit on the base branch in the main checkout)
 langfuse/                  otelcol.yaml compose.yaml (collector only; dashboards and scores are a later batch)
 settings/                  ai-toolkit.env (defaults) claude/settings.json (hook registrations)
 shared/                    rules/ (always-on + on-demand/), skills/, agents/, prompts/: frontmatter lives in each file

@@ -21,6 +21,11 @@ denies both), and never self-land: the coordinator lands.
 `commit-msg` checks a conventional type and a `#<n>` anchor. Pass the message inline with separate `-m` flags,
 one subject line and one line per body paragraph, and avoid backticks inside a `-m` string (the shell eats them).
 
+`commit-msg` also rejects a commit whose type is not `test` that adds, changes, deletes or renames a test file (`TEST_PATHS`),
+naming the paths. Satisfy it by splitting: stage the implementation by path (never `git add .`) and put the test change in its
+own `test(<scope>): ... #<n>` commit. A cross-cutting rename that must change src and tests together may carry a
+`Test-Change: <why>` line in the message. `land.sh` rechecks every pushed commit and refuses (exit 2) one that bypassed the hook.
+
 ## Locale traps in system-tool output
 
 This dev host runs a non-C, non-English locale. Any helper that parses system-tool output by English keyword must

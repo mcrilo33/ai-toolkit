@@ -76,9 +76,12 @@ Use the `tdd-refactor` agent. Improve code quality without changing behavior.
 
 ### Step 5: Commit Implementation
 
+Stage the implementation paths only. Only a `test:` commit may change a test file (`commit-msg` rejects the rest,
+`land.sh` rechecks): a test fix made now is its own `test(<scope>): ... #<n>` commit.
+
 ```bash
-git add .
-git commit -m "feat(<scope>): implement <feature>"
+git add <implementation paths>
+git commit -m "feat(<scope>): implement <feature> #<n>"
 ```
 
 ### Step 6: Add Edge Cases

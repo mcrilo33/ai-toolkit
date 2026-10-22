@@ -49,16 +49,19 @@ If a test seems wrong, stop and flag it — do not "fix" the test to match your 
 
 After all tests pass:
 
+Stage the implementation paths only, never `git add .`: `commit-msg` rejects a non-`test:` commit that changes a
+test file. If going green really needs a test fix, make it a separate `test(<scope>): ... #<n>` commit.
+
 ```bash
-git add .
-git commit -m "feat(<scope>): implement <feature>"
+git add <implementation paths>
+git commit -m "feat(<scope>): implement <feature> #<n>"
 ```
 
 ## Checklist
 
 - [ ] All failing tests now pass
 - [ ] No existing tests broken
-- [ ] No test files modified
+- [ ] No test files modified or staged (a test fix is its own `test:` commit)
 - [ ] No more code written than necessary
 - [ ] Implementation committed
 - [ ] Ready for refactor phase

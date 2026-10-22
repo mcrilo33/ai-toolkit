@@ -59,9 +59,13 @@ Same inputs must produce same outputs after every change. If a refactor breaks a
 
 After refactoring with all tests still green:
 
+Stage by path. A `refactor:` commit may not change a test file (`commit-msg` rejects it): tidying test code is its
+own `test(<scope>): tidy ... #<n>` commit. A rename that has to touch src and tests together needs a
+`Test-Change: <why>` line in the message.
+
 ```bash
-git add .
-git commit -m "refactor(<scope>): clean up <feature>"
+git add <refactored source paths>
+git commit -m "refactor(<scope>): clean up <feature> #<n>"
 ```
 
 ## Checklist

@@ -10,6 +10,7 @@
 # judges the exact captured tip, not the branch name; once it returns, origin/<branch> and the spoke HEAD must still be that tip (exit 2
 # otherwise: a sha the worker moved to meanwhile was never reviewed). gate_loop's own merge of origin/<base> stays allowed: it adds only
 # base commits, which are already landed and reviewed (it refuses first if the spoke HEAD is no longer the captured tip).
+# Before the review, every non-merge commit of origin/<base>..tip is rechecked against the hook's rule (only a test: commit may change a test file, TEST_PATHS): a violation exits 2 (the fix would rewrite pushed history).
 # In the toolkit's own checkout (it carries scripts/sync.sh, shared/ and hooks/claude) the cleanup first re-runs `sync.sh` on it, so the
 # installed copies (.claude/{rules/ai-toolkit,skills,agents}, .ai-toolkit/{scripts,hooks,claude-settings.json}) are the landed tip's: the next dispatch, answer and land use
 # the landed code. Another repo (no sync sources) is untouched. sync replaces files by rename, so a running coordinator loop keeps its
@@ -107,7 +108,18 @@ land() {   # ff main to the gated tip and push it; anything else on main is refu
     die "push of $BASE_BRANCH was rejected; local $BASE_BRANCH restored, nothing closed"
   fi
 }
+test_files_only_in_test_commits() {   # exit 2 on the first pushed commit that changes a test file without being a test: commit; the hook's rule, so the commit and land checks cannot drift
+  local c out hook="$here/../hooks/git/commit-msg"
+  if [ -z "${TEST_PATHS+x}" ]; then warn "TEST_PATHS is set nowhere: the test-file check is off"; return 0; fi
+  export TEST_PATHS
+  for c in $(git rev-list --no-merges "origin/$BASE_BRANCH..$tip"); do
+    out="$(git diff-tree --no-commit-id -r --name-status -M "$c" | bash "$hook" --check <(git log -1 --format=%B "$c") 2>&1)" \
+      || bail 2 "refused: commit $(git log -1 --format='%h %s' "$c"): ${out#commit-msg: }"
+    [ -z "$out" ] || warn "commit $(git log -1 --format=%h "$c"): ${out#commit-msg: }"
+  done
+}
 if [ "$co" = 0 ]; then
+  test_files_only_in_test_commits
   if [ "$review" = 1 ]; then
     "${REVIEW_CMD:-$here/review.sh}" "$n" "$tip" || bail 3 "review did not approve issue $n"
     git fetch -q --prune origin || die "git fetch origin failed"
