@@ -96,7 +96,7 @@ gh issue close {number}
 
 Only pass the fields you want to change.
 
-### Using gh api (fields without a flag)
+### Using gh api
 
 ```bash
 gh api repos/{owner}/{repo}/issues/{number} \

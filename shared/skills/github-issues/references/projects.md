@@ -17,7 +17,7 @@ gh api graphql -f query='{
   node(id: "PROJECT_ID") {
     ... on ProjectV2 {
       items(first: 100) {
-        edges { cursor node { id content { ... on Issue { number title } } } }
+        edges { cursor node { id content { ... on Issue { number title } } fieldValues(first: 10) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }
         pageInfo { hasNextPage }
       }
     }
