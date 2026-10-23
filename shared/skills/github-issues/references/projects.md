@@ -1,30 +1,35 @@
 # Projects V2
 
-GitHub Projects V2 is managed via GraphQL. The MCP server provides three tools that wrap the GraphQL API, so you typically don't need raw GraphQL.
+GitHub Projects V2 is managed via GraphQL, run with `gh api graphql`.
 
-## Using MCP tools (preferred)
+## Listing projects and items
 
-**List projects:**
-Call `mcp_github_projects_list` with `method: "list_projects"`, `owner`, and `owner_type` ("user" or "organization").
+**List projects** (use `user(login: "USER")` for a user):
 
-**List project fields:**
-Call `mcp_github_projects_list` with `method: "list_project_fields"` and `project_number`.
+```bash
+gh api graphql -f query='{ organization(login: "ORG") { projectsV2(first: 50) { nodes { id title number } } } }' --jq '.data.organization.projectsV2.nodes'
+```
 
-**List project items:**
-Call `mcp_github_projects_list` with `method: "list_project_items"` and `project_number`.
+**List project items** (while `hasNextPage`, repeat with `after:` set to the last edge's `cursor`):
 
-**Add an issue/PR to a project:**
-Call `mcp_github_projects_write` with `method: "add_project_item"`, `project_id` (node ID), and `content_id` (issue/PR node ID).
+```bash
+gh api graphql -f query='{
+  node(id: "PROJECT_ID") {
+    ... on ProjectV2 {
+      items(first: 100) {
+        edges { cursor node { id content { ... on Issue { number title } } } }
+        pageInfo { hasNextPage }
+      }
+    }
+  }
+}' --jq '.data.node.items'
+```
 
-**Update a project item field value:**
-Call `mcp_github_projects_write` with `method: "update_project_item_field"`, `project_id`, `item_id`, `field_id`, and `value`.
+**Add an issue/PR to a project** (`CONTENT_NODE_ID` is the issue/PR node ID):
 
-## Workflow for project operations
-
-1. **Find the project** — see [Finding a project by name](#finding-a-project-by-name) below
-2. **Discover fields** - use `projects_list` with `list_project_fields` to get field IDs and option IDs
-3. **Find items** - use `projects_list` with `list_project_items` to get item IDs
-4. **Mutate** - use `projects_write` to add, update, or delete items
+```bash
+gh api graphql -f query='mutation { addProjectV2ItemById(input: {projectId: "PROJECT_ID", contentId: "CONTENT_NODE_ID"}) { item { id } } }'
+```
 
 ## Finding a project by name
 
@@ -68,19 +73,15 @@ gh api graphql -f query='{
 }' --jq '.data.organization.projectsV2.nodes[] | select(.title == "My Project")'
 ```
 
-### 4. MCP tool (small orgs only)
-
-Call `mcp_github_projects_list` with `method: "list_projects"`. Works well for orgs with <100 projects.
-
 ## Project discovery for progress reports
 
 When a user asks for a progress update on a project (e.g., "Give me a progress update for Project X"), follow this workflow:
 
 1. **Find the project** — use the [finding a project](#finding-a-project-by-name) strategies above. Ask the user for a known issue number if name search fails.
 
-2. **Discover fields** - call `projects_list` with `list_project_fields` to find the Status field (its options tell you the workflow stages) and any Iteration field (to scope to the current sprint).
+2. **Discover fields** - query the project's fields to find the Status field (its options tell you the workflow stages) and any Iteration field (to scope to the current sprint).
 
-3. **Get all items** - call `projects_list` with `list_project_items`. For large projects (100+ items), paginate through all pages. Each item includes its field values (status, iteration, assignees).
+3. **Get all items** - list the project items. For large projects (100+ items), paginate through all pages. Each item includes its field values (status, iteration, assignees).
 
 4. **Build the report** - group items by Status field value and count them. For iteration-based projects, filter to the current iteration first. Present a breakdown like:
 
@@ -130,9 +131,7 @@ gh api graphql -f query='
 
 This returns the item ID, project info, and current field values in one query.
 
-## Using GraphQL via gh api (recommended)
-
-Use `gh api graphql` to run GraphQL queries and mutations. This is more reliable than MCP tools for write operations.
+## Project fields
 
 **Find a project and its Status field options:**
 ```bash
