@@ -364,7 +364,7 @@ def review_head(R, files, rules):   # review a commit adding <files>: the part o
     git(R.wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "change")
     assert R.go(OK, REVIEW_RULES_DIR=rules).returncode == 0
     argv = R.stubs.calls("claude")[0]
-    return json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"].partition("--- rule inventory ---")
+    return json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"].rpartition("--- rule inventory ---")   # the agent's own text names the inventory too
 
 
 @pytest.mark.parametrize("files, given", [
