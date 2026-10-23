@@ -12,7 +12,11 @@ FRONT = "effort: medium\ndisallowedTools: Edit, Write, NotebookEdit\n"   # the a
 LAYOUTS = ("checkout", "synced")   # the toolkit checkout (scripts/ at the root) and a synced repo (.ai-toolkit/scripts)
 AGENT_AT = {"checkout": "shared/agents/code-review.md", "synced": ".claude/agents/code-review.md"}
 RULE_AT = {"checkout": "shared/rules/on-demand/afk-answering.md", "synced": ".ai-toolkit/rules/afk-answering.md"}
-RULES = ("guidelines", "security", "code-quality", "python-style", "pytest-conventions")   # the rules the code-review agent cites
+ALWAYS = ("guidelines", "security", "scientific-integrity")   # the rules given in full on every diff
+PATHED = {"code-quality": ["**/*.{py,ts,tsx,js,jsx,go,rs,java,sh}"], "python-style": ["**/*.py"], "pytest-conventions": ["**/test_*.py", "**/tests/**/*.py", "**/conftest.py"],
+          "markdown-style": ["**/*.md"], "mermaid-conventions": ["**/*.md"], "github-actions": [".github/workflows/*.yml", ".github/workflows/*.yaml"], "gitignore-template": ["**/.gitignore"],
+          "operational-gotchas": ["**"], "agent-orchestration": []}   # the rules given in full when a changed file matches; the last two are process rules, inventory only
+RULES = (*ALWAYS, *PATHED)   # every rule file of the flat coordinator-side dir
 RULE_PATH = {"checkout": lambda n: f"shared/rules/{n}.md", "synced": lambda n: f".claude/rules/ai-toolkit/{n}.md", "dir": lambda n: f"{n}.md"}
 ISSUE = '{"number":9,"title":"new","body":"new body"}'   # the live issue 9 the stub gh serves
 OK = {"verdict": "APPROVE", "blockers": [], "warnings": [{"text": "a.py:1 - nit", "rule": "none"}], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
@@ -175,8 +179,9 @@ def test_a_failing_claude_or_a_missing_rule_is_an_escalation_not_an_approve(A, t
 def put_rules(root, layout, tag, skip=()):   # the coordinator-side rule files in <layout>'s place, each body "<tag> <name>" and description "about <tag> <name>"
     for n in RULES:
         path = RULE_PATH[layout](n)
+        paths = "".join(f"  - '{g}'\n" for g in PATHED.get(n, []))
         if n not in skip:
-            put(root / path, f'---\ndescription: "about {tag} {n}"\n---\n# {n}\n{tag} {n}\n')
+            put(root / path, f'---\ndescription: "about {tag} {n}"\n{"paths:" + chr(10) + paths if paths else ""}---\n# {n}\n{tag} {n}\n')
 
 
 @pytest.fixture
@@ -197,12 +202,13 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     agent = tmp_path / "agent.md"   # the coordinator's definition; the worktree's own copy, CLAUDE.md and rules are the worker's to tamper with
     agent.write_text(f"---\nname: code-review\ndescription: d\nmodel: m\n{FRONT}---\n# Reviewer\nthe coordinator body\n")
     put_rules(tmp_path / "rules", "dir", "coordinator")
+    git(R.wt, "update-ref", "refs/remotes/origin/trunk", "origin/main")   # the changed files are listed against the base, which must exist
     r = R.go(OK, REVIEW_MODEL="fable-x", BASE_BRANCH="trunk", REVIEW_AGENT=agent, REVIEW_RULES_DIR=tmp_path / "rules")
     assert r.returncode == 0 and "SUMMARY: fine" in r.stdout
     argv = R.stubs.calls("claude")[0]
     assert argv[:3] == ["-p", "--model", "fable-x"] and argv[argv.index("--agent") + 1] == "code-review"
     spec = json.loads(argv[argv.index("--agents") + 1])["code-review"]   # the coordinator's body, frontmatter stripped; never resolved from the cwd
-    assert spec["prompt"].startswith("# Reviewer\nthe coordinator body") and all(f"coordinator {n}" in spec["prompt"] for n in RULES) and "description:" not in spec["prompt"].split("--- rule inventory ---")[0]   # the coordinator's rules ride in its prompt, frontmatter stripped
+    assert spec["prompt"].startswith("# Reviewer\nthe coordinator body") and all(f"coordinator {n}" in spec["prompt"] for n in ALWAYS) and "description:" not in spec["prompt"].split("--- rule inventory ---")[0]   # the coordinator's rules ride in its prompt, frontmatter stripped
     assert argv[argv.index("--setting-sources") + 1] == "" and "--strict-mcp-config" in argv
     assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit" and argv[argv.index("--effort") + 1] == "medium"   # the definition's own read-only block and effort, not copies
     assert json.loads(argv[argv.index("--settings") + 1]) == {"autoMemoryEnabled": False}   # the flags (this, --setting-sources, --strict-mcp-config) are the pin: the stub loads no file
@@ -227,8 +233,8 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
         argv = R.stubs.calls("claude")[-1]
         prompt = json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"]
         head, _, inventory = prompt.partition("--- rule inventory ---")
-        assert head.startswith(f"{layout} body") and all(f"{layout} {n}" in head for n in RULES) and f"full {layout} workflow text" not in prompt and argv[argv.index("--effort") + 1] == layout
-        assert inventory.strip().splitlines() == sorted([f"{n} — about {layout} {n}" for n in RULES] + [f"workflow — about {layout} workflow"])   # one line per rule file of both dirs, the cited five included
+        assert head.startswith(f"{layout} body") and all(f"{layout} {n}" in head for n in ALWAYS) and f"{layout} python-style" not in head and f"full {layout} workflow text" not in prompt and argv[argv.index("--effort") + 1] == layout
+        assert inventory.strip().splitlines() == sorted([f"{n} — about {layout} {n}" for n in RULES] + [f"workflow — about {layout} workflow"])   # one line per rule file of both dirs, the ones not given in full included
         assert "ghost" not in prompt and "description:" not in head
         assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit,Bash"   # read from the file, not the old literal
     n = len(R.stubs.calls("claude"))
@@ -265,7 +271,7 @@ def test_request_changes_exits_3_with_blocker_lines_and_an_approve_that_contradi
 @pytest.mark.parametrize("out", [
     "", "Looks good to me!", "```json\nnot json\n```", json.dumps({**OK, "verdict": "MAYBE"}), json.dumps({**OK, "blockers": None}),
     json.dumps({k: v for k, v in OK.items() if k != "summary"}), json.dumps({**OK, "tdd_followed": "yes"}), "[1]", "{} trailing",
-    json.dumps({**OK, "warnings": ["a.py:1 - bare string"]}), json.dumps({**OK, "blockers": [finding("a.py:1 - x", "workflow")]}),   # a tag outside the inventory (the flat rules dir of this layout holds only the five)
+    json.dumps({**OK, "warnings": ["a.py:1 - bare string"]}), json.dumps({**OK, "blockers": [finding("a.py:1 - x", "workflow")]}),   # a tag outside the inventory (the flat rules dir of this layout holds no such rule)
     json.dumps({**OK, "warnings": [{"text": "a.py:1 - no tag"}]}), json.dumps({**OK, "warnings": [{"text": 3, "rule": "none"}]}), json.dumps({**OK, "warnings": [finding("a.py:1 - x", None)]}),
 ])
 def test_an_unparseable_verdict_exits_1_after_one_retry_and_is_never_an_approve(R, out, tmp_path):
@@ -330,7 +336,7 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
         other = "synced" if layout == "checkout" else "checkout"
         for decoy_root, at in ((root.parent, layout), (root, other), (R.wt, layout)):
             put_rules(decoy_root, at, "decoy")
-        for skip, blank in ((RULES, None), (("python-style",), None), ((), "pytest-conventions")):
+        for skip, blank in ((RULES, None), (("scientific-integrity",), None), ((), "security")):
             put_rules(root, layout, layout, skip)
             if blank:
                 put(root / RULE_PATH[layout](blank), "---\nx: y\n---\n \n")
@@ -349,3 +355,31 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
     assert R.go(OK).returncode == 1
     R.stubs.reply("orca.worktree_show", R.show)
     assert R.go(OK, rc=1).returncode == 1
+
+
+def review_head(R, files, rules):   # review a commit adding <files>: the part of the prompt before the inventory (the rules given in full)
+    for f in files:
+        put(R.wt / f, "x\n")
+    git(R.wt, "add", "-A")
+    git(R.wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "change")
+    assert R.go(OK, REVIEW_RULES_DIR=rules).returncode == 0
+    argv = R.stubs.calls("claude")[0]
+    return json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"].partition("--- rule inventory ---")
+
+
+@pytest.mark.parametrize("files, given", [
+    (["docs/a.md"], {"markdown-style", "mermaid-conventions"}),
+    ([".github/workflows/ci.yml"], {"github-actions"}),
+    (["tests/test_x.py"], {"pytest-conventions", "python-style", "code-quality"}),
+    (["pkg/x.py", ".gitignore"], {"python-style", "code-quality", "gitignore-template"}),
+])
+def test_the_rules_given_in_full_are_the_always_on_ones_plus_those_whose_paths_match_the_diff(R, tmp_path, files, given):
+    put_rules(tmp_path / "rules", "dir", "x")
+    head, _, inventory = review_head(R, files, tmp_path / "rules")
+    assert {n for n in RULES if f"x {n}\n" in head} == set(ALWAYS) | given   # operational-gotchas ('**') and agent-orchestration are never among them
+    assert all(f"{n} — about x {n}" in inventory for n in RULES)   # the others stay nameable and taggable
+
+
+def test_the_shipped_code_quality_paths_cover_shell_and_the_process_rules_are_never_given_in_full(R):
+    head, _, _ = review_head(R, ["scripts/x.sh"], Path(REVIEW).parent.parent / "shared/rules")
+    assert "# Code Quality" in head and "# Python Code Style" not in head and "# Operational Gotchas" not in head and "# Agent Orchestration" not in head
