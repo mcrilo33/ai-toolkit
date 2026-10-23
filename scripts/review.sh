@@ -7,7 +7,7 @@
 # The reviewer's instructions are the coordinator's own code-review definition (REVIEW_AGENT, else the one place of this install layout: the checkout's shared/agents, or the synced
 # .claude/agents of the repo this script is installed in, never a path above that root), passed with --agents and run with no setting source at all (so the user-level allow rules
 # cannot widen the read-only tools), no MCP config and no auto-memory, so a worker's .claude/agents, CLAUDE.md, rules or ~/.claude/projects/*/memory never reach it; a missing definition is exit 1, never a fallback.
-# The rules that definition cites (guidelines, security, code-quality, python-style, pytest-conventions) are appended to its prompt from the same coordinator-side place (REVIEW_RULES_DIR overrides it: a flat dir of <name>.md): a missing or blank one is exit 1.
+# The rules given in full are appended to its prompt from the same coordinator-side place (REVIEW_RULES_DIR overrides it: a flat dir of <name>.md): guidelines, security and scientific-integrity always, plus every rule whose frontmatter paths: glob matches a file changed on origin/$BASE_BRANCH...<sha or branch> (only the names come from the worktree; operational-gotchas and agent-orchestration are inventory only). A missing or blank one is exit 1, as is a diff that cannot be listed.
 # After them comes the rule inventory: one "<name> — <description>" line per rule file of that place and of the on-demand rules (the checkout's shared/rules/on-demand, a synced repo's .ai-toolkit/rules), the only tags a finding may carry (plus none).
 # Every valid verdict is recorded as one issue comment "review-verdict: {json}" holding the sha, the verdict, the two booleans and the rule tags only, never a finding text; a failed comment is a warning, the exit code stays.
 # Its effort and read-only block (disallowedTools) come from the definition's frontmatter, a missing one is exit 1. model: is dropped on purpose (REVIEW_MODEL decides) and so is skills:
@@ -36,12 +36,6 @@ case "$effort$blocked" in *[\"\'\[\]#]*) die "code-review agent definition: effo
 body() { awk 'NR == 1 && $0 != "---" { f = 2 } f < 2 { if ($0 == "---") f++; next } { print }' "$1"; }   # the body after the frontmatter
 prose="$(body "$agent")"
 [[ $prose == *[![:space:]]* ]] || die "code-review agent definition is empty: $agent"
-for r in guidelines security code-quality python-style pytest-conventions; do   # the rules the agent cites, from the coordinator's copies; a missing or blank one is exit 1
-  f="$rules_d/$r.md"
-  [ -f "$f" ] || die "coordinator-side rule not found: $f"
-  text="$(body "$f")"; [[ $text == *[![:space:]]* ]] || die "coordinator-side rule is empty: $f"
-  prose="$prose"$'\n\n'"--- project rule: $r ---"$'\n\n'"$text"
-done
 desc() { awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } index($0, "description: ") == 1 { sub("^description: *", ""); sub("[ \t]+$", ""); gsub(/^"|"$/, ""); print; exit }' "$1"; }   # a rule's frontmatter description, unquoted
 inventory=""; names=""
 for d in "${inventory_ds[@]}"; do   # every rule file of the coordinator-side place(s), never the worktree: the only tags a finding may carry
@@ -52,13 +46,34 @@ for d in "${inventory_ds[@]}"; do   # every rule file of the coordinator-side pl
     inventory="$inventory${r} — ${text}"$'\n'; names="$names$r"$'\n'
   done
 done
-prose="$prose"$'\n\n'"--- rule inventory ---"$'\n\n'"${inventory%$'\n'}"
-rules="$(printf '%s' "$names" | jq -Rsc 'split("\n") | map(select(. != "")) + ["none"]')"
-agents="$(jq -nc --arg p "$prose" '{"code-review": {description: "independent pre-land code review", prompt: $p}}')"
 wt="$(printf '%s' "$o" | jq -r '.result.worktree.path')"
 branch="$(printf '%s' "$o" | jq -r '.result.worktree.branch | sub("^refs/heads/"; "")')"
 if [ -n "$sha" ]; then full="$(git -C "$wt" rev-parse -q --verify "$sha^{commit}")" || die "no commit $sha in the worktree of issue $n"; sha="$full"; fi   # a full sha, never a moving ref
 tip="${sha:-$(git -C "$wt" rev-parse -q --verify "$branch^{commit}")}" || die "no commit for branch $branch in the worktree of issue $n"   # the sha the verdict is recorded against
+shopt -s extglob   # rule globs are matched below: '*' spans '/', a leading '**/' also matches at the root, {a,b} becomes @(a|b); never eval
+paths_of() { awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } /^paths:/ { f = 1; next } f && /^[ \t]+- / { sub(/^[ \t]+- */, ""); sub(/[ \t]+$/, ""); print; next } { f = 0 }' "$1" | tr -d "\"'"; }   # a rule's frontmatter paths: items, unquoted
+changed="$(git -C "$wt" -c core.quotePath=false diff --name-only "origin/$BASE_BRANCH...${sha:-$branch}")" || die "cannot list the files changed against origin/$BASE_BRANCH in the worktree of issue $n"   # only the names come from the worktree
+given=" guidelines security scientific-integrity "   # always in full; then the rules whose paths: match a changed file, in the coordinator's copies
+for f in "$rules_d"/*.md; do
+  r="$(basename "$f" .md)"
+  case "$r" in operational-gotchas | agent-orchestration) continue ;; esac   # process rules, inventory only: operational-gotchas has paths: '**', which would match every diff
+  while IFS= read -r g; do
+    g="${g//\{/@(}"; g="${g//\}/)}"; g="${g//,/|}"
+    while IFS= read -r c; do
+      # shellcheck disable=SC2053 # the glob match is intended
+      [[ $c == $g || $c == ${g#\*\*/} ]] && { given="$given$r "; break 2; }
+    done <<< "$changed"
+  done < <(paths_of "$f")
+done
+for r in $given; do   # a missing or blank rule is exit 1
+  f="$rules_d/$r.md"
+  [ -f "$f" ] || die "coordinator-side rule not found: $f"
+  text="$(body "$f")"; [[ $text == *[![:space:]]* ]] || die "coordinator-side rule is empty: $f"
+  prose="$prose"$'\n\n'"--- project rule: $r ---"$'\n\n'"$text"
+done
+prose="$prose"$'\n\n'"--- rule inventory ---"$'\n\n'"${inventory%$'\n'}"
+rules="$(printf '%s' "$names" | jq -Rsc 'split("\n") | map(select(. != "")) + ["none"]')"
+agents="$(jq -nc --arg p "$prose" '{"code-review": {description: "independent pre-land code review", prompt: $p}}')"
 issue="$(issue_text "$n")" || exit 1   # the contract is the live issue text, put in the prompt: never the worktree's task.md. Unreadable past the bound = exit 1, no verdict
 if [ -n "$sha" ]; then   # pinned: the worker keeps committing and editing while this runs, so the ref and the working tree are not the target
   target="Review commit $sha against origin/$BASE_BRANCH: git diff origin/$BASE_BRANCH...$sha. Read file contents with git show $sha:<path>; the working tree may differ from $sha and is not the review target."

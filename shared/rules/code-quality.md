@@ -1,7 +1,7 @@
 ---
 description: "Design principles (clarity, single responsibility, consistency), error handling, logging, performance, documentation, surgical changes, and dependency management"
 paths:
-  - '**/*.{py,ts,tsx,js,jsx,go,rs,java}'
+  - '**/*.{py,ts,tsx,js,jsx,go,rs,java,sh}'
 ---
 # Code Quality
 

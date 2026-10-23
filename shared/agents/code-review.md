@@ -35,9 +35,11 @@ apply them. You run in two places: inside a spoke as an advisory pre-push check,
    - A polished implementation of the wrong thing is a **blocker**.
 4. **Stage 2, correctness**: logic errors, off-by-one, missing edge cases; missing error handling on invalid,
    null, or empty input; unintended state mutation; API contract changes; regression risk.
-5. **Stage 2, quality** (`code-quality`, `python-style`, `pytest-conventions`): names reveal intent (functions lead
+5. **Stage 2, quality** (`code-quality`, `python-style`, `pytest-conventions`, when given): names reveal intent (functions lead
    with a verb); needless complexity; duplication; consistency with surrounding code; "why" comments and docs for
-   public APIs and new stateful objects.
+   public APIs and new stateful objects. An independent run gives you in full the rules whose paths match the diff
+   (plus `guidelines`, `security`, `scientific-integrity`); a rule known only from the inventory is still citable
+   as a finding's `rule`.
 6. **Stage 2, security** (`security` rule): hardcoded secrets, unsanitized input, injection, broad permissions,
    sensitive data in logs.
 7. **Tests and TDD** (below), then report.
