@@ -61,7 +61,7 @@ for f in "$rules_d"/*.md; do
     g="${g//\{/@(}"; g="${g//\}/)}"; g="${g//,/|}"
     while IFS= read -r c; do
       # shellcheck disable=SC2053 # the glob match is intended
-      [[ $c == $g || $c == ${g#\*\*/} ]] && { given="$given$r "; break 2; }
+      [[ $c == $g || $c == ${g#\*\*/} ]] && { [[ $given == *" $r "* ]] || given="$given$r "; break 2; }
     done <<< "$changed"
   done < <(paths_of "$f")
 done
