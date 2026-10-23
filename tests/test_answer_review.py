@@ -355,6 +355,9 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
     assert R.go(OK).returncode == 1
     R.stubs.reply("orca.worktree_show", R.show)
     assert R.go(OK, rc=1).returncode == 1
+    n = len(R.stubs.calls("claude"))
+    r = R.go(OK, BASE_BRANCH="nope")   # the changed files cannot be listed: no rule selection to trust, so no review
+    assert r.returncode == 1 and "cannot list the files changed" in r.stderr and r.stdout == "" and len(R.stubs.calls("claude")) == n
 
 
 def review_head(R, files, rules):   # review a commit adding <files>: the part of the prompt before the inventory (the rules given in full)
