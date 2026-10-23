@@ -21,14 +21,6 @@ echo "{\"sub_issue_id\": $ISSUE_ID}" | gh api repos/{owner}/{repo}/issues/{paren
 
 **Why `--input` instead of `-f`?** The `gh api -f` flag sends all values as strings, but the API requires `sub_issue_id` as an integer. Using `-f sub_issue_id=12345` will return a 422 error.
 
-## Using MCP tools
-
-**List sub-issues:**
-Call `mcp_github_issue_read` with `method: "get_sub_issues"`, `owner`, `repo`, and `issue_number`.
-
-**Create an issue as a sub-issue:**
-There is no MCP tool for creating sub-issues directly. Use the workflow above or GraphQL.
-
 ## Using REST API
 
 **List sub-issues:**

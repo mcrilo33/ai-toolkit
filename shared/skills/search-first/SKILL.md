@@ -67,12 +67,7 @@ Evaluate results by:
 
 ### Rung 3 — Library Docs (right tool, right API?)
 
-Use Context7 to fetch current documentation:
-
-1. Resolve the library ID (`resolve-library-id`)
-2. Query the specific topic (`query-docs`)
-3. Verify the API exists in the version used by the project
-
+Verify the API exists in the version the project uses, from the official docs.
 Follow the full `library-research` rule for this step.
 
 **Exit if:** An installed or readily-available library covers the use case.
@@ -152,5 +147,5 @@ After completing the search, produce a brief summary:
 - **License matters** — flag GPL/AGPL dependencies that may conflict
 - **Recency matters** — deprioritize packages with no updates in 12+ months
 - **Max 5 minutes of research** — if nothing emerges, state that and proceed
-- Defer to `library-research` for Context7 workflow details
+- Defer to `library-research` for the library docs workflow
 - Defer to `security` rule for dependency vetting
