@@ -1183,7 +1183,7 @@ AWAITING = "status:awaiting-main"
 
 def pr_json(reviewed="h1", **kw):   # GitHub keeps reviewDecision after new commits: `reviewed` is the head the review was made on, the PR's head is h1
     return json.dumps([{"number": 5, "url": "https://x/pull/5", "state": "OPEN", "reviewDecision": "", "mergeCommit": None, "body": "Closes #1\n", "headRefOid": "h1",
-                        "latestReviews": [{"state": kw.get("reviewDecision") or "COMMENTED", "commit": {"oid": reviewed}}], **kw}])
+                        "reviews": [{"author": {"login": "r"}, "state": kw.get("reviewDecision") or "COMMENTED", "submittedAt": "2026-10-24T10:00:00Z", "commit": {"oid": reviewed}}], **kw}])   # the shape gh returns: `reviews` carries commit{oid}, `latestReviews` does not
 
 
 def test_a_land_that_awaits_its_merge_into_main_is_logged_with_its_pr_never_blocked_and_still_routes_the_leftovers(C):
@@ -1215,8 +1215,12 @@ def test_a_replayed_worker_done_of_an_issue_awaiting_main_is_not_landed_again(C)
     (pr_json(state="CLOSED"), INT, "closed without merge"),
     (pr_json(reviewDecision="CHANGES_REQUESTED"), PRMODE, "changes requested"),   # an issue's own PR: its worker can address it
     (pr_json(reviewDecision="CHANGES_REQUESTED", reviewed="h0"), PRMODE, "left"),   # the worker already pushed past that review: blocking again would stop the address round before the reviewer looks
+    (pr_json(reviewDecision="CHANGES_REQUESTED", reviews=[{"author": {"login": "r"}, "state": "CHANGES_REQUESTED", "submittedAt": "2026-10-24T10:00:00Z", "commit": {"oid": "h1"}},
+                                                         {"author": {"login": "r"}, "state": "COMMENTED", "submittedAt": "2026-10-24T11:00:00Z", "commit": {"oid": "h1"}}]), PRMODE, "changes requested"),   # a later comment does not lift the request
+    (pr_json(reviewDecision="CHANGES_REQUESTED", reviews=[{"author": {"login": "r"}, "state": "CHANGES_REQUESTED", "submittedAt": "2026-10-24T10:00:00Z", "commit": {"oid": "h0"}},
+                                                         {"author": {"login": "r"}, "state": "COMMENTED", "submittedAt": "2026-10-24T11:00:00Z", "commit": {"oid": "h1"}}]), PRMODE, "left"),   # the request is on an older head
     (pr_json(reviewDecision="CHANGES_REQUESTED"), INT, "left"),   # the rolling PR carries many issues: the human decides, --status shows it
-    (pr_json(reviewDecision="REVIEW_REQUIRED"), INT, "left"), ("[]", INT, "left"), ("boom", INT, "left")], ids=["merged", "closed", "changes-pr", "changes-addressed", "changes-rolling", "open", "no-pr", "gh-fails"])
+    (pr_json(reviewDecision="REVIEW_REQUIRED"), INT, "left"), ("[]", INT, "left"), ("boom", INT, "left")], ids=["merged", "closed", "changes-pr", "changes-addressed", "changes-after-comment", "changes-old-head", "changes-rolling", "open", "no-pr", "gh-fails"])
 def test_the_sweep_checks_the_pr_of_each_issue_awaiting_main(C, pr, env, action):
     C.stubs.reply("gh.issue_list", json.dumps([{"number": 1, "title": "t", "state": "OPEN"}]))
     C.stubs.reply("gh.pr_list", pr, rc=1 if pr == "boom" else 0)
