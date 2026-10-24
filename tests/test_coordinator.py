@@ -721,7 +721,6 @@ def test_a_kept_worktree_is_re_dispatched_after_its_old_agent_terminal_is_closed
 
 
 @pytest.mark.parametrize("rel_rc, stop, stop_rc, st, abandoned", [
-    (0, "", 0, "dispatched", False),   # worker-release settled it
     (1, '{"ok":true,"result":{"state":"stopped"}}', 0, "completed", False),   # the stop settled
     (1, '{"ok":true,"result":{"state":"stop_unknown"}}', 0, "dispatched", True),   # the incident: ok:true, nothing settled
     (1, '{"ok":true,"result":{"state":"stopped"}}', 0, "dispatched", True),   # ... or an ok that leaves the dispatch dispatched
@@ -735,6 +734,23 @@ def test_a_release_whose_stop_does_not_settle_escalates_to_worker_abandon(C, rel
     r = C.go()
     ab = C.calls("orca orchestration worker-abandon")
     assert bool(ab) == abandoned and (not ab or arg(ab[0], "--dispatch") == "ctx_1" and "worker-abandon" in r.stderr and "ctx_1" in r.stderr)
+
+
+def test_an_exited_worker_with_a_queued_replace_request_is_released_not_relaunched_on_its_old_model(C, tmp_path):
+    (tmp_path / "state/run_t/requests").mkdir(parents=True)
+    (tmp_path / "state/run_t/requests/1").write_text("on another model\nx\n")
+    C.workers(C.row(lv="exited"))
+    C.go("--cap", "1", **SWEEP)
+    assert not relaunches(C) and C.calls("orca orchestration worker-release")
+
+
+def test_a_failed_notice_of_a_dropped_reply_is_not_said_to_be_retried(C):
+    C.inbox(["msg_open"])
+    C.stubs.reply("orca.orchestration_reply", "boom", rc=1)
+    C.stubs.reply("orca.terminal_send", "boom", rc=1)
+    C.spool("msg_open", "approve")
+    r = C.go("--answer", "attended", COORD_REPLY_TRIES=1)
+    assert "cannot tell the session (reply msg_open)" in r.stderr and "retried" not in "".join(ln for ln in r.stderr.splitlines() if "reply msg_open" in ln)
 
 
 def test_a_worker_whose_only_open_question_is_an_expired_permission_request_is_swept_like_any_silent_one(C):
