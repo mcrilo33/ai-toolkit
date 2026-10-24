@@ -1235,9 +1235,10 @@ def test_the_sweep_checks_the_pr_of_each_issue_awaiting_main(C, pr, env, action)
         assert ["--remove-label", AWAITING] in [a[3:] for a in C.calls("gh issue edit")] and comments == [f"blocked: https://x/pull/5: {action}"]
 
 
-@pytest.mark.parametrize("rc, labels, blocks", [(5, [AWAITING], True), (5, [AWAITING, "blocked"], False), (6, [AWAITING], False)], ids=["conflict", "conflict-already-blocked", "cleanup-incomplete"])
-def test_a_merge_back_that_conflicts_blocks_the_issue_once_while_a_failed_cleanup_only_warns(C, rc, labels, blocks):
-    C.stubs.reply("gh.issue_list", json.dumps([{"number": 1, "title": "t", "state": "OPEN", "labels": [{"name": n} for n in labels]}]))
+@pytest.mark.parametrize("rc, state, labels, blocks", [(5, "OPEN", [AWAITING], True), (5, "CLOSED", [AWAITING], True), (5, "OPEN", [AWAITING, "blocked"], False), (5, "CLOSED", [AWAITING, "blocked"], False), (6, "OPEN", [AWAITING], False)],
+                         ids=["conflict", "conflict-closed", "conflict-already-blocked", "conflict-closed-already-blocked", "cleanup-incomplete"])
+def test_a_merge_back_that_conflicts_blocks_the_issue_once_while_a_failed_cleanup_only_warns(C, rc, state, labels, blocks):   # a closed issue (the PR's Closes) is reopened: the queue and --status list open issues only
+    C.stubs.reply("gh.issue_list", json.dumps([{"number": 1, "title": "t", "state": state, "labels": [{"name": n} for n in labels]}]))
     C.stubs.reply("gh.pr_list", pr_json(state="MERGED", mergeCommit={"oid": "abc"}))
     C.stubs.reply(key("land.sh", "--merged", "1"), "land.sh: conflict\n", rc=rc)
     C.go(COORD_SWEEP_EVERY=1, **INT)
@@ -1246,8 +1247,9 @@ def test_a_merge_back_that_conflicts_blocks_the_issue_once_while_a_failed_cleanu
     if blocks:
         assert ["--add-label", "blocked"] in edits and ["--remove-label", AWAITING] not in edits
         assert comments == ["blocked: https://x/pull/5: merge of develop back into main conflicts: merge it by hand and push, then remove the blocked label"]
+        assert [a[2:] for a in C.calls("gh issue reopen")] == ([["1"]] if state == "CLOSED" else [])
     else:
-        assert not edits and not comments
+        assert not edits and not comments and not C.calls("gh issue reopen")
 
 
 def test_status_lists_the_issues_awaiting_main_with_their_pr_and_a_requested_change(C):
