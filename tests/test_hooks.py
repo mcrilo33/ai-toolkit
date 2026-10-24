@@ -516,6 +516,7 @@ def test_relay_allows_only_on_the_exact_word_allow(relay, reply, behavior):
 @pytest.mark.parametrize("tool, command, own_message", [
     ("Bash", 'orca orchestration send --from t --type worker_done --subject "done" --body "x" --outcome succeeded', True),
     ("Bash", "orca orchestration send --from t --type worker_done --body 'reworded' --task-id t", True),
+    ("Bash", "orca orchestration send --from t --type 'worker_done' --body x", True), ("Bash", 'orca orchestration send --from t --type="worker_done" --body x', True),   # a quoted type
     ("Bash", 'orca orchestration send --from t --type heartbeat --body "worker_done soon"', False),   # another message type, or the word in a body
     ("Bash", "echo --type worker_done", False), ("Write", "orca orchestration send --type worker_done", False)])   # not an orchestration send / not a Bash call
 def test_relay_deny_of_a_worker_done_forbids_every_resend_and_sends_the_worker_to_the_coordinator(relay, tool, command, own_message):
