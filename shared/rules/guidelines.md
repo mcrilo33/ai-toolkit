@@ -32,7 +32,7 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 - If something is unclear and no sensible default settles it, stop. Name what's confusing. Ask.
 - If multiple interpretations exist, present them — don't pick silently
 - If a simpler approach exists, say so. Push back when warranted.
-- Prefer option-based clarification: propose a short bulleted list (2–5 items) of alternatives
+- Anything that waits on the human (a yes/no, a choice, an approval, a permission, a blocked item) is asked in an `AskUserQuestion` card, one card per decision: 2-4 short options, the recommended one first and labelled `(Recommended)`, a free-form answer through the card's own Other; explanation may precede it, the decision is never only in text (the card is what alerts the human). A worker (spoke, headless run) never uses it: it asks through `orca orchestration ask`.
 - When a request could have unintended side effects, warn before proceeding
 - Challenge your own assumptions — ask "why" before accepting a constraint or approach as given
 - Consider long-term implications (maintenance, scaling, coupling) before committing to an approach
