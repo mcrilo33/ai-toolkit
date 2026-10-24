@@ -308,10 +308,30 @@ def test_a_reply_for_an_unknown_or_already_answered_question_is_dropped_and_a_fa
     C.spool("msg_nope", "approve")
     r = C.go()
     assert not C.calls("orca orchestration reply") and not C.spooled("msg_done") and not C.spooled("msg_nope") and r.stderr.count("dropped") == 2
+    C.stubs.reply("orca.orchestration_reply", json.dumps({"error": {"code": "bad_state"}}), rc=1)
+    C.spool("msg_open", "approve")
+    C.go(COORD_REPLY_TRIES=2)
+    assert C.spooled("msg_open")   # retried on the next wake, up to the bound
+    r = C.go("--answer", "attended", COORD_REPLY_TRIES=2)
+    told = [arg(a, "--text") for a in C.calls("orca terminal send") if arg(a, "--terminal") == "term_s"]
+    assert not C.spooled("msg_open") and "dropped" in r.stderr and "bad_state" in r.stderr and any("reply to msg_open was dropped" in t for t in told)   # the human hears about it
+
+
+def test_a_reply_dropped_after_the_bound_is_not_announced_to_the_session_outside_attended_mode(C):
+    C.inbox(["msg_open"])
     C.stubs.reply("orca.orchestration_reply", "boom", rc=1)
     C.spool("msg_open", "approve")
-    C.go()
-    assert C.spooled("msg_open")   # retried on the next wake
+    C.go(COORD_REPLY_TRIES=1)
+    assert not C.spooled("msg_open") and not [a for a in C.calls("orca terminal send") if "dropped" in arg(a, "--text")]
+
+
+@pytest.mark.parametrize("age, kw, body", [(10, dict(question=PQ), "deny"), (1, dict(question=PQ, dispatchId="ctx_9"), "deny"), (1, dict(question="PLAN?", dispatchId="ctx_9"), "approve")])
+def test_a_queued_reply_for_a_permission_request_past_the_relay_window_or_a_dead_dispatch_is_dropped_never_sent(C, age, kw, body):
+    ago = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age * 60))
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_p", **kw), "run_id": "run_t", "thread_id": "msg_p", "created_at": ago}]}}))
+    C.spool("msg_p", body)
+    r = C.go()
+    assert r.returncode == 0 and not C.calls("orca orchestration reply") and not C.spooled("msg_p") and "dropped" in r.stderr
 
 
 def test_a_queued_reply_is_only_dropped_when_its_question_is_seen_answered_or_the_inbox_page_was_not_truncated(C):
@@ -647,14 +667,14 @@ def issue_json(state="OPEN", scope="a.py", labels=()):
 
 
 BLOCKED = issue_json(labels=["blocked"])
-DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed; one that cannot keeps its file with the reason on line 2 (only a closed issue and an already running one are dropped)
+DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed; one that cannot keeps its file with the reason on line 2 (only a closed issue and a plain request for an already running one are dropped)
     "plain": {}, "fresh-with-message": dict(text="do it test-first", v7=BLOCKED, why="no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"),
     "kept-worktree-with-message": dict(text="do it test-first", v7=BLOCKED, kept=True, expect=("--address", "do it test-first", "7"), label=True), "kept-worktree-default-message": dict(kept=True, expect="default"),
     "cap": dict(cap=1, why="waiting for a free slot (cap 1)"), "refused": dict(refuses=True, why="dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"), "closed": dict(v7=issue_json(state="CLOSED"), dropped=True),
     "hold": dict(v7=issue_json(labels=["hold"]), why="on hold: remove the hold label to start it"), "blocked-no-message": dict(v7=BLOCKED, why="blocked: remove the label, or give a message to re-dispatch it"),
     "no-toolkit-label": dict(v7=issue_json(labels=["bug"]), env={"DISPATCH_LABEL": "ai-toolkit"}, why="not a toolkit issue: it lacks the ai-toolkit label"),
     "toolkit-label": dict(v7=issue_json(labels=["ai-toolkit"]), env={"DISPATCH_LABEL": "ai-toolkit"}),
-    "running": dict(kept=True, running=True, dropped=True), "unreadable": dict(unreadable=True, why="cannot read the issue (unknown, or GitHub did not answer)"),
+    "running": dict(kept=True, running=True, dropped=True), "running-with-message": dict(text="on another model", kept=True, running=True, why="a worker is still live on the worktree (dispatch ctx_7): it starts once that worker ends"), "unreadable": dict(unreadable=True, why="cannot read the issue (unknown, or GitHub did not answer)"),
     "worktrees": dict(no_worktrees=True, why="cannot read the worktrees"), "dispatch-fails": dict(fails=True, why="dispatch failed: boom"),
 }
 
@@ -688,6 +708,58 @@ def test_a_queued_dispatch_request_runs_ahead_of_the_automatic_pick_within_the_c
         if asked:
             C.go("--answer", "attended")
             assert len(ran()) == (1 if c.get("fails") else 2)   # a failed dispatch is not retried on every tick (the human asks again or cancels); a refusal is asked again at the next wake: the board may have changed
+
+
+def test_a_kept_worktree_is_re_dispatched_after_its_old_agent_terminal_is_closed(C, tmp_path):
+    (tmp_path / "state/run_t/requests").mkdir(parents=True)
+    (tmp_path / "state/run_t/requests/7").write_text("on another model\n")
+    C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": "/k7", "linkedIssue": 7, "branch": "refs/heads/7-x"}]}}))
+    C.workers({**C.row("ctx_7", st="failed", lv="exited"), "agentTerminalHandle": "term_old", "resource": {"worktreeId": "r::/k7"}})
+    C.stubs.reply("gh.issue_view", issue_json())
+    C.go("--cap", "1")
+    assert in_order(C.kinds(), "orca terminal close", "dispatch.sh") is None and arg(C.calls("orca terminal close")[0], "--terminal") == "term_old"
+
+
+@pytest.mark.parametrize("rel_rc, stop, stop_rc, st, abandoned", [
+    (0, "", 0, "dispatched", False),   # worker-release settled it
+    (1, '{"ok":true,"result":{"state":"stopped"}}', 0, "completed", False),   # the stop settled
+    (1, '{"ok":true,"result":{"state":"stop_unknown"}}', 0, "dispatched", True),   # the incident: ok:true, nothing settled
+    (1, '{"ok":true,"result":{"state":"stopped"}}', 0, "dispatched", True),   # ... or an ok that leaves the dispatch dispatched
+    (1, "boom", 1, "dispatched", True),   # neither verb worked
+])
+def test_a_release_whose_stop_does_not_settle_escalates_to_worker_abandon(C, rel_rc, stop, stop_rc, st, abandoned):
+    C.workers(C.row(st=st))
+    C.stubs.reply("orca.orchestration_worker_release", "boom", rc=rel_rc)
+    C.stubs.reply("orca.orchestration_worker_stop", stop, rc=stop_rc)
+    C.mail([msg("worker_done", outcome="failed")])
+    r = C.go()
+    ab = C.calls("orca orchestration worker-abandon")
+    assert bool(ab) == abandoned and (not ab or arg(ab[0], "--dispatch") == "ctx_1" and "worker-abandon" in r.stderr and "ctx_1" in r.stderr)
+
+
+def test_a_worker_whose_only_open_question_is_an_expired_permission_request_is_swept_like_any_silent_one(C):
+    ago = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 20 * 60))
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_p", question=PQ), "run_id": "run_t", "thread_id": "msg_p", "created_at": ago}]}}))
+    C.workers(C.row()); C.show(silent=40)
+    C.go("--cap", "0", **SWEEP)
+    assert C.blocked()
+
+
+def test_replaying_the_incident_ends_with_the_issue_re_dispatched_never_a_silent_loop(C, tmp_path):
+    ago = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 12 * 60))
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_p", question=PQ), "run_id": "run_t", "thread_id": "msg_p", "created_at": ago}]}}))
+    C.spool("msg_p", "deny")   # the deny of the incident: the relay already denied it, the worker is stopped from outside and is still dispatched
+    req = tmp_path / "state/run_t/requests/1"
+    req.parent.mkdir(parents=True)
+    req.write_text("on another model\n")
+    C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 1, "branch": "refs/heads/1-x"}]}}))
+    C.stubs.reply("gh.issue_view", issue_json())
+    C.stubs.reply("orca.orchestration_reply", json.dumps({"error": {"code": "bad_state"}}), rc=1)
+    C.go("--answer", "attended", "--cap", "1")
+    assert not C.calls("orca orchestration reply") and not C.spooled("msg_p") and req.read_text().splitlines()[1].startswith("a worker is still live on the worktree (dispatch ctx_1)")   # kept with its reason, the stale reply dropped
+    C.workers(C.row(st="failed", lv="exited"))   # the human abandoned the worker
+    C.go("--answer", "attended", "--cap", "1")
+    assert C.stubs.calls("dispatch.sh") == [["--address", "on another model", "1"]] and not req.exists()
 
 
 def test_status_lists_the_queue_in_the_order_to_present_it_and_the_dispatch_requests_with_their_reason(C, tmp_path):
