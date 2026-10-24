@@ -56,7 +56,7 @@ def test_up_falls_back_to_the_keychain_and_keeps_the_secret_off_argv(run, docker
     r = run([OTEL, "up"])
     assert r.returncode == 0, r.stderr
     sec = docker.calls("security")
-    assert [c[2] for c in sec] == [f"ai-toolkit-langfuse-LANGFUSE_INIT_PROJECT_{k}_KEY" for k in ("PUBLIC", "SECRET")]
+    assert [c[4] for c in sec] == [f"ai-toolkit-langfuse-LANGFUSE_INIT_PROJECT_{k}_KEY" for k in ("PUBLIC", "SECRET")]
     assert f"LANGFUSE_BASIC_AUTH={HEADER}" in docker.env("docker")
     assert not any("sk-lf" in a or "cGstbGYt" in a for c in docker.calls("docker") + docker.calls("curl") for a in c)
     assert "sk-lf" not in r.stdout + r.stderr
