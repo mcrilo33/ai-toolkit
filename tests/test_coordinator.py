@@ -740,6 +740,7 @@ def test_an_exited_worker_with_a_queued_replace_request_is_released_not_relaunch
     (tmp_path / "state/run_t/requests").mkdir(parents=True)
     (tmp_path / "state/run_t/requests/1").write_text("on another model\nx\n")
     C.workers(C.row(lv="exited"))
+    C.stubs.reply("gh.issue_view", issue_json())
     C.go("--cap", "1", **SWEEP)
     assert not relaunches(C) and C.calls("orca orchestration worker-release")
 
