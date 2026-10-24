@@ -238,7 +238,7 @@ def test_a_takeover_during_answer_sh_exits_instead_of_asking_the_human(C):
 
 
 def test_a_replayed_worker_done_for_an_already_closed_issue_is_acked_without_landing_or_blocking(C):
-    C.stubs.reply("gh.issue_view", "CLOSED\n")
+    C.stubs.reply("gh.issue_view", json.dumps({"state": "CLOSED", "labels": []}))
     C.mail([msg("worker_done", "msg_d", outcome="succeeded")])
     r = C.go()
     assert r.returncode == 0 and "already landed" in r.stdout
