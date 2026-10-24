@@ -1242,6 +1242,7 @@ def test_a_merge_back_that_conflicts_blocks_the_issue_once_while_a_failed_cleanu
     C.stubs.reply(key("land.sh", "--merged", "1"), "land.sh: conflict\n", rc=rc)
     C.go(COORD_SWEEP_EVERY=1, **INT)
     edits, comments = [a[3:] for a in C.calls("gh issue edit")], [a[-1] for a in C.calls("gh issue comment")]
+    assert C.stubs.calls("land.sh") == [["--merged", "1"]]
     if blocks:
         assert ["--add-label", "blocked"] in edits and ["--remove-label", AWAITING] not in edits
         assert comments == ["blocked: https://x/pull/5: merge of develop back into main conflicts: merge it by hand and push, then remove the blocked label"]
