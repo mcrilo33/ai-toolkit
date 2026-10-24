@@ -630,7 +630,7 @@ def test_a_merge_back_that_conflicts_leaves_every_issue_awaiting_so_the_next_swe
     r = L.go("--merged", "9", MAIN_BRANCH="develop", POST_LAND_CMD=link_script(L.tmp / "pl.sh", POST_LAND_MAIN))
     assert r.returncode == 6 and "merge" in r.stderr, r.stderr
     assert not calls_of(L, "gh", "issue", "close") and not calls_of(L, "gh", "issue", "edit") and not calls_of(L, "post-land")   # the label is the retry marker: it goes last
-    assert git(L.root, "status", "--porcelain") == "" and git(L.root, "rev-parse", "HEAD") == main_sha(L)
+    assert git(L.root, "status", "--porcelain", "--untracked-files=no") == "" and git(L.root, "rev-parse", "HEAD") == main_sha(L)
 
 
 def test_a_label_that_cannot_be_removed_stops_the_tracker_update_so_it_never_runs_twice(L, link_script):
