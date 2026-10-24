@@ -145,7 +145,7 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
   [ -z "$mine" ] || echo "being answered by the loop:$mine"   # not decisions: no text, no reply command
   [ -z "$main_kind" ] || { echo "awaiting main:"; awaiting_q open | jq -r '.[] | "\(.number)\t\(.title)"' | while IFS=$'\t' read -r n t; do
     pr="$(pr_of "$n" 2> /dev/null)" || pr="{}"   # the PR url and a requested change: the human's to decide when the PR is the rolling one
-    echo "  #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120): $(jq -r '.url // "no PR found"' <<< "$pr")$(jq -r 'if .reviewDecision == "CHANGES_REQUESTED" then " (changes requested)" else "" end' <<< "$pr")"; done; } || true
+    echo "  #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120): $(jq -r '.url // "no PR found"' <<< "$pr")$(! pr_changes_requested "$pr" || echo " (changes requested)")"; done; } || true
   echo "dispatch requests:"
   for f in "$(spool_dir "$run")/requests"/*; do [ -f "$f" ] && echo "  #${f##*/} $(head -n 1 "$f"): $(sed -n 2p "$f" | grep . || echo queued)"; done
   exit 0
@@ -459,9 +459,9 @@ pr_sweep() {   # the PR of each issue awaiting its merge into MAIN_BRANCH (heade
     [ -n "$n" ] || continue; why=""
     pr="$(pr_of "$n")" || continue
     case "$(jq -r .state <<< "$pr")" in
-      MERGED) out="$(RUN="$run" "$LAND_CMD" --merged "$n" 2>&1)" && log "#$n merged into $MAIN_BRANCH" || warn "#$n: land.sh --merged failed, tried again at the next sweep: ${out##*$'\n'}" ;;
+      MERGED) out="$(RUN="$run" "$LAND_CMD" --merged "$n" 2>&1)" && log "#$n merged into $MAIN_BRANCH" || warn "#$n: its PR is merged but land.sh --merged did not finish; the issue stays awaiting main and the next sweep tries again: ${out##*$'\n'}" ;;
       CLOSED) why="closed without merge" ;;
-      OPEN) [ "$main_kind" != pr ] || [ "$(jq -r .reviewDecision <<< "$pr")" != CHANGES_REQUESTED ] || why="changes requested" ;;
+      OPEN) [ "$main_kind" != pr ] || ! pr_changes_requested "$pr" || why="changes requested" ;;
     esac
     [ -z "$why" ] || [ "$st" != OPEN ] || { issue="$n"; disp=""; wtp=""; status_label remove "$n" "$AWAITING_LABEL"; block "$(jq -r .url <<< "$pr"): $why"; }
   done <<< "$rows"

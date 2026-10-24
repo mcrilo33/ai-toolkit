@@ -23,7 +23,7 @@
 # MAIN_BRANCH (settings/ai-toolkit.env) is where an issue is DONE; empty = BASE_BRANCH, everything above is unchanged. MAIN_BRANCH != BASE_BRANCH (an integration branch): the land
 # still pushes BASE_BRANCH, but the issue stays OPEN with `status:awaiting-main`, one rolling PR BASE_BRANCH -> MAIN_BRANCH lists `Closes #<n>` for every issue waiting, POST_LAND_CMD
 # does not run, and the cleanup runs (the work is on the base). LAND_MODE=pr (a protected base): nothing is pushed to the base; the branch gets its own PR into it (a draft while CI
-# gates its tip, then ready), the issue waits the same way, the worker is released and the branch and worktree are kept for --address. Both exit 7. Humans merge; the toolkit never
+# gates its tip, then ready: the project's CI must run on draft PRs, jobs skipped on a draft would pass the gate), the issue waits the same way, the worker is released and the branch and worktree are kept for --address. Both exit 7. Humans merge; the toolkit never
 # merges into MAIN_BRANCH. --merged <n>: the PR that carries #n is MERGED (a squash merge defeats the landed check, the PR state is the proof; else exit 2, nothing touched): close
 # each issue still awaiting main in it (`merged into <MAIN_BRANCH> in <merge sha>`), drop the label, run POST_LAND_CMD <n> <key> <merge sha> (BASE_BRANCH and MAIN_BRANCH in its
 # environment), then remove the branch and worktree (pr) or merge origin/MAIN_BRANCH back into BASE_BRANCH and push it (integration: a squash merge leaves the base diverged).
@@ -105,15 +105,7 @@ land_merged() {   # --merged <n>: exits; every step but the proof is retried by 
   git fetch -q --prune origin || die "git fetch origin failed"
   git merge-base --is-ancestor HEAD "origin/$BASE_BRANCH" || bail 2 "refused: local $BASE_BRANCH is not at origin/$BASE_BRANCH (ahead or diverged)"
   git merge -q --ff-only "origin/$BASE_BRANCH"
-  ids="$n"; [ "$main_kind" != integration ] || ids="$(jq -r '.body | [scan("Closes #([0-9]+)") | .[0]] | unique | .[]' <<< "$pr")"
-  for m in $ids; do
-    v="$(gh issue view "$m" --json state,labels)" || { warn "cannot read #$m: run --merged again"; bad=1; continue; }
-    jq -e --arg l "$AWAITING_LABEL" '.labels | map(.name) | index($l)' <<< "$v" > /dev/null || continue   # already handled: the label is the marker
-    [ "$(jq -r .state <<< "$v")" != OPEN ] || gh issue close "$m" -c "merged into $MAIN_BRANCH in $sha" > /dev/null || { warn "cannot close #$m: run --merged again"; bad=1; continue; }
-    status_label remove "$m" "$AWAITING_LABEL"
-    post_land "$m" "$sha"
-    printf 'merged #%s into %s in %s\n' "$m" "$MAIN_BRANCH" "$sha"
-  done
+  # The cleanup comes first and the label goes last: the label is what the loop's next sweep retries from, so a step that fails here leaves every issue awaiting main.
   if [ "$main_kind" = pr ] && o="$(orca_json worktree show --worktree "issue:$n" 2> /dev/null)"; then
     branch="$(jq -r '.result.worktree.branch | sub("^refs/heads/"; "")' <<< "$o")"
     if git rev-parse -q --verify "refs/remotes/origin/$branch" > /dev/null; then git push -q origin ":refs/heads/$branch" || { warn "cannot delete origin/$branch"; bad=1; }; fi
@@ -121,8 +113,18 @@ land_merged() {   # --merged <n>: exits; every step but the proof is retried by 
   fi
   if [ "$main_kind" = integration ] && ! git merge-base --is-ancestor "origin/$MAIN_BRANCH" HEAD; then   # a squash merge leaves the base diverged: bring the true main back so the next rolling PR shows only new work
     git merge -q --no-edit "origin/$MAIN_BRANCH" > /dev/null && git push -q origin "$BASE_BRANCH" \
-      || { git merge --abort 2> /dev/null || true; git reset -q --hard "origin/$BASE_BRANCH"; warn "cannot merge origin/$MAIN_BRANCH back into $BASE_BRANCH: do it by hand"; bad=1; }
+      || { git merge --abort 2> /dev/null || true; git reset -q --hard "origin/$BASE_BRANCH"; warn "cannot merge origin/$MAIN_BRANCH back into $BASE_BRANCH: do it by hand, the next sweep finishes the rest"; bad=1; }
   fi
+  [ "$bad" = 0 ] || bail 6 "merged into $MAIN_BRANCH, but the cleanup is incomplete: the issues stay awaiting main, run --merged again"
+  ids="$n"; [ "$main_kind" != integration ] || ids="$(jq -r '.body | [scan("Closes #([0-9]+)") | .[0]] | unique | .[]' <<< "$pr")"
+  for m in $ids; do
+    v="$(gh issue view "$m" --json state,labels)" || { warn "cannot read #$m: run --merged again"; bad=1; continue; }
+    jq -e --arg l "$AWAITING_LABEL" '.labels | map(.name) | index($l)' <<< "$v" > /dev/null || continue   # already handled: the label is the marker
+    [ "$(jq -r .state <<< "$v")" != OPEN ] || gh issue close "$m" -c "merged into $MAIN_BRANCH in $sha" > /dev/null || { warn "cannot close #$m: run --merged again"; bad=1; continue; }
+    gh issue edit "$m" --remove-label "$AWAITING_LABEL" > /dev/null || { warn "cannot remove $AWAITING_LABEL from #$m: its tracker update waits for the next run"; bad=1; continue; }   # else the next run would repeat post_land
+    post_land "$m" "$sha"
+    printf 'merged #%s into %s in %s\n' "$m" "$MAIN_BRANCH" "$sha"
+  done
   [ "$bad" = 0 ] || bail 6 "merged into $MAIN_BRANCH, but a step failed: see the warnings, run --merged again"
   exit 0
 }
@@ -148,7 +150,9 @@ else bail 2 "refused: no Orca worktree is linked to issue $n"; fi
 [ "$branch" != "$BASE_BRANCH" ] || bail 2 "refused: issue $n's branch is the base branch $BASE_BRANCH"
 # Behind origin/main is fine (the gated tip contains it); ahead or diverged would ship commits that never ran the gate.
 git merge-base --is-ancestor HEAD "origin/$BASE_BRANCH" || bail 2 "refused: local $BASE_BRANCH is not at origin/$BASE_BRANCH (ahead or diverged)"
-if [ "$co" = 1 ]; then [ "$main_kind" = pr ] || git merge-base --is-ancestor "$tip" "origin/$BASE_BRANCH" || bail 2 "refused: $branch is not landed on $BASE_BRANCH"
+if [ "$co" = 1 ]; then
+  if [ "$main_kind" = pr ]; then pr_of "$n" > /dev/null || bail 2 "refused: no pull request into $MAIN_BRANCH carries #$n: $branch was not landed"   # the PR is the land
+  else git merge-base --is-ancestor "$tip" "origin/$BASE_BRANCH" || bail 2 "refused: $branch is not landed on $BASE_BRANCH"; fi
 else [ "$(git rev-parse -q --verify "refs/remotes/origin/$branch" || true)" = "$tip" ] || bail 2 "refused: $branch is not pushed (origin/$branch != spoke HEAD)"; fi
 
 # --- review (WP2 hook point), then the merge-and-gate loop
