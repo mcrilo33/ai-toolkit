@@ -12,7 +12,7 @@ auth="${LANGFUSE_BASIC_AUTH:-}" pk="${LANGFUSE_PUBLIC_KEY:-}" sk="${LANGFUSE_SEC
 unset LANGFUSE_BASIC_AUTH LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY
 load_env
 [ -z "${LANGFUSE_BASIC_AUTH:-}${LANGFUSE_SECRET_KEY:-}" ] ||
-  echo "otel.sh: ignoring LANGFUSE_BASIC_AUTH/LANGFUSE_SECRET_KEY found in an env file: move the key pair to the Keychain" >&2
+  warn "ignoring LANGFUSE_BASIC_AUTH/LANGFUSE_SECRET_KEY found in an env file: move the key pair to the Keychain"
 keychain() { security find-generic-password -a "${USER:-$(id -un)}" -s "ai-toolkit-langfuse-LANGFUSE_INIT_PROJECT_$1_KEY" -w 2> /dev/null || true; }
 dc() { docker compose -p ai-toolkit-otel -f "${OTEL_COMPOSE_FILE:-$here/../langfuse/compose.yaml}" "$@"; }
 export AITK_OTEL_RAW_DIR="${AITK_OTEL_RAW_DIR:-$HOME/.ai-toolkit/otel-raw}"
@@ -36,7 +36,7 @@ case "${1:-}" in
     code="$(printf 'header = "Authorization: %s"\n' "$auth" | curl -sS -m 5 -K - -o /dev/null -w '%{http_code}' "$lf_host/api/public/projects" 2> /dev/null)" || code=000
     case "$code" in
       2??) ;;
-      000) echo "otel.sh: Langfuse unreachable at $lf_host, starting without checking the credential" >&2 ;;
+      000) warn "Langfuse unreachable at $lf_host, starting without checking the credential" ;;
       *) die "Langfuse rejected the credential (HTTP $code)" ;;
     esac
     mkdir -p "$AITK_OTEL_RAW_DIR" && chmod 700 "$AITK_OTEL_RAW_DIR"  # holds prompts and tool output in plaintext
@@ -44,7 +44,8 @@ case "${1:-}" in
   down) dc down ;;
   status)
     [ -n "$(dc ps --status running --quiet 2> /dev/null || true)" ] || { echo down; exit 1; }
-    fails="$(LC_ALL=C docker logs --since 15m lf-collector 2>&1 | grep 'Exporting failed.*otlp_http/langfuse' || true)"
+    export LC_ALL=C
+    fails="$(docker logs --since 15m lf-collector 2>&1 | grep 'Exporting failed.*otlp_http/langfuse' || true)"
     [ -n "$fails" ] || { echo up; exit 0; }
     last="$(printf '%s\n' "$fails" | tail -1 | sed -nE 's/.*HTTP Status Code ([0-9]+).*/\1/p')"
     echo "degraded: $(printf '%s\n' "$fails" | wc -l | tr -d ' ') export failures in 15m (last: ${last:-no HTTP status})"; exit 3 ;;
