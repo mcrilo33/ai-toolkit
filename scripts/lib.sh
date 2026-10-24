@@ -93,13 +93,33 @@ issue_text() {
   wait_until "${ORCA_LINK_TRIES:-40}" "${AI_TOOLKIT_POLL:-3}" _issue_text_once "$1" || { printf '%s: cannot read issue %s from GitHub (%s); nothing is judged\n' "${0##*/}" "$1" "${_ISSUE_ERR:-gh failed or returned nothing}" >&2; return 1; }
 }
 
-# status_label <add|remove> <issue>: the one `status:in-progress` marker follows the worker. A failure only warns: the work it marks is already done.
+# status_label <add|remove> <issue> [label]: the one `status:in-progress` marker follows the worker (label: status:awaiting-main for an issue waiting on its merge into MAIN_BRANCH).
+# A failure only warns: the work it marks is already done.
+# shellcheck disable=SC2034  # read by land.sh, dispatch.sh and coordinator.sh
+AWAITING_LABEL="status:awaiting-main"
 status_label() {
-  local l="status:in-progress"
+  local l="${3:-status:in-progress}"
   if [ "$1" = add ]; then
     gh issue edit "$2" --add-label "$l" > /dev/null 2>&1 \
       || { gh label create "$l" --color FBCA04 > /dev/null 2>&1 || true; gh issue edit "$2" --add-label "$l" > /dev/null || warn "cannot label #$2 $l"; }
   else gh issue edit "$2" --remove-label "$l" > /dev/null || warn "cannot remove $l from #$2"; fi
+}
+
+# resolve_main: sets MAIN_BRANCH (the true main, where an issue is done) and main_kind: "" = done at land (MAIN_BRANCH empty or = BASE_BRANCH), integration (MAIN_BRANCH != BASE_BRANCH:
+# the toolkit pushes BASE_BRANCH, humans merge into MAIN_BRANCH), pr (LAND_MODE=pr: the base is protected, each issue is a PR into it). rc 1 = an incoherent pair.
+resolve_main() {
+  local base="${BASE_BRANCH:-}"
+  case "${LAND_MODE:-}" in
+    pr) [ -z "${MAIN_BRANCH:-}" ] || [ "$MAIN_BRANCH" = "$base" ] || return 1; MAIN_BRANCH="$base"; main_kind="pr" ;;
+    "") MAIN_BRANCH="${MAIN_BRANCH:-$base}"; main_kind=""; [ "$MAIN_BRANCH" = "$base" ] || main_kind=integration ;;
+    *) return 1 ;;
+  esac
+}
+# pr_of <n>: the newest PR into MAIN_BRANCH (integration: from BASE_BRANCH) whose body says `Closes #n`, as one JSON object; rc 1 = none, or gh failed.
+pr_of() {
+  local hd=(); [ "$main_kind" != integration ] || hd=(--head "$BASE_BRANCH")
+  gh pr list --base "$MAIN_BRANCH" ${hd[@]+"${hd[@]}"} --state all --limit 100 --json number,url,state,reviewDecision,mergeCommit,body \
+    | jq -ce --argjson n "$1" '[.[] | select(.body | test("Closes #\($n)([^0-9]|$)"))] | sort_by(.number) | last // empty'
 }
 
 # issue_footer <body> <Key>: value of the last `Key: value` line (Scope:, Gate:, Model:).

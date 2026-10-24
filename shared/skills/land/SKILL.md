@@ -16,6 +16,10 @@ argument-hint: "[issue number]"
    With `POST_LAND_CMD` set and a `Tracker:` footer, `<cmd> <n> <key> <sha>` runs right after the push (never on `--cleanup-only`); a failure only comments.
 5. `orca orchestration worker-release`, then `orca worktree rm --worktree issue:<n> --run-hooks`.
 
+`MAIN_BRANCH` (empty = the base) is where an issue is done. Different from the base (an integration branch), step 4 still pushes the base but leaves the issue open as `status:awaiting-main`, opens or updates one rolling PR base -> `MAIN_BRANCH`
+(`Closes #<n>` per waiting issue), skips `POST_LAND_CMD`, and exits 7. `LAND_MODE=pr` (protected base): no push, one PR per issue (a draft while CI gates the tip), branch and worktree kept, exit 7. Humans merge; `land.sh --merged <n>`
+(the loop runs it) proves the merge from the PR, closes the issues, runs `POST_LAND_CMD` and cleans up. Landed means merged into `MAIN_BRANCH`.
+
 Run it on the main worktree only (it refuses elsewhere). The coordinator calls it itself on
 `worker_done succeeded`; run it by hand for an attended land.
 

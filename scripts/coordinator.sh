@@ -16,6 +16,9 @@
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
 # consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
 # the Run from this terminal, then wait until the loop is gone. Without a terminal handle (a chat session) --stop runs itself in a coordinator-stop terminal and exits with that run's status.
+# MAIN_BRANCH != BASE_BRANCH or LAND_MODE=pr (#507): a land that exits 7 is on BASE_BRANCH or in a PR, its issue open as `status:awaiting-main`: logged, never blocked. At each sweep the PR of every such issue is read:
+# MERGED -> land.sh --merged (closes the issue, POST_LAND_CMD); CLOSED without a merge -> blocked with the PR url; CHANGES_REQUESTED -> blocked for an issue's own PR (LAND_MODE=pr), only shown by --status for the
+# rolling PR (it carries many issues: the human decides); an open PR without a decision, no PR found or a failed gh read -> left alone, read again at the next sweep.
 # A failed Orca read is one warning naming the call and its error code, retried at the next wake; an exit on an error is logged with its status and the failing command (attended: typed into the session), and --status says when no loop runs.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -39,6 +42,7 @@ case "$answer" in auto | attended | human) ;; *) usage_exit "--answer takes auto
 [ "$watch" = 0 ] || [ -n "$run" ] || usage_exit "--wait needs --run <run-id>"
 [ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"; [[ -z $session || $session =~ ^term_[A-Za-z0-9_-]+$ ]] || usage_exit "--session takes an Orca terminal handle"; [ "$answer" != attended ] || [ -n "$session" ] || warn "attended without --session: the loop cannot tell the session of a decision, only --status shows the queue"
 case "$cap$until" in *[!0-9:]* | '') usage_exit "--cap takes a number and --until HH:MM" ;; esac
+resolve_main || usage_exit "LAND_MODE is empty or pr, and pr needs MAIN_BRANCH empty or equal to BASE_BRANCH (LAND_MODE=${LAND_MODE:-}, MAIN_BRANCH=${MAIN_BRANCH:-}, BASE_BRANCH=${BASE_BRANCH:-})"
 [ "$reply" = 0 ] || exec "$here/reply.sh" "$run" "$reply_id" "$reply_body"   # the human's answer, queued for the loop (the only state v2 keeps, with holder.<pid>, held: the ids the loop left open for the human, and landing: the land under way)
 if [ "$dreq" = 1 ]; then   # a dispatch request: <issue> = its one-line message (empty = a plain dispatch), queued in the reply spool's shape for the loop's next wake
   [ -n "$run" ] || usage_exit "--dispatch needs --run <run-id>"; [[ $dreq_n =~ ^[0-9]+$ ]] || usage_exit "--dispatch takes an issue number and an optional one-line message"
@@ -112,6 +116,7 @@ open_q() {   # the open questions a human can still answer, oldest first (Orca l
       and ((($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") | not) or ((try ((.created_at | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)) catch $now) >= $now - 540)))' <<< "$o"
 }
 blocked_q() { gh issue list --label blocked ${DISPATCH_LABEL:+--label "$DISPATCH_LABEL"} --state open --limit 100 --json number,title,labels | jq -r '[.[] | select(.labels | map(.name) | index("hold") | not)] | sort_by(.number)[] | "\(.number)\t\(.title)"'; }   # hold = parked on purpose
+awaiting_q() { gh issue list --label "$AWAITING_LABEL" --state "$1" --limit 100 --json number,title,state; }   # $1 open|all: the issues waiting for their merge into MAIN_BRANCH (all: GitHub may have closed one with its PR's Closes)
 queue_ids() {   # the decisions waiting for the human, in the order to present them, one word each: q:<message id> (a plan: a worker waits, a slot is held) or p:<message id> (a permission request), then b:<issue> (blocked; a review that kept rejecting is one)
   local q; q="$(open_q | jq -r '"\(if ((.payload // "{}" | if type == "string" then fromjson else . end).question // .body // "") | test("^\\s*PERMISSION REQUEST") then "p" else "q" end):\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
 }
@@ -138,6 +143,9 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
     echo "  blocked #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)${w:+: $w}"
     echo "    decide: re-dispatch (comment the guidance, then remove the blocked label, or --dispatch $n '<message>'), park it with the hold label, or close it"; done
   [ -z "$mine" ] || echo "being answered by the loop:$mine"   # not decisions: no text, no reply command
+  [ -z "$main_kind" ] || { echo "awaiting main:"; awaiting_q open | jq -r '.[] | "\(.number)\t\(.title)"' | while IFS=$'\t' read -r n t; do
+    pr="$(pr_of "$n" 2> /dev/null)" || pr="{}"   # the PR url and a requested change: the human's to decide when the PR is the rolling one
+    echo "  #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120): $(jq -r '.url // "no PR found"' <<< "$pr")$(jq -r 'if .reviewDecision == "CHANGES_REQUESTED" then " (changes requested)" else "" end' <<< "$pr")"; done; } || true
   echo "dispatch requests:"
   for f in "$(spool_dir "$run")/requests"/*; do [ -f "$f" ] && echo "  #${f##*/} $(head -n 1 "$f"): $(sed -n 2p "$f" | grep . || echo queued)"; done
   exit 0
@@ -337,6 +345,7 @@ on_done() {
     ((++t < 3)) || { block "cannot read the issue (GitHub did not answer), so its hold label is unknown: not landed on a guess"; return 0; }; sleep "${AI_TOOLKIT_POLL:-3}"
   done
   [ "$(jq -r .state <<< "$v")" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; return 0; }
+  ! jq -e --arg l "$AWAITING_LABEL" '.labels | map(.name) | index($l)' <<< "$v" > /dev/null || { log "#$issue already awaiting its merge into $MAIN_BRANCH (replayed worker_done)"; return 0; }
   if jq -e '.labels | map(.name) | index("hold")' <<< "$v" > /dev/null; then   # the human's "do not land yet": the worktree stays, the batch ack still closes this delivery
     log "#$issue: worker_done held (hold label), not landed"
     comment "$issue" "Finished but held: the hold label stops the land and the worktree is kept. To land it, remove the hold label (gh issue edit $issue --remove-label hold), then queue: bash $here/coordinator.sh --run $run --dispatch $issue 'address: send worker_done again' (its next worker_done lands)."
@@ -347,6 +356,7 @@ on_done() {
   printf '%s\n' "$out"; last="$(tail -n 1 <<< "$out")"
   case $rc in
     0) log "#$issue landed" ;;
+    7) log "#$issue: $([ "$main_kind" != integration ] || echo "on $BASE_BRANCH, ")awaiting merge into $MAIN_BRANCH ($(sed -n 's/^PR: //p' <<< "$out" | tail -n 1))" ;;
     3) bl="$(sed -n 's/^BLOCKER: //p' <<< "$out" | awk '{ printf "%s(%d) %s", (NR > 1 ? " " : ""), NR, $0 }')"   # no blocker lines = no usable verdict: nothing the worker could address
        if [ -n "$bl" ]; then redispatch 2 "address: the independent review requested changes. Fix each blocker test-first, push, then send worker_done again. Blockers: $bl" "review still rejects after 2 rounds"
        else block "the independent review gave no usable verdict"; fi ;;
@@ -356,10 +366,10 @@ on_done() {
       esac ;;
     6) if [ -z "$br" ]; then block "landed, but Orca gives no branch for worktree $wtp, so cleanup cannot name it (finish with land.sh --cleanup-only --branch <name> $issue); blocked so the still-open issue is not dispatched again"
        else landing; RUN="$run" "$LAND_CMD" --cleanup-only --branch "$br" --tip "$(git rev-parse HEAD)" --dispatch "$disp" "$issue" \
-         || block "landed, but cleanup is incomplete (finish with land.sh --cleanup-only $issue); blocked so the still-open issue is not dispatched again"; fi ;;
+         || [ $? = 7 ] || block "landed, but cleanup is incomplete (finish with land.sh --cleanup-only $issue); blocked so the still-open issue is not dispatched again"; fi ;;
     *) block "land.sh exited $rc: $last" ;;
   esac; rm -f "$sd/landing"
-  case $rc in 0 | 6) triage "$out" "$(jq -r '.body // ""' <<< "$1")" || true ;; esac   # landed: what is left over goes to the scopers, after the land's own work
+  case $rc in 0 | 6 | 7) triage "$out" "$(jq -r '.body // ""' <<< "$1")" || true ;; esac   # landed: what is left over goes to the scopers, after the land's own work
 }
 handle() {
   case "$(jq -r .type <<< "$1")" in
@@ -441,6 +451,21 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
   done
 }
 
+pr_sweep() {   # the PR of each issue awaiting its merge into MAIN_BRANCH (header); a failed gh read changes nothing
+  local rows n st pr why out
+  [ -n "$main_kind" ] || return 0
+  rows="$(awaiting_q all | jq -r '.[] | "\(.number) \(.state)"')" || return 0
+  while read -r n st; do
+    [ -n "$n" ] || continue; why=""
+    pr="$(pr_of "$n")" || continue
+    case "$(jq -r .state <<< "$pr")" in
+      MERGED) out="$(RUN="$run" "$LAND_CMD" --merged "$n" 2>&1)" && log "#$n merged into $MAIN_BRANCH" || warn "#$n: land.sh --merged failed, tried again at the next sweep: ${out##*$'\n'}" ;;
+      CLOSED) why="closed without merge" ;;
+      OPEN) [ "$main_kind" != pr ] || [ "$(jq -r .reviewDecision <<< "$pr")" != CHANGES_REQUESTED ] || why="changes requested" ;;
+    esac
+    [ -z "$why" ] || [ "$st" != OPEN ] || { issue="$n"; disp=""; wtp=""; status_label remove "$n" "$AWAITING_LABEL"; block "$(jq -r .url <<< "$pr"): $why"; }
+  done <<< "$rows"
+}
 tell() {   # $1 kind (p|q|b|h = a finished issue held|r = a dropped reply), $2 id: one fixed line typed into the session's terminal, never text a worker wrote (it lands in an agent's prompt); no --session = nothing to send
   [ -n "$session" ] || return 0; local kind=plan id txt; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; h) kind="finished issue held" ;; r) kind=reply ;; esac; id="$(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2")"
   txt="new decision waiting: $kind $id. Read it whole, present it with one recommendation, then ring."; [ "$1" != r ] || txt="reply to $id was dropped after repeated send failures: its question may still be open, present it again."
@@ -482,7 +507,7 @@ while :; do
   msgs="$(jq -c '.result.messages[]?' <<< "$out" 2> /dev/null)" || msgs=""
   if [ -z "$msgs" ]; then
     empties=$((empties + 1)); [ "$rc" = 0 ] || sleep "${AI_TOOLKIT_POLL:-3}"
-    [ $((empties % ${COORD_SWEEP_EVERY:-2})) -ne 0 ] || { sweep; bdirty=1; }
+    [ $((empties % ${COORD_SWEEP_EVERY:-2})) -ne 0 ] || { sweep; pr_sweep; bdirty=1; }
     notify_queue; continue
   fi
   # fd 3, not stdin: a handler that reads stdin (claude -p, ssh) must not swallow the rest of the batch.

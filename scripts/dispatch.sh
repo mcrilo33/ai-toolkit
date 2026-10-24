@@ -32,7 +32,7 @@ done
 main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 base="origin/$BASE_BRANCH"
 
-# Ready = not hold/blocked, blockers closed, not in flight, Scope disjoint from every in-flight Scope
+# Ready = not hold/blocked/awaiting-main (merged into BASE_BRANCH or in a PR, waiting for MAIN_BRANCH), blockers closed, not in flight, Scope disjoint from every in-flight Scope
 # (a missing or `*` scope is exclusive and collides with everything); `priority` first, then number.
 # shellcheck disable=SC2016
 PICK='def scope: [(.body // "") | split("\n")[] | select(test("^\\s*[Ss]cope:"))] | .[-1]
@@ -45,7 +45,7 @@ PICK='def scope: [(.body // "") | split("\n")[] | select(test("^\\s*[Ss]cope:"))
       | select($only == null or $i.number == $only)
       | select(($busy | index($i.number)) == null)
       | select($label == "" or (names | index($label)) != null)
-      | select(names | any(. == "hold" or . == "blocked") | not)
+      | select(names | any(. == "hold" or . == "blocked" or . == "status:awaiting-main") | not)
       | select([$i.blockedBy.nodes[] | select(.state != "CLOSED")] | length == 0)
       | select($held | all(clash($s; .) | not))
       | {n: $i.number, p: (if (names | index("priority")) == null then 1 else 0 end)}]
@@ -119,6 +119,7 @@ dispatch() {
   name="$n-${slug:-issue}"
   if [ -n "$retry_of$address" ]; then launch_retry; else "launch_${DISPATCH_LAUNCH:-twostep}"; fi
   status_label add "$n"
+  [ -z "$retry_of$address" ] || gh issue edit "$n" --remove-label "$AWAITING_LABEL" > /dev/null 2>&1 || true   # a reviewer asked for changes: the issue is worked again
   orca_json worktree set --worktree "$sel" --issue "$n" --workspace-status in-progress > /dev/null || die "worktree set failed for $sel"
   record_dispatch "$run" "$disp" "$n"   # what coordinator.sh's ctx() checks Orca's link against: the worker can relink its worktree, not rewrite this
   jq -nc --argjson issue "$n" --arg dispatch "$disp" --arg worktree "$wt" --arg terminal "$term" \
