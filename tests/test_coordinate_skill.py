@@ -100,7 +100,7 @@ def test_a_chat_session_decision_is_alerted_by_a_mandatory_ask_user_question_car
     assert "holds only the question" in chat and "#<n>: <choice>?" in chat and "no `preview`" in chat   # a short card question; Orca renders no option preview
     assert re.search(r"option.s description says what", chat)
     assert "inline chat visuals" in chat and "one-line choice" in chat   # a condensed visual in the technical level, none when a line is enough
-    assert "folds" in chat and "sleep" in chat and re.search(r"PushNotification.{0,200}final text", chat)   # Orca folds text written before a tool call: tools first, the context is the turn's last output
+    assert "folds" in chat and "background `sleep" in chat and "final text, no tool call after" in chat and re.search(r"PushNotification.{0,200}final text", chat)   # Orca folds text written before a tool call: tools first, the context is the turn's last output
     assert re.search(r"card alone.{0,40}no text before", chat) and "turn 1 short" in chat   # turn 2 is the bare card; a short turn 1 keeps a permission request inside its 9 minutes
 
 
