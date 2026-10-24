@@ -513,6 +513,20 @@ def test_relay_allows_only_on_the_exact_word_allow(relay, reply, behavior):
     assert behavior == "allow" or "Do not retry the same call" in r.out["decision"]["message"]  # an explicit deny, or any reply that is not allow, is final
 
 
+@pytest.mark.parametrize("tool, command, own_message", [
+    ("Bash", 'orca orchestration send --from t --type worker_done --subject "done" --body "x" --outcome succeeded', True),
+    ("Bash", "orca orchestration send --from t --type worker_done --body 'reworded' --task-id t", True),
+    ("Bash", 'orca orchestration send --from t --type heartbeat --body "worker_done soon"', False),   # another message type, or the word in a body
+    ("Bash", "echo --type worker_done", False), ("Write", "orca orchestration send --type worker_done", False)])   # not an orchestration send / not a Bash call
+def test_relay_deny_of_a_worker_done_forbids_every_resend_and_sends_the_worker_to_the_coordinator(relay, tool, command, own_message):
+    r = relay.run(tool, {"command": command, "file_path": "a", "content": command}, reply="deny")
+    msg = r.out["decision"]["message"]
+    assert r.behavior == "deny" and r.asks == 1
+    assert own_message == ("say so in your worker_done report" not in msg)   # the generic text tells the worker to send worker_done again: a reworded resend obeys it
+    assert own_message == (("in any form" in msg) and ("orchestration ask" in msg))
+    assert own_message or "Do not retry the same call" in msg
+
+
 def test_relay_does_nothing_outside_a_worker(relay):
     (relay.dir / ".ai-toolkit/spoke-run-id").unlink()
     r = relay.run()

@@ -442,6 +442,24 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
         assert any("w4" in a[-1] and "w5" in a[-1] for a in C.calls("gh issue comment")[1:])
 
 
+@pytest.mark.parametrize("mode", ["human", "attended"])   # attended also tells the session; neither lands
+def test_a_finished_worker_on_a_held_issue_is_not_landed_and_the_comment_gives_the_way_back(C, mode):
+    C.stubs.reply("gh.issue_view", issue_json(labels=["hold"]))
+    C.mail([msg("worker_done", "msg_d", outcome="succeeded")])
+    r = C.go("--answer", mode)
+    assert r.returncode == 0 and not C.stubs.calls("land.sh") and "#1: worker_done held (hold label), not landed" in r.stdout
+    assert not any(k in C.kinds() for k in ("orca worktree rm", "orca orchestration worker-release")) and len(C.calls("orca orchestration check ack")) == 1   # the worktree and the worker stay, the delivery is acked
+    c = [a[-1] for a in C.calls("gh issue comment")]
+    assert len(c) == 1 and "remove the hold label" in c[0] and "--run run_t --dispatch 1 'address: send worker_done again'" in c[0]
+    assert bool(C.calls("orca terminal send")) == (mode == "attended")
+
+
+def test_a_finished_worker_whose_issue_cannot_be_read_is_blocked_not_landed_on_a_guess(C):
+    C.stubs.reply("gh.issue_view", "boom", rc=1)   # the hold label is unknown: the loop does not guess
+    C.mail([msg("worker_done", "msg_d", outcome="succeeded")])
+    assert C.go().returncode == 0 and not C.stubs.calls("land.sh") and C.blocked()
+
+
 @pytest.mark.parametrize("rc, out, limit", [(3, "BLOCKER: a.py:3 - bug\nBLOCKER: b.py:1 - no test\n", 2), (4, "land.sh: CI is red for abc\n", 1),
                                             (5, "land.sh: merge conflict: main into 1-x\n", 1)])
 def test_a_rejected_land_re_dispatches_the_reason_to_the_same_worker_a_bounded_number_of_times(C, rc, out, limit):

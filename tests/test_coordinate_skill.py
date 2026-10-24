@@ -104,5 +104,12 @@ def test_a_chat_session_decision_is_alerted_by_a_mandatory_ask_user_question_car
     assert re.search(r"card alone.{0,40}no text before", chat) and "turn 1 short" in chat   # turn 2 is the bare card; a short turn 1 keeps a permission request inside its 9 minutes
 
 
+def test_a_deny_refuses_one_command_and_the_hold_label_is_the_do_not_land_yet_lever_with_its_way_back():
+    perm = next(ln for ln in SKILL.split("\n- ") if ln.startswith("**`PERMISSION REQUEST`**"))
+    assert "refuses one command, not the land" in perm and "gh issue edit <n> --add-label hold" in perm and re.search(r"hold.{0,40}before (the )?repl", perm)
+    land = next(ln for ln in SKILL.split("\n- ") if ln.startswith("**Land this**"))
+    assert "`hold`" in land and "do not land yet" in land and "remove `hold`" in land and "--dispatch <n> 'address: send worker_done again'" in land
+
+
 def test_hub_lands_with_the_review():
     assert "land.sh --review" in (SHARED / "skills/hub/SKILL.md").read_text()
