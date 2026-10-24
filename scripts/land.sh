@@ -27,7 +27,7 @@
 # merges into MAIN_BRANCH. --merged <n>: the PR that carries #n is MERGED (a squash merge defeats the landed check, the PR state is the proof; else exit 2, nothing touched): close
 # each issue still awaiting main in it (`merged into <MAIN_BRANCH> in <merge sha>`), drop the label, run POST_LAND_CMD <n> <key> <merge sha> (BASE_BRANCH and MAIN_BRANCH in its
 # environment), then remove the branch and worktree (pr) or merge origin/MAIN_BRANCH back into BASE_BRANCH and push it (integration: a squash merge leaves the base diverged).
-# Exit: 0 landed, 1 error, 2 refused (precondition), 3 review not approved, 4 gate red/timeout, 5 merge conflict,
+# Exit: 0 landed, 1 error, 2 refused (precondition), 3 review not approved, 4 gate red/timeout, 5 merge conflict (the merge-back of MAIN_BRANCH included: by hand, then --merged again),
 #       6 landed but a cleanup step failed, a failed refresh of the installed copies included (main is already pushed; finish by hand,
 #         --cleanup-only retries the refresh too), 7 landed, awaiting the merge into MAIN_BRANCH (the PR url is the `PR:` line).
 set -euo pipefail
@@ -112,8 +112,11 @@ land_merged() {   # --merged <n>: exits; every step but the proof is retried by 
     orca_json worktree rm --worktree "issue:$n" --run-hooks > /dev/null || ! orca_json worktree show --worktree "issue:$n" > /dev/null 2>&1 || { warn "cleanup failed: worktree rm issue:$n"; bad=1; }
   fi
   if [ "$main_kind" = integration ] && ! git merge-base --is-ancestor "origin/$MAIN_BRANCH" HEAD; then   # a squash merge leaves the base diverged: bring the true main back so the next rolling PR shows only new work
-    git merge -q --no-edit "origin/$MAIN_BRANCH" > /dev/null && git push -q origin "$BASE_BRANCH" \
-      || { git merge --abort 2> /dev/null || true; git reset -q --hard "origin/$BASE_BRANCH"; warn "cannot merge origin/$MAIN_BRANCH back into $BASE_BRANCH: do it by hand, the next sweep finishes the rest"; bad=1; }
+    if ! git merge -q --no-edit "origin/$MAIN_BRANCH" > /dev/null; then   # a content conflict does not resolve itself: its own exit, the loop blocks the issue
+      git merge --abort 2> /dev/null || true; git reset -q --hard "origin/$BASE_BRANCH"
+      bail 5 "$(jq -r .url <<< "$pr"): merging origin/$MAIN_BRANCH back into $BASE_BRANCH conflicts: merge origin/$MAIN_BRANCH into $BASE_BRANCH by hand and push, the next sweep finishes the rest"
+    fi
+    git push -q origin "$BASE_BRANCH" || { git reset -q --hard "origin/$BASE_BRANCH"; warn "cannot push the merge of origin/$MAIN_BRANCH into $BASE_BRANCH: the next sweep tries again"; bad=1; }
   fi
   [ "$bad" = 0 ] || bail 6 "merged into $MAIN_BRANCH, but the cleanup is incomplete: the issues stay awaiting main, run --merged again"
   ids="$n"; [ "$main_kind" != integration ] || ids="$(jq -r '.body | [scan("Closes #([0-9]+)") | .[0]] | unique | .[]' <<< "$pr")"

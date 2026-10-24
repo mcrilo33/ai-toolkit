@@ -623,12 +623,12 @@ def merged_labelled(L):
     L.stubs.reply("gh.issue_view", json.dumps({"state": "OPEN", "labels": [{"name": AWAITING}], "body": "Scope: a\nTracker: PM-17\n"}))
 
 
-def test_a_merge_back_that_conflicts_leaves_every_issue_awaiting_so_the_next_sweep_tries_again(L, link_script):
+def test_a_merge_back_that_conflicts_exits_5_naming_the_by_hand_step_and_leaves_every_issue_awaiting(L, link_script):
     squash_into_develop(L, "clash.txt", "squash")
     L.other_push("clash.txt", "base")
     merged_labelled(L)
     r = L.go("--merged", "9", MAIN_BRANCH="develop", POST_LAND_CMD=link_script(L.tmp / "pl.sh", POST_LAND_MAIN))
-    assert r.returncode == 6 and "merge" in r.stderr, r.stderr
+    assert r.returncode == 5 and PR["url"] in r.stderr and "merge origin/develop into main by hand and push" in r.stderr, r.stderr
     assert not calls_of(L, "gh", "issue", "close") and not calls_of(L, "gh", "issue", "edit") and not calls_of(L, "post-land")   # the label is the retry marker: it goes last
     assert git(L.root, "status", "--porcelain", "--untracked-files=no") == "" and git(L.root, "rev-parse", "HEAD") == main_sha(L)
 

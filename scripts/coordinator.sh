@@ -17,7 +17,7 @@
 # consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
 # the Run from this terminal, then wait until the loop is gone. Without a terminal handle (a chat session) --stop runs itself in a coordinator-stop terminal and exits with that run's status.
 # MAIN_BRANCH != BASE_BRANCH or LAND_MODE=pr (#507): a land that exits 7 is on BASE_BRANCH or in a PR, its issue open as `status:awaiting-main`: logged, never blocked. At each sweep the PR of every such issue is read:
-# MERGED -> land.sh --merged (closes the issue, POST_LAND_CMD); CLOSED without a merge -> blocked with the PR url; CHANGES_REQUESTED -> blocked for an issue's own PR (LAND_MODE=pr), only shown by --status for the
+# MERGED -> land.sh --merged (closes the issue, POST_LAND_CMD; exit 5, the merge-back of MAIN_BRANCH conflicts -> blocked once with the PR url, the awaiting label kept so the next sweep finishes after the human merged it by hand); CLOSED without a merge -> blocked with the PR url; CHANGES_REQUESTED -> blocked for an issue's own PR (LAND_MODE=pr), only shown by --status for the
 # rolling PR (it carries many issues: the human decides); an open PR without a decision, no PR found or a failed gh read -> left alone, read again at the next sweep.
 # A failed Orca read is one warning naming the call and its error code, retried at the next wake; an exit on an error is logged with its status and the failing command (attended: typed into the session), and --status says when no loop runs.
 set -euo pipefail
@@ -116,7 +116,7 @@ open_q() {   # the open questions a human can still answer, oldest first (Orca l
       and ((($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") | not) or ((try ((.created_at | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)) catch $now) >= $now - 540)))' <<< "$o"
 }
 blocked_q() { gh issue list --label blocked ${DISPATCH_LABEL:+--label "$DISPATCH_LABEL"} --state open --limit 100 --json number,title,labels | jq -r '[.[] | select(.labels | map(.name) | index("hold") | not)] | sort_by(.number)[] | "\(.number)\t\(.title)"'; }   # hold = parked on purpose
-awaiting_q() { gh issue list --label "$AWAITING_LABEL" --state "$1" --limit 100 --json number,title,state; }   # $1 open|all: the issues waiting for their merge into MAIN_BRANCH (all: GitHub may have closed one with its PR's Closes)
+awaiting_q() { gh issue list --label "$AWAITING_LABEL" --state "$1" --limit 100 --json number,title,state,labels; }   # $1 open|all: the issues waiting for their merge into MAIN_BRANCH (all: GitHub may have closed one with its PR's Closes)
 queue_ids() {   # the decisions waiting for the human, in the order to present them, one word each: q:<message id> (a plan: a worker waits, a slot is held) or p:<message id> (a permission request), then b:<issue> (blocked; a review that kept rejecting is one)
   local q; q="$(open_q | jq -r '"\(if ((.payload // "{}" | if type == "string" then fromjson else . end).question // .body // "") | test("^\\s*PERMISSION REQUEST") then "p" else "q" end):\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
 }
@@ -452,14 +452,21 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
 }
 
 pr_sweep() {   # the PR of each issue awaiting its merge into MAIN_BRANCH (header); a failed gh read changes nothing
-  local rows n st pr why out
+  local rows n st bl pr why out rc
   [ -n "$main_kind" ] || return 0
-  rows="$(awaiting_q all | jq -r '.[] | "\(.number) \(.state)"')" || return 0
-  while read -r n st; do
+  rows="$(awaiting_q all | jq -r '.[] | "\(.number) \(.state) \(((.labels // []) | map(.name) | index("blocked")) != null)"')" || return 0
+  while read -r n st bl; do
     [ -n "$n" ] || continue; why=""
     pr="$(pr_of "$n")" || continue
     case "$(jq -r .state <<< "$pr")" in
-      MERGED) out="$(RUN="$run" "$LAND_CMD" --merged "$n" 2>&1)" && log "#$n merged into $MAIN_BRANCH" || warn "#$n: its PR is merged but land.sh --merged did not finish; the issue stays awaiting main and the next sweep tries again: ${out##*$'\n'}" ;;
+      MERGED) rc=0; out="$(RUN="$run" "$LAND_CMD" --merged "$n" 2>&1)" || rc=$?
+        case "$rc" in
+          0) log "#$n merged into $MAIN_BRANCH" ;;
+          5) [ "$st" = OPEN ] || gh issue reopen "$n" > /dev/null 2>&1 || warn "cannot reopen #$n"   # the PR's Closes closed it, and the queue and --status list open issues only; retried while it stays closed
+             if [ "$bl" = true ]; then log "#$n: the merge-back of $MAIN_BRANCH still conflicts, blocked until a human merges it"   # blocked once; --merged runs again, so removing the label after the by-hand merge finishes the close
+             else issue="$n"; disp=""; wtp=""; block "$(jq -r .url <<< "$pr"): merge of $MAIN_BRANCH back into $BASE_BRANCH conflicts: merge it by hand and push, then remove the blocked label"; fi ;;
+          *) warn "#$n: its PR is merged but land.sh --merged did not finish; the issue stays awaiting main and the next sweep tries again: ${out##*$'\n'}" ;;
+        esac ;;
       CLOSED) why="closed without merge" ;;
       OPEN) [ "$main_kind" != pr ] || ! pr_changes_requested "$pr" || why="changes requested" ;;
     esac
