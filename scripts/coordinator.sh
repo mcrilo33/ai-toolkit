@@ -224,7 +224,14 @@ ctx() {
 }
 nlive() { jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length'; }   # the workers of one wl reply that are live
 rounds() { wl | jq --arg p "::$wtp" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] | length - 1'; }   # dispatches so far - 1
-release() { [ -z "$1" ] || orca_mutate orchestration worker-release --dispatch "$1" > /dev/null 2>&1 || orca_mutate orchestration worker-stop --dispatch "$1" > /dev/null 2>&1 || true; }
+release() {   # $1 dispatch: worker-release, else worker-stop. A stop can answer ok:true and leave the dispatch dispatched (stop_unknown): that, or a failed stop, is fenced with worker-abandon, never left live
+  local out
+  [ -n "$1" ] || return 0
+  orca_mutate orchestration worker-release --dispatch "$1" > /dev/null 2>&1 && return 0
+  if out="$(orca_mutate orchestration worker-stop --dispatch "$1" 2> /dev/null)" && ! grep -q stop_unknown <<< "$out" \
+    && ! wl | jq -e --arg d "$1" '.result.workers[] | select(.dispatchId == $d and .dispatchStatus == "dispatched")' > /dev/null 2>&1; then return 0; fi
+  warn "dispatch $1 did not stop, fencing it with worker-abandon"; orca_mutate orchestration worker-abandon --dispatch "$1" > /dev/null 2>&1 || warn "worker-abandon of dispatch $1 failed"
+}
 block() {   # $1 = why. Label, comment, flag (log, worktree comment), free the slot; the worktree stays for the human. Never when the Run was taken back (yield).
   yield; gh issue edit "$issue" --add-label blocked > /dev/null 2>&1 \
     || { gh label create blocked --color B60205 > /dev/null 2>&1 || true; gh issue edit "$issue" --add-label blocked > /dev/null || warn "cannot label #$issue"; }
@@ -239,10 +246,10 @@ redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds 
   comment "$issue" "round $((r + 1)): $2"
 }
 
-drain_replies() {   # send the queued human replies as the bound consumer. Dropped: a malformed body, a question seen answered, or (page not full)
-  local f id body q pend kind   # unknown. Kept and retried: a failed send, or an id the full inbox page does not show (it may be older than the page)
+drain_replies() {   # send the queued human replies as the bound consumer. Dropped: a malformed body, a question seen answered, one open_q no longer lists (its dispatch is not live, a permission request past the relay's 540 s),
+  local f id body q pend kind oq oqok=1 out tries code   # or (page not full) unknown, or a send that failed COORD_REPLY_TRIES times (its count is line 2 of the spool file). Kept and retried: a failed send under the bound, or an id the full inbox page does not show (it may be older than the page)
   ls "$sd/replies"/* > /dev/null 2>&1 || return 0
-  pend="$(pending)" || return 0
+  pend="$(pending)" || return 0; oq="$(open_q)" || oqok=0   # Orca silent on the live workers: open_q keeps everything, as here
   for f in "$sd/replies"/*; do
     [ -f "$f" ] || continue
     id="${f##*/}"; body="$(head -n 1 "$f")"; q="$(jq -c --arg i "$id" '[.open[] | select(.id == $i)][0] // empty' <<< "$pend")"
@@ -252,16 +259,21 @@ drain_replies() {   # send the queued human replies as the bound consumer. Dropp
       plan:approve | "plan:approve with: "*[![:space:]]* | plan:revise:*[![:space:]]* | perm:allow | perm:deny) ;;
       *) warn "reply to $id dropped: malformed body"; rm -f "$f"; continue ;;
     esac
-    if [ -z "$q" ]; then
+    if [ -n "$q" ] && [ "$oqok" = 1 ] && ! jq -e --arg i "$id" 'select(.id == $i)' <<< "$oq" > /dev/null; then warn "reply to $id dropped: its worker is no longer live, or its permission request is past the relay's 540 s window"
+    elif [ -z "$q" ]; then
       if jq -e --arg i "$id" '(.answered | index($i)) != null or (.truncated | not)' <<< "$pend" > /dev/null; then warn "reply to $id dropped: no such unanswered question"
       else warn "reply to $id kept: the inbox page is truncated and does not show that question"; continue; fi
-    elif orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
+    elif out="$(orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" 2> /dev/null)"; then
       log "gate $id answered by the human: $body"
       if ctx "$(pj "$q" dispatchId)"; then
         if [ "$kind" = perm ]; then comment "$issue" "Permission answered by the human: $body (tool: $(tool_of "$(question_of "$q")"))"; else comment "$issue" "Gate answered by the human: $body"; fi
         orca_json worktree set --worktree "path:$wtp" --comment "gate answered by the human: ${body:0:60}" > /dev/null 2>&1 || warn "cannot update the worktree comment"
       fi
-    else warn "reply to $id failed, it stays queued"; continue; fi
+    else
+      tries="$(sed -n 2p "$f")"; [[ $tries =~ ^[0-9]+$ ]] || tries=0; tries=$((tries + 1)); code="$(jq -r '.error.code // empty' <<< "$out" 2> /dev/null)" || code=""
+      if [ "$tries" -lt "${COORD_REPLY_TRIES:-5}" ]; then printf '%s\n%s\n' "$body" "$tries" > "$f"; warn "reply to $id failed (orca error: ${code:-none}), it stays queued"; continue; fi
+      warn "reply to $id dropped after $tries failed sends (orca error: ${code:-none})"; [ "$answer" != attended ] || tell r "$id" || true
+    fi
     rm -f "$f"
   done
 }
@@ -350,7 +362,7 @@ handle() {
 }
 
 named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of the automatic pick: dispatch.sh runs them, within the cap and the Scope rule. One that cannot run keeps its file, the reason on line 2 (--status shows it)
-  local f n spec v why live wts all path r out rc   # (a closed issue and an already running one are the drops; a failed dispatch is not retried until the human asks again or cancels)
+  local f n spec v why live wts all path r out rc old   # (a closed issue and an already running one are the drops; a failed dispatch is not retried until the human asks again or cancels)
   for f in "$sd/requests"/*; do
     [ -f "$f" ] || continue; n="${f##*/}"; spec="$(head -n 1 "$f")"; why=""; path=""
     case "$(sed -n 2p "$f")" in "dispatch failed"*) continue ;; esac
@@ -364,12 +376,16 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
     else
       path="$(jq -r --argjson n "$n" '[.[] | select(.linkedIssue == $n)][0].path // empty' <<< "$wts")"
       r="$(jq -r --arg p "::$path" '[.result.workers[] | select(.dispatchStatus == "dispatched" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty' <<< "$all")"; live="$(nlive <<< "$all")"
-      if [ -n "$path" ] && [ -n "$r" ]; then log "dispatch request for #$n dropped: already running (dispatch $r)"; rm -f "$f"; continue   # met: the issue runs, whoever started it
+      if [ -n "$path" ] && [ -n "$r" ]; then
+        [ -n "$spec" ] || { log "dispatch request for #$n dropped: already running (dispatch $r)"; rm -f "$f"; continue; }   # a plain request is met: the issue runs, whoever started it
+        why="a worker is still live on the worktree (dispatch $r): it starts once that worker ends"   # a message asks to replace it: kept, shown by --status, waked on by --wait
       elif [ "$live" -ge "$cap" ]; then why="waiting for a free slot (cap $cap)"; fi
     fi
     [ -n "$why" ] || [ -n "$path" ] || [ -z "$spec" ] || why="no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"
     if [ -z "$why" ]; then   # a kept worktree is re-dispatched (--address, a default message when none was given); none yet: dispatch.sh --next <n> starts it only if it is ready (its rule: hold, blocked, in flight, Scope)
-      if [ -n "$path" ]; then out="$(RUN="$run" "$DISPATCH_CMD" --address "${spec:-address: continue from the pushed branch (git log), push, then send worker_done.}" "$n" 2>&1)" && rc=0 || rc=$?
+      if [ -n "$path" ]; then old="$(jq -r --arg p "::$path" '[.result.workers[] | select(.resource.worktreeId | endswith($p))][0].agentTerminalHandle // empty' <<< "$all")"
+        [ -z "$old" ] || orca terminal close --terminal "$old" --json > /dev/null 2>&1 || true   # the previous agent's terminal (as redispatch does): two agents must not share the worktree
+        out="$(RUN="$run" "$DISPATCH_CMD" --address "${spec:-address: continue from the pushed branch (git log), push, then send worker_done.}" "$n" 2>&1)" && rc=0 || rc=$?
       else out="$(RUN="$run" "$DISPATCH_CMD" --next "$n" 2>&1)" && rc=0 || rc=$?; [ "$rc" = 0 ] || [ "$rc" = 3 ] || orca_json worktree rm --worktree "issue:$n" --force > /dev/null 2>&1 || true; fi   # a failed fresh dispatch may leave a half-made worktree (as fill() does)
       if [ "$rc" = 0 ]; then
         ! jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null || gh issue edit "$n" --remove-label blocked > /dev/null 2>&1 || warn "cannot remove the blocked label of #$n"
@@ -404,7 +420,7 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
       log "#$issue: worker $d exited without worker_done, relaunching"; RUN="$run" "$DISPATCH_CMD" --retry-of "$d" --task "$task" "$issue" > /dev/null || block "relaunch failed"
     else block "worker exited again without worker_done"; fi
   done
-  open="$(pending | jq -c '[.open[] | (.payload // "{}" | if type == "string" then fromjson else . end).dispatchId]')" || return 0   # a worker waiting on a gate or permission question is never idle
+  open="$(open_q | jq -sc '[.[] | (.payload // "{}" | if type == "string" then fromjson else . end).dispatchId]')" || return 0   # a worker waiting on a gate or permission question the human can still answer is never idle (an expired one does not shield it)
   for d in $(wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited") | .dispatchId'); do
     ! jq -e --arg d "$d" 'index($d)' <<< "$open" > /dev/null || continue
     how="$(silent "$d")" || true; [ -n "$how" ] || { warn "worker $d: cannot tell how long it has been silent (worker-show or its jq failed), left alone"; continue; }; read -r age how <<< "$how"; [ "$age" -ge "${COORD_IDLE_MIN:-15}" ] || continue   # never an age of 0: an unknown age is not an idle check that passed
@@ -416,9 +432,10 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
   done
 }
 
-tell() {   # $1 kind (p|q|b), $2 id: one fixed line typed into the session's terminal, never text a worker wrote (it lands in an agent's prompt); no --session = nothing to send
-  [ -n "$session" ] || return 0; local kind=plan; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; esac
-  orca_json terminal send --terminal "$session" --text "[coordinator loop] new decision waiting: $kind $(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2"). Read it whole, present it with one recommendation, then ring." --enter > /dev/null 2>&1 || { warn "cannot tell the session ($kind $2): retried at the next wake"; return 1; }
+tell() {   # $1 kind (p|q|b|r = a dropped reply), $2 id: one fixed line typed into the session's terminal, never text a worker wrote (it lands in an agent's prompt); no --session = nothing to send
+  [ -n "$session" ] || return 0; local kind=plan id txt; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; esac; id="$(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2")"
+  txt="new decision waiting: $kind $id. Read it whole, present it with one recommendation, then ring."; [ "$1" != r ] || txt="reply to $id was dropped after repeated send failures: its question may still be open, present it again."
+  orca_json terminal send --terminal "$session" --text "[coordinator loop] $txt" --enter > /dev/null 2>&1 || { warn "cannot tell the session ($kind $2): retried at the next wake"; return 1; }
 }
 notify_queue() {   # attended: tell the session of a decision that was not queued at the last look, once: the first one when nothing that was waiting at the last look still is, and every permission request (it expires in 9 minutes); the ids last seen live in $seen (no file); a failed read or send changes nothing, the next wake looks again. A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event.
   [ "$answer" = attended ] || return 0; local now i all k first=0 fail=0; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
