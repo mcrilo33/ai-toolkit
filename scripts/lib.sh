@@ -118,11 +118,15 @@ resolve_main() {
 # pr_of <n>: the PR into MAIN_BRANCH (integration: from BASE_BRANCH) whose body says `Closes #n`, as one JSON object: the merged one if any, else the newest; rc 1 = none, or gh failed.
 pr_of() {
   local hd=(); [ "$main_kind" != integration ] || hd=(--head "$BASE_BRANCH")
-  gh pr list --base "$MAIN_BRANCH" ${hd[@]+"${hd[@]}"} --state all --limit 100 --json number,url,state,reviewDecision,mergeCommit,body,headRefOid,latestReviews \
+  gh pr list --base "$MAIN_BRANCH" ${hd[@]+"${hd[@]}"} --state all --limit 100 --json number,url,state,reviewDecision,mergeCommit,body,headRefOid,reviews \
     | jq -ce --argjson n "$1" '[.[] | select(.body | test("Closes #\($n)([^0-9]|$)"))] | sort_by(.number) | (map(select(.state == "MERGED")) | last) // last // empty'
 }
 # pr_changes_requested <pr json>: a CHANGES_REQUESTED review made on the PR's current head (GitHub keeps the decision after new commits, until the reviewer reviews again).
-pr_changes_requested() { jq -e '.reviewDecision == "CHANGES_REQUESTED" and (.headRefOid as $h | any(.latestReviews[]?; .state == "CHANGES_REQUESTED" and .commit.oid == $h))' <<< "$1" > /dev/null; }
+# `reviews` (not `latestReviews`) carries commit{oid}; each reviewer's latest non-comment review decides, as in GitHub's own reviewDecision.
+pr_changes_requested() {
+  jq -e '.reviewDecision == "CHANGES_REQUESTED" and (.headRefOid as $h | [.reviews[]? | select(.state | IN("APPROVED", "CHANGES_REQUESTED", "DISMISSED"))]
+    | group_by(.author.login) | map(max_by(.submittedAt)) | any(.state == "CHANGES_REQUESTED" and .commit.oid == $h))' <<< "$1" > /dev/null
+}
 
 # issue_footer <body> <Key>: value of the last `Key: value` line (Scope:, Gate:, Model:).
 issue_footer() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | tail -n 1; }
