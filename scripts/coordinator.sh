@@ -328,12 +328,18 @@ triage() {   # $1 = land output, $2 = the worker's report: after a land, hand wh
 }
 landing() { printf '%s %s %s\n' "$issue" "$disp" "$(date +%H:%M)" > "$sd/landing"; log "#$issue: worker_done from $disp, landing"; }   # a land takes minutes, its dispatch is already completed: loop.log and --status say it is under way
 on_done() {
-  local out rc=0 bl last
+  local out rc=0 bl last v
   ctx "$(pj "$1" dispatchId)" || return 1
   out="$(wl | jq -r --arg p "::$wtp" --arg d "$disp" '[.result.workers[] | select(.dispatchStatus == "dispatched" and .dispatchId != $d and .projection.liveness.verdict != "exited" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty')" || return 1
   [ -z "$out" ] || { warn "#$issue: worker_done from $disp ignored: dispatch $out is live on $wtp"; return 0; }   # a stale or duplicate dispatch never lands the worktree its live worker is editing
   [ "$(pj "$1" outcome)" = succeeded ] || { block "worker_done failed: $(jq -r '.body // ""' <<< "$1")"; return 0; }
-  [ "$(gh issue view "$issue" --json state --jq .state 2> /dev/null)" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; return 0; }
+  v="$(gh issue view "$issue" --json state,labels 2> /dev/null)" || { block "cannot read the issue (GitHub did not answer), so its hold label is unknown: not landed on a guess"; return 0; }
+  [ "$(jq -r .state <<< "$v")" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; return 0; }
+  if jq -e '.labels | map(.name) | index("hold")' <<< "$v" > /dev/null; then   # the human's "do not land yet": the worktree stays, the batch ack still closes this delivery
+    log "#$issue: worker_done held (hold label), not landed"
+    comment "$issue" "Finished but held: the hold label stops the land and the worktree is kept. To land it, remove the hold label (gh issue edit $issue --remove-label hold), then queue: bash $here/coordinator.sh --run $run --dispatch $issue 'address: send worker_done again' (its next worker_done lands)."
+    [ "$answer" != attended ] || tell h "$issue" || true; return 0
+  fi
   # No --dispatch: land finds and releases EVERY dispatch of the worktree, earlier address rounds included.
   landing; out="$(RUN="$run" "$LAND_CMD" --review "$issue" 2>&1)" || rc=$?
   printf '%s\n' "$out"; last="$(tail -n 1 <<< "$out")"
@@ -433,8 +439,8 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
   done
 }
 
-tell() {   # $1 kind (p|q|b|r = a dropped reply), $2 id: one fixed line typed into the session's terminal, never text a worker wrote (it lands in an agent's prompt); no --session = nothing to send
-  [ -n "$session" ] || return 0; local kind=plan id txt; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; r) kind=reply ;; esac; id="$(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2")"
+tell() {   # $1 kind (p|q|b|h = a finished issue held|r = a dropped reply), $2 id: one fixed line typed into the session's terminal, never text a worker wrote (it lands in an agent's prompt); no --session = nothing to send
+  [ -n "$session" ] || return 0; local kind=plan id txt; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; h) kind="finished issue held" ;; r) kind=reply ;; esac; id="$(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2")"
   txt="new decision waiting: $kind $id. Read it whole, present it with one recommendation, then ring."; [ "$1" != r ] || txt="reply to $id was dropped after repeated send failures: its question may still be open, present it again."
   orca_json terminal send --terminal "$session" --text "[coordinator loop] $txt" --enter > /dev/null 2>&1 || { warn "cannot tell the session ($kind $2)$([ "$1" = r ] || echo ': retried at the next wake')"; return 1; }
 }

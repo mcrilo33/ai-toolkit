@@ -5,13 +5,13 @@
 # fires in bypass mode and an allow/deny from it dismisses the dialog, but a hook that hits its own timeout is killed with NO decision and the dialog stays
 # waiting, so the ask is bounded by a kill timer below the hook timeout (settings: 600 s) and every failure (no handle, no Run, orca erroring, timeout (the worker may ask again, up to 3 requests),
 # unparsable payload, no jq) answers deny. AskUserQuestion and ExitPlanMode are denied without asking: a hook allow does not resolve ExitPlanMode and
-# AskUserQuestion needs the user's answers, not a yes. The question's first line, PERMISSION REQUEST, is what coordinator.sh and the coordinate skill key on.
+# AskUserQuestion needs the user's answers, not a yes. A denied Bash `orca orchestration send --type worker_done` gets its own message (never resend it in any form, ask the coordinator): the generic one tells the worker to send worker_done again. The question's first line, PERMISSION REQUEST, is what coordinator.sh and the coordinate skill key on.
 set -eo pipefail
 root="${CLAUDE_PROJECT_DIR:-$PWD}"
 [ -e "$root/.ai-toolkit/spoke-run-id" ] || exit 0
 deny() { printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"permission relay: denied (%s). %s"}}}\n' "$1" "${2:-Do not retry the same call; say so in your worker_done report.}"; exit 0; }
 trap 'deny "the relay itself failed"' ERR; late="You may make the same call again, up to 3 requests in total; if the third is also unanswered, treat it as denied and say so in your worker_done report." # an unanswered request can come back, an explicit deny cannot
-in="$(cat)"; tool="$(jq -er .tool_name <<< "$in")"
+in="$(cat)"; tool="$(jq -er .tool_name <<< "$in")"; refused=""; jq -e '.tool_name == "Bash" and (.tool_input.command // "" | test("orca +orchestration +send") and test("--type[ =]+worker_done\\b"))' <<< "$in" > /dev/null && refused="The Run refused this worker_done. Do not send it again in any form (a reworded or shortened resend is the same refusal); ask the coordinator with your preamble's orchestration ask what to do next."
 case "$tool" in AskUserQuestion | ExitPlanMode) deny "$tool is not a permission: ask the coordinator with your preamble's orchestration ask";; esac
 h="${ORCA_TERMINAL_HANDLE:-}"; [ -n "$h" ] || deny "no Orca terminal handle"
 reason=unknown; rf="$root/.ai-toolkit/ask-reasons/$(jq -cS '[.tool_name,.tool_input]' <<< "$in" | shasum -a 256 | cut -d' ' -f1)" # why a PreToolUse ask raised it (danger-guard records it)
@@ -30,5 +30,5 @@ reply="$(cat "$o")"; killed=0; [ ! -e "$o.killed" ] || killed=1; late_ask=0; gre
 [ "$killed$late_ask" = 00 ] || deny "nobody answered in time" "$late"
 [ "$rc" = 0 ] || deny "the ask failed: no Run to ask, or orca erroring"
 reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
-[ "$reply" = allow ] || deny "the Run did not answer allow"
+[ "$reply" = allow ] || deny "the Run did not answer allow" "$refused"
 printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}\n'
