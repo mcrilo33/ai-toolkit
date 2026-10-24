@@ -463,7 +463,8 @@ pr_sweep() {   # the PR of each issue awaiting its merge into MAIN_BRANCH (heade
         case "$rc" in
           0) log "#$n merged into $MAIN_BRANCH" ;;
           5) if [ "$bl" = true ]; then log "#$n: the merge-back of $MAIN_BRANCH still conflicts, blocked until a human merges it"   # blocked once; --merged runs again, so removing the label after the by-hand merge finishes the close
-             else issue="$n"; disp=""; wtp=""; block "$(jq -r .url <<< "$pr"): merge of $MAIN_BRANCH back into $BASE_BRANCH conflicts: merge it by hand and push, then remove the blocked label"; fi ;;
+             else issue="$n"; disp=""; wtp=""; [ "$st" = OPEN ] || gh issue reopen "$n" > /dev/null 2>&1 || warn "cannot reopen #$n"   # the PR's Closes closed it, and the queue and --status list open issues only
+               block "$(jq -r .url <<< "$pr"): merge of $MAIN_BRANCH back into $BASE_BRANCH conflicts: merge it by hand and push, then remove the blocked label"; fi ;;
           *) warn "#$n: its PR is merged but land.sh --merged did not finish; the issue stays awaiting main and the next sweep tries again: ${out##*$'\n'}" ;;
         esac ;;
       CLOSED) why="closed without merge" ;;
