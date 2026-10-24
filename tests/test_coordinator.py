@@ -1235,6 +1235,20 @@ def test_the_sweep_checks_the_pr_of_each_issue_awaiting_main(C, pr, env, action)
         assert ["--remove-label", AWAITING] in [a[3:] for a in C.calls("gh issue edit")] and comments == [f"blocked: https://x/pull/5: {action}"]
 
 
+@pytest.mark.parametrize("rc, labels, blocks", [(5, [AWAITING], True), (5, [AWAITING, "blocked"], False), (6, [AWAITING], False)], ids=["conflict", "conflict-already-blocked", "cleanup-incomplete"])
+def test_a_merge_back_that_conflicts_blocks_the_issue_once_while_a_failed_cleanup_only_warns(C, rc, labels, blocks):
+    C.stubs.reply("gh.issue_list", json.dumps([{"number": 1, "title": "t", "state": "OPEN", "labels": [{"name": n} for n in labels]}]))
+    C.stubs.reply("gh.pr_list", pr_json(state="MERGED", mergeCommit={"oid": "abc"}))
+    C.stubs.reply(key("land.sh", "--merged", "1"), "land.sh: conflict\n", rc=rc)
+    C.go(COORD_SWEEP_EVERY=1, **INT)
+    edits, comments = [a[3:] for a in C.calls("gh issue edit")], [a[-1] for a in C.calls("gh issue comment")]
+    if blocks:
+        assert ["--add-label", "blocked"] in edits and ["--remove-label", AWAITING] not in edits
+        assert comments == ["blocked: https://x/pull/5: merge of develop back into main conflicts: merge it by hand and push, then remove the blocked label"]
+    else:
+        assert not edits and not comments
+
+
 def test_status_lists_the_issues_awaiting_main_with_their_pr_and_a_requested_change(C):
     C.stubs.reply("gh.issue_list", "[]", n=1)   # the blocked queue
     C.stubs.reply("gh.issue_list", json.dumps([{"number": 7, "title": "t7", "state": "OPEN"}]), n=2)
