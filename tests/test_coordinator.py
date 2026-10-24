@@ -1181,8 +1181,9 @@ INT, PRMODE = dict(MAIN_BRANCH="develop"), dict(LAND_MODE="pr")
 AWAITING = "status:awaiting-main"
 
 
-def pr_json(**kw):
-    return json.dumps([{"number": 5, "url": "https://x/pull/5", "state": "OPEN", "reviewDecision": "", "mergeCommit": None, "body": "Closes #1\n", **kw}])
+def pr_json(reviewed="h1", **kw):   # GitHub keeps reviewDecision after new commits: `reviewed` is the head the review was made on, the PR's head is h1
+    return json.dumps([{"number": 5, "url": "https://x/pull/5", "state": "OPEN", "reviewDecision": "", "mergeCommit": None, "body": "Closes #1\n", "headRefOid": "h1",
+                        "latestReviews": [{"state": kw.get("reviewDecision") or "COMMENTED", "commit": {"oid": reviewed}}], **kw}])
 
 
 def test_a_land_that_awaits_its_merge_into_main_is_logged_with_its_pr_never_blocked_and_still_routes_the_leftovers(C):
@@ -1213,8 +1214,9 @@ def test_a_replayed_worker_done_of_an_issue_awaiting_main_is_not_landed_again(C)
     (pr_json(state="MERGED", mergeCommit={"oid": "abc"}), INT, "merged"),
     (pr_json(state="CLOSED"), INT, "closed without merge"),
     (pr_json(reviewDecision="CHANGES_REQUESTED"), PRMODE, "changes requested"),   # an issue's own PR: its worker can address it
+    (pr_json(reviewDecision="CHANGES_REQUESTED", reviewed="h0"), PRMODE, "left"),   # the worker already pushed past that review: blocking again would stop the address round before the reviewer looks
     (pr_json(reviewDecision="CHANGES_REQUESTED"), INT, "left"),   # the rolling PR carries many issues: the human decides, --status shows it
-    (pr_json(reviewDecision="REVIEW_REQUIRED"), INT, "left"), ("[]", INT, "left"), ("boom", INT, "left")], ids=["merged", "closed", "changes-pr", "changes-rolling", "open", "no-pr", "gh-fails"])
+    (pr_json(reviewDecision="REVIEW_REQUIRED"), INT, "left"), ("[]", INT, "left"), ("boom", INT, "left")], ids=["merged", "closed", "changes-pr", "changes-addressed", "changes-rolling", "open", "no-pr", "gh-fails"])
 def test_the_sweep_checks_the_pr_of_each_issue_awaiting_main(C, pr, env, action):
     C.stubs.reply("gh.issue_list", json.dumps([{"number": 1, "title": "t", "state": "OPEN"}]))
     C.stubs.reply("gh.pr_list", pr, rc=1 if pr == "boom" else 0)

@@ -576,24 +576,25 @@ def test_an_incoherent_land_mode_is_a_usage_error(L, env):
     assert L.go("9", **env).returncode == 2 and not L.trail()
 
 
-def squash_into_develop(L):   # the human merged the promotion PR: develop holds a squash commit that main does not
+def squash_into_develop(L, name="squashed.txt", text="x"):   # the human merged the promotion PR: develop holds a squash commit that main does not
     o = L.tmp / "dev"
     subprocess.run(["git", "clone", "-q", str(L.origin), str(o)], check=True, capture_output=True)
     git(o, "switch", "-q", "-c", "develop")
-    commit(o, "squashed.txt", push="develop")
+    commit(o, name, text, push="develop")
     (L.tmp / "stubs/calls.log").write_text("")
 
 
-def test_merged_closes_every_issue_of_the_squash_merged_rolling_pr_runs_post_land_with_the_merge_sha_and_merges_main_back(L, link_script):
+@pytest.mark.parametrize("state", ["OPEN", "CLOSED"], ids=["open", "closed-by-github"])   # the PR's own Closes keyword closes the issue when MAIN_BRANCH is the default branch: the label is the marker
+def test_merged_closes_every_issue_of_the_squash_merged_rolling_pr_runs_post_land_with_the_merge_sha_and_merges_main_back(L, link_script, state):
     squash_into_develop(L)
     L.other_push("on_base.txt")   # the base moved on after the PR was opened: the merge-back must keep it
     L.stubs.reply("gh.pr_list", json.dumps([PR]))
-    L.stubs.reply("gh.issue_view", json.dumps({"state": "OPEN", "labels": [{"name": AWAITING}], "body": "Scope: a\nTracker: PM-17\n"}))
+    L.stubs.reply("gh.issue_view", json.dumps({"state": state, "labels": [{"name": AWAITING}], "body": "Scope: a\nTracker: PM-17\n"}))
     r = L.go("--merged", "9", MAIN_BRANCH="develop", POST_LAND_CMD=link_script(L.tmp / "pl.sh", POST_LAND_MAIN))
     assert r.returncode == 0, r.stderr
     t = L.trail()
     for m in ("9", "4"):
-        assert ("gh", "issue", "close", m, "-c", "merged into develop in abc123") in t and ("gh", "issue", "edit", m, "--remove-label", AWAITING) in t
+        assert (("gh", "issue", "close", m, "-c", "merged into develop in abc123") in t) == (state == "OPEN") and ("gh", "issue", "edit", m, "--remove-label", AWAITING) in t
     assert [x[1:] for x in calls_of(L, "post-land")] == [(m, "PM-17", "abc123", "BASE_BRANCH=main", "MAIN_BRANCH=develop") for m in ("4", "9")]
     assert git(L.origin, "ls-tree", "--name-only", "-r", "main").split() == ["README", "on_base.txt", "squashed.txt"]   # merged back, so the next rolling PR shows only new work
     assert not calls_of(L, "orca", "worktree", "rm")
@@ -615,3 +616,33 @@ def test_merged_refuses_a_pr_that_is_not_merged_and_touches_nothing(L, env, stat
     r = L.go("--merged", "9", **env)
     assert r.returncode == 2, r.stderr
     assert not [x for x in L.trail() if x[:3] in (("gh", "issue", "close"), ("gh", "issue", "edit"), ("orca", "worktree", "rm")) or x[0] in ("git", "post-land")]
+
+
+def merged_labelled(L):
+    L.stubs.reply("gh.pr_list", json.dumps([PR]))
+    L.stubs.reply("gh.issue_view", json.dumps({"state": "OPEN", "labels": [{"name": AWAITING}], "body": "Scope: a\nTracker: PM-17\n"}))
+
+
+def test_a_merge_back_that_conflicts_leaves_every_issue_awaiting_so_the_next_sweep_tries_again(L, link_script):
+    squash_into_develop(L, "clash.txt", "squash")
+    L.other_push("clash.txt", "base")
+    merged_labelled(L)
+    r = L.go("--merged", "9", MAIN_BRANCH="develop", POST_LAND_CMD=link_script(L.tmp / "pl.sh", POST_LAND_MAIN))
+    assert r.returncode == 6 and "merge" in r.stderr, r.stderr
+    assert not calls_of(L, "gh", "issue", "close") and not calls_of(L, "gh", "issue", "edit") and not calls_of(L, "post-land")   # the label is the retry marker: it goes last
+    assert git(L.root, "status", "--porcelain") == "" and git(L.root, "rev-parse", "HEAD") == main_sha(L)
+
+
+def test_a_label_that_cannot_be_removed_stops_the_tracker_update_so_it_never_runs_twice(L, link_script):
+    merged_labelled(L)
+    L.stubs.reply("gh.issue_edit", "boom", rc=1)
+    r = L.go("--merged", "9", LAND_MODE="pr", POST_LAND_CMD=link_script(L.tmp / "pl.sh", POST_LAND_MAIN))
+    assert r.returncode == 6 and not calls_of(L, "post-land")
+
+
+@pytest.mark.parametrize("prs, rc", [("[]", 2), (json.dumps([{**PR, "state": "OPEN", "body": "Closes #9"}]), 7)], ids=["no-pr", "pr-open"])
+def test_pr_mode_cleanup_only_needs_the_pr_as_proof_of_the_land(L, prs, rc):
+    L.stubs.reply("gh.pr_list", prs)
+    r = L.go("--cleanup-only", "9", LAND_MODE="pr")
+    assert r.returncode == rc, r.stderr
+    assert bool(calls_of(L, "orca", "orchestration", "worker-release")) == (rc == 7) and not calls_of(L, "orca", "worktree", "rm")
