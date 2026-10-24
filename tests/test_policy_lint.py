@@ -161,3 +161,13 @@ def test_ci_checks_job_is_capped_to_keep_suite_duration_visible():
     timeout = job.get("timeout-minutes")
     assert isinstance(timeout, int) and not isinstance(timeout, bool), "checks needs a job-level timeout-minutes"
     assert 0 < timeout <= CHECKS_TIMEOUT_CAP
+
+
+def test_guidelines_ask_every_human_decision_in_a_card_and_route_workers_to_orchestration_ask():
+    body = (SHARED / "rules" / "guidelines.md").read_text()
+    assert all(s in body for s in ("AskUserQuestion", "(Recommended)", "orca orchestration ask"))
+    assert "2–5 items" not in body
+
+
+def test_hub_asks_its_next_move_in_a_card():
+    assert "AskUserQuestion" in (SHARED / "skills" / "hub" / "SKILL.md").read_text()

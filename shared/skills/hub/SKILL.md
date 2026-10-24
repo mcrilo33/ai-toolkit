@@ -38,7 +38,7 @@ Summarize as one table, one row per issue: `#n title · state · next step`.
 
 ## 2. Propose, then act on confirmation
 
-State the single best next move and why, then wait. Never dispatch, answer, land, or remove a worktree
+State the single best next move and why, then ask it in an `AskUserQuestion` card (recommended first) and wait. Never dispatch, answer, land, or remove a worktree
 unconfirmed; those change shared state and are hard to undo.
 
 - **Dispatch**: `.ai-toolkit/scripts/dispatch.sh <n>` or `--next` (picks the next ready issue).
