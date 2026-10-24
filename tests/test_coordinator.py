@@ -1247,9 +1247,9 @@ def test_a_merge_back_that_conflicts_blocks_the_issue_once_while_a_failed_cleanu
     if blocks:
         assert ["--add-label", "blocked"] in edits and ["--remove-label", AWAITING] not in edits
         assert comments == ["blocked: https://x/pull/5: merge of develop back into main conflicts: merge it by hand and push, then remove the blocked label"]
-        assert [a[2:] for a in C.calls("gh issue reopen")] == ([["1"]] if state == "CLOSED" else [])
     else:
-        assert not edits and not comments and not C.calls("gh issue reopen")
+        assert not edits and not comments
+    assert [a[2:] for a in C.calls("gh issue reopen")] == ([["1"]] if state == "CLOSED" and rc == 5 else [])   # also when already blocked: a failed reopen is retried at the next sweep
 
 
 def test_status_lists_the_issues_awaiting_main_with_their_pr_and_a_requested_change(C):
