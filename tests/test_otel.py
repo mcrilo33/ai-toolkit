@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 
 import pytest
 import yaml
-from conftest import STUB, V2
+from conftest import STUB, STUB_TEE, V2
 
 OTEL = str(V2 / "scripts/otel.sh")
 COLLECTOR = yaml.safe_load((V2 / "langfuse/otelcol.yaml").read_text())
@@ -13,44 +13,88 @@ COMPOSE = yaml.safe_load((V2 / "langfuse/compose.yaml").read_text())
 @pytest.fixture
 def docker(stubs, tmp_path, monkeypatch, link_script):
     link_script(tmp_path / "stubs/bin/docker", STUB)
-    (tmp_path / "local.env").write_text("LANGFUSE_PUBLIC_KEY=pk-lf-1\nLANGFUSE_SECRET_KEY=sk-lf-2\n")
+    link_script(tmp_path / "stubs/bin/security", STUB)
+    link_script(tmp_path / "stubs/bin/curl", STUB_TEE)
+    stubs.reply("curl", "200")
+    for k in ("LANGFUSE_BASIC_AUTH", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST"):
+        monkeypatch.delenv(k, raising=False)
+    (tmp_path / "local.env").write_text("")
     monkeypatch.setenv("AI_TOOLKIT_LOCAL_ENV", str(tmp_path / "local.env"))
     monkeypatch.setenv("AITK_OTEL_RAW_DIR", str(tmp_path / "raw"))
     return stubs
 
 
+KEYCHAIN = "security.find_generic_password__a"  # the stub's reply key for `security find-generic-password -a ...`
+KEYS = {"LANGFUSE_PUBLIC_KEY": "pk-lf-1", "LANGFUSE_SECRET_KEY": "sk-lf-2"}
+HEADER = "Basic cGstbGYtMTpzay1sZi0y"  # base64 of pk-lf-1:sk-lf-2
+
+
 def test_up_starts_the_compose_stack_with_auth_in_the_child_env_only(run, docker, tmp_path):
-    r = run([OTEL, "up"])
+    r = run([OTEL, "up"], **KEYS)
     (argv,) = docker.calls("docker")
     assert r.returncode == 0, r.stderr
     assert argv[:4] == ["compose", "-p", "ai-toolkit-otel", "-f"] and os.path.normpath(argv[4]) == str(V2 / "langfuse/compose.yaml") and argv[5:] == ["up", "-d"]
     env = docker.env("docker")
-    assert "LANGFUSE_BASIC_AUTH=Basic cGstbGYtMTpzay1sZi0y" in env  # base64 of pk-lf-1:sk-lf-2
+    assert f"LANGFUSE_BASIC_AUTH={HEADER}" in env
     assert "LANGFUSE_OTLP_ENDPOINT=http://host.docker.internal:3000/api/public/otel" in env
     assert f"AITK_OTEL_RAW_DIR={tmp_path / 'raw'}" in env and (tmp_path / "raw").is_dir()
-    assert not any("sk-lf" in a or "cGstbGYt" in a for a in argv)
+    (curl,) = docker.calls("curl")
+    assert curl[-1] == "http://localhost:3000/api/public/projects"  # the host URL, not the container-side rewrite
+    assert not any("sk-lf" in a or "cGstbGYt" in a for a in argv + curl)
+    assert f'Authorization: {HEADER}' in (tmp_path / "stubs/curl.stdin").read_text()  # the header reaches curl on stdin only
 
 
-def test_up_without_credentials_fails_before_docker(run, docker, tmp_path):
-    (tmp_path / "local.env").write_text("")
+def test_up_without_credentials_fails_before_docker(run, docker):
     r = run([OTEL, "up"])
-    assert r.returncode != 0 and "LANGFUSE_SECRET_KEY" in r.stderr and docker.calls("docker") == []
+    assert r.returncode != 0 and "LANGFUSE_SECRET_KEY" in r.stderr and "Keychain" in r.stderr
+    assert docker.calls("docker") == [] and docker.calls("curl") == []
+
+
+def test_up_falls_back_to_the_keychain_and_keeps_the_secret_off_argv(run, docker):
+    docker.reply(KEYCHAIN, "pk-lf-1\n", n=1)
+    docker.reply(KEYCHAIN, "sk-lf-2\n", n=2)
+    r = run([OTEL, "up"])
+    assert r.returncode == 0, r.stderr
+    sec = docker.calls("security")
+    assert [c[2] for c in sec] == [f"ai-toolkit-langfuse-LANGFUSE_INIT_PROJECT_{k}_KEY" for k in ("PUBLIC", "SECRET")]
+    assert f"LANGFUSE_BASIC_AUTH={HEADER}" in docker.env("docker")
+    assert not any("sk-lf" in a or "cGstbGYt" in a for c in docker.calls("docker") + docker.calls("curl") for a in c)
+    assert "sk-lf" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("code,rc,started", [("401", 0, False), ("000", 7, True)], ids=["rejected", "unreachable"])
+def test_up_preflights_the_credential_against_langfuse(run, docker, code, rc, started):
+    docker.reply("curl", code, rc=rc)
+    r = run([OTEL, "up"], **KEYS)
+    assert (r.returncode == 0) is started and len(docker.calls("docker")) == started
+    assert ("unreachable" in r.stderr) is started and ("rejected the credential (HTTP 401)" in r.stderr) is not started
+
+
+def test_up_ignores_a_langfuse_secret_in_the_local_env_file_and_says_so(run, docker, tmp_path):
+    (tmp_path / "local.env").write_text("LANGFUSE_BASIC_AUTH=Basic c3RhbGU=\nLANGFUSE_SECRET_KEY=sk-stale\nLANGFUSE_PUBLIC_KEY=pk-stale\n")
+    docker.reply(KEYCHAIN, "pk-lf-1\n", n=1)
+    docker.reply(KEYCHAIN, "sk-lf-2\n", n=2)
+    r = run([OTEL, "up"])
+    assert r.returncode == 0, r.stderr
+    assert "ignoring" in r.stderr and "Keychain" in r.stderr and "sk-stale" not in r.stderr + r.stdout
+    env = docker.env("docker")
+    assert f"LANGFUSE_BASIC_AUTH={HEADER}" in env and "c3RhbGU" not in env and "sk-stale" not in env
 
 
 def test_up_refuses_a_raw_dir_inside_a_git_worktree(run, docker, repo):
-    r = run([OTEL, "up"], cwd=repo.root, AITK_OTEL_RAW_DIR=repo.root / "raw")
+    r = run([OTEL, "up"], cwd=repo.root, AITK_OTEL_RAW_DIR=repo.root / "raw", **KEYS)
     assert r.returncode != 0 and "inside a git worktree" in r.stderr and docker.calls("docker") == []
     assert not (repo.root / "raw").exists()  # refused before mkdir: no stray dir
 
 
 def test_up_accepts_a_raw_dir_outside_any_repo_even_with_git_dir_exported(run, docker, repo, tmp_path):
-    r = run([OTEL, "up"], GIT_DIR=repo.root / ".git")  # what any git hook exports
+    r = run([OTEL, "up"], GIT_DIR=repo.root / ".git", **KEYS)  # what any git hook exports
     assert r.returncode == 0, r.stderr
     assert len(docker.calls("docker")) == 1 and (tmp_path / "raw").is_dir()
 
 
 def test_up_makes_the_raw_dir_private_and_rewrites_loopback_hosts(run, docker, tmp_path):
-    assert run([OTEL, "up"], LANGFUSE_HOST="http://127.0.0.1:3000").returncode == 0
+    assert run([OTEL, "up"], LANGFUSE_HOST="http://127.0.0.1:3000", **KEYS).returncode == 0
     assert (tmp_path / "raw").stat().st_mode & 0o777 == 0o700
     assert "LANGFUSE_OTLP_ENDPOINT=http://host.docker.internal:3000/api/public/otel" in docker.env("docker")
 
@@ -63,6 +107,16 @@ def test_down_and_status_argv_and_status_exit_code(run, docker):
     docker.reply("docker", "abc123\n")
     r = run([OTEL, "status"])
     assert r.returncode == 0 and r.stdout.strip() == "up"
+
+
+def test_status_is_degraded_while_the_collector_logs_langfuse_export_failures(run, docker):
+    docker.reply("docker", "abc123\n")
+    fail = 'Exporting failed. Dropping data.\t{"otelcol.component.id": "otlp_http/langfuse", "error": "not retryable error: Permanent error: error exporting items, request to http://h/api/public/otel/v1/traces responded with HTTP Status Code %s, Message=Unauthorized"}\n'
+    other = 'Exporting failed. Dropping data.\t{"otelcol.component.id": "file/logs", "error": "disk full"}\n'
+    docker.reply("docker.logs___since", fail % 401 + other + fail % 401)
+    r = run([OTEL, "status"])
+    assert r.returncode == 3 and r.stdout.strip() == "degraded: 2 export failures in 15m (last: 401)"
+    assert docker.calls("docker")[-1] == ["logs", "--since", "15m", "lf-collector"]
 
 
 def test_unknown_subcommand_is_a_usage_error(run, docker):
