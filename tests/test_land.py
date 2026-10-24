@@ -594,7 +594,7 @@ def test_merged_closes_every_issue_of_the_squash_merged_rolling_pr_runs_post_lan
     t = L.trail()
     for m in ("9", "4"):
         assert ("gh", "issue", "close", m, "-c", "merged into develop in abc123") in t and ("gh", "issue", "edit", m, "--remove-label", AWAITING) in t
-    assert [x[1:] for x in calls_of(L, "post-land")] == [("9", "PM-17", "abc123", "BASE_BRANCH=main", "MAIN_BRANCH=develop"), ("4", "PM-17", "abc123", "BASE_BRANCH=main", "MAIN_BRANCH=develop")]
+    assert [x[1:] for x in calls_of(L, "post-land")] == [(m, "PM-17", "abc123", "BASE_BRANCH=main", "MAIN_BRANCH=develop") for m in ("4", "9")]
     assert git(L.origin, "ls-tree", "--name-only", "-r", "main").split() == ["README", "on_base.txt", "squashed.txt"]   # merged back, so the next rolling PR shows only new work
     assert not calls_of(L, "orca", "worktree", "rm")
 
