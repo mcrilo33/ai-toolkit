@@ -497,3 +497,121 @@ def test_a_tracker_key_that_is_not_one_token_is_refused_with_a_warning_and_no_ca
     r = L.go("9", POST_LAND_CMD=tracked(f"Scope: a\nTracker: {key}\n"))
     assert r.returncode == 0 and "warning" in r.stderr and "Tracker" in r.stderr
     assert post_land_calls(L) == [] and main_sha(L) == L.tip
+
+
+# --- #507: an issue is done when merged into the true main branch (MAIN_BRANCH), not when BASE_BRANCH takes it
+AWAITING = "status:awaiting-main"
+POST_LAND_MAIN = """#!/bin/bash
+printf 'post-land' >> "$STUB_DIR/calls.log"; for a in "$@"; do printf '\\037%s' "$a" >> "$STUB_DIR/calls.log"; done
+printf '\\037BASE_BRANCH=%s\\037MAIN_BRANCH=%s\\n' "$BASE_BRANCH" "$MAIN_BRANCH" >> "$STUB_DIR/calls.log"
+"""
+PR = {"number": 5, "url": "https://x/pull/5", "state": "MERGED", "reviewDecision": "APPROVED", "mergeCommit": {"oid": "abc123"}, "body": "Closes #9\nCloses #4\n"}
+OPEN_PR = [{"url": "https://x/pull/5", "isDraft": False}]
+
+
+def calls_of(L, *prefix):
+    return [t for t in L.trail() if t[:len(prefix)] == prefix]
+
+
+def test_integration_land_pushes_the_base_leaves_the_issue_open_awaiting_main_and_opens_the_rolling_pr(L, link_script):
+    L.stubs.reply("gh.pr_list", "[]")
+    L.stubs.reply("gh.pr_create", "https://x/pull/5")
+    L.stubs.reply("gh.issue_list", json.dumps([{"number": 4}]))
+    L.stubs.reply("gh.issue_view", json.dumps({"number": 9, "title": "t", "body": "Scope: a\nTracker: PM-17\n"}))
+    r = L.go("9", MAIN_BRANCH="develop", POST_LAND_CMD=link_script(L.tmp / "pl.sh", POST_LAND_MAIN))
+    assert r.returncode == 7, r.stderr
+    t = L.trail()
+    assert main_sha(L) == L.tip and ("git", "push", "main") in t
+    assert not calls_of(L, "gh", "issue", "close") and not calls_of(L, "post-land")
+    assert ("gh", "issue", "edit", "9", "--add-label", AWAITING) in t and ("gh", "issue", "edit", "9", "--remove-label", "status:in-progress") in t
+    assert [x[-1] for x in calls_of(L, "gh", "issue", "comment", "9")] == [f"integrated in main at {L.tip}, open until merged into develop"]
+    (create,) = calls_of(L, "gh", "pr", "create")
+    assert create[create.index("--head") + 1] == "main" and create[create.index("--base") + 1] == "develop"
+    body = create[create.index("--body") + 1]
+    assert "Closes #9" in body and "Closes #4" in body   # this issue and the ones already waiting
+    assert ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks") in t and ("git", "delete", BRANCH) in t   # the work is on the base: nothing needs the worktree
+    assert "PR: https://x/pull/5" in r.stdout
+
+
+def test_a_second_integration_land_adds_its_issue_to_the_open_rolling_pr_instead_of_opening_another(L):
+    L.stubs.reply("gh.pr_list", json.dumps(OPEN_PR))
+    L.stubs.reply("gh.issue_list", json.dumps([{"number": 3}]))
+    r = L.go("9", MAIN_BRANCH="develop")
+    assert r.returncode == 7, r.stderr
+    assert not calls_of(L, "gh", "pr", "create")
+    (edit,) = calls_of(L, "gh", "pr", "edit")
+    assert edit[3] == "https://x/pull/5" and "Closes #3" in edit[-1] and "Closes #9" in edit[-1]
+    assert "PR: https://x/pull/5" in r.stdout
+
+
+def test_pr_mode_opens_a_draft_for_ci_pushes_nothing_then_readies_it_and_keeps_the_worktree(L):
+    L.stubs.reply("gh.pr_list", "[]", n=1)
+    L.stubs.reply("gh.pr_list", json.dumps([{"url": "https://x/pull/6", "isDraft": True}]), n=2)
+    L.stubs.reply("gh.pr_create", "https://x/pull/6")
+    before = main_sha(L)
+    r = L.go("9", LAND_MODE="pr")
+    assert r.returncode == 7, r.stderr
+    t = L.trail()
+    assert main_sha(L) == before and not [x for x in t if x[0] == "git"]   # the base is not pushed, nor the branch or anything else
+    (create,) = calls_of(L, "gh", "pr", "create")
+    assert "--draft" in create and create[create.index("--head") + 1] == BRANCH and create[create.index("--base") + 1] == "main"
+    assert t.index(create) < t.index(calls_of(L, "gh", "run", "list")[0]) < t.index(("gh", "pr", "ready", "https://x/pull/6"))   # draft, CI on the tip, then ready
+    assert "Closes #9" in calls_of(L, "gh", "pr", "edit")[0][-1] and L.tip in calls_of(L, "gh", "pr", "edit")[0][-1]
+    assert ("gh", "issue", "edit", "9", "--add-label", AWAITING) in t and not calls_of(L, "gh", "issue", "close")
+    assert [x[3:5] for x in calls_of(L, "orca", "orchestration", "worker-release")] == [("--dispatch", "ctx_9")]
+    assert not calls_of(L, "orca", "worktree", "rm") and ("git", "delete", BRANCH) not in t
+    assert "https://x/pull/6" in calls_of(L, "gh", "issue", "comment", "9")[0][-1] and "PR: https://x/pull/6" in r.stdout
+
+
+def test_a_second_pr_mode_land_updates_the_open_pr_with_the_local_gate(L):
+    L.stubs.reply("gh.pr_list", json.dumps(OPEN_PR))
+    r = L.go("9", LAND_MODE="pr", LOCAL_GATE=1, CHECK_CMD="true")
+    assert r.returncode == 7, r.stderr
+    assert not calls_of(L, "gh", "pr", "create") and not calls_of(L, "gh", "pr", "ready") and not calls_of(L, "gh", "run")
+    assert len(calls_of(L, "gh", "pr", "edit")) == 1 and "Closes #9" in calls_of(L, "gh", "pr", "edit")[0][-1]
+
+
+@pytest.mark.parametrize("env", [{"LAND_MODE": "pr", "MAIN_BRANCH": "develop"}, {"LAND_MODE": "merge"}], ids=["pr-with-another-main", "unknown-mode"])
+def test_an_incoherent_land_mode_is_a_usage_error(L, env):
+    assert L.go("9", **env).returncode == 2 and not L.trail()
+
+
+def squash_into_develop(L):   # the human merged the promotion PR: develop holds a squash commit that main does not
+    o = L.tmp / "dev"
+    subprocess.run(["git", "clone", "-q", str(L.origin), str(o)], check=True, capture_output=True)
+    git(o, "switch", "-q", "-c", "develop")
+    commit(o, "squashed.txt", push="develop")
+    (L.tmp / "stubs/calls.log").write_text("")
+
+
+def test_merged_closes_every_issue_of_the_squash_merged_rolling_pr_runs_post_land_with_the_merge_sha_and_merges_main_back(L, link_script):
+    squash_into_develop(L)
+    L.other_push("on_base.txt")   # the base moved on after the PR was opened: the merge-back must keep it
+    L.stubs.reply("gh.pr_list", json.dumps([PR]))
+    L.stubs.reply("gh.issue_view", json.dumps({"state": "OPEN", "labels": [{"name": AWAITING}], "body": "Scope: a\nTracker: PM-17\n"}))
+    r = L.go("--merged", "9", MAIN_BRANCH="develop", POST_LAND_CMD=link_script(L.tmp / "pl.sh", POST_LAND_MAIN))
+    assert r.returncode == 0, r.stderr
+    t = L.trail()
+    for m in ("9", "4"):
+        assert ("gh", "issue", "close", m, "-c", "merged into develop in abc123") in t and ("gh", "issue", "edit", m, "--remove-label", AWAITING) in t
+    assert [x[1:] for x in calls_of(L, "post-land")] == [("9", "PM-17", "abc123", "BASE_BRANCH=main", "MAIN_BRANCH=develop"), ("4", "PM-17", "abc123", "BASE_BRANCH=main", "MAIN_BRANCH=develop")]
+    assert git(L.origin, "ls-tree", "--name-only", "-r", "main").split() == ["README", "on_base.txt", "squashed.txt"]   # merged back, so the next rolling PR shows only new work
+    assert not calls_of(L, "orca", "worktree", "rm")
+
+
+def test_merged_in_pr_mode_closes_the_issue_and_removes_the_branch_and_the_worktree(L, link_script):
+    L.stubs.reply("gh.pr_list", json.dumps([{**PR, "body": "Closes #9\n"}]))
+    L.stubs.reply("gh.issue_view", json.dumps({"state": "OPEN", "labels": [{"name": AWAITING}], "body": "Scope: a\nTracker: PM-17\n"}))
+    r = L.go("--merged", "9", LAND_MODE="pr", POST_LAND_CMD=link_script(L.tmp / "pl.sh", POST_LAND_MAIN))
+    assert r.returncode == 0, r.stderr
+    t = L.trail()
+    assert ("gh", "issue", "close", "9", "-c", "merged into main in abc123") in t and calls_of(L, "post-land")[0][1:4] == ("9", "PM-17", "abc123")
+    assert ("git", "delete", BRANCH) in t and ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks") in t and ("git", "push", "main") not in t
+
+
+@pytest.mark.parametrize("env, state", [({"MAIN_BRANCH": "develop"}, "OPEN"), ({"MAIN_BRANCH": "develop"}, "CLOSED"), ({}, "MERGED")], ids=["open", "closed", "nothing-waits"])
+def test_merged_refuses_a_pr_that_is_not_merged_and_touches_nothing(L, env, state):
+    L.stubs.reply("gh.pr_list", json.dumps([{**PR, "state": state}]))
+    r = L.go("--merged", "9", **env)
+    assert r.returncode == 2, r.stderr
+    assert not [x for x in L.trail() if x[:3] in (("gh", "issue", "close"), ("gh", "issue", "edit"), ("orca", "worktree", "rm")) or x[0] in ("git", "post-land")]

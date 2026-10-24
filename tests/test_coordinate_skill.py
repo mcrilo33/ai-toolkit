@@ -113,3 +113,10 @@ def test_a_deny_refuses_one_command_and_the_hold_label_is_the_do_not_land_yet_le
 
 def test_hub_lands_with_the_review():
     assert "land.sh --review" in (SHARED / "skills/hub/SKILL.md").read_text()
+
+
+def test_an_issue_awaiting_main_is_not_landed_yet_and_a_rejected_pr_arrives_as_a_blocked_item():
+    land = next(ln for ln in SKILL.split("\n- ") if ln.startswith("**Land this**"))
+    done = next(ln for ln in SKILL.split("\n- ") if ln.startswith("**What landed**"))
+    assert "`status:awaiting-main`" in land and "not landed yet" in land and "merged into `MAIN_BRANCH`" in land and "blocked item" in land
+    assert "awaiting-main" in done and "not landed" in done

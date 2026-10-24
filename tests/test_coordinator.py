@@ -1174,3 +1174,64 @@ def test_a_synced_coordinator_that_does_not_parse_is_not_exec_d_and_warns_once(T
     link_script(T.tk / "scripts/sync.sh", '#!/bin/bash\nprintf "if\n" > "$1/.ai-toolkit/scripts/c.new"; mv -f "$1/.ai-toolkit/scripts/c.new" "$1/.ai-toolkit/scripts/coordinator.sh"; echo ff0000000000 > "$1/.ai-toolkit/toolkit-version"\n')   # a rename, as sync.sh does
     r = T.go(COORD_MAX_TICKS=3)
     assert r.returncode == 0 and len(T.C.calls("orca orchestration check")) == 3 and "re-exec" not in T.log() and T.log().count("does not parse") == 1
+
+
+# --- #507: an issue is done when merged into MAIN_BRANCH; the loop logs a land that awaits it and watches the PR
+INT, PRMODE = dict(MAIN_BRANCH="develop"), dict(LAND_MODE="pr")
+AWAITING = "status:awaiting-main"
+
+
+def pr_json(**kw):
+    return json.dumps([{"number": 5, "url": "https://x/pull/5", "state": "OPEN", "reviewDecision": "", "mergeCommit": None, "body": "Closes #1\n", **kw}])
+
+
+def test_a_land_that_awaits_its_merge_into_main_is_logged_with_its_pr_never_blocked_and_still_routes_the_leftovers(C):
+    C.stubs.reply(key("land.sh", "--review", "1"), f"{W}x\nlanded #1 in abc, awaiting merge into develop\nPR: https://x/pull/5\n", rc=7)
+    C.stubs.reply("claude", "filed #9\n")
+    C.mail([msg("worker_done", outcome="succeeded")])
+    r = C.go(**INT)
+    assert "#1: on main, awaiting merge into develop (https://x/pull/5)" in r.stdout
+    assert len(C.stubs.calls("land.sh")) == 1 and "blocked" not in sum(C.calls("gh issue edit"), []) and len(C.stubs.calls("claude")) == 1
+
+
+def test_a_cleanup_retry_that_ends_awaiting_main_does_not_block(C):
+    C.stubs.reply(key("land.sh", "--review", "1"), "land.sh: landed abc but cleanup is incomplete\n", rc=6)
+    C.stubs.reply(key("land.sh", "--cleanup-only", "--branch"), "", rc=7)
+    C.mail([msg("worker_done", outcome="succeeded")])
+    C.go(**INT)
+    assert len(C.stubs.calls("land.sh")) == 2 and not C.calls("gh issue edit")
+
+
+def test_a_replayed_worker_done_of_an_issue_awaiting_main_is_not_landed_again(C):
+    C.stubs.reply("gh.issue_view", issue_json(labels=[AWAITING]))
+    C.mail([msg("worker_done", outcome="succeeded")])
+    r = C.go(**PRMODE)
+    assert not C.stubs.calls("land.sh") and "#1 already awaiting its merge into main (replayed worker_done)" in r.stdout
+
+
+@pytest.mark.parametrize("pr, env, action", [
+    (pr_json(state="MERGED", mergeCommit={"oid": "abc"}), INT, "merged"),
+    (pr_json(state="CLOSED"), INT, "closed without merge"),
+    (pr_json(reviewDecision="CHANGES_REQUESTED"), PRMODE, "changes requested"),   # an issue's own PR: its worker can address it
+    (pr_json(reviewDecision="CHANGES_REQUESTED"), INT, "left"),   # the rolling PR carries many issues: the human decides, --status shows it
+    (pr_json(reviewDecision="REVIEW_REQUIRED"), INT, "left"), ("[]", INT, "left"), ("boom", INT, "left")], ids=["merged", "closed", "changes-pr", "changes-rolling", "open", "no-pr", "gh-fails"])
+def test_the_sweep_checks_the_pr_of_each_issue_awaiting_main(C, pr, env, action):
+    C.stubs.reply("gh.issue_list", json.dumps([{"number": 1, "title": "t", "state": "OPEN"}]))
+    C.stubs.reply("gh.pr_list", pr, rc=1 if pr == "boom" else 0)
+    C.go(COORD_SWEEP_EVERY=1, **env)
+    comments = [a[-1] for a in C.calls("gh issue comment")]
+    if action == "merged":
+        assert C.stubs.calls("land.sh") == [["--merged", "1"]] and not comments
+    elif action == "left":
+        assert not C.stubs.calls("land.sh") and not C.calls("gh issue edit") and not comments
+    else:
+        assert not C.stubs.calls("land.sh") and ["--add-label", "blocked"] in [a[3:] for a in C.calls("gh issue edit")]
+        assert ["--remove-label", AWAITING] in [a[3:] for a in C.calls("gh issue edit")] and comments == [f"blocked: https://x/pull/5: {action}"]
+
+
+def test_status_lists_the_issues_awaiting_main_with_their_pr_and_a_requested_change(C):
+    C.stubs.reply("gh.issue_list", "[]", n=1)   # the blocked queue
+    C.stubs.reply("gh.issue_list", json.dumps([{"number": 7, "title": "t7", "state": "OPEN"}]), n=2)
+    C.stubs.reply("gh.pr_list", pr_json(reviewDecision="CHANGES_REQUESTED", body="Closes #7\n"))
+    out = C.go("--status", ORCA_TERMINAL_HANDLE="", **INT).stdout
+    assert re.search(r"awaiting main:\n\s+#7 t7: https://x/pull/5 \(changes requested\)", out)

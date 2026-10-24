@@ -216,6 +216,7 @@ NEXT = [
     ("priority beats a lower number", [issue(3), issue(9, "Scope: z.py", ["priority"])], [], 9),
     ("hold is skipped", [issue(3, labels=["hold"]), issue(4, "Scope: b.py")], [], 4),
     ("blocked label is skipped", [issue(3, labels=["blocked"]), issue(4, "Scope: b.py")], [], 4),
+    ("an issue awaiting its merge into main is skipped", [issue(3, labels=["status:awaiting-main"]), issue(4, "Scope: b.py")], [], 4),
     ("open blocker is skipped", [issue(3, blocked=[(1, "OPEN")]), issue(4, "Scope: b.py")], [], 4),
     ("closed blockers are fine", [issue(3, blocked=[(1, "CLOSED"), (2, "CLOSED")])], [], 3),
     ("overlapping scope with an in-flight issue is skipped",
@@ -360,3 +361,4 @@ def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_th
     assert calls[4] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}", "--terminal", "term_agent",
                         "--task-title", "#7 address", "--spec", "address: fix the blocker", "--timeout-ms", "120000"]
     assert (d.record / "ctx_3").read_text() == "7\n"
+    assert ["issue", "edit", "7", "--remove-label", "status:awaiting-main"] in d.stubs.calls("gh")   # a reviewer asked for changes: the issue is being worked again
