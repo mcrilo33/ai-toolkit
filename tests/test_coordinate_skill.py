@@ -127,4 +127,4 @@ def test_a_held_finished_issue_is_read_with_gh_not_status_and_only_a_terminal_se
     chat = SKILL[SKILL.index("**Chat session.**"):].split("\n")[0]   # coordinator.sh sends the held line only through --session; --wait and --status never list a held issue
     assert "gh issue view <n>" in bell and "Finished but held" in bell and "--status` does not list" in bell
     assert not re.search(r"held issue: `--status`", bell)
-    assert "finished issue held: land now" not in chat and "gh issue list --label hold --state open" in chat
+    assert "finished issue held: land now" not in chat and "gh issue list --label hold --state open" in chat and "Finished but held" in chat   # the label also marks follow-ups and parked blocked issues
