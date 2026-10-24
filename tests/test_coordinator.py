@@ -742,7 +742,7 @@ def test_a_worker_whose_only_open_question_is_an_expired_permission_request_is_s
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_p", question=PQ), "run_id": "run_t", "thread_id": "msg_p", "created_at": ago}]}}))
     C.workers(C.row()); C.show(silent=40)
     C.go("--cap", "0", **SWEEP)
-    assert C.blocked()
+    assert [a[0] for a in C.stubs.calls("dispatch.sh") if a != ["--next", "--dry-run"]] == ["--address"] and C.calls("orca orchestration worker-release")   # relaunched like any idle worker
 
 
 def test_replaying_the_incident_ends_with_the_issue_re_dispatched_never_a_silent_loop(C, tmp_path):
@@ -759,7 +759,7 @@ def test_replaying_the_incident_ends_with_the_issue_re_dispatched_never_a_silent
     assert not C.calls("orca orchestration reply") and not C.spooled("msg_p") and req.read_text().splitlines()[1].startswith("a worker is still live on the worktree (dispatch ctx_1)")   # kept with its reason, the stale reply dropped
     C.workers(C.row(st="failed", lv="exited"))   # the human abandoned the worker
     C.go("--answer", "attended", "--cap", "1")
-    assert C.stubs.calls("dispatch.sh") == [["--address", "on another model", "1"]] and not req.exists()
+    assert [a for a in C.stubs.calls("dispatch.sh") if a != ["--next", "--dry-run"]] == [["--address", "on another model", "1"]] and not req.exists()
 
 
 def test_status_lists_the_queue_in_the_order_to_present_it_and_the_dispatch_requests_with_their_reason(C, tmp_path):
