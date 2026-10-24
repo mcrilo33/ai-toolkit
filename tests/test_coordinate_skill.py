@@ -123,7 +123,7 @@ def test_an_issue_awaiting_main_is_not_landed_yet_and_a_rejected_pr_arrives_as_a
 
 
 def test_a_held_finished_issue_is_read_with_gh_not_status_and_only_a_terminal_session_hears_of_it():
-    bell = SKILL[SKILL.index("**The bell, the one rule**"):].split("\n")[0]
+    bell = SKILL[SKILL.index("**The bell, the one rule**"):SKILL.index("**Chat session.**")]
     chat = SKILL[SKILL.index("**Chat session.**"):].split("\n")[0]   # coordinator.sh sends the held line only through --session; --wait and --status never list a held issue
     assert "gh issue view <n>" in bell and "Finished but held" in bell and "--status` does not list" in bell
     assert not re.search(r"held issue: `--status`", bell)
