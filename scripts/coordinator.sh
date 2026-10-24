@@ -415,6 +415,7 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
   for d in $(wl | jq -r '.result.workers as $w | $w[] | select(.dispatchStatus == "dispatched" and .projection.liveness.verdict == "exited")
       | .resource.worktreeId as $p | select([$w[] | select(.resource.worktreeId == $p and .dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited")] | length == 0) | .dispatchId'); do
     ctx "$d" || continue
+    if [ -n "$(head -n 1 "$sd/requests/$issue" 2> /dev/null)" ]; then log "#$issue: worker $d exited and a replace request waits: releasing it, not relaunching it"; release "$d"; continue; fi   # the request starts at the next wake
     r="$(rounds)" || continue
     if [ "$r" -lt 1 ]; then
       log "#$issue: worker $d exited without worker_done, relaunching"; RUN="$run" "$DISPATCH_CMD" --retry-of "$d" --task "$task" "$issue" > /dev/null || block "relaunch failed"
@@ -433,9 +434,9 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
 }
 
 tell() {   # $1 kind (p|q|b|r = a dropped reply), $2 id: one fixed line typed into the session's terminal, never text a worker wrote (it lands in an agent's prompt); no --session = nothing to send
-  [ -n "$session" ] || return 0; local kind=plan id txt; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; esac; id="$(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2")"
+  [ -n "$session" ] || return 0; local kind=plan id txt; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; r) kind=reply ;; esac; id="$(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2")"
   txt="new decision waiting: $kind $id. Read it whole, present it with one recommendation, then ring."; [ "$1" != r ] || txt="reply to $id was dropped after repeated send failures: its question may still be open, present it again."
-  orca_json terminal send --terminal "$session" --text "[coordinator loop] $txt" --enter > /dev/null 2>&1 || { warn "cannot tell the session ($kind $2): retried at the next wake"; return 1; }
+  orca_json terminal send --terminal "$session" --text "[coordinator loop] $txt" --enter > /dev/null 2>&1 || { warn "cannot tell the session ($kind $2)$([ "$1" = r ] || echo ': retried at the next wake')"; return 1; }
 }
 notify_queue() {   # attended: tell the session of a decision that was not queued at the last look, once: the first one when nothing that was waiting at the last look still is, and every permission request (it expires in 9 minutes); the ids last seen live in $seen (no file); a failed read or send changes nothing, the next wake looks again. A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event.
   [ "$answer" = attended ] || return 0; local now i all k first=0 fail=0; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
