@@ -94,7 +94,10 @@ def test_between_stop_and_its_exit_the_session_handles_nothing():
 def test_a_chat_session_decision_is_alerted_by_a_mandatory_ask_user_question_card():
     chat = SKILL[SKILL.index("**Chat session.**"):].split("\n")[0]   # no terminal to ring: the card is the alert, so it cannot be optional
     assert "AskUserQuestion" in chat and "optionally" not in chat and "permission request" in chat
-    assert "no bell" not in chat.lower() and "afplay" not in chat and "PushNotification" in chat
+    assert "no bell" not in chat.lower() and "PushNotification" in chat
+    assert "Orca raises its sound" not in chat and "no sound command" not in chat   # Orca's card sound is its Agent Task Complete notification, often off: the session cannot rely on it
+    assert "Agent Task Complete" in chat and "`afplay /System/Library/Sounds/Glass.aiff`" in chat   # so the session sounds every decision card itself
+    assert re.search(r"every decision.{0,80}plan, permission request, blocked issue, refused dispatch request", chat) and re.search(r"turn 1.{0,200}afplay", chat)   # one background sound per decision, in the context turn, before the card
     assert re.search(r"permission request .{0,40}card is open", chat)   # a request waking the watcher behind an open card
     assert "**quick decision**" in chat and "**technical detail**" in chat   # two levels in the chat before the card: decide fast, or deep-dive
     assert "holds only the question" in chat and "#<n>: <choice>?" in chat and "no `preview`" in chat   # a short card question; Orca renders no option preview
