@@ -552,12 +552,13 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     C.workers(C.row(lv="live" if idle else "exited")); C.show(silent=25, **shown)
     C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
     assert not C.stubs.calls("dispatch.sh")
+    first_run = len(C.kinds())   # its exit closed the loop's own pane
     r = C.go("--cap", "1", **SWEEP)
     if not idle:
         assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]]
         return
     assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and C.stubs.calls("dispatch.sh")[0][-1] == "1" and "continue from the pushed branch" in C.stubs.calls("dispatch.sh")[0][1].replace("Continue", "continue")
-    in_order(C.kinds(), "orca orchestration worker-release", "dispatch.sh", "orca terminal close")   # the live dispatch is stopped before its replacement starts
+    in_order(C.kinds()[first_run:], "orca orchestration worker-release", "dispatch.sh", "orca terminal close")   # the live dispatch is stopped before its replacement starts
     assert re.search(r"silent for 2[45]m, relaunching", r.stdout) and "round 1" in C.calls("gh issue comment")[0][-1]
 
 
