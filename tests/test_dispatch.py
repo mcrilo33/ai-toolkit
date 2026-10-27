@@ -127,6 +127,31 @@ def test_a_tracker_key_that_is_not_one_token_starts_no_worker(d, key):
     assert not any(c[:2] in (["terminal", "create"], ["orchestration", "worker-start"]) for c in d.orca())
 
 
+@pytest.mark.parametrize("tail, human", [("Land: human\n", True), ("Land: Human\r\n", True), ("Land: auto\n", False), ("", False)])
+def test_a_land_human_footer_adds_the_round_report_paragraph_to_the_seed_and_the_default_is_auto(d, tail, human):
+    d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": ISSUE["body"] + tail}))
+    assert d.go("7").returncode == 0
+    ws = worker_start(d)
+    seed = ws[ws.index("--spec") + 1]
+    assert ("Land: human" in seed) == human and seed.endswith("Never merge or push the base branch.")
+    if human:   # one paragraph: the round report (numbers, open items kept off DEFERRED, absolute artefact paths) and what an address: means
+        for part in ("round report", "never marked DEFERRED", "absolute paths", "gitignored", "address:", "next round"):
+            assert part in seed
+
+
+@pytest.mark.parametrize("land", ["maybe", "human; touch x", "auto human"])
+def test_a_land_footer_that_is_not_auto_or_human_starts_no_worker(d, land):
+    d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": f"x\nScope: a\nLand: {land}\n"}))
+    r = d.go("7")
+    assert r.returncode == 1 and "bad Land footer" in r.stderr and not d.orca()
+
+
+def test_a_land_human_issue_is_ready_like_any_other(d):
+    stub_board(d, [issue(3, "Scope: a.py\nLand: human")], [])
+    r = d.go("--next", "--dry-run")
+    assert r.returncode == 0 and r.stdout.strip() == "3"
+
+
 def test_missing_gate_footer_falls_back_to_the_env_default(d):
     d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": "no footer"}))
     d.go("7")
@@ -362,3 +387,11 @@ def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_th
                         "--task-title", "#7 address", "--spec", "address: fix the blocker", "--timeout-ms", "120000"]
     assert (d.record / "ctx_3").read_text() == "7\n"
     assert ["issue", "edit", "7", "--remove-label", "status:awaiting-main"] in d.stubs.calls("gh")   # a reviewer asked for changes: the issue is being worked again
+
+
+def test_a_round_requested_by_the_human_is_a_task_titled_round_so_the_retry_budget_can_skip_it(d):
+    stale_worktree(d)
+    d.stubs.reply("orca.orchestration_worker_start", '{"result":{"dispatchId":"ctx_3","state":"ready"}}')
+    assert d.go("--address", "address: try the second prompt", "--round", "7").returncode == 0
+    ws = worker_start(d)
+    assert ws[ws.index("--task-title") + 1] == "#7 round" and ws[ws.index("--spec") + 1] == "address: try the second prompt"
