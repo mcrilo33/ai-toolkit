@@ -559,6 +559,7 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
         return
     assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and C.stubs.calls("dispatch.sh")[0][-1] == "1" and "continue from the pushed branch" in C.stubs.calls("dispatch.sh")[0][1].replace("Continue", "continue")
     in_order(C.kinds()[first_run:], "orca orchestration worker-release", "dispatch.sh", "orca terminal close")   # the live dispatch is stopped before its replacement starts
+    assert [arg(a, "--terminal") for a in C.calls("orca terminal close")] == ["term_c", "term_w", "term_c"]   # the first run's pane, the old worker's terminal, this run's pane
     assert re.search(r"silent for 2[45]m, relaunching", r.stdout) and "round 1" in C.calls("gh issue comment")[0][-1]
 
 
