@@ -12,6 +12,7 @@
 # --answer attended (the /coordinate attended loop, #450): the routine work out of sight, the human only for a decision. A routine plan is approved by answer.sh; a plan it hands over (exit 3, a reason) and every permission
 # request stay OPEN (the loop never approves one), queued for the human with the other open questions and the blocked issues; the session is told by ONE line typed into its terminal (--session <handle>, orca terminal send) when a decision arrives on an empty queue, and for every permission request; the loop rings nothing. --show <message-id> prints one open question whole. --dispatch <issue> [message]
 # queues a dispatch request the loop runs ahead of its own pick (cap and Scope rule apply). auto and human are unchanged.
+# `Land: human` issue (#511): each worker_done is a round report, never landed: the issue gets a "Round finished" comment carrying it, the worktree stays, and while no worker runs on it the round is a decision (--status, --wait). --dispatch <n> '<guidance>' starts the next round (a task titled "#<n> round", which rounds() counts from); the land is the footer set to `Land: auto` and --dispatch <n> 'address: send worker_done again'.
 # --run R --wait [--seen '<ids>'] (a chat session, #473): read-only, needs no terminal; polls every COORD_WATCH_SEC (5) and exits 0 printing the id of a decision that was not waiting when it started (nor in --seen), by notify_queue's rule; a failed read retries.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
 # consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
@@ -116,6 +117,18 @@ open_q() {   # the open questions a human can still answer, oldest first (Orca l
       and ((($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") | not) or ((try ((.created_at | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)) catch $now) >= $now - 540)))' <<< "$o"
 }
 blocked_q() { gh issue list --label blocked ${DISPATCH_LABEL:+--label "$DISPATCH_LABEL"} --state open --limit 100 --json number,title,labels | jq -r '[.[] | select(.labels | map(.name) | index("hold") | not)] | sort_by(.number)[] | "\(.number)\t\(.title)"'; }   # hold = parked on purpose
+round_q() {   # "<n>\t<title>" of each finished Land: human round (the human decides): the footer says human, the loop's last comment says "Round finished", and Orca shows no dispatched worker on it (the issue each dispatch was given by dispatch.sh, not the worker's own link)
+  local c me lw live d n t cm
+  c="$(gh issue list --state open ${DISPATCH_LABEL:+--label "$DISPATCH_LABEL"} --limit 100 --json number,title,body,labels | jq -r '.[] | select((.labels | map(.name) | index("blocked") | not) and ((.body // "") | split("\n") | map(select(test("^Land:"))) | last // "" | ascii_downcase | test("^land:\\s*human\\s*$"))) | "\(.number)\t\(.title)"')" || return 1
+  [ -n "$c" ] || return 0
+  me="$(gh api user --jq .login)" && lw="$(wl)" || return 1; live=" "
+  for d in $(jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | .dispatchId' <<< "$lw"); do live="$live$(recorded_issue "$run" "$d" 2> /dev/null || true) "; done
+  while IFS=$'\t' read -r n t <&3; do
+    case "$live" in *" $n "*) continue ;; esac
+    cm="$(gh issue view "$n" --json comments)" || return 1
+    ! jq -e --arg me "$me" '[.comments[] | select(.author.login == $me)] | (last // {}).body // "" | startswith("Round finished")' <<< "$cm" > /dev/null || printf '%s\t%s\n' "$n" "$t"
+  done 3<<< "$c"
+}
 awaiting_q() { gh issue list --label "$AWAITING_LABEL" --state "$1" --limit 100 --json number,title,state,labels; }   # $1 open|all: the issues waiting for their merge into MAIN_BRANCH (all: GitHub may have closed one with its PR's Closes)
 queue_ids() {   # the decisions waiting for the human, in the order to present them, one word each: q:<message id> (a plan: a worker waits, a slot is held) or p:<message id> (a permission request), then b:<issue> (blocked; a review that kept rejecting is one)
   local q; q="$(open_q | jq -r '"\(if ((.payload // "{}" | if type == "string" then fromjson else . end).question // .body // "") | test("^\\s*PERMISSION REQUEST") then "p" else "q" end):\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
@@ -146,6 +159,9 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
   [ -z "$main_kind" ] || { echo "awaiting main:"; awaiting_q open | jq -r '.[] | "\(.number)\t\(.title)"' | while IFS=$'\t' read -r n t; do
     pr="$(pr_of "$n" 2> /dev/null)" || pr="{}"   # the PR url and a requested change: the human's to decide when the PR is the rolling one
     echo "  #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120): $(jq -r '.url // "no PR found"' <<< "$pr")$(! pr_changes_requested "$pr" || echo " (changes requested)")"; done; } || true
+  { round_q || true; } | while IFS=$'\t' read -r n t; do   # a finished Land: human round: the report is the issue's last comment
+    echo "  finished round #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)"
+    echo "    decide: read the report (gh issue view $n --comments), then the next round: bash $here/coordinator.sh --run $run --dispatch $n '<guidance>'; or land (it removes the worktree and its gitignored artefacts): gh issue view $n --json body -q .body | sed 's/^Land:.*/Land: auto/' | gh issue edit $n --body-file -  then  --dispatch $n 'address: send worker_done again'"; done
   echo "dispatch requests:"
   for f in "$(spool_dir "$run")/requests"/*; do [ -f "$f" ] && echo "  #${f##*/} $(head -n 1 "$f"): $(sed -n 2p "$f" | grep . || echo queued)"; done
   exit 0
@@ -153,7 +169,7 @@ fi
 
 watch_queue() {   # $1 poll number: one look at the queue (#473). Sets $found to the id of a decision that is new since the last look, by notify_queue's rule (a permission request always; the rest only when nothing seen is still waiting). Status 1 = nothing new or a read failed: a failed read learns nothing, it is no empty baseline
   local all="" i k f b first=1 now=""; lm="$(live_hold ne "")" || lm=""
-  if [ "$bok" = 0 ] || [ $(($1 % ${COORD_WATCH_GH_EVERY:-12})) -eq 0 ]; then b="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 1; bids="$b"; bok=1; fi   # gh is read every COORD_WATCH_GH_EVERY polls, not every poll
+  if [ "$bok" = 0 ] || [ $(($1 % ${COORD_WATCH_GH_EVERY:-12})) -eq 0 ]; then b="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 1; f="$(round_q | cut -f1 | sed 's/^/f:/')" || return 1; bids="$b"$'\n'"$f"; bok=1; fi   # gh is read every COORD_WATCH_GH_EVERY polls, not every poll
   all="$(queue_ids | tr '\n' ' ')" || return 1
   for f in "$(spool_dir "$run")/requests"/*; do [ ! -f "$f" ] || [ -z "$(sed -n 2p "$f")" ] || all="$all r:${f##*/} "; done   # a dispatch request with a refusal reason
   all=" $all"; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || all="${all/ [qp]:${f##*/} / }"; done   # a decision answered with --reply stays open in Orca until the loop's next wake: it is no longer waiting
@@ -231,7 +247,12 @@ ctx() {
     || { block "more than one worktree is linked to #$issue in Orca: nothing is answered or landed until a human checks"; return 2; }
 }
 nlive() { jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length'; }   # the workers of one wl reply that are live
-rounds() { wl | jq --arg p "::$wtp" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] | length - 1'; }   # dispatches so far - 1
+rounds() {   # dispatches of the worktree since its last human-requested round (a task titled "#<n> round", see named()), else all of them - 1; a relaunch shares its task, so the base is that task's oldest dispatch
+  local hr; hr="$(okread orchestration task-list --run "$run" --brief | jq -c '[.result.tasks[] | select(.task_title | test("^#[0-9]+ round$")) | .id]')" || return 1
+  wl | jq --arg p "::$wtp" --argjson h "$hr" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] as $w   # worker-list is newest first
+    | ([$w[] | select(.taskId as $t | $h | index($t))][0].taskId) as $t
+    | if $t == null then ($w | length) - 1 else [$w | to_entries[] | select(.value.taskId == $t) | .key] | last end'
+}
 release() {   # $1 dispatch: worker-release, else worker-stop. A stop can answer ok:true and leave the dispatch dispatched (stop_unknown): that, or a failed stop, is fenced with worker-abandon, never left live
   local out
   [ -n "$1" ] || return 0
@@ -350,16 +371,22 @@ closed_cleanup() {   # $1 = 1 when the worktree already carries the flag below. 
 }
 landing() { printf '%s %s %s\n' "$issue" "$disp" "$(date +%H:%M)" > "$sd/landing"; log "#$issue: worker_done from $disp, landing"; }   # a land takes minutes, its dispatch is already completed: loop.log and --status say it is under way
 on_done() {
-  local out rc=0 bl last v t=0
+  local out rc=0 bl last v t=0 land rep
   ctx "$(pj "$1" dispatchId)" || return 1
   out="$(wl | jq -r --arg p "::$wtp" --arg d "$disp" '[.result.workers[] | select(.dispatchStatus == "dispatched" and .dispatchId != $d and .projection.liveness.verdict != "exited" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty')" || return 1
   [ -z "$out" ] || { warn "#$issue: worker_done from $disp ignored: dispatch $out is live on $wtp"; return 0; }   # a stale or duplicate dispatch never lands the worktree its live worker is editing
   [ "$(pj "$1" outcome)" = succeeded ] || { block "worker_done failed: $(jq -r '.body // ""' <<< "$1")"; return 0; }
-  until v="$(gh issue view "$issue" --json state,labels 2> /dev/null)"; do   # a few tries, then blocked: the hold label is unknown, never landed on a guess
+  until v="$(gh issue view "$issue" --json state,labels,body 2> /dev/null)"; do   # a few tries, then blocked: the hold label is unknown, never landed on a guess
     ((++t < 3)) || { block "cannot read the issue (GitHub did not answer), so its hold label is unknown: not landed on a guess"; return 0; }; sleep "${AI_TOOLKIT_POLL:-3}"
   done
   [ "$(jq -r .state <<< "$v")" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; closed_cleanup 0; return 0; }   # a worktree still linked was never cleaned: closed outside a land
   ! jq -e --arg l "$AWAITING_LABEL" '.labels | map(.name) | index($l)' <<< "$v" > /dev/null || { log "#$issue already awaiting its merge into $MAIN_BRANCH (replayed worker_done)"; return 0; }
+  land="$(issue_footer "$(jq -r '.body // ""' <<< "$v")" Land | LC_ALL=C tr -d '[:space:]' | LC_ALL=C tr '[:upper:]' '[:lower:]')"   # human = rounds, the human decides the land
+  if [ "$land" = human ]; then   # a round report, not an end: the worktree and its gitignored artefacts stay until the human lands
+    log "#$issue: worker_done held (Land: human), not landed"; rep="$(jq -r '.body // ""' <<< "$1")"
+    comment "$issue" "Round finished, held for the human. The worker's report:"$'\n\n'"${rep:0:6000}"$'\n\n'"Next round: bash $here/coordinator.sh --run $run --dispatch $issue '<guidance>'. To land (it removes the worktree and its gitignored artefacts): gh issue view $issue --json body -q .body | sed 's/^Land:.*/Land: auto/' | gh issue edit $issue --body-file -  then  bash $here/coordinator.sh --run $run --dispatch $issue 'address: send worker_done again' (its next worker_done lands)."
+    [ "$answer" != attended ] || tell h "$issue" || true; return 0
+  fi
   if jq -e '.labels | map(.name) | index("hold")' <<< "$v" > /dev/null; then   # the human's "do not land yet": the worktree stays, the batch ack still closes this delivery
     log "#$issue: worker_done held (hold label), not landed"
     comment "$issue" "Finished but held: the hold label stops the land and the worktree is kept. To land it, remove the hold label (gh issue edit $issue --remove-label hold), then queue: bash $here/coordinator.sh --run $run --dispatch $issue 'address: send worker_done again' (its next worker_done lands)."
@@ -417,7 +444,7 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
     if [ -z "$why" ]; then   # a kept worktree is re-dispatched (--address, a default message when none was given); none yet: dispatch.sh --next <n> starts it only if it is ready (its rule: hold, blocked, in flight, Scope)
       if [ -n "$path" ]; then old="$(jq -r --arg p "::$path" '[.result.workers[] | select(.resource.worktreeId | endswith($p))][0].agentTerminalHandle // empty' <<< "$all")"
         [ -z "$old" ] || orca terminal close --terminal "$old" --json > /dev/null 2>&1 || true   # the previous agent's terminal (as redispatch does): two agents must not share the worktree
-        out="$(RUN="$run" "$DISPATCH_CMD" --address "${spec:-address: continue from the pushed branch (git log), push, then send worker_done.}" "$n" 2>&1)" && rc=0 || rc=$?
+        out="$(RUN="$run" "$DISPATCH_CMD" --address "${spec:-address: continue from the pushed branch (git log), push, then send worker_done.}" --round "$n" 2>&1)" && rc=0 || rc=$?
       else out="$(RUN="$run" "$DISPATCH_CMD" --next "$n" 2>&1)" && rc=0 || rc=$?; [ "$rc" = 0 ] || [ "$rc" = 3 ] || orca_json worktree rm --worktree "issue:$n" --force > /dev/null 2>&1 || true; fi   # a failed fresh dispatch may leave a half-made worktree (as fill() does)
       if [ "$rc" = 0 ]; then
         ! jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null || gh issue edit "$n" --remove-label blocked > /dev/null 2>&1 || warn "cannot remove the blocked label of #$n"
