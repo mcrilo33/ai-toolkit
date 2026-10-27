@@ -5,6 +5,7 @@
 # --address "<spec>" <issue>: same fresh terminal, but a NEW task whose spec is the text (a review/CI round: worker-start refuses --task with --spec,
 # and Orca does not accept a new task on an idle two-step terminal: agent_unconfigured). Both first refresh the worktree's installed
 # copies from the main checkout (setup.sh --refresh), keeping its spoke-run-id; a failed refresh starts no agent.
+# --round (with --address): the new task is titled "#<n> round", a round the human asked for (coordinator.sh counts the retry budget from the last one).
 # --next <issue>: the same pick restricted to that issue, so it starts only if it is ready (exit 3 and a message when it is not).
 # Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready.
 set -euo pipefail
@@ -12,7 +13,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; n=""; only=""; next=0; dry=0; retry_of=""; task=""; address=""; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
+run="${RUN:-}"; n=""; only=""; next=0; dry=0; retry_of=""; task=""; address=""; round=0; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;;
@@ -21,6 +22,7 @@ while [ $# -gt 0 ]; do
     --retry-of) retry_of="${2:-}"; shift ;;
     --task) task="${2:-}"; shift ;;
     --address) address="${2:-}"; shift ;;
+    --round) round=1 ;;
     [0-9]*) n="$1" ;;
     *) usage_exit "usage: dispatch.sh [--run R] <issue> | --next" ;;
   esac; shift
@@ -62,17 +64,18 @@ pick_next() {   # $only: restrict the pick to that issue (--next <issue>)
 }
 
 seed() {   # $1 = gate: plan = full cycle; none = light lane (no PLAN gate, no in-worker review)
-  local s="Read .ai-toolkit/task.md." review=" -> in-spoke code-review" key=""
+  local s="Read .ai-toolkit/task.md." review=" -> in-spoke code-review" key="" rounds=""
   [ -z "$tracker" ] || key="Put the tracker key in every commit subject, keeping the #$n anchor: type(scope): subject ($tracker, #$n). "
   [ "$1" = none ] || s="$s Gate: plan. Explore, write the plan, then run your preamble's ask command with the plan as the question and options approve,revise; do not edit code before approve. The reply is one of: approve (start work); approve with: <change> (apply the change and start work, do NOT ask again; if you cannot apply it without altering the approach, say so in your worker_done report instead of re-asking); revise: <change>, amend the plan and ask again (max 2 rounds)."
   [ "$1" != none ] || review=""
-  printf '%s' "$s A confirmed defect or deliberately deferred follow-up found outside the issue's Scope is handed to its scoper agent to file, per .ai-toolkit/rules/bug-triage.md, not just mentioned in worker_done. Anything you deliberately leave unfiled goes in worker_done on its own line, \"DEFERRED: <item>\", one item per line: only those lines are routed after the land, so never mark one you already filed. Send no heartbeat messages: report only with worker_done, a question, or an escalation. An ask that times out is still pending: resume it with orca orchestration ask --resume <message id> and keep waiting; never send worker_done --outcome failed because a question got no reply yet (also for a question raised after a permission request nobody answered). In a recursive delete, write the target as a literal path inside the worktree or the scratch directory, never a variable or a command substitution: the guard allows the first and asks for the second. ${key}Cycle per subtask: RED -> GREEN -> REFACTOR${review} -> git push -u origin HEAD. When the acceptance criteria hold: push, then send worker_done --outcome succeeded with a 3-sentence summary. Never merge or push the base branch."
+  [ "$land" != human ] || rounds=" Land: human. The issue is worked in rounds and only the human decides when it lands. Each round ends with worker_done --outcome succeeded whose body is a round report instead of the 3-sentence summary: the measurements, which acceptance items are still open (left for a next round, never marked DEFERRED), and the absolute paths of the artefacts the human should look at (gitignored ones included). Never land or merge. An address: re-engagement is the human's guidance for the next round: follow it, then report the new round the same way."
+  printf '%s' "$s A confirmed defect or deliberately deferred follow-up found outside the issue's Scope is handed to its scoper agent to file, per .ai-toolkit/rules/bug-triage.md, not just mentioned in worker_done. Anything you deliberately leave unfiled goes in worker_done on its own line, \"DEFERRED: <item>\", one item per line: only those lines are routed after the land, so never mark one you already filed. Send no heartbeat messages: report only with worker_done, a question, or an escalation. An ask that times out is still pending: resume it with orca orchestration ask --resume <message id> and keep waiting; never send worker_done --outcome failed because a question got no reply yet (also for a question raised after a permission request nobody answered). In a recursive delete, write the target as a literal path inside the worktree or the scratch directory, never a variable or a command substitution: the guard allows the first and asks for the second. ${key}Cycle per subtask: RED -> GREEN -> REFACTOR${review} -> git push -u origin HEAD. When the acceptance criteria hold: push, then send worker_done --outcome succeeded with a 3-sentence summary. Never merge or push the base branch.$rounds"
 }
 
 start_worker() {   # worker-start with the common flags; $@ = placement flags. Sets $disp.
   local out what=(--task-title "#$n $title" --spec "$(seed "$gate")")
   [ -z "$retry_of" ] || what=(--task "$task" --retry-of "$retry_of")
-  [ -z "$address" ] || what=(--task-title "#$n address" --spec "$address")
+  [ -z "$address" ] || what=(--task-title "#$n $([ "$round" = 1 ] && echo round || echo address)" --spec "$address")
   out="$(orca_mutate orchestration worker-start --run "$run" --from "$ORCA_TERMINAL_HANDLE" "$@" "${what[@]}" --timeout-ms 120000)" \
     || die "worker-start failed: $(printf '%s' "$out" | jq -c '{state: .result.state, stage: .result.failedStage}' 2> /dev/null)"
   disp="$(printf '%s' "$out" | jq -r '.result.dispatchId // empty')"; [ -n "$disp" ] || die "worker-start returned no dispatch id: nothing could verify this worker"
@@ -113,6 +116,8 @@ dispatch() {
   model="${model:-$SPOKE_MODEL}"; effort="${effort:-$SPOKE_EFFORT}"
   # The model/effort end up in a shell command typed into a terminal: allow nothing but id characters.
   case "$model$effort" in *[!A-Za-z0-9._-]*) die "issue $n: bad Model footer '$model $effort'" ;; esac
+  land="$(issue_footer "$body" Land | LC_ALL=C tr -d '[:space:]' | LC_ALL=C tr '[:upper:]' '[:lower:]')"; land="${land:-auto}"
+  case "$land" in auto | human) ;; *) die "issue $n: bad Land footer '$land'" ;; esac
   tracker="$(issue_footer "$body" Tracker)"; tracker="${tracker%"${tracker##*[![:space:]]}"}"   # a body edited on GitHub comes back with CRLF
   case "$tracker" in *[!A-Za-z0-9._/#-]*) die "issue $n: bad Tracker footer '$tracker'" ;; esac
   slug="$(printf '%s' "$title" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
