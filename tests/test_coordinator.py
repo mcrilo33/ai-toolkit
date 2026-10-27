@@ -1412,10 +1412,10 @@ def test_status_lists_a_finished_round_with_the_commands_for_the_next_round_and_
     assert "--run run_t --dispatch 1 '<guidance>'" in out and "Land: auto" in out and "--dispatch 1 'address: send worker_done again'" in out
 
 
-def test_a_round_kept_for_later_does_not_silence_the_wake_for_a_new_plan(C):
+def test_a_round_kept_for_later_does_not_silence_the_wake_for_a_new_decision(C):
     r = finished_round(C)
-    out = watched(C, ([], [], [r]), (["msg_a"], [], [r]), seen="1")   # the session re-arms with the round still waiting
-    assert out.returncode == 0 and out.stdout.split() == ["msg_a"]
+    out = watched(C, ([], [], [r]), ([], [4], [r]), seen="1")   # the session re-arms with the round still waiting; a blocked issue arrives
+    assert out.returncode == 0 and out.stdout.split() == ["4"]
 
 
 def test_a_relaunch_inside_a_human_round_shares_its_task_so_the_second_idle_blocks(C):
