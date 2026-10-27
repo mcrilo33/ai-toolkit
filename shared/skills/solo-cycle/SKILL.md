@@ -86,6 +86,8 @@ If you are stuck (ambiguity you cannot resolve, a failing dependency you do not 
 If the coordinator re-engages you with `address: …`, that is the independent review (or a CI/merge
 conflict): fix exactly those items, run steps 5-6, and send `worker_done` again.
 
+On a `Land: human` issue (your seed says so) each `worker_done --outcome succeeded` ends a round, not the task: its body is the round report (measurements, acceptance items still open left for a next round and never marked Deferred, absolute paths of the artefacts to look at, gitignored ones included). An `address: …` there is the human's guidance for the next round: follow it, then report again. Never land; the human decides when.
+
 ## Rules of thumb
 
 - Push once per subtask; commit granularity inside it is free (RED + GREEN minimum for TDD).

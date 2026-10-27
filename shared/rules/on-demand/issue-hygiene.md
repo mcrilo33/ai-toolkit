@@ -58,6 +58,10 @@ in the conversation; no filer, agent, template or `answer.sh` ever writes or app
 records *which* gate, not *who* answers it: `coordinator.sh --answer auto` (`answer.sh`) or
 `--answer human`, chosen per run.
 
+## The optional `Land:` line
+
+`Land:` is `auto` (the default: the loop lands the finished worker) or `human`, which marks round-based work (eval or prompt iteration, a human annotator): each `worker_done` is a round report the human reviews, the loop never lands it and keeps the worktree; any other value is refused at dispatch.
+
 ## The optional `Tracker:` line
 
 A project whose tickets live in an external tracker may add a plain `Key: value` line carrying the ticket key:

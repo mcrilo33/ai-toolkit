@@ -34,6 +34,7 @@ The footer is the dispatch contract (see `.ai-toolkit/rules/issue-hygiene.md`):
 | `Gate:` | `plan` (always, unless told otherwise: the worker `ask`s for approval of its plan). `none` is the light lane (no PLAN gate, no in-worker review): write it only when the user asked for light on this issue, never because the work looks small |
 | `Model:` | optional override of `SPOKE_MODEL`; reasoning-heavy work gets an Opus id |
 | `Tracker:` | optional external ticket key; the worker puts it in every commit subject |
+| `Land:` | optional `auto` (default: the loop lands the finished worker) or `human`. Propose `human` for open-ended iteration where only the human knows when to stop: eval or prompt tuning, a human annotator in the loop. Each `worker_done` is then a round report, the worktree is kept, and `coordinate` presents the round; any other value is refused at dispatch |
 
 Labels: `priority` (dispatched first), `hold` (never dispatched), and `DISPATCH_LABEL` when set (create it if missing; see `bug-triage`). **Blocked-by**: answer "does this depend on
 open work?" for every issue and declare a real native edge if yes (`github-issues/references/dependencies.md`);
