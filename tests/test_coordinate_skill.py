@@ -138,3 +138,23 @@ def test_a_held_finished_issue_is_read_with_gh_not_status_and_only_a_terminal_se
     assert "gh issue view <n>" in bell and "Finished but held" in bell and "--status` does not list" in bell
     assert not re.search(r"held issue: `--status`", bell)
     assert "finished issue held: land now" not in chat and "gh issue list --label hold --state open" in chat and "Finished but held" in chat   # the label also marks follow-ups and parked blocked issues
+
+
+def test_a_finished_land_human_round_is_presented_as_two_levels_with_a_three_option_card_that_warns_about_the_land():
+    chat = SKILL[SKILL.index("**Chat session.**"):].split("\n")[0]
+    assert "finished `Land: human` round" in chat and "next round with guidance / land / keep for later" in chat   # --wait wakes for it; the card's three options
+    rnd = next(ln for ln in SKILL.split("\n- ") if ln.startswith("**A finished round**"))
+    assert "round report" in rnd and "artefact paths" in rnd and "quick decision" in rnd and "technical detail" in rnd
+    assert "--dispatch <n> '<guidance>'" in rnd and "Land: auto" in rnd and "--dispatch <n> 'address: send worker_done again'" in rnd
+    assert re.search(r"removes the worktree and its gitignored artefacts", rnd) and "gh issue view <n> --comments" in rnd
+    assert "never lands a `Land: human` issue" in next(ln for ln in SKILL.split("\n- ") if ln.startswith("**Land this**"))
+
+
+@pytest.mark.parametrize("path, needles", [
+    ("skills/start-task/SKILL.md", ["`Land:`", "`human`", "eval", "prompt", "annotator", "refused at dispatch"]),
+    ("skills/solo-cycle/SKILL.md", ["`Land: human`", "round report", "absolute paths", "guidance for the next round", "Deferred"]),
+    ("rules/on-demand/issue-hygiene.md", ["`Land:`", "`human`", "round report", "`auto`"]),
+])
+def test_the_land_human_footer_is_taught_where_issues_are_filed_worked_and_documented(path, needles):
+    text = (SHARED / path).read_text()
+    assert all(n in text for n in needles), [n for n in needles if n not in text]
