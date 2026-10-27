@@ -1277,14 +1277,16 @@ def test_the_worktree_of_an_issue_closed_outside_a_land_is_cleaned_at_the_next_s
     assert C.stubs.calls("land.sh") == cleanup_call(C) and not C.calls("gh issue edit")
 
 
-@pytest.mark.parametrize("work", ["commit", "dirty"])
-def test_a_closed_issue_with_unlanded_work_is_released_and_flagged_once_never_removed(C, work):
+@pytest.mark.parametrize("work, env", [("commit", {}), ("dirty", {}), ("untracked", {}), ("none", INT)], ids=["commit", "dirty", "untracked", "integration-mode"])
+def test_a_closed_issue_with_unlanded_work_or_in_a_main_branch_mode_is_released_and_flagged_never_removed(C, work, env):   # integration: land.sh --cleanup-only would label the closed issue awaiting main
     closed_issue(C); C.show()
     if work == "commit":
         Path(C.wt, "f").write_text("x"); git(C.wt, "add", "f"); git(C.wt, "commit", "-qm", "wip")
-    else:
+    elif work == "dirty":
         Path(C.wt, "README").write_text("changed")
-    C.go("--cap", "0", **SWEEP)
+    elif work == "untracked":
+        Path(C.wt, "new_test.py").write_text("x")   # a RED test not yet added
+    C.go("--cap", "0", **SWEEP, **env)
     assert not C.stubs.calls("land.sh") and "orca worktree rm" not in C.kinds() and git(C.wt, "rev-parse", "--verify", "1-x")
     assert [arg(a, "--dispatch") for a in C.calls("orca orchestration worker-release")] == ["ctx_1"]
     assert [a[3:] for a in C.calls("gh issue edit")] == [["--remove-label", "status:in-progress"]]
@@ -1299,10 +1301,10 @@ def test_a_closed_issue_already_flagged_is_left_alone_at_the_next_sweep(C):
     assert not C.stubs.calls("land.sh") and not C.calls("gh issue edit") and not C.calls("orca worktree set") and not C.calls("orca orchestration worker-release")
 
 
-@pytest.mark.parametrize("state, labels, env", [("OPEN", (), {}), ("CLOSED", (AWAITING,), {}), ("CLOSED", (), INT)], ids=["open", "awaiting-main", "integration-mode"])
-def test_the_sweep_leaves_an_open_issue_one_awaiting_main_and_every_closed_issue_of_a_main_branch_mode_alone(C, state, labels, env):   # pr_sweep and --merged own those
+@pytest.mark.parametrize("state, labels", [("OPEN", ()), ("CLOSED", (AWAITING,))], ids=["open", "awaiting-main"])
+def test_the_sweep_leaves_an_open_issue_and_one_awaiting_main_alone(C, state, labels):   # pr_sweep and --merged own those
     closed_issue(C, state, labels); C.show()
-    C.go("--cap", "0", **SWEEP, **env)
+    C.go("--cap", "0", **SWEEP)
     assert not C.stubs.calls("land.sh") and not C.calls("gh issue edit") and not C.calls("orca worktree set") and not C.calls("orca orchestration worker-release")
 
 
