@@ -133,7 +133,7 @@ def test_a_land_human_footer_adds_the_round_report_paragraph_to_the_seed_and_the
     assert d.go("7").returncode == 0
     ws = worker_start(d)
     seed = ws[ws.index("--spec") + 1]
-    assert ("Land: human" in seed) == human and seed.endswith("Never merge or push the base branch.")
+    assert ("Land: human" in seed) == human and "Never merge or push the base branch." in seed and seed.endswith("Never merge or push the base branch.") != human
     if human:   # one paragraph: the round report (numbers, open items kept off DEFERRED, absolute artefact paths) and what an address: means
         for part in ("round report", "never marked DEFERRED", "absolute paths", "gitignored", "address:", "next round"):
             assert part in seed
