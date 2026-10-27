@@ -395,3 +395,12 @@ def test_a_round_requested_by_the_human_is_a_task_titled_round_so_the_retry_budg
     assert d.go("--address", "address: try the second prompt", "--round", "7").returncode == 0
     ws = worker_start(d)
     assert ws[ws.index("--task-title") + 1] == "#7 round" and ws[ws.index("--spec") + 1] == "address: try the second prompt"
+
+
+def test_a_round_requested_on_a_land_human_issue_repeats_the_round_report_reminder_in_its_spec(d):
+    stale_worktree(d)
+    d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": ISSUE["body"] + "Land: human\n"}))
+    assert d.go("--address", "address: try the second prompt", "--round", "7").returncode == 0
+    ws = worker_start(d)
+    spec = ws[ws.index("--spec") + 1]   # the fresh agent reads no seed: the guidance and the reminder are all it gets
+    assert spec.startswith("address: try the second prompt") and "round report" in spec and "never marked DEFERRED" in spec and "absolute paths" in spec

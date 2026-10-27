@@ -1256,10 +1256,11 @@ def test_a_merge_back_that_conflicts_blocks_the_issue_once_while_a_failed_cleanu
 
 def test_status_lists_the_issues_awaiting_main_with_their_pr_and_a_requested_change(C):
     C.stubs.reply("gh.issue_list", "[]", n=1)   # the blocked queue
-    C.stubs.reply("gh.issue_list", json.dumps([{"number": 7, "title": "t7", "state": "OPEN"}]), n=2)
+    C.stubs.reply("gh.issue_list", json.dumps([finished_round(C)]), n=2)   # the finished rounds, listed with the queue, above the awaiting-main block
+    C.stubs.reply("gh.issue_list", json.dumps([{"number": 7, "title": "t7", "state": "OPEN"}]), n=3)
     C.stubs.reply("gh.pr_list", pr_json(reviewDecision="CHANGES_REQUESTED", body="Closes #7\n"))
     out = C.go("--status", ORCA_TERMINAL_HANDLE="", **INT).stdout
-    assert re.search(r"awaiting main:\n\s+#7 t7: https://x/pull/5 \(changes requested\)", out)
+    assert re.search(r"awaiting main:\n\s+#7 t7: https://x/pull/5 \(changes requested\)", out) and out.index("finished round #1") < out.index("awaiting main:")
 
 
 def closed_issue(C, state="CLOSED", labels=()):   # the one `gh issue list` reply every query of the run reads: issue 1, linked to the worker's worktree
@@ -1345,6 +1346,7 @@ def test_a_finished_round_of_a_land_human_issue_is_held_never_landed_and_its_com
     assert "--run run_t --dispatch 1 '<guidance>'" in c[0] and "Land: auto" in c[0] and "--dispatch 1 'address: send worker_done again'" in c[0] and "hold label" not in c[0]
     sent = C.calls("orca terminal send")
     assert bool(sent) == (mode == "attended") and not any("F1" in " ".join(a) for a in sent)   # a worker's text is never typed into a terminal
+    assert all("finished round 1." in arg(a, "--text") and "held" not in arg(a, "--text") for a in sent)   # not the hold flow's line
 
 
 def test_a_land_human_issue_whose_footer_went_back_to_auto_lands_through_the_review_like_any_other(C):
@@ -1408,3 +1410,17 @@ def test_status_lists_a_finished_round_with_the_commands_for_the_next_round_and_
     out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
     assert re.search(r"finished round #1 tune the theme prompt", out) and "#2" not in out
     assert "--run run_t --dispatch 1 '<guidance>'" in out and "Land: auto" in out and "--dispatch 1 'address: send worker_done again'" in out
+
+
+def test_a_round_kept_for_later_does_not_silence_the_wake_for_a_new_plan(C):
+    r = finished_round(C)
+    out = watched(C, ([], [], [r]), (["msg_a"], [], [r]), seen="1")   # the session re-arms with the round still waiting
+    assert out.returncode == 0 and out.stdout.split() == ["msg_a"]
+
+
+def test_a_relaunch_inside_a_human_round_shares_its_task_so_the_second_idle_blocks(C):
+    C.workers({**C.row("ctx_3"), "taskId": "task_ctx_2"}, C.row("ctx_2", st="failed", lv="exited"), C.row("ctx_1", st="completed"))
+    C.stubs.reply("orca.orchestration_task_list", json.dumps({"result": {"tasks": [{"id": "task_ctx_2", "task_title": "#1 round"}, {"id": "task_ctx_1", "task_title": "#1 x"}]}}))
+    C.show(silent=40)
+    C.go("--cap", "0", **SWEEP)
+    assert not [a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"] and ["--add-label", "blocked"] in [a[3:] for a in C.calls("gh issue edit")]
