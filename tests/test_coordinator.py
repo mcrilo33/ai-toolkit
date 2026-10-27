@@ -1258,3 +1258,65 @@ def test_status_lists_the_issues_awaiting_main_with_their_pr_and_a_requested_cha
     C.stubs.reply("gh.pr_list", pr_json(reviewDecision="CHANGES_REQUESTED", body="Closes #7\n"))
     out = C.go("--status", ORCA_TERMINAL_HANDLE="", **INT).stdout
     assert re.search(r"awaiting main:\n\s+#7 t7: https://x/pull/5 \(changes requested\)", out)
+
+
+def closed_issue(C, state="CLOSED", labels=()):   # the one `gh issue list` reply every query of the run reads: issue 1, linked to the worker's worktree
+    C.stubs.reply("gh.issue_list", json.dumps([{"number": 1, "title": "t", "state": state, "labels": [{"name": n} for n in labels]}]))
+
+
+def cleanup_call(C):
+    return [["--cleanup-only", "--branch", "1-x", "--tip", git(C.wt, "rev-parse", "HEAD"), "1"]]
+
+
+@pytest.mark.parametrize("gate", [False, True], ids=["idle", "parked-on-a-gate"])
+def test_the_worktree_of_an_issue_closed_outside_a_land_is_cleaned_at_the_next_sweep_when_its_tip_is_on_the_base(C, gate):   # else it keeps its worktree, branch and slot for ever
+    closed_issue(C); C.show()
+    if gate:
+        C.inbox(["msg_q"])   # a worker waiting on its PLAN gate is never looked at by the idle checks
+    C.go("--cap", "0", **SWEEP)
+    assert C.stubs.calls("land.sh") == cleanup_call(C) and not C.calls("gh issue edit")
+
+
+@pytest.mark.parametrize("work", ["commit", "dirty"])
+def test_a_closed_issue_with_unlanded_work_is_released_and_flagged_once_never_removed(C, work):
+    closed_issue(C); C.show()
+    if work == "commit":
+        Path(C.wt, "f").write_text("x"); git(C.wt, "add", "f"); git(C.wt, "commit", "-qm", "wip")
+    else:
+        Path(C.wt, "README").write_text("changed")
+    C.go("--cap", "0", **SWEEP)
+    assert not C.stubs.calls("land.sh") and "orca worktree rm" not in C.kinds() and git(C.wt, "rev-parse", "--verify", "1-x")
+    assert [arg(a, "--dispatch") for a in C.calls("orca orchestration worker-release")] == ["ctx_1"]
+    assert [a[3:] for a in C.calls("gh issue edit")] == [["--remove-label", "status:in-progress"]]
+    assert [arg(a, "--comment") for a in C.calls("orca worktree set")] == ["#1 closed with unlanded work: remove by hand"]
+
+
+def test_a_closed_issue_already_flagged_is_left_alone_at_the_next_sweep(C):
+    closed_issue(C); C.workers(C.row(st="completed", lv="exited"))
+    Path(C.wt, "f").write_text("x"); git(C.wt, "add", "f"); git(C.wt, "commit", "-qm", "wip")
+    C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 1, "branch": "refs/heads/1-x", "comment": "#1 closed with unlanded work: remove by hand"}]}}))
+    C.go("--cap", "0", **SWEEP)
+    assert not C.stubs.calls("land.sh") and not C.calls("gh issue edit") and not C.calls("orca worktree set") and not C.calls("orca orchestration worker-release")
+
+
+@pytest.mark.parametrize("state, labels, env", [("OPEN", (), {}), ("CLOSED", (AWAITING,), {}), ("CLOSED", (), INT)], ids=["open", "awaiting-main", "integration-mode"])
+def test_the_sweep_leaves_an_open_issue_one_awaiting_main_and_every_closed_issue_of_a_main_branch_mode_alone(C, state, labels, env):   # pr_sweep and --merged own those
+    closed_issue(C, state, labels); C.show()
+    C.go("--cap", "0", **SWEEP, **env)
+    assert not C.stubs.calls("land.sh") and not C.calls("gh issue edit") and not C.calls("orca worktree set") and not C.calls("orca orchestration worker-release")
+
+
+@pytest.mark.parametrize("linked", [True, False], ids=["worktree-linked", "worktree-gone"])
+def test_a_replayed_worker_done_of_a_closed_issue_cleans_a_worktree_still_linked_and_does_nothing_otherwise(C, linked):
+    C.stubs.reply("gh.issue_view", json.dumps({"state": "CLOSED", "labels": []}))
+    if not linked:
+        C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": []}}))
+    C.mail([msg("worker_done", outcome="succeeded")])
+    C.go()
+    assert C.stubs.calls("land.sh") == (cleanup_call(C) if linked else [])
+
+
+def test_the_sweep_prunes_the_registrations_of_worktree_folders_that_are_gone(C, repo):   # the throwaway checkouts agents leave in scratch dirs
+    shutil.rmtree(repo.wt("scratch"))
+    C.go("--cap", "0", **SWEEP)
+    assert "scratch" not in git(repo.root, "worktree", "list")
