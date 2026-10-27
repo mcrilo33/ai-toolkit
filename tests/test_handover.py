@@ -237,12 +237,12 @@ def test_a_takeover_during_answer_sh_exits_instead_of_asking_the_human(C):
     assert not C.calls("orca worktree set") and not C.calls("orca orchestration check ack")
 
 
-def test_a_replayed_worker_done_for_an_already_closed_issue_is_acked_without_landing_or_blocking(C):
+def test_a_replayed_worker_done_for_an_already_closed_issue_is_acked_without_landing_or_blocking(C):   # its worktree, still linked and on the base, is only cleaned up
     C.stubs.reply("gh.issue_view", json.dumps({"state": "CLOSED", "labels": []}))
     C.mail([msg("worker_done", "msg_d", outcome="succeeded")])
     r = C.go()
     assert r.returncode == 0 and "already landed" in r.stdout
-    assert not C.stubs.calls("land.sh") and not C.calls("gh issue edit") and not C.stubs.calls("notify") and C.calls("orca orchestration check ack")
+    assert [a[0] for a in C.stubs.calls("land.sh")] == ["--cleanup-only"] and not C.calls("gh issue edit") and not C.stubs.calls("notify") and C.calls("orca orchestration check ack")
 
 
 @pytest.mark.parametrize("bad", ["../x", "run_", "run_A1", "x run_1", "run_1/../../y"])
