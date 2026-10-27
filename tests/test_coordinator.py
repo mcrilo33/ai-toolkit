@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from conftest import STUB_TEE, V2, git
+from conftest import STUB, STUB_TEE, V2, git
 
 CO = str(V2 / "scripts/coordinator.sh")
 EMPTY = json.dumps({"result": {"messages": [], "deliveryId": None}})
@@ -620,17 +620,33 @@ def test_slots_are_filled_up_to_the_cap_and_a_failed_dispatch_is_cleaned_up_and_
     assert not C.calls("orca worktree set")   # the worktree is gone: never a comment on a stale one
 
 
-def test_drain_stops_when_nothing_is_ready_and_no_worker_is_live_but_not_before(C):
+def test_drain_stops_when_nothing_is_ready_and_no_worker_is_live_but_not_before(C, tmp_path, link_script):
     C.workers(C.row(st="completed"))
-    assert C.go("--drain", COORD_MAX_TICKS=5).returncode == 0 and not C.calls("orca orchestration check")
+    closes_its_own_pane_after_its_exit_line(C, tmp_path, link_script, "--drain", COORD_MAX_TICKS=5)
+    assert not C.calls("orca orchestration check")
     C.workers(C.row())
     assert C.go("--drain", COORD_MAX_TICKS=2).returncode == 0 and len(C.calls("orca orchestration check")) == 2
 
 
+CLOSE_SPY = STUB.replace("d=$STUB_DIR;", 'd=$STUB_DIR; [ "$2" = close ] && cp "$AITK_STATE_DIR/run_t/loop.log" "$d/log.at_close";', 1)   # keeps loop.log as it was when a terminal was closed
+
+
+def closes_its_own_pane_after_its_exit_line(C, tmp_path, link_script, *args, **env):   # a normal exit (status 0): the loop's pane is closed once, last, with the exit line already in loop.log
+    link_script(tmp_path / "stubs/bin/orca", CLOSE_SPY)
+    assert C.go(*args, **env).returncode == 0
+    assert [arg(a, "--terminal") for a in C.calls("orca terminal close")] == ["term_c"]
+    assert "coordinator: exiting: status 0" in (tmp_path / "stubs/log.at_close").read_text().splitlines()[-1]
+
+
 @pytest.mark.parametrize("now, until, runs", [("10:00", "10:00", False), ("10:30", "10:00", True), ("09:59", "10:00", True), ("23:30", "00:30", True)])
-def test_until_stops_the_loop_at_the_clock_time_and_wraps_past_midnight(C, now, until, runs):
-    C.go("--until", until, AI_TOOLKIT_NOW=now)
+def test_until_stops_the_loop_at_the_clock_time_and_wraps_past_midnight(C, tmp_path, link_script, now, until, runs):
+    closes_its_own_pane_after_its_exit_line(C, tmp_path, link_script, "--until", until, AI_TOOLKIT_NOW=now)
     assert bool(C.calls("orca orchestration check")) == runs
+
+
+def test_a_loop_whose_run_was_taken_back_exits_and_closes_its_own_pane(C, tmp_path, link_script):
+    C.stubs.reply("orca.orchestration_check", "consumer_fenced", rc=1)
+    closes_its_own_pane_after_its_exit_line(C, tmp_path, link_script)
 
 
 def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply_command_and_changes_nothing(C):
@@ -1063,6 +1079,7 @@ def test_a_loop_that_ends_on_an_error_names_its_status_tells_the_session_and_sta
     C.spool("msg_q", "approve")
     r = C.go("--answer", "attended", "--until", "23:59", AI_TOOLKIT_NOW="bad")   # an arithmetic error before the first tick: no handler, no guard
     assert r.returncode != 0 and re.search(r"coordinator: exiting on an error: status \d+, last command: ", r.stdout.splitlines()[-1])
+    assert not C.calls("orca terminal close")   # the pane keeps the die text
     assert [arg(a, "--text") for a in C.calls("orca terminal send") if arg(a, "--terminal") == "term_s"] == [
         "[coordinator loop] stopped on an error: nothing coordinates Run run_t, read its terminal and start it again."]
     out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
@@ -1076,7 +1093,7 @@ def test_a_loop_whose_terminal_is_closed_leaves_its_exit_in_loop_log_tells_the_s
     hup = link_script(tmp_path / "hup.sh", '#!/bin/bash\n[ "$1" = --next ] && kill -HUP "$(ls "$AITK_STATE_DIR"/run_t/holder.* | sed "s/.*\\.//")"\n')   # the loop's own pane closed: a hang-up
     r = C.go("--answer", "attended", DISPATCH_CMD=hup)
     last = log.read_text().splitlines()
-    assert r.returncode == 129 and len(last) < 210 and last[0] == "old line 100"   # the log keeps the last 200 lines of the earlier loops
+    assert r.returncode == 129 and len(last) < 210 and last[0] == "old line 100" and not C.calls("orca terminal close")   # the log keeps the last 200 lines of the earlier loops
     assert re.search(r"coordinator: exiting: status 129 = SIGHUP \(its terminal was closed\), last command: ", last[-1]) and "run run_t" in "".join(last)
     assert [arg(a, "--text") for a in C.calls("orca terminal send") if arg(a, "--terminal") == "term_s"] == [
         f"[coordinator loop] stopped by SIGHUP (its terminal was closed): nothing coordinates Run run_t, see {log} and start it again."]
@@ -1098,7 +1115,7 @@ def test_a_re_dispatch_for_a_worker_with_no_terminal_closes_none_rather_than_the
     C.workers({**C.row(), "agentTerminalHandle": None})
     C.mail([msg("worker_done", outcome="succeeded")])
     C.go()
-    assert C.stubs.calls("dispatch.sh") and not C.calls("orca terminal close")
+    assert C.stubs.calls("dispatch.sh") and [arg(a, "--terminal") for a in C.calls("orca terminal close")] == ["term_c"]   # the loop's own pane only
 
 
 @pytest.fixture
