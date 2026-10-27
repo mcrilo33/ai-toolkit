@@ -26,7 +26,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-orig=("$@")   # the arguments the re-exec on a new toolkit version starts again with
+login=""; orig=("$@")   # the arguments the re-exec on a new toolkit version starts again with
 run="${RUN:-}"; answer=auto; cap="${CONCURRENCY_CAP:-3}"; until=""; drain=0; status=0; watch=0; seen_arg=""; seen_given=0; reply=0; reply_id=""; reply_body=""; stop=0; session=""; show_id=""; dreq=0; dreq_n=""; dreq_text=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -118,15 +118,15 @@ open_q() {   # the open questions a human can still answer, oldest first (Orca l
 }
 blocked_q() { gh issue list --label blocked ${DISPATCH_LABEL:+--label "$DISPATCH_LABEL"} --state open --limit 100 --json number,title,labels | jq -r '[.[] | select(.labels | map(.name) | index("hold") | not)] | sort_by(.number)[] | "\(.number)\t\(.title)"'; }   # hold = parked on purpose
 round_q() {   # "<n>\t<title>" of each finished Land: human round (the human decides): the footer says human, the loop's last comment says "Round finished", and Orca shows no dispatched worker on it (the issue each dispatch was given by dispatch.sh, not the worker's own link)
-  local c me lw live d n t cm
+  local c lw live d n t cm
   c="$(gh issue list --state open ${DISPATCH_LABEL:+--label "$DISPATCH_LABEL"} --limit 100 --json number,title,body,labels | jq -r '.[] | select((.labels | map(.name) | index("blocked") | not) and ((.body // "") | split("\n") | map(select(test("^Land:"))) | last // "" | ascii_downcase | test("^land:\\s*human\\s*$"))) | "\(.number)\t\(.title)"')" || return 1
   [ -n "$c" ] || return 0
-  me="$(gh api user --jq .login)" && lw="$(wl)" || return 1; live=" "
+  [ -n "$login" ] || login="$(gh api user --jq .login)" || return 1; lw="$(wl)" || return 1; live=" "   # the loop's own login is read once
   for d in $(jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | .dispatchId' <<< "$lw"); do live="$live$(recorded_issue "$run" "$d" 2> /dev/null || true) "; done
   while IFS=$'\t' read -r n t <&3; do
     case "$live" in *" $n "*) continue ;; esac
     cm="$(gh issue view "$n" --json comments)" || return 1
-    ! jq -e --arg me "$me" '[.comments[] | select(.author.login == $me)] | (last // {}).body // "" | startswith("Round finished")' <<< "$cm" > /dev/null || printf '%s\t%s\n' "$n" "$t"
+    ! jq -e --arg me "$login" '[.comments[] | select(.author.login == $me)] | (last // {}).body // "" | startswith("Round finished")' <<< "$cm" > /dev/null || printf '%s\t%s\n' "$n" "$t"
   done 3<<< "$c"
 }
 awaiting_q() { gh issue list --label "$AWAITING_LABEL" --state "$1" --limit 100 --json number,title,state,labels; }   # $1 open|all: the issues waiting for their merge into MAIN_BRANCH (all: GitHub may have closed one with its PR's Closes)
@@ -155,13 +155,13 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
     w="$(gh issue view "$n" --json comments 2> /dev/null | jq -r --arg me "$me" '[.comments[] | select(.author.login == $me and (.body | startswith("blocked: "))) | .body] | last // "" | .[9:]' 2> /dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-160)" || w=""
     echo "  blocked #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)${w:+: $w}"
     echo "    decide: re-dispatch (comment the guidance, then remove the blocked label, or --dispatch $n '<message>'), park it with the hold label, or close it"; done
+  { round_q || true; } | while IFS=$'\t' read -r n t; do   # a finished Land: human round: the report is the issue's last comment
+    echo "  finished round #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)"
+    echo "    decide: read the report (gh issue view $n --comments), then the next round: bash $here/coordinator.sh --run $run --dispatch $n '<guidance>'; or land (it removes the worktree and its gitignored artefacts): gh issue view $n --json body -q .body | sed 's/^Land:.*/Land: auto/' | gh issue edit $n --body-file -  then  --dispatch $n 'address: send worker_done again'"; done
   [ -z "$mine" ] || echo "being answered by the loop:$mine"   # not decisions: no text, no reply command
   [ -z "$main_kind" ] || { echo "awaiting main:"; awaiting_q open | jq -r '.[] | "\(.number)\t\(.title)"' | while IFS=$'\t' read -r n t; do
     pr="$(pr_of "$n" 2> /dev/null)" || pr="{}"   # the PR url and a requested change: the human's to decide when the PR is the rolling one
     echo "  #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120): $(jq -r '.url // "no PR found"' <<< "$pr")$(! pr_changes_requested "$pr" || echo " (changes requested)")"; done; } || true
-  { round_q || true; } | while IFS=$'\t' read -r n t; do   # a finished Land: human round: the report is the issue's last comment
-    echo "  finished round #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)"
-    echo "    decide: read the report (gh issue view $n --comments), then the next round: bash $here/coordinator.sh --run $run --dispatch $n '<guidance>'; or land (it removes the worktree and its gitignored artefacts): gh issue view $n --json body -q .body | sed 's/^Land:.*/Land: auto/' | gh issue edit $n --body-file -  then  --dispatch $n 'address: send worker_done again'"; done
   echo "dispatch requests:"
   for f in "$(spool_dir "$run")/requests"/*; do [ -f "$f" ] && echo "  #${f##*/} $(head -n 1 "$f"): $(sed -n 2p "$f" | grep . || echo queued)"; done
   exit 0
@@ -174,7 +174,7 @@ watch_queue() {   # $1 poll number: one look at the queue (#473). Sets $found to
   for f in "$(spool_dir "$run")/requests"/*; do [ ! -f "$f" ] || [ -z "$(sed -n 2p "$f")" ] || all="$all r:${f##*/} "; done   # a dispatch request with a refusal reason
   all=" $all"; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || all="${all/ [qp]:${f##*/} / }"; done   # a decision answered with --reply stays open in Orca until the loop's next wake: it is no longer waiting
   if [ -z "$started" ]; then started=1; seen="$all"; [ "$seen_given" = 0 ] || { seen=""; for i in $all; do case " $seen_arg " in *" ${i#?:} "*) seen="$seen$i " ;; esac; done; }; fi
-  for i in $seen; do case " $all " in *" $i "*) first=0 ;; esac; done
+  for i in $seen; do case "$i" in f:*) continue ;; esac; case " $all " in *" $i "*) first=0 ;; esac; done   # a round kept for later is parked, it must not silence the next wake
   for i in $all; do case "$i" in p:*) case " $seen " in *" $i "*) ;; *) found="${i#?:}"; return 0 ;; esac ;; esac; done   # a permission request first: it expires in 9 minutes
   for i in $all; do k="${i%%:*}"; [ "$k" != q ] || ! by_loop "${i#?:}" x || continue; now="$now$i "   # a plan the loop still answers is not a decision
     case " $seen " in *" $i "*) continue ;; esac; [ "$first" = 1 ] || continue; first=0
@@ -385,7 +385,7 @@ on_done() {
   if [ "$land" = human ]; then   # a round report, not an end: the worktree and its gitignored artefacts stay until the human lands
     log "#$issue: worker_done held (Land: human), not landed"; rep="$(jq -r '.body // ""' <<< "$1")"
     comment "$issue" "Round finished, held for the human. The worker's report:"$'\n\n'"${rep:0:6000}"$'\n\n'"Next round: bash $here/coordinator.sh --run $run --dispatch $issue '<guidance>'. To land (it removes the worktree and its gitignored artefacts): gh issue view $issue --json body -q .body | sed 's/^Land:.*/Land: auto/' | gh issue edit $issue --body-file -  then  bash $here/coordinator.sh --run $run --dispatch $issue 'address: send worker_done again' (its next worker_done lands)."
-    [ "$answer" != attended ] || tell h "$issue" || true; return 0
+    [ "$answer" != attended ] || tell f "$issue" || true; return 0
   fi
   if jq -e '.labels | map(.name) | index("hold")' <<< "$v" > /dev/null; then   # the human's "do not land yet": the worktree stays, the batch ack still closes this delivery
     log "#$issue: worker_done held (hold label), not landed"
@@ -527,9 +527,9 @@ pr_sweep() {   # the PR of each issue awaiting its merge into MAIN_BRANCH (heade
   done <<< "$rows"
 }
 tell() {   # $1 kind (p|q|b|h = a finished issue held|r = a dropped reply), $2 id: one fixed line typed into the session's terminal, never text a worker wrote (it lands in an agent's prompt); no --session = nothing to send
-  [ -n "$session" ] || return 0; local kind=plan id txt; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; h) kind="finished issue held" ;; r) kind=reply ;; esac; id="$(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2")"
+  [ -n "$session" ] || return 0; local kind=plan id txt; case "$1" in p) kind="permission request" ;; b) kind="blocked issue" ;; h) kind="finished issue held" ;; f) kind="finished round" ;; r) kind=reply ;; esac; id="$(LC_ALL=C tr -cd 'A-Za-z0-9_-' <<< "$2")"
   txt="new decision waiting: $kind $id. Read it whole, present it with one recommendation, then ring."; [ "$1" != r ] || txt="reply to $id was dropped after repeated send failures: its question may still be open, present it again."
-  orca_json terminal send --terminal "$session" --text "[coordinator loop] $txt" --enter > /dev/null 2>&1 || { warn "cannot tell the session ($kind $2)$([ "$1" = r ] || [ "$1" = h ] || echo ': retried at the next wake')"; return 1; }
+  orca_json terminal send --terminal "$session" --text "[coordinator loop] $txt" --enter > /dev/null 2>&1 || { warn "cannot tell the session ($kind $2)$([ "$1" = r ] || [ "$1" = h ] || [ "$1" = f ] || echo ': retried at the next wake')"; return 1; }
 }
 notify_queue() {   # attended: tell the session of a decision that was not queued at the last look, once: the first one when nothing that was waiting at the last look still is, and every permission request (it expires in 9 minutes); the ids last seen live in $seen (no file); a failed read or send changes nothing, the next wake looks again. A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event.
   [ "$answer" = attended ] || return 0; local now i all k first=0 fail=0; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
