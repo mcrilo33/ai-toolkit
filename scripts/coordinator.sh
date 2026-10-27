@@ -219,6 +219,7 @@ died() {   # the EXIT trap, $1 = the exit status, $2 = the last command: every e
   case $1 in 0 | 130 | 129 | 143) log "exiting: status $1${sig:+ = $sig}, last command: ${2:0:100}" ;; *) log "exiting on an error: status $1, last command: ${2:0:100}" ;; esac
   [ -z "$sig" ] || { how="by $sig"; rd="see $lf"; }
   { [ "$1" = 0 ] || [ "$1" = 130 ] || [ "$answer" != attended ] || [ -z "$session" ]; } || orca_json terminal send --terminal "$session" --text "[coordinator loop] stopped $how: nothing coordinates Run $run, $rd and start it again." --enter > /dev/null 2>&1 || true
+  [ "$1" != 0 ] || orca_json terminal close --terminal "$H" > /dev/null 2>&1 || true   # a normal exit leaves a dead shell in this pane (Start types the command into a login shell); any other status keeps it, it holds the die text
 }
 sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$BASH_COMMAND"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (umask 077; mkdir -p "$sd"); lf="$sd/loop.log"; rm -f "$sd/held" "$sd/landing"; printf '%s %s\n' "$H" "$mode" > "$hf"
 [ ! -f "$lf" ] || { tail -n 200 "$lf" > "$lf.t" && mv "$lf.t" "$lf"; }   # the loop's own record, kept when its pane is gone: the last 200 lines of the earlier loops, then this one's; written before the pane (a closed pty fails the print)
