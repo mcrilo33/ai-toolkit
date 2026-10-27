@@ -48,6 +48,10 @@ from the system prompt, never through a shell variable (`S=...; rm -rf "$S"`): `
 `rm -r` target, and in auto mode that ask blocks the issue. In pytest, use the `tmp_path` fixture, not a hard-coded
 `/tmp/<name>` path.
 
+For a read-only look at another revision, use `git show <rev>:<path>`, `git diff <a> <b> -- <path>` or `git archive <rev> | tar -x -C <scratch>`,
+never `git worktree add`: it registers in the main repo, shows in Orca as a project worktree, and outlives the session. If a full checkout is
+unavoidable, `git worktree remove --force <literal path>` it in the same step that used it.
+
 ## Google Cloud: expired gcloud tokens
 
 Where interactive 2-step reauthentication is enforced, gcloud tokens expire and a refresh fails in a non-interactive shell with `Reauthentication failed. cannot prompt during non-interactive execution`. When that happens, or when `gcloud auth print-access-token --quiet` fails before a GCP task: run `gcloud auth login --update-adc` yourself in the background, poll `gcloud auth print-access-token --quiet` until it succeeds, then carry on. The user validates the browser prompt; do not ask them to run the command and do not stop to ask. `--update-adc` refreshes the Python ADC in the same flow. If the token is still invalid after about 5 minutes, stop polling and say so.

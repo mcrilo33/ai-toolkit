@@ -334,6 +334,20 @@ triage() {   # $1 = land output, $2 = the worker's report: after a land, hand wh
     ! grep -qi 'drafted' <<< "$out" || comment "$issue" "A scoper drafted instead of filing, file by hand: ${out//$'\n'/ }"
   else warn "#$issue: routing the leftover findings failed (exit $rc, after at most ${t}s), they are kept in a comment: $routed"; comment "$issue" "Routing to the scopers failed, file by hand: $routed"; fi
 }
+closed_cleanup() {   # $1 = 1 when the worktree already carries the flag below. $issue was closed outside a land (the human, a "close it" hint): its worktree $wtp, Orca's branch $br
+  local tip st all d; [ -z "$main_kind" ] && [ "$1" != 1 ] || return 0   # a main-branch mode keeps its worktree until --merged; a flagged one is the human's
+  tip="$(git rev-parse -q --verify "refs/heads/$br" 2> /dev/null)" || tip=""
+  if [ -n "$tip" ] && st="$(git -C "$wtp" status --porcelain --untracked-files=no 2> /dev/null)" && [ -z "$st" ]; then   # nothing unlanded to lose: land.sh --cleanup-only checks it again and releases every dispatch of the worktree
+    git fetch -q origin 2> /dev/null || { warn "#$issue is closed but git fetch failed: its worktree is left alone"; return 0; }
+    if git merge-base --is-ancestor "$tip" "origin/$BASE_BRANCH"; then
+      yield; log "#$issue is closed outside a land: cleaning up $wtp"
+      st="$(RUN="$run" "$LAND_CMD" --cleanup-only --branch "$br" --tip "$tip" "$issue" 2>&1)" || warn "#$issue: cleanup of $wtp failed, tried again at the next sweep: ${st##*$'\n'}"; return 0
+    fi
+  fi
+  all="$(wl)" || return 0; yield   # unlanded commits, a dirty tree or no branch: nothing is deleted, the human decides
+  for d in $(jq -r --arg p "::$wtp" '.result.workers[] | select(.dispatchStatus == "dispatched" and (.resource.worktreeId | endswith($p))) | .dispatchId' <<< "$all"); do release "$d"; done
+  status_label remove "$issue"; flag "$wtp" "#$issue closed with unlanded work: remove by hand"; log "#$issue is closed with unlanded work: worker released, $wtp kept, remove it by hand"
+}
 landing() { printf '%s %s %s\n' "$issue" "$disp" "$(date +%H:%M)" > "$sd/landing"; log "#$issue: worker_done from $disp, landing"; }   # a land takes minutes, its dispatch is already completed: loop.log and --status say it is under way
 on_done() {
   local out rc=0 bl last v t=0
@@ -344,7 +358,7 @@ on_done() {
   until v="$(gh issue view "$issue" --json state,labels 2> /dev/null)"; do   # a few tries, then blocked: the hold label is unknown, never landed on a guess
     ((++t < 3)) || { block "cannot read the issue (GitHub did not answer), so its hold label is unknown: not landed on a guess"; return 0; }; sleep "${AI_TOOLKIT_POLL:-3}"
   done
-  [ "$(jq -r .state <<< "$v")" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; return 0; }
+  [ "$(jq -r .state <<< "$v")" != CLOSED ] || { log "#$issue already landed (replayed worker_done)"; closed_cleanup 0; return 0; }   # a worktree still linked was never cleaned: closed outside a land
   ! jq -e --arg l "$AWAITING_LABEL" '.labels | map(.name) | index($l)' <<< "$v" > /dev/null || { log "#$issue already awaiting its merge into $MAIN_BRANCH (replayed worker_done)"; return 0; }
   if jq -e '.labels | map(.name) | index("hold")' <<< "$v" > /dev/null; then   # the human's "do not land yet": the worktree stays, the batch ack still closes this delivery
     log "#$issue: worker_done held (hold label), not landed"
@@ -451,6 +465,18 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
   done
 }
 
+closed_sweep() {   # prune the registrations of worktree folders that are gone; then each worktree linked to a CLOSED issue (one query, not awaiting main: pr_sweep owns those) is cleaned or flagged by closed_cleanup
+  local rows closed list fl
+  git worktree prune || warn "git worktree prune failed"
+  rows="$(okread worktree list --repo "path:$PWD" | jq -c '.result.worktrees')" || return 0
+  closed="$(gh issue list --state closed --limit 200 --json number,state,labels 2> /dev/null | jq -c --arg l "$AWAITING_LABEL" '[.[] | select(.state == "CLOSED" and (.labels | map(.name) | index($l) | not)) | .number]')" || return 0
+  [ -n "$closed" ] || return 0
+  list="$(jq -r --argjson c "$closed" '. as $all | .[] | .linkedIssue as $i | select($i != null and ($c | index($i)) != null and ([$all[] | select(.linkedIssue == $i)] | length) == 1)
+    | "\($i)\t\(.path)\t\(if (.comment // "") | startswith("#\($i) closed with unlanded work") then 1 else 0 end)\t\((.branch // "") | sub("^refs/heads/"; ""))"' <<< "$rows")" || return 0
+  [ -n "$list" ] || return 0
+  while IFS=$'\t' read -r issue wtp fl br <&3; do closed_cleanup "$fl"; done 3<<< "$list"   # fd 3: land.sh and gh must not swallow the rest of the list
+}
+
 pr_sweep() {   # the PR of each issue awaiting its merge into MAIN_BRANCH (header); a failed gh read changes nothing
   local rows n st bl pr why out rc
   [ -n "$main_kind" ] || return 0
@@ -514,7 +540,7 @@ while :; do
   msgs="$(jq -c '.result.messages[]?' <<< "$out" 2> /dev/null)" || msgs=""
   if [ -z "$msgs" ]; then
     empties=$((empties + 1)); [ "$rc" = 0 ] || sleep "${AI_TOOLKIT_POLL:-3}"
-    [ $((empties % ${COORD_SWEEP_EVERY:-2})) -ne 0 ] || { sweep; pr_sweep; bdirty=1; }
+    [ $((empties % ${COORD_SWEEP_EVERY:-2})) -ne 0 ] || { sweep; closed_sweep; pr_sweep; bdirty=1; }
     notify_queue; continue
   fi
   # fd 3, not stdin: a handler that reads stdin (claude -p, ssh) must not swallow the rest of the batch.
