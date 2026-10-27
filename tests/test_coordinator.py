@@ -1340,7 +1340,7 @@ def test_a_finished_round_of_a_land_human_issue_is_held_never_landed_and_its_com
     r = C.go("--answer", mode)
     assert r.returncode == 0 and not landed(C) and "#1: worker_done held (Land: human), not landed" in r.stdout
     assert not any(k in C.kinds() for k in ("orca worktree rm", "orca orchestration worker-release")) and len(C.calls("orca orchestration check ack")) == 1
-    c = [a[-1] for a in C.calls("gh issue comment")]
+    c = (Path(os.environ["STUB_DIR"]) / "calls.log").read_text().split("gh\x1fissue\x1fcomment\x1f1\x1f-b\x1f")[1:]   # the comment is several lines: the call log's first line is not all of it
     assert len(c) == 1 and c[0].startswith("Round finished, held for the human") and REPORT in c[0]
     assert "--run run_t --dispatch 1 '<guidance>'" in c[0] and "Land: auto" in c[0] and "--dispatch 1 'address: send worker_done again'" in c[0] and "hold label" not in c[0]
     sent = C.calls("orca terminal send")
