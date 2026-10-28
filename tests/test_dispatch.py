@@ -186,6 +186,31 @@ def test_trust_dialog_is_dismissed_with_down_then_enter(d):
                      ["terminal", "send", "--terminal", "term_agent", "--enter"]]
 
 
+ZSH_ERROR = "zsh: no such file or directory: Users/x/.ai-toolkit/bin/claude-spoke"
+
+
+def shell_error_tail(line):
+    return json.dumps({"result": {"terminal": {"tail": ["% " + line]}}})
+
+
+@pytest.mark.parametrize("line", [ZSH_ERROR, "bash: /x/.ai-toolkit/bin/claude-spoke: No such file or directory"])
+def test_a_launch_line_eaten_by_a_shell_startup_prompt_is_re_typed_once(d, line):
+    d.stubs.reply("orca.terminal_show", '{"result":{"terminal":{}}}', n=1)
+    d.stubs.reply("orca.terminal_read", shell_error_tail(line))
+    assert d.go("7").returncode == 0
+    calls = d.orca()
+    launch = next(c for c in calls if c[:2] == ["terminal", "create"])[7]
+    assert [c for c in calls if c[:2] == ["terminal", "send"]] == [["terminal", "send", "--terminal", "term_agent", "--text", launch, "--enter"]]
+
+
+def test_the_same_shell_error_on_every_poll_re_types_once_then_fails(d):
+    d.stubs.reply("orca.terminal_show", '{"result":{"terminal":{}}}')
+    d.stubs.reply("orca.terminal_read", shell_error_tail(ZSH_ERROR))
+    r = d.go("7", DISPATCH_TRIES=4)
+    assert r.returncode == 1 and "claude did not start" in r.stderr
+    assert len([c for c in d.orca() if c[:2] == ["terminal", "send"]]) == 1
+
+
 def test_setup_that_never_finishes_launches_nothing(d):
     (d.wt / ".ai-toolkit/setup-done").unlink()
     r = d.go("7", DISPATCH_TRIES=2)
@@ -197,7 +222,7 @@ def test_agent_that_never_comes_up_is_not_handed_a_task(d):
     d.stubs.reply("orca.terminal_show", '{"result":{"terminal":{}}}')
     r = d.go("7", DISPATCH_TRIES=2)
     assert r.returncode == 1 and "claude did not start" in r.stderr
-    assert not any(c[:2] in (["orchestration", "worker-start"], ["worktree", "set"]) for c in d.orca())
+    assert not any(c[:2] in (["orchestration", "worker-start"], ["worktree", "set"], ["terminal", "send"]) for c in d.orca())
 
 
 @pytest.mark.parametrize("out, rc", [('{"result":{"state":"failed","failedStage":"setup"}}', 1), ('{"result":{"state":"ready"}}', 0)])   # failed / no dispatch id to record: nothing could verify the worker
