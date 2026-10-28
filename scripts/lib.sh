@@ -155,21 +155,25 @@ wait_until() {
 
 # spawn_claude <worktree> <title> <model> <effort>: the two-step launch (docs/architecture.md): a terminal running bin/claude-spoke
 # (OTel env), waited on until claude is up; prints its handle. The first run in a repo root meets Claude's trust dialog
-# (default "No, exit"): Down+Enter. dispatch.sh uses it for a new worker and for a retry, so a retried worker keeps the shim's env.
+# (default "No, exit"): Down+Enter. A shell startup prompt (oh-my-zsh's update question) can eat the typed launch line's first byte and leave
+# the shell failing to run the launcher: the line is re-typed once, never on a timeout alone (it would land in claude's TUI). dispatch.sh uses it for a new worker and for a retry, so a retried worker keeps the shim's env.
 _agent_up() {
   [ "$(orca_json terminal show --terminal "$1" | jq -r '.result.terminal.agentIdentity // empty')" = claude ] && return 0
   if orca_json terminal read --terminal "$1" | jq -e '.result.terminal.tail | join(" ") | test("No, exit")' > /dev/null; then
     orca terminal send --terminal "$1" --text $'\e[B' --json > /dev/null; sleep "${AI_TOOLKIT_POLL:-3}"
     orca terminal send --terminal "$1" --enter --json > /dev/null
+  elif [ -z "$retyped" ] && orca_json terminal read --terminal "$1" \
+    | jq -e '.result.terminal.tail | any(.[]; test("claude-spoke"; "i") and test("no such file or directory|not found"; "i"))' > /dev/null; then
+    retyped=1; orca terminal send --terminal "$1" --text "$2" --enter --json > /dev/null
   fi
   return 1
 }
 spawn_claude() {
-  local h bin
+  local h bin line retyped=   # retyped: _agent_up's once-only flag (dynamic scope), fresh per spawn
   bin="$(cd "$AI_TOOLKIT_LIB_DIR/../bin" && pwd -P)/claude-spoke"
-  h="$(orca_json terminal create --worktree "path:$1" --title "$2" \
-    --command "$(printf %q "$bin") --model $3 --effort $4 --dangerously-skip-permissions" | jq -r '.result.terminal.handle // empty')"
+  line="$(printf %q "$bin") --model $3 --effort $4 --dangerously-skip-permissions"
+  h="$(orca_json terminal create --worktree "path:$1" --title "$2" --command "$line" | jq -r '.result.terminal.handle // empty')"
   [ -n "$h" ] || die "terminal create returned no handle"
-  wait_until "${DISPATCH_TRIES:-60}" "${AI_TOOLKIT_POLL:-3}" _agent_up "$h" || die "claude did not start in terminal $h"
+  wait_until "${DISPATCH_TRIES:-60}" "${AI_TOOLKIT_POLL:-3}" _agent_up "$h" "$line" || die "claude did not start in terminal $h"
   printf '%s' "$h"
 }
