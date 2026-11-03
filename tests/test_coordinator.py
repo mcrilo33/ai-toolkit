@@ -651,12 +651,15 @@ def test_a_loop_whose_run_was_taken_back_exits_and_closes_its_own_pane(C, tmp_pa
     closes_its_own_pane_after_its_exit_line(C, tmp_path, link_script)
 
 
-def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply_command_and_changes_nothing(C):
+@pytest.mark.parametrize("given", [True, False])   # False: no --run, the Run is Orca's current one
+def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply_command_and_changes_nothing(C, given):
     C.inbox(["msg_q"], answered=["msg_a"]); C.show(silent=30, wait=True)
-    r = C.go("--status", ORCA_TERMINAL_HANDLE="")   # read-only: no coordinator terminal needed
+    C.stubs.reply("orca.orchestration_run_current", '{"result":{"run":{"id":"run_t"}}}')
+    r = C.go("--status", run_id="run_t" if given else None, ORCA_TERMINAL_HANDLE="")   # read-only: no coordinator terminal needed
     assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and REPLY in r.stdout and "msg_a" not in r.stdout
     assert re.search(r"ctx_1 \S+ live working, silent (29|30)m, waits on a prompt", r.stdout)   # verdict, activity and silence: a stuck worker is told from a working one
-    assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in ("worker-list", "worker-show", "inbox", "run-show")] == []
+    reads = ("worker-list", "worker-show", "inbox", "run-show") + (() if given else ("run-current",))
+    assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in reads] == []
 
 
 def queued(C, *, held=True):   # three open questions (the newer first, as Orca lists them) and a blocked issue; one parked on purpose with the hold label
