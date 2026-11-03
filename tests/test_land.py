@@ -87,7 +87,7 @@ def test_ci_land_runs_every_step_in_order(L):
         ("gh", "issue", "close", "9", "-c", f"landed in {sha}"),
         ("gh", "issue", "edit", "9", "--remove-label", "status:in-progress"),
         ("git", "delete", BRANCH),
-        ("orca", "orchestration", "worker-list"),
+        ("orca", "orchestration", "worker-list", "--full"),
         ("orca", "orchestration", "worker-release", "--dispatch", "ctx_9", *t[7][5:]),
         ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks"),
     ]

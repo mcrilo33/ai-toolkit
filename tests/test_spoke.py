@@ -140,7 +140,7 @@ def test_install_checks_prerequisites_then_prints_the_orca_override_without_a_pa
     quick = dict(ORCA_ROOT_PATH=tmp_path, STUB_NOENV=1)
     r = run(["bash", f"{V2}/scripts/install.sh"], PATH=f"{tmp_path}:/usr/bin:/bin", **quick)
     assert r.returncode != 0 and "missing prerequisite" in r.stderr and "orca" in r.stderr
-    stubs.reply("orca", "1.4.219")
+    stubs.reply("orca", "1.4.246")
     r = run(["bash", f"{V2}/scripts/install.sh"], **quick)
     assert r.returncode == 0, r.stderr
     assert f"{V2}/bin/claude-spoke" in r.stdout and not any((tmp_path / "home").rglob("claude"))

@@ -12,7 +12,7 @@ from conftest import V2
 def tool(tmp_path, stubs):
     root = tmp_path / "tool"
     shutil.copytree(V2, root)
-    stubs.reply("orca", "1.4.219")
+    stubs.reply("orca", "1.4.246")
     return root
 
 
