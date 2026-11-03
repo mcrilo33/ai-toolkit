@@ -64,7 +64,7 @@ okread() {   # an Orca read whose reply has .result: prints it; any other reply 
 wl() {   # every page of the Run's workers (newest first, 100 a page), in the shape of one reply; live = dispatchStatus "dispatched"
   local cur="" out all="[]"
   while :; do
-    out="$(okread orchestration worker-list --run "$run" --limit 100 ${cur:+--cursor "$cur"})" || return 1
+    out="$(okread orchestration worker-list --run "$run" --limit 100 ${cur:+--cursor "$cur"} --full)" || return 1
     all="$(jq -c --argjson o "$out" '. + $o.result.workers' <<< "$all")"; cur="$(jq -r '.result.page.nextCursor // empty' <<< "$out")"
     [ -n "$cur" ] || break
   done
@@ -92,11 +92,11 @@ pending() {   # {open: questions nobody has replied to (waiting for the human), 
        answered: [$m[] | select(.thread_id != null and .thread_id != .id) | .thread_id], truncated: ($all | length >= 200)}'
 }
 silent() {   # $1 dispatch: "<minutes> <run|wait>": minutes since the newest sign of life (terminal output, liveness observation, heartbeat, never before dispatchedAt);
-  okread orchestration worker-show --dispatch "$1" < /dev/null | jq -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer, or Orca could not prove the worker (never "not waiting")
+  okread orchestration worker-show --dispatch "$1" --full < /dev/null | jq -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer, or Orca could not prove the worker (never "not waiting")
     | ([($r.terminal.lastOutputAt, $r.projection.liveness.observedAt | select(. != null) / 1000), ($r.dispatch.lastHeartbeatAt, $r.dispatch.dispatchedAt | select(. != null) | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)] | max) as $t
     | "\(([(($now - $t) / 60) | floor, 0] | max)) \(if ($r.terminal == null or (($r.observation // {}) | has("agentWait") | not) or $r.observation.agentWait) then "wait" else "run" end)"'
 }
-holder() { okread orchestration run-show --id "$run" | jq -r '.result.run.coordinator_handle // empty' || true; }   # the terminal that holds the Run
+holder() { okread orchestration run-show --id "$run" --full | jq -r '.result.run.coordinator_handle // empty' || true; }   # the terminal that holds the Run
 live_hold() {   # $1 eq|ne, $2 a handle: if a live coordinator.sh (holder.<pid> = "<handle> <mode>", the pid's command must still be coordinator.sh) is bound as
   local f h  # (eq) / as anything but (ne) that handle, print its mode and succeed
   for f in "$(spool_dir "$run")"/holder.*; do
@@ -137,7 +137,7 @@ hold() { held="$held $1 "; printf '%s\n' "$1" >> "$sd/held"; }   # $1 message id
 by_loop() { case "${lm%% *}" in attended | auto) ! is_perm "$2" && [ -f "$(spool_dir "$run")/held" ] && ! grep -qxF "$1" "$(spool_dir "$run")/held" ;; *) false ;; esac; }   # $1 message id, $2 its question, $lm the live loop's mode (none, human or no held file, e.g. an older loop: every open question is the human's)
 replycmd() { printf 'bash %s --run %s --reply %s %s' "$here/coordinator.sh" "$run" "$1" "${2:-approve}"; }
 if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to; --show: one of them whole
-  [ -n "$run" ] || run="$(orca_json orchestration run-current | jq -r '.result.run.id // empty')"; if [ -n "$show_id" ]; then m="$(open_q | jq -c --arg i "$show_id" 'select(.id == $i)')" && [ -n "$m" ] || die "no open question $show_id on run $run"; show_q "$(question_of "$m")" 1000000; exit 0; fi
+  [ -n "$run" ] || run="$(orca_json orchestration run-current --full | jq -r '.result.run.id // empty')"; if [ -n "$show_id" ]; then m="$(open_q | jq -c --arg i "$show_id" 'select(.id == $i)')" && [ -n "$m" ] || die "no open question $show_id on run $run"; show_q "$(question_of "$m")" 1000000; exit 0; fi
   log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold eq "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
   lm="$(live_hold ne "")" || { echo "no coordinator.sh loop is running for this Run"; [ ! -s "$(spool_dir "$run")/loop.log" ] || { echo "its last log lines:"; tail -n 3 "$(spool_dir "$run")/loop.log" | LC_ALL=C tr -d '\000-\010\013-\037\177' | sed 's/^/  /'; }; }; q=""; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || q="$q${f##*/} "; done; [ -z "$q" ] || echo "replies queued in the spool: $q"
   echo "live workers:"   # verdict, the agent's activity and the silence: `unverifiable` for a long run tells a stuck worker from a working one
@@ -249,7 +249,7 @@ ctx() {
 }
 nlive() { jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length'; }   # the workers of one wl reply that are live
 rounds() {   # dispatches of the worktree since its last human-requested round (a task titled "#<n> round", see named()), else all of them - 1; a relaunch shares its task, so the base is that task's oldest dispatch
-  local hr; hr="$(okread orchestration task-list --run "$run" --brief | jq -c '[.result.tasks[] | select(.task_title | test("^#[0-9]+ round$")) | .id]')" || return 1
+  local hr; hr="$(okread orchestration task-list --run "$run" --brief --full | jq -c '[.result.tasks[] | select(.task_title | test("^#[0-9]+ round$")) | .id]')" || return 1
   wl | jq --arg p "::$wtp" --argjson h "$hr" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] as $w   # worker-list is newest first
     | ([$w[] | select(.taskId as $t | $h | index($t))][0].taskId) as $t
     | if $t == null then ($w | length) - 1 else [$w | to_entries[] | select(.value.taskId == $t) | .key] | last end'
@@ -563,7 +563,7 @@ while :; do
   drain_replies
   rc=0; wait_ms="${COORD_WAIT_MS:-300000}"   # 30 s while a question waits for the human: its reply is picked up soon
   [ "$(pending | jq '.open | length')" -eq 0 ] 2> /dev/null || wait_ms="${COORD_WAIT_PENDING_MS:-30000}"
-  out="$(orca_json orchestration check --run "$run" --terminal "$H" --wait --types question,worker_done,escalation --timeout-ms "$wait_ms" 2> "$errf")" || rc=$?
+  out="$(orca_json orchestration check --run "$run" --terminal "$H" --wait --types question,worker_done,escalation --timeout-ms "$wait_ms" --full 2> "$errf")" || rc=$?
   case "$out$(cat "$errf")" in *consumer_fenced*) yield fenced ;; esac
   msgs="$(jq -c '.result.messages[]?' <<< "$out" 2> /dev/null)" || msgs=""
   if [ -z "$msgs" ]; then
