@@ -241,7 +241,7 @@ if [ "$main_kind" != pr ] && git rev-parse -q --verify "refs/remotes/origin/$bra
   step git push -q --force-with-lease="refs/heads/$branch:$tip" origin ":refs/heads/$branch"
 fi
 if [ -z "$disp" ] && [ "$gone" = 0 ]; then
-  disp="$(orca_json orchestration worker-list ${RUN:+--run "$RUN"} --full | jq -r --arg p "::$wt" '[.result.workers[] | select(.resource.worktreeId | endswith($p)) | .dispatchId] | .[]')" || disp=""
+  disp="$(orca_json orchestration worker-list ${RUN:+--run "$RUN"} --full | jq -r --arg p "::$wt" '[.result.workers[] | select((.resource.worktreeId // "") | endswith($p)) | .dispatchId] | .[]')" || disp=""
 fi
 for d in $disp; do step orca_mutate orchestration worker-release --dispatch "$d"; done
 if [ "$gone" = 0 ]; then
