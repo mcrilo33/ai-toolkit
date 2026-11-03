@@ -43,6 +43,8 @@ def L(stubs, repo, run, tmp_path, link_script):
     stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(wt), "branch": f"refs/heads/{BRANCH}"}}}))
     stubs.reply("orca.orchestration_worker_list",
                 json.dumps({"result": {"workers": [{"dispatchId": "ctx_other", "resource": {"worktreeId": "r::/elsewhere"}},
+                                                   {"dispatchId": "ctx_nowt", "resource": {"worktreeId": None}},   # one row without a worktree id must not drop the lookup
+                                                   {"dispatchId": "ctx_nores"},
                                                    {"dispatchId": "ctx_9", "resource": {"worktreeId": f"r::{wt}"}}]}}))
     stubs.reply("gh.run_list", GREEN)
 
@@ -92,6 +94,7 @@ def test_ci_land_runs_every_step_in_order(L):
         ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks"),
     ]
     assert "--retry-request" in t[7]
+    assert "no dispatch found" not in r.stderr
     # a repo without the sync sources is no toolkit checkout: land installs nothing and touches no installed copy
     assert not (L.root / ".ai-toolkit").exists() and (L.root / ".claude/hooks/guard.sh").read_text() == "#!/bin/sh\n"
 
