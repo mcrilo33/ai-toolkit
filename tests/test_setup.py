@@ -2,7 +2,6 @@ import re
 import shutil
 
 import pytest
-
 from conftest import V2, git
 
 

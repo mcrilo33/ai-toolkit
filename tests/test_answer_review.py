@@ -94,7 +94,9 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
     assert f"PWD={A.wt.resolve()}" in A.stubs.env("claude") and p.startswith("PLAN: do X. Approve?") and "# #9 new\n\nnew body" in p and len(A.stubs.calls("orca")) == 3
     assert "forged" not in p and "#7" not in p and "stale" not in p and task.read_text() == "# #7 forged by the worker\n\nthe worker's own contract\n"
     assert A.stubs.calls("gh")[0][:3] == ["issue", "view", "9"]
-    git_in = lambda *a: subprocess.run(["git", "-C", str(A.wt), *a], check=True, capture_output=True)
+    def git_in(*a):
+        return subprocess.run(["git", "-C", str(A.wt), *a], check=True, capture_output=True)
+
     git_in("init", "-q", "-b", "5-x")   # the Orca link outranks the branch name, which the judged worker can rename
 
     def refused(why):   # Orca's link is the only source: without it the gate judges nothing (no claude, no fetch, no answer) and the loop takes its unanswered path
@@ -106,7 +108,9 @@ def test_answer_runs_read_only_claude_in_the_worktree_with_the_rule_and_the_ques
 
     assert A.go("ANSWER: approve\n", input="PLAN: do X.").returncode == 0 and A.stubs.calls("gh")[-1][2] == "9"
     task.write_text("# #7 edited by the worker\n\nother issue\n")   # neither a header nor the branch number 5 picks the issue
-    link = lambda n, rc=0: A.stubs.reply("orca.worktree_show", n, rc=rc)
+    def link(n, rc=0):
+        return A.stubs.reply("orca.worktree_show", n, rc=rc)
+
     link('{"result":{"worktree":{"linkedIssue":null}}}')
     assert refused("no issue linked") == 1   # an answer of no link is final: not retried
     link('{"result":{"worktree":{"linkedIssue":"x;y"}}}')
@@ -281,7 +285,7 @@ def test_request_changes_exits_3_with_blocker_lines_and_an_approve_that_contradi
     "", "Looks good to me!", "```json\nnot json\n```", json.dumps({**OK, "verdict": "MAYBE"}), json.dumps({**OK, "blockers": None}),
     json.dumps({k: v for k, v in OK.items() if k != "summary"}), json.dumps({**OK, "tdd_followed": "yes"}), "[1]", "{} trailing",
     json.dumps({**OK, "warnings": ["a.py:1 - bare string"]}), json.dumps({**OK, "blockers": [finding("a.py:1 - x", "workflow")]}),   # a tag outside the inventory (the lean rules dir holds no such rule)
-    json.dumps({**OK, "warnings": [{"text": "a.py:1 - no tag"}]}), json.dumps({**OK, "warnings": [{"text": 3, "rule": "none"}]}), json.dumps({**OK, "warnings": [finding("a.py:1 - x", None)]}),
+    json.dumps({**OK, "warnings": [{"text": "a.py:1 - no tag"}]}), json.dumps({**OK, "warnings": [{"text": 3, "rule": "none"}]}), json.dumps({**OK, "warnings": [{"text": "a.py:1 - x", "rule": None}]}),
 ])
 def test_an_unparseable_verdict_exits_1_after_one_retry_and_is_never_an_approve(R, out):
     r = R.go(out)

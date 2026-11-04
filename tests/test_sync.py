@@ -5,7 +5,6 @@ import shutil
 import subprocess
 
 import pytest
-
 from conftest import V2, git
 
 
@@ -180,7 +179,7 @@ def test_edit_in_source_reaches_target_by_rename_so_a_running_script_is_not_corr
         assert running.read() == old   # the old inode is untouched: an in-place write would have changed what the loop reads next
     assert installed.read_text() == "#!/bin/sh\nnew\n" and installed.stat().st_ino != inode
     assert (target / ".claude" / "skills" / "land" / "SKILL.md").read_text() == "new\n"
-    assert not [p for p in target.rglob("*.new.*")]
+    assert not list(target.rglob("*.new.*"))
 
 
 def test_a_rewrite_keeps_the_destinations_mode_and_writes_through_a_symlink(sync, src, target, tmp_path):

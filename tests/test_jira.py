@@ -28,7 +28,7 @@ def J(stubs, tmp_path, link_script, run, monkeypatch):
     def curl():   # (argv words, stdin) of every curl call
         return stubs.calls("curl")
 
-    return type("J", (), dict(go=staticmethod(go), curl=staticmethod(curl), stubs=stubs, tmp=tmp_path))
+    return type("J", (), {"go": staticmethod(go), "curl": staticmethod(curl), "stubs": stubs, "tmp": tmp_path})
 
 
 def body_text(argv):   # the text of every node of the ADF comment

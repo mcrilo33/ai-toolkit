@@ -6,7 +6,6 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
-
 from conftest import V2, git
 
 HOOKS = V2 / "hooks"
@@ -96,7 +95,7 @@ def call(script, cwd, tool="Bash", raw=None, env=None, **tool_input):
 
 def check(script, places, where, want, tool="Bash", env=None, **ti):
     for n, p in places.items():
-        ti = {k: v.replace("{%s}" % n, str(p)) for k, v in ti.items()}
+        ti = {k: v.replace("{" + n + "}", str(p)) for k, v in ti.items()}
     r = call(script, places[where], tool, env={**places["env"], **(env or {})}, **ti)
     assert r.returncode == want, f"{where}: {ti} -> rc={r.returncode} {r.stderr}"
     if want == 2:
@@ -371,11 +370,11 @@ WF_CASES = [(RELAYED, *lane) for lane in WF_LANES] + [
 @pytest.mark.parametrize("scenario,tool,ti,named", WF_CASES)
 def test_danger_guard_sensitive_operations_ask_only_where_the_prompt_reaches_someone(shared, tmp_path, scenario, tool, ti, named):
     where, how, asks = WF_SCENARIOS[scenario]
-    named = (named,) if isinstance(named, str) else named
+    named = [named] if isinstance(named, str) else list(named)
     if named[0] == W:
         named = named[1:]
     if named[0] == D:
-        asks, named = False, ()
+        asks, named = False, []
     places = {**shared, "spoke": tmp_path / "w", "tk": tmp_path / "tk"}
     launched = install_relay(places["spoke"], how, places["tk"]) if where == "spoke" else {}
     sub = lambda v: v.replace("{tk}", str(places["tk"])).replace("{spoke}", str(places[where])).replace("{home}", str(shared["home"])).replace("{root}", str(shared["root"])).replace("{other}", str(shared["spoke"]))  # noqa: E731
@@ -819,7 +818,9 @@ def test_settings_register_the_hooks_at_the_synced_path(shared, tmp_path):
     seen = {}
     for e in cfg["hooks"]["PreToolUse"]:
         cmd = e["hooks"][0]["command"]
-        script = re.search(r"/([a-z-]+\.sh)", cmd)[1]
+        found = re.search(r"/([a-z-]+\.sh)", cmd)
+        assert found, cmd
+        script = found[1]
         assert cmd.endswith(" || exit 2")  # a hook that cannot run (no AI_TOOLKIT_DIR, no script) must deny: any other non-zero code lets the call through
         seen[script] = e["matcher"].split("|")
         tool, ti = ("Bash", {"command": "git push --force"}) if script == "push-guard.sh" else ("Write", {"file_path": "orca.yaml", "content": AWS})
@@ -876,7 +877,8 @@ def test_commit_msg_only_a_test_commit_changes_test_files(hooked, tmp_path, msg,
     for f in files:
         if f.startswith("mv:"):
             old, new = f[3:].split(":")
-            (wt / old).parent.mkdir(exist_ok=True), (wt / new).parent.mkdir(exist_ok=True)
+            (wt / old).parent.mkdir(exist_ok=True)
+            (wt / new).parent.mkdir(exist_ok=True)
             (wt / old).write_text("x")
             git(wt, "add", old)
             assert commit(wt, "test: seed #1").returncode == 0

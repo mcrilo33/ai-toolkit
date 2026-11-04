@@ -1,6 +1,5 @@
 """Policy lint of the /coordinate skill (WP7): the session only converses and decides, every mechanic it names must exist."""
 import re
-from pathlib import Path
 
 import pytest
 from conftest import ROOT, V2

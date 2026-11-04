@@ -84,8 +84,8 @@ def L(stubs, repo, run, tmp_path, link_script, origin_template):
         log.write_text("")   # setup, not part of land's trail
         return sha
 
-    return type("L", (), dict(go=staticmethod(go), trail=staticmethod(trail), other_push=staticmethod(other_push), wt=wt, tip=tip,
-                              root=repo.root, origin=origin, stubs=stubs, tmp=tmp_path, git=staticmethod(git)))
+    return type("L", (), {"go": staticmethod(go), "trail": staticmethod(trail), "other_push": staticmethod(other_push), "wt": wt, "tip": tip,
+                              "root": repo.root, "origin": origin, "stubs": stubs, "tmp": tmp_path, "git": staticmethod(git)})
 
 
 def main_sha(L):
@@ -123,7 +123,7 @@ def test_ci_land_runs_every_step_in_order(L):
 def test_explicit_dispatch_skips_the_worker_list_lookup(L):
     assert L.go("--dispatch", "ctx_x", "9").returncode == 0
     assert ("orca", "orchestration", "worker-list") not in [t[:3] for t in L.trail()]
-    assert [t for t in L.trail() if t[2:3] == ("worker-release",)][0][3:5] == ("--dispatch", "ctx_x")
+    assert next(t for t in L.trail() if t[2:3] == ("worker-release",))[3:5] == ("--dispatch", "ctx_x")
 
 
 def run_log(job, step, failed=()):   # `gh run view --log-failed`: job TAB step TAB timestamp message, 100 lines, the pytest summary lines near the top

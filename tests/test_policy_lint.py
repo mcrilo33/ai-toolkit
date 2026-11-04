@@ -116,7 +116,7 @@ def test_agent_frontmatter(path):
     for s in fm.get("skills", []):
         assert (SHARED / "skills" / s / "SKILL.md").is_file(), f"{path.stem}: unknown skill {s}"
     if path.stem in READ_ONLY_AGENTS:
-        assert EDIT_TOOLS <= denied
+        assert denied >= EDIT_TOOLS
 
 
 @pytest.mark.parametrize("path", COMMANDS)
@@ -166,7 +166,7 @@ def test_ci_checks_job_is_capped_to_keep_suite_duration_visible():
 def test_guidelines_ask_every_human_decision_in_a_card_and_route_workers_to_orchestration_ask():
     body = (SHARED / "rules" / "guidelines.md").read_text()
     assert all(s in body for s in ("AskUserQuestion", "(Recommended)", "orca orchestration ask"))
-    assert "2–5 items" not in body
+    assert "2\u20135 items" not in body
 
 
 def test_hub_asks_its_next_move_in_a_card():

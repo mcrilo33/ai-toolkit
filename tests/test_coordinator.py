@@ -50,7 +50,9 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
                 "resource": {"worktreeId": f"r::{wt}"}, "projection": {"liveness": {"verdict": lv}, "stage": {"activity": "working"}}}
 
     def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim
-        ago = lambda m: time.time() - m * 60
+        def ago(m):
+            return time.time() - m * 60
+
         fs = ".123" if frac else ""
         reply = {"terminal": {"lastOutputAt": ago(silent) * 1000}, "observation": {"agentWait": {"source": "hook"} if wait else None},
                  "dispatch": {"dispatchedAt": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ago(born))) + fs if born is not None else "2020-01-01 00:00:00", "lastHeartbeatAt": None if beat is None else time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ago(beat))) + fs + "Z"}}
@@ -113,11 +115,11 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         edits = [a[3:] for a in calls("gh issue edit")]   # one in-progress or blocked label, never both
         return (["--add-label", "blocked"] in edits and edits.index(["--remove-label", "status:in-progress"]) > edits.index(["--add-label", "blocked"]) and "gh issue comment" in ks
                 and any(arg(a, "--comment").startswith("BLOCKED #1") and arg(a, "--worktree") == f"path:{wt}" for a in calls("orca worktree set"))
-                and "orca orchestration worker-release" in ks and "--address" not in sum(stubs.calls("dispatch.sh"), []) and "orca worktree rm" not in ks)
+                and "orca orchestration worker-release" in ks and not any("--address" in c for c in stubs.calls("dispatch.sh")) and "orca worktree rm" not in ks)
 
-    return type("C", (), dict(go=staticmethod(go), mail=staticmethod(mail), inbox=staticmethod(inbox), spool=staticmethod(spool), spooled=lambda m: (tmp_path / "state/run_t/replies" / m).exists(), workers=staticmethod(workers), row=staticmethod(row), show=staticmethod(show), wt=wt,
-                              calls=staticmethod(calls), blocked=staticmethod(blocked), stubs=stubs, kinds=staticmethod(lambda: [k for k, _ in trail()]),
-                              stdin=staticmethod(lambda n: (tmp_path / f"stubs/{n}.stdin").read_text())))
+    return type("C", (), {"go": staticmethod(go), "mail": staticmethod(mail), "inbox": staticmethod(inbox), "spool": staticmethod(spool), "spooled": lambda m: (tmp_path / "state/run_t/replies" / m).exists(), "workers": staticmethod(workers), "row": staticmethod(row), "show": staticmethod(show), "wt": wt,
+                              "calls": staticmethod(calls), "blocked": staticmethod(blocked), "stubs": stubs, "kinds": staticmethod(lambda: [k for k, _ in trail()]),
+                              "stdin": staticmethod(lambda n: (tmp_path / f"stubs/{n}.stdin").read_text())})
 
 
 def test_a_given_run_is_rebound_without_one_a_run_is_created_and_every_wait_names_it_and_the_wake_types(C):
@@ -162,7 +164,7 @@ def test_question_auto_runs_the_answerer_in_the_workers_worktree_replies_then_ac
     assert "touches CI" in arg(C.calls("orca worktree set")[0], "--comment") and not C.calls("orca terminal send")   # Orca's surface: the worktree comment; the loop rings nothing
 
 
-REPLY = "bash {}/scripts/coordinator.sh --run run_t --reply msg_q approve".format(V2)
+REPLY = f"bash {V2}/scripts/coordinator.sh --run run_t --reply msg_q approve"
 
 
 WHY = "human: the plan adds a mechanism the issue left open"
@@ -324,7 +326,7 @@ def test_a_reply_dropped_after_the_bound_is_not_announced_to_the_session_outside
     assert not C.spooled("msg_open") and not [a for a in C.calls("orca terminal send") if "dropped" in arg(a, "--text")]
 
 
-@pytest.mark.parametrize("age, kw, body", [(10, dict(question=PQ), "deny"), (1, dict(question=PQ, dispatchId="ctx_9"), "deny"), (1, dict(question="PLAN?", dispatchId="ctx_9"), "approve")])
+@pytest.mark.parametrize("age, kw, body", [(10, {"question": PQ}, "deny"), (1, {"question": PQ, "dispatchId": "ctx_9"}, "deny"), (1, {"question": "PLAN?", "dispatchId": "ctx_9"}, "approve")])
 def test_a_queued_reply_for_a_permission_request_past_the_relay_window_or_a_dead_dispatch_is_dropped_never_sent(C, age, kw, body):
     ago = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age * 60))
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_p", **kw), "run_id": "run_t", "thread_id": "msg_p", "created_at": ago}]}}))
@@ -556,7 +558,7 @@ def test_a_land_under_way_is_logged_and_shown_by_status_until_it_returns(C, tmp_
     assert "landing #1" not in C.go("--status", ORCA_TERMINAL_HANDLE="").stdout and not (tmp_path / "state/run_t/landing").exists()
 
 
-SWEEP = dict(COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=1)   # the sweep runs after every empty wait here (every 2nd by default, read in the test below): one tick reaches it
+SWEEP = {"COORD_MAX_TICKS": 1, "COORD_SWEEP_EVERY": 1}   # the sweep runs after every empty wait here (every 2nd by default, read in the test below): one tick reaches it
 
 
 def relaunches(C):
@@ -566,8 +568,8 @@ def relaunches(C):
 @pytest.mark.parametrize("idle, shown", [
     (False, {}),   # the process exited
     (True, {}),   # the agent is alive but silent past the 15-minute bound after a failed turn
-    (True, dict(beat=25, frac=True)),   # the same, the heartbeat carrying fractional seconds
-    (True, dict(born=25, frac=True)),   # ... or dispatchedAt
+    (True, {"beat": 25, "frac": True}),   # the same, the heartbeat carrying fractional seconds
+    (True, {"born": 25, "frac": True}),   # ... or dispatchedAt
 ])
 def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C, idle, shown):
     assert re.search(r"COORD_SWEEP_EVERY:-2\}", (V2 / "scripts/coordinator.sh").read_text())   # the defaults, read rather than waited for: a sweep every 2nd empty wait (~10 min), the idle bound 15 minutes
@@ -587,16 +589,16 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
 
 
 @pytest.mark.parametrize("rows, shown, gate", [
-    ([dict(st="completed", lv="exited")], {}, False),   # a settled worker's process is expected to be gone
-    ([dict(d="ctx_1", st="failed", lv="exited"), dict(d="ctx_2", lv="live")], {}, False),   # the relaunched worker is alive: left alone
-    ([dict()], dict(silent=0, beat=93), False),   # an old heartbeat, the agent working: #415 and #418 at 09:39 UTC
-    ([dict()], dict(silent=40, beat=1), False),   # a worker that heartbeats
-    ([dict()], dict(silent=40, beat=1, frac=True), False),   # ... the heartbeat carrying fractional seconds: read, not dropped
-    ([dict()], dict(silent=40, born=1), False),   # just (re)dispatched: the old terminal output is not the new worker's silence
-    ([dict()], dict(silent=14), False),   # silent, but under the bound
-    ([dict()], dict(silent=14, wait=True), False),   # ... also with a proved human-only prompt
-    ([dict()], dict(silent=40), True),   # waiting on an open gate or permission question
-    ([dict()], dict(silent=40, raw="not json"), False),   # worker-show unreadable: the age is unknown, so the worker is neither relaunched nor blocked idle
+    ([{"st": "completed", "lv": "exited"}], {}, False),   # a settled worker's process is expected to be gone
+    ([{"d": "ctx_1", "st": "failed", "lv": "exited"}, {"d": "ctx_2", "lv": "live"}], {}, False),   # the relaunched worker is alive: left alone
+    ([{}], {"silent": 0, "beat": 93}, False),   # an old heartbeat, the agent working: #415 and #418 at 09:39 UTC
+    ([{}], {"silent": 40, "beat": 1}, False),   # a worker that heartbeats
+    ([{}], {"silent": 40, "beat": 1, "frac": True}, False),   # ... the heartbeat carrying fractional seconds: read, not dropped
+    ([{}], {"silent": 40, "born": 1}, False),   # just (re)dispatched: the old terminal output is not the new worker's silence
+    ([{}], {"silent": 14}, False),   # silent, but under the bound
+    ([{}], {"silent": 14, "wait": True}, False),   # ... also with a proved human-only prompt
+    ([{}], {"silent": 40}, True),   # waiting on an open gate or permission question
+    ([{}], {"silent": 40, "raw": "not json"}, False),   # worker-show unreadable: the age is unknown, so the worker is neither relaunched nor blocked idle
 ])
 def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worker_alone(C, rows, shown, gate):
     C.workers(*[C.row(**r) for r in rows]); C.show(**shown)
@@ -609,11 +611,11 @@ def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worke
 
 
 @pytest.mark.parametrize("shown", [
-    dict(silent=16, wait=True),   # a proved human-only prompt, just past the bound: nobody answers it in an unattended run, so it blocks like any silent worker
-    dict(silent=40, wait=True),   # ... however late the loop first sees it
-    dict(silent=40, obs="missing"),   # no agentWait key: Orca never looked, the incident's `unverifiable` shape
-    dict(silent=40, obs="null"),   # no observation at all
-    dict(silent=40, noterm=True),   # a null terminal
+    {"silent": 16, "wait": True},   # a proved human-only prompt, just past the bound: nobody answers it in an unattended run, so it blocks like any silent worker
+    {"silent": 40, "wait": True},   # ... however late the loop first sees it
+    {"silent": 40, "obs": "missing"},   # no agentWait key: Orca never looked, the incident's `unverifiable` shape
+    {"silent": 40, "obs": "null"},   # no observation at all
+    {"silent": 40, "noterm": True},   # a null terminal
 ])
 def test_a_silent_worker_with_no_open_question_is_blocked_at_the_first_sweep_past_the_bound_whether_or_not_its_prompt_is_proved(C, shown):
     C.workers(C.row()); C.show(**shown)
@@ -624,7 +626,7 @@ def test_a_silent_worker_with_no_open_question_is_blocked_at_the_first_sweep_pas
 
 @pytest.mark.parametrize("rows, shown", [
     ([("ctx_1", "failed", "exited"), ("ctx_2", "dispatched", "exited")], {}),   # died again
-    ([("ctx_1", "failed", "exited"), ("ctx_2", "dispatched", "live")], dict(silent=20)),   # idle again after a relaunch
+    ([("ctx_1", "failed", "exited"), ("ctx_2", "dispatched", "live")], {"silent": 20}),   # idle again after a relaunch
 ])
 def test_a_worker_that_died_or_went_idle_again_after_its_relaunch_blocks_the_issue(C, rows, shown):
     C.workers(*[C.row(d, st=st, lv=lv) for d, st, lv in rows]); C.show(**shown)
@@ -690,8 +692,8 @@ def queued(C, *, held=True):   # three open questions (the newer first, as Orca 
     ago = lambda m: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - m * 60))  # noqa: E731
     perm = "PERMISSION REQUEST (not a plan gate)"   # kept: a fresh permission request, an old PLAN gate (live worker); left out: a permission request past the relay's 9 minutes, a question of an ended dispatch
     rows += [{**msg("question", i, **kw), "run_id": "run_t", "thread_id": i, "sequence": n, "created_at": ago(m)} for i, n, m, kw in (
-        ("msg_fresh", 11, 2, dict(question=perm)), ("msg_oldplan", 12, 600, dict(question="PLAN?")),
-        ("msg_stale", 13, 10, dict(question=perm)), ("msg_ended", 14, 1, dict(dispatchId="ctx_9", question="PLAN?")))]
+        ("msg_fresh", 11, 2, {"question": perm}), ("msg_oldplan", 12, 600, {"question": "PLAN?"}),
+        ("msg_stale", 13, 10, {"question": perm}), ("msg_ended", 14, 1, {"dispatchId": "ctx_9", "question": "PLAN?"}))]
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
     issues = [{"number": 4, "title": "t4\x1b[2Kx", "labels": [{"name": "blocked"}]}] + ([{"number": 5, "title": "t5", "labels": [{"name": "blocked"}, {"name": "hold"}]}] if held else [])
     C.stubs.reply("gh.issue_list", json.dumps(issues))
@@ -731,14 +733,14 @@ def issue_json(state="OPEN", scope="a.py", labels=(), land=None):
 
 BLOCKED = issue_json(labels=["blocked"])
 DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed; one that cannot keeps its file with the reason on line 2 (only a closed issue and a plain request for an already running one are dropped)
-    "plain": {}, "fresh-with-message": dict(text="do it test-first", v7=BLOCKED, why="no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"),
-    "kept-worktree-with-message": dict(text="do it test-first", v7=BLOCKED, kept=True, expect=("--address", "do it test-first", "--round", "7"), label=True), "kept-worktree-default-message": dict(kept=True, expect="default"),
-    "cap": dict(cap=1, why="waiting for a free slot (cap 1)"), "refused": dict(refuses=True, why="dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"), "closed": dict(v7=issue_json(state="CLOSED"), dropped=True),
-    "hold": dict(v7=issue_json(labels=["hold"]), why="on hold: remove the hold label to start it"), "blocked-no-message": dict(v7=BLOCKED, why="blocked: remove the label, or give a message to re-dispatch it"),
-    "no-toolkit-label": dict(v7=issue_json(labels=["bug"]), env={"DISPATCH_LABEL": "ai-toolkit"}, why="not a toolkit issue: it lacks the ai-toolkit label"),
-    "toolkit-label": dict(v7=issue_json(labels=["ai-toolkit"]), env={"DISPATCH_LABEL": "ai-toolkit"}),
-    "running": dict(kept=True, running=True, dropped=True), "running-with-message": dict(text="on another model", kept=True, running=True, why="a worker is still live on the worktree (dispatch ctx_7): it starts once that worker ends"), "unreadable": dict(unreadable=True, why="cannot read the issue (unknown, or GitHub did not answer)"),
-    "worktrees": dict(no_worktrees=True, why="cannot read the worktrees"), "dispatch-fails": dict(fails=True, why="dispatch failed: boom"),
+    "plain": {}, "fresh-with-message": {"text": "do it test-first", "v7": BLOCKED, "why": "no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"},
+    "kept-worktree-with-message": {"text": "do it test-first", "v7": BLOCKED, "kept": True, "expect": ("--address", "do it test-first", "--round", "7"), "label": True}, "kept-worktree-default-message": {"kept": True, "expect": "default"},
+    "cap": {"cap": 1, "why": "waiting for a free slot (cap 1)"}, "refused": {"refuses": True, "why": "dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"}, "closed": {"v7": issue_json(state="CLOSED"), "dropped": True},
+    "hold": {"v7": issue_json(labels=["hold"]), "why": "on hold: remove the hold label to start it"}, "blocked-no-message": {"v7": BLOCKED, "why": "blocked: remove the label, or give a message to re-dispatch it"},
+    "no-toolkit-label": {"v7": issue_json(labels=["bug"]), "env": {"DISPATCH_LABEL": "ai-toolkit"}, "why": "not a toolkit issue: it lacks the ai-toolkit label"},
+    "toolkit-label": {"v7": issue_json(labels=["ai-toolkit"]), "env": {"DISPATCH_LABEL": "ai-toolkit"}},
+    "running": {"kept": True, "running": True, "dropped": True}, "running-with-message": {"text": "on another model", "kept": True, "running": True, "why": "a worker is still live on the worktree (dispatch ctx_7): it starts once that worker ends"}, "unreadable": {"unreadable": True, "why": "cannot read the issue (unknown, or GitHub did not answer)"},
+    "worktrees": {"no_worktrees": True, "why": "cannot read the worktrees"}, "dispatch-fails": {"fails": True, "why": "dispatch failed: boom"},
 }
 
 
@@ -796,7 +798,7 @@ def test_a_release_whose_stop_does_not_settle_escalates_to_worker_abandon(C, rel
     C.mail([msg("worker_done", outcome="failed")])
     r = C.go()
     ab = C.calls("orca orchestration worker-abandon")
-    assert bool(ab) == abandoned and (not ab or arg(ab[0], "--dispatch") == "ctx_1" and "worker-abandon" in r.stderr and "ctx_1" in r.stderr)
+    assert bool(ab) == abandoned and (not ab or (arg(ab[0], "--dispatch") == "ctx_1" and "worker-abandon" in r.stderr and "ctx_1" in r.stderr))
 
 
 def test_an_exited_worker_with_a_queued_replace_request_is_released_not_relaunched_on_its_old_model(C, tmp_path):
@@ -870,7 +872,9 @@ def test_status_leaves_to_a_live_loop_the_plans_it_answers_and_queues_the_rest_f
     try:
         out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
     finally:
-        loop and (loop.kill(), loop.wait())
+        if loop:
+            loop.kill()
+            loop.wait()
     queue = out[out.index("queue (the order"):out.index("dispatch requests:")].split("being answered")[0]
     assert ("being answered by the loop: " + by_loop + "\n" in out) == bool(by_loop) and ("being answered" not in out) == (not by_loop)
     assert all((i in queue and f"--reply {i} " in queue) != (i in by_loop) for i in ("msg_a", "msg_b", "msg_c", "msg_oldplan")) and "msg_fresh" in queue and "--reply msg_fresh allow" in queue   # a plan the loop answers has no text and no reply line; a permission request is always queued
@@ -892,6 +896,7 @@ def sent(C, *args, **env):   # the lines one attended loop run typed into the se
 def ticks(*snapshots):   # the Run's open questions at the start, then at each tick (two inbox reads each; sweeps off): ids by sequence, "msg_p*" ones are permission requests
     base = Path(os.environ["STUB_DIR"])
     (base / "orca.orchestration_inbox.count").unlink(missing_ok=True)   # the stub numbers its replies per call: start again at the first
+    rows = []
     for i, ids in enumerate(snapshots):
         rows = [{**msg("question", q, question=PQ if q.startswith("msg_p") else "PLAN\x1b[2J?\nrm -rf /"), "run_id": "run_t", "thread_id": q, "sequence": ord(q[-1])} for q in ids]
         for n in ((1,) if i == 0 else (2 * i, 2 * i + 1)):
@@ -964,7 +969,8 @@ def watched(C, *polls, seen=None, fail=None, **env):   # --wait with no terminal
         C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}), n=n)
         C.stubs.reply("gh.issue_list", json.dumps([{"number": b, "title": "t", "labels": [{"name": "blocked"}]} for b in blocked]), n=2 * n - 1)   # each read: the blocked list, then the open issues that may be finished rounds
         C.stubs.reply("gh.issue_list", json.dumps(rounds[0] if rounds else []), n=2 * n)
-    fail and C.stubs.reply(fail[0], "boom", rc=1, n=fail[1])   # (stub, call number) that errors
+    if fail:
+        C.stubs.reply(fail[0], "boom", rc=1, n=fail[1])   # (stub, call number) that errors
     r = C.go("--wait", *(["--seen", seen] if seen is not None else []), ORCA_TERMINAL_HANDLE="", COORD_WATCH_SEC=0, COORD_WATCH_GH_EVERY=env.pop("every", 1), COORD_WATCH_MAX=len(polls), **env)
     assert not C.calls("orca terminal send") and not C.calls("orca orchestration run-use") and not C.calls("orca orchestration check")   # it types nothing and never binds the Run
     return r
@@ -1003,7 +1009,9 @@ def test_wait_keeps_polling_without_exiting_for_a_decision_already_waiting_or_on
     try:
         r = watched(C, *polls)
     finally:
-        loop and (loop.kill(), loop.wait())
+        if loop:
+            loop.kill()
+            loop.wait()
     assert r.returncode == 1 and r.stdout == ""
 
 
@@ -1029,7 +1037,8 @@ def test_wait_wakes_for_a_plan_the_attended_loop_handed_over_not_one_it_answers(
     try:
         r = watched(C, ([], []), (["msg_b"], []), (["msg_b", "msg_a"], []))
     finally:
-        loop.kill(), loop.wait()
+        loop.kill()
+        loop.wait()
     assert r.returncode == 0 and r.stdout.split() == ["msg_a"]
 
 
@@ -1056,14 +1065,15 @@ def test_status_shows_each_open_question_text_above_its_reply_command_and_show_p
     try:
         out, whole = (C.go(*a, ORCA_TERMINAL_HANDLE="").stdout for a in (("--status",), ("--show", "msg_q")))
     finally:
-        loop.kill(), loop.wait()
+        loop.kill()
+        loop.wait()
     assert "being answered by the loop: msg_q\n" in out and "PLAN: add" not in out and "--reply" not in out and "step 299: do the thing" in whole
 
 
 def test_a_pending_human_gate_sets_the_worktree_comment_then_the_reply_overwrites_the_comment(C):
     C.mail([msg("question", "msg_q", question="PLAN: add hello.py\nthen a test")])
     assert C.go("--answer", "human").returncode == 0
-    cm = [a for a in C.calls("orca worktree set")]
+    cm = list(C.calls("orca worktree set"))
     assert len(cm) == 1 and arg(cm[0], "--worktree") == f"path:{C.wt}"
     assert arg(cm[0], "--comment") == f"GATE waiting: PLAN: add hello.py then a test | reply: {REPLY}"   # the full line: it needs --run
     C.inbox(["msg_q"]); C.spool("msg_q", "approve")
@@ -1224,7 +1234,7 @@ def test_a_synced_coordinator_that_does_not_parse_is_not_exec_d_and_warns_once(T
 
 
 # --- #507: an issue is done when merged into MAIN_BRANCH; the loop logs a land that awaits it and watches the PR
-INT, PRMODE = dict(MAIN_BRANCH="develop"), dict(LAND_MODE="pr")
+INT, PRMODE = {"MAIN_BRANCH": "develop"}, {"LAND_MODE": "pr"}
 AWAITING = "status:awaiting-main"
 
 
@@ -1239,7 +1249,7 @@ def test_a_land_that_awaits_its_merge_into_main_is_logged_with_its_pr_never_bloc
     C.mail([msg("worker_done", outcome="succeeded")])
     r = C.go(**INT)
     assert "#1: on main, awaiting merge into develop (https://x/pull/5)" in r.stdout
-    assert len(C.stubs.calls("land.sh")) == 1 and "blocked" not in sum(C.calls("gh issue edit"), []) and len(C.stubs.calls("claude")) == 1
+    assert len(C.stubs.calls("land.sh")) == 1 and not any("blocked" in c for c in C.calls("gh issue edit")) and len(C.stubs.calls("claude")) == 1
 
 
 def test_a_cleanup_retry_that_ends_awaiting_main_does_not_block(C):
@@ -1429,13 +1439,15 @@ R1 = {"number": 1, "title": "tune the theme prompt", "body": "Scope: a.py\nLand:
 ROUND = "Round finished, held for the human\n" + REPORT
 CM = lambda who, body: {"author": {"login": who}, "body": body}  # noqa: E731
 FINISHED = {   # a finished round is a decision while its footer says human, the loop's last comment says it finished and Orca shows no worker on it
-    "finished": dict(woken="1"), "plain-hold": dict(issue={**R1, "body": "Scope: a.py\n", "labels": [{"name": "hold"}]}), "worker-live": dict(live=True),
-    "a-new-round-started": dict(comments=[CM("me", ROUND), CM("me", "round 1: address: more")]), "blocked": dict(comments=[CM("me", ROUND), CM("me", "blocked: worker idle again")]),
-    "footer-back-to-auto": dict(issue={**R1, "body": "Scope: a.py\nLand: auto\n"}),
+    "finished": {"woken": "1"}, "plain-hold": {"issue": {**R1, "body": "Scope: a.py\n", "labels": [{"name": "hold"}]}}, "worker-live": {"live": True},
+    "a-new-round-started": {"comments": [CM("me", ROUND), CM("me", "round 1: address: more")]}, "blocked": {"comments": [CM("me", ROUND), CM("me", "blocked: worker idle again")]},
+    "footer-back-to-auto": {"issue": {**R1, "body": "Scope: a.py\nLand: auto\n"}},
 }
 
 
-def finished_round(C, issue=R1, comments=(CM("me", ROUND),), live=False, **_):
+def finished_round(C, issue=R1, comments=None, live=False, **_):
+    if comments is None:
+        comments = (CM("me", ROUND),)
     C.stubs.reply("gh.api_user", "me\n")
     C.stubs.reply("gh.issue_view", json.dumps({"comments": list(comments)}))
     C.workers(C.row(st="dispatched" if live else "completed"))

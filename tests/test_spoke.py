@@ -112,6 +112,7 @@ def test_spoke_tags_a_session_in_a_synced_main_checkout_as_the_coordinator(run, 
 def test_the_launcher_passes_the_settings_file_of_the_project_it_starts_in(run, stubs, repo, project, worker, args, ok, passed, fwd):
     tk = synced(repo) if project in ("synced", "broken", "empty") else None
     if project in ("broken", "empty"):
+        assert tk is not None
         (tk / "claude-settings.json").write_text("{not json" if project == "broken" else "{}")
     r = run([SPOKE, *args], cwd=in_spoke(repo) if worker else repo.wt("w"), AI_TOOLKIT_DIR="/inherited")   # an inherited variable must never survive into a session that has no guards
     calls = stubs.calls("claude")
@@ -170,7 +171,7 @@ def test_a_human_session_keeps_its_own_mcp_servers(run, stubs, repo):
 
 def test_install_checks_prerequisites_then_prints_the_orca_override_without_a_path_shim(run, stubs, tmp_path):
     # spawns are the cost on macOS: a set ORCA_ROOT_PATH spares load_env its `git rev-parse` (the /usr/bin git there is an xcrun shim), STUB_NOENV the stub its `env`
-    quick = dict(ORCA_ROOT_PATH=tmp_path, STUB_NOENV=1)
+    quick = {"ORCA_ROOT_PATH": tmp_path, "STUB_NOENV": 1}
     r = run(["bash", f"{V2}/scripts/install.sh"], PATH=f"{tmp_path}:/usr/bin:/bin", **quick)
     assert r.returncode != 0 and "missing prerequisite" in r.stderr and "orca" in r.stderr
     stubs.reply("orca", "1.4.246")
