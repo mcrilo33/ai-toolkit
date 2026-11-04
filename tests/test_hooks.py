@@ -473,8 +473,10 @@ def test_danger_guard_judge_clears_the_observed_false_positives_without_a_prompt
 # --- permission-relay ---------------------------------------------------------------------------
 # PermissionRequest fires for every tool-permission dialog a worker would show (a PreToolUse "ask", an `ask` rule, a prompt Claude Code raises itself
 # in bypass mode, a subagent's), measured on claude 2.1.289 in bypass mode. Its payload: tool_name, tool_input, cwd, permission_mode; no reason, no tool_use_id.
+# Models orca 1.4.246: an ask without --wait returns at once ("Question <id> sent.", exit 0); only --wait blocks for the reply.
 ASK_SHIM = """#!/bin/bash
 printf '%s\\0' "$@" > "$SHIM_ARGS"; echo x >> "$SHIM_ARGS.n"
+case " $* " in *" --wait "*) ;; *) echo "Question msg_x sent."; exit 0;; esac
 sleep "${SHIM_SLEEP:-0}"; printf '%s' "${SHIM_REPLY-}"; printf '%s' "${SHIM_ERR-}" >&2; exit "${SHIM_RC:-0}"
 """
 
@@ -536,7 +538,7 @@ def test_relay_does_nothing_outside_a_worker(relay):
 def test_relay_asks_the_run_one_question_with_options_a_timeout_and_the_workers_handle(relay):
     r = relay.run("Bash", {"command": "cd wf && rm -rf *", "description": "wipe the dir"})
     assert r.asks == 1 and r.args[:2] == ["orchestration", "ask"] and r.args[r.args.index("--from") + 1] == "term_w"
-    assert r.args[r.args.index("--options") + 1] == "allow,deny" and 0 < int(r.args[r.args.index("--timeout-ms") + 1]) <= 560000
+    assert "--wait" in r.args and r.args[r.args.index("--options") + 1] == "allow,deny" and 0 < int(r.args[r.args.index("--timeout-ms") + 1]) <= 560000
     q = r.question
     assert q.startswith("PERMISSION REQUEST") and "not a plan gate" in q.splitlines()[0]  # what the loop and the coordinate skill key on
     assert "#394" in q and str(relay.dir) in q and "tool: Bash" in q and "cd wf && rm -rf *" in q and "wipe the dir" in q and "bypassPermissions" in q
@@ -591,9 +593,9 @@ def test_relay_denies_when_orca_is_missing(relay):
     final_deny(relay, env={"PATH": "/usr/bin:/bin"})  # no orca on the path at all
 
 
-# measured on orca 2026-10-06: an ask whose --timeout-ms expires exits 1 with an empty stdout and "ask timeout after <n>ms; question is still pending" on stderr
+# measured on orca 1.4.246: a --wait ask whose --timeout-ms expires exits 1 with "error: ask_timeout: ask timeout after <n>ms; question <id> is still pending. ..." on stderr
 @pytest.mark.parametrize("kw", [{"SHIM_SLEEP": 3, "PERMISSION_RELAY_KILL_S": 1},   # measured: when the hook times out it is killed with NO decision and the local dialog stays
-                                {"rc": 1, "SHIM_ERR": "ask timeout after 540000ms; question is still pending (messageId: msg_x)"}], ids=["kill-timer", "orca-timeout"])
+                                {"rc": 1, "SHIM_ERR": "error: ask_timeout: ask timeout after 540000ms; question msg_x is still pending. Resume it with orca orchestration ask --resume msg_x"}], ids=["kill-timer", "orca-timeout"])
 def test_relay_denies_on_a_timeout_before_the_hook_does_but_lets_the_worker_ask_again(relay, kw):
     m = fail_closed(relay, **kw).out["decision"]["message"]
     assert "nobody answered in time" in m and "up to 3 requests in total" in m and "the ask failed" not in m and "Do not retry" not in m
