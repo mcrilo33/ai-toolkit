@@ -401,7 +401,7 @@ def left_alive(C):   # not blocked, not stopped, not fenced, not released
 
 
 @pytest.mark.parametrize("mode", ["attended", "auto"])
-def test_a_needs_input_escalation_batched_with_its_permission_request_neither_blocks_nor_abandons_the_worker(C, mode):
+def test_a_needs_input_escalation_batched_with_its_permission_request_neither_blocks_nor_abandons_the_worker(C, mode, tmp_path):
     C.mail([msg("escalation", "msg_stop", stopReason="needs-input"), msg("question", "msg_p", question=PQ)])
     r = C.go("--answer", mode)
     assert r.returncode == 0 and left_alive(C) and "needs-input" in r.stdout and C.calls("orca orchestration check ack")
@@ -409,6 +409,7 @@ def test_a_needs_input_escalation_batched_with_its_permission_request_neither_bl
         assert [arg(a, "--body") for a in C.calls("orca orchestration reply")] == ["deny"]
     else:
         assert not C.calls("orca orchestration reply") and REPLY_P in C.calls("gh issue comment")[0][-1] and "permission request waiting" in r.stdout
+        assert "msg_p" in (tmp_path / "state/run_t/held").read_text().split()   # queued for --status and the human, not orphaned
 
 
 def test_a_needs_input_escalation_alone_is_logged_and_blocks_nothing_at_once(C):
