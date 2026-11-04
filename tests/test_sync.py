@@ -41,7 +41,7 @@ def src(tmp_path):
     write(sh / "skills" / "land" / "scripts" / "__pycache__" / "x.pyc")
     write(sh / "skills" / "land" / ".DS_Store")
     write(sh / "skills" / "hub" / "SKILL.md", "---\nname: hub\ndescription: d\n---\n")
-    write(sh / "agents" / "debug.md", "---\nname: debug\n---\n")
+    write(sh / "agents" / "code-review.md", "---\nname: code-review\n---\n")
     write(sh / "prompts" / "commit-msg.md", "---\ndescription: d\n---\n")
     git(root / "v2", "init", "-q")
     git(root / "v2", "remote", "add", "origin", "git@github.com:acme/toolkit.git")
@@ -130,7 +130,7 @@ def test_layout_in_target(sync, target):
     assert not (target / "CLAUDE.md").exists() and not (target / "CLAUDE.md.bak").exists()
     assert (target / ".ai-toolkit" / "rules" / "workflow.md").is_file()  # on-demand: never auto-loaded
     assert (target / ".claude" / "skills" / "land" / "references" / "r.md").is_file()
-    assert (target / ".claude" / "agents" / "debug.md").is_file()
+    assert (target / ".claude" / "agents" / "code-review.md").is_file()
     assert (target / ".claude" / "commands" / "commit-msg.md").is_file()
     assert (target / ".ai-toolkit" / "claude-settings.json").read_text() == '{"hooks": {}}\n'   # the toolkit's own registrations; the project's .claude/settings.json is never written
     assert (target / ".ai-toolkit" / "mcp.json").read_text() == '{"mcpServers": {}}\n'   # the workers' server list (bin/claude-spoke passes it with --mcp-config)
@@ -364,15 +364,15 @@ def test_otel_sh_stays_in_the_toolkit_checkout(sync, src, target):
 
 
 def test_a_hosts_own_files_are_never_touched(sync, target):
-    own = {"CLAUDE.md": "the project's\n", ".claude/rules/security.md": "its own security\n", ".claude/agents/debug.md": "its own agent\n",
+    own = {"CLAUDE.md": "the project's\n", ".claude/rules/security.md": "its own security\n", ".claude/agents/code-review.md": "its own agent\n",
            ".claude/settings.json": '{"hooks": {"mine": 1}}\n', ".claude/hooks/mine.sh": "#!/bin/sh\n"}
     for rel, text in own.items():
         write(target / rel, text)
-    git(target, "add", "-f", ".claude/agents/debug.md", ".claude/settings.json")   # .claude/ files the project tracks itself
+    git(target, "add", "-f", ".claude/agents/code-review.md", ".claude/settings.json")   # .claude/ files the project tracks itself
     r = sync()
-    assert r.returncode == 0 and ".claude/agents/debug.md is tracked" in r.stderr
+    assert r.returncode == 0 and ".claude/agents/code-review.md is tracked" in r.stderr
     assert {rel: (target / rel).read_text() for rel in own} == own and not list(target.rglob("*.bak"))   # byte for byte, no backup of what the sync never writes
-    assert ".claude/agents/debug.md" not in manifest(target) and "/.claude/agents/debug.md" not in exclude(target).splitlines()
+    assert ".claude/agents/code-review.md" not in manifest(target) and "/.claude/agents/code-review.md" not in exclude(target).splitlines()
     assert (target / ".claude" / "rules" / "ai-toolkit" / "security.md").is_file() and (target / ".ai-toolkit" / "claude-settings.json").is_file()
 
 

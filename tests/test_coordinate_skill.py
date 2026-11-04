@@ -72,10 +72,9 @@ def test_the_switch_never_reads_state_files_for_the_summary():
     assert not re.search(r"AITK_STATE_DIR|holder\.|/replies|\.ai-toolkit/coordinator|state file", summary)
 
 
-def test_afk_and_hub_point_at_coordinate_instead_of_duplicating_it():
-    afk, hub = (SHARED / "skills/afk/SKILL.md").read_text(), (SHARED / "skills/hub/SKILL.md").read_text()
-    assert "/coordinate auto" in afk and "/coordinate" in hub
-    assert "terminal create" not in afk and "--reply" not in hub and "--answer" not in hub
+def test_hub_points_at_coordinate_instead_of_duplicating_it():
+    hub = (SHARED / "skills/hub/SKILL.md").read_text()
+    assert "/coordinate" in hub and "--reply" not in hub and "--answer" not in hub
 
 
 def test_the_architecture_doc_describes_both_modes_the_switch_and_the_attended_flow():
