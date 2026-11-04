@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 
@@ -16,9 +17,11 @@ def write(path, text="x\n"):
 
 @pytest.fixture
 def src(tmp_path):
-    """A fake toolkit checkout: the real sync/lib scripts around a tiny shared/ tree."""
+    """A fake toolkit checkout: the real sync/lib scripts around a tiny shared/ tree. Each file it holds is copied by every sync (a few processes each), so only the scripts the tests name are in it."""
     root = tmp_path / "src"
-    shutil.copytree(V2 / "scripts", root / "v2" / "scripts")
+    (root / "v2" / "scripts").mkdir(parents=True)
+    for name in ("sync.sh", "lib.sh", "coordinator.sh", "otel.sh"):
+        shutil.copy(V2 / "scripts" / name, root / "v2" / "scripts" / name)
     shutil.copytree(V2 / "bin", root / "v2" / "bin")
     (root / "v2" / "settings").mkdir(parents=True)
     shutil.copy(V2 / "settings" / "ai-toolkit.env", root / "v2" / "settings")
@@ -61,15 +64,36 @@ def sync(src, target, run):   # the layout tests are about files, not history: t
 MSG = "chore(ai-toolkit): sync orca.yaml with the toolkit (#0)"
 
 
+@pytest.fixture(scope="session")
+def host_templates(tmp_path_factory):  # per xdist worker: a host on main with a local bare origin, empty and with the project's first commit pushed; each test gets a copy of one
+    base = tmp_path_factory.mktemp("host_templates")
+    env = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def sh(*a, cwd):
+        subprocess.run(["git", *a], cwd=cwd, env=env, check=True, capture_output=True)
+
+    for kind in ("empty", "history"):
+        d = base / kind
+        d.mkdir()
+        sh("init", "-q", "--bare", "--template=", "-b", "main", "origin.git", cwd=d)
+        sh("init", "-q", "--template=", "-b", "main", "host", cwd=d)
+        for a in (["remote", "add", "origin", str(d / "origin.git")], ["config", "user.name", "t"], ["config", "user.email", "t@t"]):
+            sh(*a, cwd=d / "host")
+    write(base / "history" / "host" / "README.md", "hi\n")
+    for a in (["add", "README.md"], ["commit", "-qm", "chore: init (#1)"], ["push", "-q", "origin", "main"]):
+        sh(*a, cwd=base / "history" / "host")
+    return base
+
+
 @pytest.fixture
-def host(tmp_path):
-    """A host on its base branch with a local bare repository as its origin: (host dir, origin dir). No commit yet."""
+def host(tmp_path, host_templates, request):
+    """A host on its base branch with a local bare repository as its origin: (host dir, origin dir). With the project's first commit pushed, unless the test asks for "empty" (indirect parameter)."""
+    kind = getattr(request, "param", "history")
     origin, h = tmp_path / "origin.git", tmp_path / "host"
-    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
-    git(tmp_path, "init", "-q", "-b", "main", str(h))
-    git(h, "remote", "add", "origin", str(origin))
-    for k, v in (("user.name", "t"), ("user.email", "t@t")):
-        git(h, "config", k, v)
+    shutil.copytree(host_templates / kind / "origin.git", origin)
+    shutil.copytree(host_templates / kind / "host", h)   # copies, not git processes: the setup is a handful of file copies
+    config = h / ".git" / "config"
+    config.write_text(re.sub(r"(?m)^(\s*url = ).*$", lambda m: m[1] + str(origin), config.read_text()))
     return h, origin
 
 
@@ -81,16 +105,6 @@ def host_sync(src, host, run):   # the committing run, from the toolkit's main c
 def history(repo, ref="HEAD"):
     r = subprocess.run(["git", "-C", str(repo), "log", "--format=%s", ref], capture_output=True, text=True)
     return r.stdout.splitlines() if r.returncode == 0 else []
-
-
-def adopt(host, with_history):
-    """The host's first commit and its push, as a project that already has history."""
-    h, _ = host
-    if with_history:
-        write(h / "README.md", "hi\n")
-        git(h, "add", "README.md")
-        git(h, "commit", "-qm", "chore: init (#1)")
-        git(h, "push", "-q", "origin", "main")
 
 
 def tree(t):
@@ -197,7 +211,6 @@ def test_gc_removes_what_a_previous_sync_wrote_and_nothing_else(sync, src, targe
 
 
 def test_a_sync_never_writes_or_removes_the_hosts_own_mcp_list(sync, src, target):
-    sync()
     mine = write(target / ".ai-toolkit" / "mcp.local.json", '{"mcpServers": {"mine": {}}}\n')
     write(src / "v2" / "settings" / "claude" / "mcp.json", '{"mcpServers": {"x": {"command": "x"}}}\n')
     assert sync().returncode == 0 and sync().returncode == 0
@@ -240,7 +253,7 @@ def test_owner_repo_reads_every_remote_form_and_refuses_what_is_no_repo(src, run
     assert r.stdout.splitlines() == ["acme/toolkit"] * 5 + ["-"] * 3  # one bash for every form: no full sync per URL
 
 
-def test_a_host_records_the_toolkits_origin_as_upstream_and_the_toolkit_itself_stays_empty(sync, src, target, run):
+def test_a_host_records_the_toolkits_origin_as_upstream_and_loses_it_with_the_remote(sync, src, target, run):
     def value():
         return [ln for ln in (target / ".ai-toolkit" / "ai-toolkit.env").read_text().splitlines() if ln.startswith("UPSTREAM_REPO=")]
     assert sync().returncode == 0 and value() == ["UPSTREAM_REPO=acme/toolkit"]
@@ -248,9 +261,7 @@ def test_a_host_records_the_toolkits_origin_as_upstream_and_the_toolkit_itself_s
     write(target / ".ai-toolkit" / "ai-toolkit.local.env", "UPSTREAM_REPO=me/fork\n")  # the per-target override still wins
     probe = f'. "{target}/.ai-toolkit/scripts/lib.sh"; ORCA_ROOT_PATH="{target}" load_env; echo "$UPSTREAM_REPO"'
     assert run(["bash", "-c", probe]).stdout.strip() == "me/fork"
-    assert sync(tgt=src / "v2").returncode == 0  # the toolkit syncing into itself: no upstream, and its own path as TOOLKIT_DIR
-    assert (src / "v2" / ".ai-toolkit" / "ai-toolkit.env").read_text() == (src / "v2" / "settings" / "ai-toolkit.env").read_text().replace("TOOLKIT_DIR=", f"TOOLKIT_DIR={(src / 'v2').resolve()}")
-    git(src / "v2", "remote", "remove", "origin")
+    git(src / "v2", "remote", "remove", "origin")   # the toolkit syncing into itself records no upstream and its own path as TOOLKIT_DIR: pinned in the test of that sync below
     r = sync()
     assert r.returncode == 0 and r.stderr.count("UPSTREAM_REPO") == 1 and value() == ["UPSTREAM_REPO="]
 
@@ -342,7 +353,7 @@ def test_migrate_v1_removes_what_the_v1_manifest_listed_and_nothing_else(sync, t
 
 
 def test_otel_sh_stays_in_the_toolkit_checkout(sync, src, target):
-    assert (src / "v2" / "scripts" / "otel.sh").is_file()  # the fixture copies the real scripts
+    assert (src / "v2" / "scripts" / "otel.sh").is_file()  # the fixture copies the real script
     sync()
     assert not (target / ".ai-toolkit" / "scripts" / "otel.sh").exists() and "otel.sh" not in "".join(manifest(target))
     stale = write(target / ".ai-toolkit" / "scripts" / "otel.sh")  # shipped by an earlier sync
@@ -393,10 +404,9 @@ def test_a_host_synced_the_old_way_is_cleaned_up_from_its_manifest_only(sync, sr
     assert [(target / rel).read_text() if (target / rel).exists() else None for rel in own] == [want, want]
 
 
-@pytest.mark.parametrize("with_history", [False, True, "no-commit-leftover"], ids=["empty-host", "host-with-history", "no-commit-leftover"])
+@pytest.mark.parametrize("host, with_history", [("empty", False), ("history", True), ("history", "no-commit-leftover")], indirect=["host"], ids=["empty-host", "host-with-history", "no-commit-leftover"])
 def test_a_host_sync_commits_and_pushes_orca_yaml_once_then_is_idempotent(host_sync, host, src, with_history):
     h, origin = host
-    adopt(host, with_history)
     before = history(h)
     if with_history == "no-commit-leftover":   # a --no-commit run leaves orca.yaml changed with the sync's own bytes: the next run commits it, it is no human's edit
         write(h / "orca.yaml", "scripts: {}\n")
@@ -430,7 +440,6 @@ def test_a_host_sync_commits_and_pushes_orca_yaml_once_then_is_idempotent(host_s
 @pytest.mark.parametrize("case", ["unreachable-remote", "a-human-commit-waits", "a-commit-with-the-sync-subject-and-other-content", "an-evil-merge-with-the-sync-subject", "orca-yaml-is-ignored"])
 def test_a_refused_push_keeps_the_commit_and_the_next_run_pushes_it(host_sync, host, case, tmp_path):
     h, origin = host
-    adopt(host, True)
     if case == "unreachable-remote":
         git(h, "config", "remote.origin.url", str(tmp_path / "gone.git"))
         r = host_sync()
@@ -474,7 +483,6 @@ def test_a_refused_push_keeps_the_commit_and_the_next_run_pushes_it(host_sync, h
     ("linked-worktree-target", "linked worktree"), ("toolkit-copy-in-a-linked-worktree", "linked worktree"), ("linked-worktree-despite-GIT_DIR", "linked worktree")])
 def test_a_host_sync_refuses_before_it_writes_or_commits_anything(host_sync, host, src, case, message, tmp_path):
     h, origin = host
-    adopt(host, True)
     target, script = h, None
     if case == "wrong-branch":
         git(h, "checkout", "-q", "-b", "dev")
@@ -508,7 +516,6 @@ def test_a_host_sync_refuses_before_it_writes_or_commits_anything(host_sync, hos
 @pytest.mark.parametrize("how", ["--no-commit", "--local-only", "the-toolkit-itself", "the-toolkit-through-a-symlink"])
 def test_no_commit_local_only_and_the_toolkit_itself_commit_nothing(host_sync, host, src, how, tmp_path):
     h, origin = host
-    adopt(host, True)
     git(h, "checkout", "-q", "-b", "dev")   # off the base branch: a committing run would refuse, so these runs prove they never try
     git(src / "v2", "symbolic-ref", "HEAD", "refs/heads/trunk")   # the toolkit is not on BASE_BRANCH either
     (tmp_path / "link").symlink_to(src / "v2")
@@ -598,3 +605,4 @@ def test_the_toolkit_syncing_into_itself_writes_nothing_of_the_base_configs(sync
     r = sync(tgt=toolkit)
     assert r.returncode == 0 and {c: (toolkit / c).read_bytes() for c in CONFIGS} == before
     assert not list(toolkit.rglob("*.bak")) and "proposed" not in r.stdout
+    assert (toolkit / ".ai-toolkit" / "ai-toolkit.env").read_text() == (toolkit / "settings" / "ai-toolkit.env").read_text().replace("TOOLKIT_DIR=", f"TOOLKIT_DIR={toolkit.resolve()}")   # no upstream recorded though the toolkit has an origin, and its own path as TOOLKIT_DIR

@@ -20,6 +20,7 @@ RULES = (*ALWAYS, *PATHED)   # every rule file of the flat coordinator-side dir
 RULE_PATH = {"checkout": lambda n: f"shared/rules/{n}.md", "synced": lambda n: f".claude/rules/ai-toolkit/{n}.md", "dir": lambda n: f"{n}.md"}
 ISSUE = '{"number":9,"title":"new","body":"new body"}'   # the live issue 9 the stub gh serves
 OK = {"verdict": "APPROVE", "blockers": [], "warnings": [{"text": "a.py:1 - nit", "rule": "none"}], "tdd_followed": True, "tests_weakened": False, "summary": "fine"}
+LEAN = (*ALWAYS, "python-style")   # the rule files a layout test writes: the always-given ones and one conditional, enough to tell "given in full" from "inventory only"
 ON_DEMAND_AT = {"checkout": "shared/rules/on-demand/workflow.md", "synced": ".ai-toolkit/rules/workflow.md"}   # a rule the reviewer is only told about, never given in full
 
 
@@ -176,16 +177,23 @@ def test_a_failing_claude_or_a_missing_rule_is_an_escalation_not_an_approve(A, t
         assert r.returncode == 0 and os.path.realpath(argv[argv.index("--append-system-prompt-file") + 1]) == os.path.realpath(root / RULE_AT[layout])
 
 
-def put_rules(root, layout, tag, skip=()):   # the coordinator-side rule files in <layout>'s place, each body "<tag> <name>" and description "about <tag> <name>"
-    for n in RULES:
+def put_rules(root, layout, tag, skip=(), names=RULES):   # the coordinator-side rule files in <layout>'s place, each body "<tag> <name>" and description "about <tag> <name>"
+    for n in names:
         path = RULE_PATH[layout](n)
         paths = "".join(f"  - '{g}'\n" for g in PATHED.get(n, []))
         if n not in skip:
             put(root / path, f'---\ndescription: "about {tag} {n}"\n{"paths:" + chr(10) + paths if paths else ""}---\n# {n}\n{tag} {n}\n')
 
 
+@pytest.fixture(scope="session")
+def lean_rules(tmp_path_factory):   # the flat rules dir R.go reviews with unless a test names its own: each run costs a process per rule file, and these are the tags the tests use
+    d = tmp_path_factory.mktemp("lean_rules")
+    put_rules(d, "dir", "lean", names=(*ALWAYS, "code-quality"))
+    return d
+
+
 @pytest.fixture
-def R(stubs, repo, link_script):
+def R(stubs, repo, link_script, lean_rules):
     stdin, wt = tee_stdin(link_script), repo.wt("9-feat")
     show = json.dumps({"result": {"worktree": {"path": str(wt), "branch": "refs/heads/9-feat"}}})
     stubs.reply("orca.worktree_show", show)
@@ -193,7 +201,7 @@ def R(stubs, repo, link_script):
 
     def go(verdict, rc=0, sha=None, **env):
         stubs.reply("claude", verdict if isinstance(verdict, str) else json.dumps(verdict), rc=rc)
-        return sh(["bash", REVIEW, "9", *([sha] if sha else [])], repo.root, **{"ORCA_LINK_TRIES": 3, "AI_TOOLKIT_POLL": 0, **env})
+        return sh(["bash", REVIEW, "9", *([sha] if sha else [])], repo.root, **{"ORCA_LINK_TRIES": 3, "AI_TOOLKIT_POLL": 0, "REVIEW_RULES_DIR": lean_rules, **env})
 
     return type("R", (), {"go": staticmethod(go), "wt": wt, "stubs": stubs, "stdin": staticmethod(stdin), "show": show, "root": repo.root})
 
@@ -201,7 +209,7 @@ def R(stubs, repo, link_script):
 def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktree(R, tmp_path):
     agent = tmp_path / "agent.md"   # the coordinator's definition; the worktree's own copy, CLAUDE.md and rules are the worker's to tamper with
     agent.write_text(f"---\nname: code-review\ndescription: d\nmodel: m\n{FRONT}---\n# Reviewer\nthe coordinator body\n")
-    put_rules(tmp_path / "rules", "dir", "coordinator")
+    put_rules(tmp_path / "rules", "dir", "coordinator", names=ALWAYS)   # every run is a process per rule file: the rules given in full are all this test reads
     git(R.wt, "update-ref", "refs/remotes/origin/trunk", "origin/main")   # the changed files are listed against the base, which must exist
     r = R.go(OK, REVIEW_MODEL="fable-x", BASE_BRANCH="trunk", REVIEW_AGENT=agent, REVIEW_RULES_DIR=tmp_path / "rules")
     assert r.returncode == 0 and "SUMMARY: fine" in r.stdout
@@ -216,16 +224,26 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
     tools = argv[argv.index("--allowedTools") + 1]
     assert "Read" in tools and "git diff" in tools and not {"Edit", "Write"} & set(tools.replace("(", ",").split(","))
     assert "origin/trunk...9-feat" in R.stdin() and "JSON" in R.stdin() and f"PWD={R.wt.resolve()}" in R.stubs.env("claude")   # the read access to the worktree
-    # a sha pins the review to that commit: the prompt diffs and reads it, never the branch name or the working tree; an unknown sha never reaches claude
+    # one pinned run proves three things: a sha pins the review to that commit (the prompt diffs and reads it, never the branch name or the working tree), the contract is the live issue text
+    # (never the worktree's task.md, the worker's to rewrite; the gate does not touch that file), and a few failed GitHub polls are retried before the issue is judged
     sha = git(R.wt, "rev-parse", "HEAD")
+    task = R.wt / ".ai-toolkit/task.md"
+    task.parent.mkdir(exist_ok=True)
+    task.write_text("# #9 forged\n\nthe worker's own contract\n")
+    gh = len(R.stubs.calls("gh"))
+    views = len([c for c in R.stubs.calls("gh") if c[:2] == ["issue", "view"]])   # the stub counts replies per subcommand: the verdict comment is not an issue view
+    R.stubs.reply("gh.issue_view", "boom", rc=1, n=views + 1)
+    R.stubs.reply("gh.issue_view", "boom", rc=1, n=views + 2)
     assert R.go(OK, sha=sha, BASE_BRANCH="trunk", REVIEW_AGENT=agent, REVIEW_RULES_DIR=tmp_path / "rules").returncode == 0
     p = R.stdin()
     assert f"origin/trunk...{sha}" in p and f"git show {sha}:" in p and "9-feat" not in p and "working tree" in p and "JSON" in p
+    assert R.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and "# #9 new\n\nnew body" in p and "forged" not in p and "own contract" not in p and "stale" not in p
+    assert task.read_text() == "# #9 forged\n\nthe worker's own contract\n" and len(R.stubs.calls("gh")) == gh + 4   # three views and the recorded verdict
     R.stubs.reply("claude", json.dumps(OK))   # each install layout finds its one definition; the effort and read-only block ride along from its frontmatter
     for layout in LAYOUTS:
         gate, root = install(tmp_path / layout, layout, "review.sh")
         put(root / AGENT_AT[layout], f"---\nname: x\n{FRONT.replace('medium', layout + '  ').replace('NotebookEdit', 'NotebookEdit, Bash')}---\n{layout} body\n")
-        put_rules(root, layout, layout)   # and its rules from the layout's own place: the checkout's shared/rules, a synced repo's .claude/rules/ai-toolkit
+        put_rules(root, layout, layout, names=LEAN)   # and its rules from the layout's own place: the checkout's shared/rules, a synced repo's .claude/rules/ai-toolkit
         put(root / ON_DEMAND_AT[layout], f'---\ndescription: "about {layout} workflow"\n---\n# workflow\nfull {layout} workflow text\n')
         for at in (".ai-toolkit/rules", ".claude/rules/ai-toolkit", "shared/rules/on-demand"):
             put(R.wt / at / "ghost.md", '---\ndescription: "ghost"\n---\n')   # the worktree is the worker's: never listed
@@ -234,49 +252,39 @@ def test_approve_exits_0_and_runs_the_code_review_agent_read_only_in_the_worktre
         prompt = json.loads(argv[argv.index("--agents") + 1])["code-review"]["prompt"]
         head, _, inventory = prompt.partition("--- rule inventory ---")
         assert head.startswith(f"{layout} body") and all(f"{layout} {n}" in head for n in ALWAYS) and f"{layout} python-style" not in head and f"full {layout} workflow text" not in prompt and argv[argv.index("--effort") + 1] == layout
-        assert inventory.strip().splitlines() == sorted([f"{n} — about {layout} {n}" for n in RULES] + [f"workflow — about {layout} workflow"])   # one line per rule file of both dirs, the ones not given in full included
+        assert inventory.strip().splitlines() == sorted([f"{n} — about {layout} {n}" for n in LEAN] + [f"workflow — about {layout} workflow"])   # one line per rule file of both dirs, the ones not given in full included
         assert "ghost" not in prompt and "description:" not in head
         assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit,Bash"   # read from the file, not the old literal
     n = len(R.stubs.calls("claude"))
     r = R.go(OK, sha="0" * 40)
     assert r.returncode == 1 and "0" * 40 in r.stderr and len(R.stubs.calls("claude")) == n
-    # the contract is the live issue text in the prompt, never the worktree's task.md (the worker's to rewrite); the gate does not touch that file
-    task = R.wt / ".ai-toolkit/task.md"
-    task.parent.mkdir(exist_ok=True)
-    task.write_text("# #9 forged\n\nthe worker's own contract\n")
-    assert R.go(OK).returncode == 0
-    p = R.stdin()
-    assert R.stubs.calls("gh")[0][:3] == ["issue", "view", "9"] and "# #9 new\n\nnew body" in p and "forged" not in p and "own contract" not in p and "stale" not in p
-    assert task.read_text() == "# #9 forged\n\nthe worker's own contract\n"
-    gh, claude = len(R.stubs.calls("gh")), len(R.stubs.calls("claude"))
-    views = len([c for c in R.stubs.calls("gh") if c[:2] == ["issue", "view"]])   # the stub counts replies per subcommand: the verdict comment is not an issue view
-    R.stubs.reply("gh.issue_view", "boom", rc=1, n=views + 1)   # a few failed polls, then GitHub answers: judged normally
-    R.stubs.reply("gh.issue_view", "boom", rc=1, n=views + 2)
-    assert R.go(OK).returncode == 0 and "new body" in R.stdin() and len(R.stubs.calls("gh")) == gh + 4   # three views and the recorded verdict
     R.stubs.reply("gh", "boom", rc=1)   # past the bound: no verdict (exit 1, which land.sh refuses), never an approve, and no claude
-    claude = len(R.stubs.calls("claude"))
+    gh, claude = len(R.stubs.calls("gh")), len(R.stubs.calls("claude"))
     r = R.go(OK)
     assert r.returncode == 1 and r.stdout == "" and "issue 9" in r.stderr and "cannot read" in r.stderr and "unparseable" not in r.stderr
-    assert len(R.stubs.calls("claude")) == claude and len(R.stubs.calls("gh")) == gh + 7   # the verdict recorded above, then three failed views
+    assert len(R.stubs.calls("claude")) == claude and len(R.stubs.calls("gh")) == gh + 3   # three failed views, no verdict recorded
 
 
 @pytest.mark.parametrize("patch, word", [({"verdict": "REQUEST_CHANGES", "blockers": [finding("a.py:3 - off by one", "code-quality")]}, "BLOCKER: [code-quality] a.py:3 - off by one"),
                                          ({"tests_weakened": True}, "tests_weakened"), ({"tdd_followed": False}, "tdd_followed"),
                                          ({"blockers": [finding("x.py:1 - bug\nsecond line", "none")]}, "BLOCKER: [none] x.py:1 - bug second line")])
-def test_request_changes_exits_3_with_blocker_lines_and_an_approve_that_contradicts_its_own_fields_is_rejected(R, patch, word):
-    r = R.go({**OK, **patch})
+def test_request_changes_exits_3_with_blocker_lines_and_an_approve_that_contradicts_its_own_fields_is_rejected_and_recorded_as_that_rejection(R, patch, word):
+    verdict = {**OK, **patch}
+    r = R.go(verdict)
     assert r.returncode == 3 and word in r.stdout and "WARNING: [none] a.py:1 - nit" in r.stdout
+    rec = json.loads(comments(R)[0].removeprefix("review-verdict: "))   # an APPROVE the exit rejects is recorded as the rejection it is
+    assert rec == {"v": 1, "sha": git(R.wt, "rev-parse", "HEAD"), "verdict": "REQUEST_CHANGES", "tdd_followed": verdict["tdd_followed"], "tests_weakened": verdict["tests_weakened"],
+                   "blockers": [f["rule"] for f in verdict["blockers"]], "warnings": [f["rule"] for f in verdict["warnings"]]}
 
 
 @pytest.mark.parametrize("out", [
     "", "Looks good to me!", "```json\nnot json\n```", json.dumps({**OK, "verdict": "MAYBE"}), json.dumps({**OK, "blockers": None}),
     json.dumps({k: v for k, v in OK.items() if k != "summary"}), json.dumps({**OK, "tdd_followed": "yes"}), "[1]", "{} trailing",
-    json.dumps({**OK, "warnings": ["a.py:1 - bare string"]}), json.dumps({**OK, "blockers": [finding("a.py:1 - x", "workflow")]}),   # a tag outside the inventory (the flat rules dir of this layout holds no such rule)
+    json.dumps({**OK, "warnings": ["a.py:1 - bare string"]}), json.dumps({**OK, "blockers": [finding("a.py:1 - x", "workflow")]}),   # a tag outside the inventory (the lean rules dir holds no such rule)
     json.dumps({**OK, "warnings": [{"text": "a.py:1 - no tag"}]}), json.dumps({**OK, "warnings": [{"text": 3, "rule": "none"}]}), json.dumps({**OK, "warnings": [finding("a.py:1 - x", None)]}),
 ])
-def test_an_unparseable_verdict_exits_1_after_one_retry_and_is_never_an_approve(R, out, tmp_path):
-    put_rules(tmp_path / "rules", "dir", "x")
-    r = R.go(out, REVIEW_RULES_DIR=tmp_path / "rules")
+def test_an_unparseable_verdict_exits_1_after_one_retry_and_is_never_an_approve(R, out):
+    r = R.go(out)
     assert r.returncode == 1 and "unparseable" in r.stderr and len(R.stubs.calls("claude")) == 2 and not comments(R)   # a review error is no verdict: nothing is recorded
 
 
@@ -296,12 +304,6 @@ def test_every_valid_verdict_is_recorded_once_as_rule_names_only_and_a_failing_g
         rec = json.loads(body[0].removeprefix("review-verdict: "))
         assert rec == {"v": 1, "sha": sha, "verdict": verdict["verdict"], "tdd_followed": True, "tests_weakened": False,
                        "blockers": [f["rule"] for f in verdict["blockers"]], "warnings": [f["rule"] for f in verdict["warnings"]]}
-    for bad in ({**OK, "tests_weakened": True}, {**OK, "tdd_followed": False}, {**OK, "blockers": [finding("a.py:3 - bug")]}):   # an APPROVE the exit rejects is recorded as the rejection it is
-        before = len(comments(R))
-        assert R.go(bad).returncode == 3
-        rec = json.loads(comments(R)[before:][0].removeprefix("review-verdict: "))
-        assert rec == {"v": 1, "sha": sha, "verdict": "REQUEST_CHANGES", "tdd_followed": bad["tdd_followed"], "tests_weakened": bad["tests_weakened"],
-                       "blockers": [f["rule"] for f in bad["blockers"]], "warnings": [f["rule"] for f in bad["warnings"]]}
     assert R.stubs.calls("gh")[-1][:3] == ["issue", "comment", "9"]
     R.stubs.reply("gh.issue_comment", "boom", rc=1)   # a GitHub outage must not turn an approve into a rejection
     r = R.go(OK)
@@ -337,13 +339,13 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
         for decoy_root, at in ((root.parent, layout), (root, other), (R.wt, layout)):
             put_rules(decoy_root, at, "decoy")
         for skip, blank in ((RULES, None), (("scientific-integrity",), None), ((), "security")):
-            put_rules(root, layout, layout, skip)
+            put_rules(root, layout, layout, skip, names=LEAN)
             if blank:
                 put(root / RULE_PATH[layout](blank), "---\nx: y\n---\n \n")
             r = sh(["bash", gate, "9"], R.root, REVIEW_MODEL="m", ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0)
             assert r.returncode == 1 and "coordinator-side rule" in r.stderr and r.stdout == "" and not R.stubs.calls("claude")
     rules = tmp_path / "some-rules"
-    put_rules(rules, "dir", "x", skip=("security",))
+    put_rules(rules, "dir", "x", skip=("security",), names=LEAN)
     ok = put(tmp_path / "ok.md", f"---\nname: x\n{FRONT}---\nbody\n")
     r = R.go(OK, REVIEW_AGENT=ok, REVIEW_RULES_DIR=rules)
     assert r.returncode == 1 and "security.md" in r.stderr and not R.stubs.calls("claude")
