@@ -693,6 +693,85 @@ def test_secrets_scan_allows_clean_writes(shared, tool, ti):
     assert call("secrets-scan.sh", shared["wt"], tool, **ti).returncode == 0
 
 
+# --- quality-check ------------------------------------------------------------------------------
+STUB_CHECK = """#!/bin/bash
+echo "$0 $*" >> "$STUB_LOG"; grep -q "FAIL-${0##*/}" "${@: -1}" && { echo "${0##*/}: ${@: -1}: finding"; exit 1; }; exit 0
+"""
+
+
+@pytest.fixture
+def qc(tmp_path, link_script, shared):
+    """qc(content, name=, lint=, types=, tool=, env=) runs quality-check.sh on a file in tmp_path; the knobs are stub commands, so neither ruff nor pyright is needed."""
+    stubs = {k: link_script(tmp_path / k, STUB_CHECK + f"# {k}\n") for k in ("lint", "types")}
+    log = tmp_path / "stub.log"
+    log.touch()
+
+    def run(content, name="a.py", lint="{lint} --quiet", types="{types}", tool="Write", env=None):
+        f = tmp_path / name
+        f.write_text(content)
+        knobs = {"LINT_CMD": lint.format(**stubs), "TYPECHECK_CMD": types.format(**stubs)}
+        r = call("quality-check.sh", shared["wt"], tool, env={"STUB_LOG": str(log), **knobs, **(env or {})}, file_path=str(f), content=content)
+        r.file, r.log = str(f), log.read_text()
+        return r
+    return run
+
+
+@pytest.mark.parametrize("content,said", [("FAIL-lint\n", ["lint"]), ("FAIL-types\n", ["types"]), ("FAIL-lint FAIL-types\n", ["lint", "types"])])
+def test_quality_check_returns_the_failing_tools_output_on_stderr_and_exits_2(qc, content, said):
+    r = qc(content)
+    assert r.returncode == 2 and r.stdout == "" and [k for k in ("lint", "types") if f"{k}: {r.file}: finding" in r.stderr] == said
+
+
+def test_quality_check_runs_each_knob_on_that_file_only_with_its_own_flags(qc):
+    r = qc("x = 1\n")
+    assert r.returncode == 0 and r.stderr == ""
+    calls = [ln.split()[1:] for ln in r.log.splitlines()]
+    assert calls == [["--quiet", r.file], [r.file]]
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit"])
+def test_quality_check_reads_the_path_of_every_edit_tool(qc, tool):
+    assert qc("FAIL-lint\n", tool=tool).returncode == 2
+
+
+@pytest.mark.parametrize("kw", [
+    {"content": "x = 1\n"},                                           # a clean file
+    {"content": "FAIL-lint FAIL-types\n", "name": "notes.md"},                          # not python
+    {"content": "FAIL-lint FAIL-types\n", "name": "tool.pyi"},
+    {"content": "FAIL-lint FAIL-types\n", "lint": "", "types": ""},                    # both knobs off
+    {"content": "FAIL-lint FAIL-types\n", "lint": "no-such-binary-517 --x", "types": "no-such-binary-517"},   # the binaries are not installed: skipped, never failed
+])
+def test_quality_check_lets_the_edit_through(qc, kw):
+    r = qc(kw.pop("content"), **kw)
+    assert (r.returncode, r.stderr) == (0, "")
+
+
+def test_quality_check_skips_only_the_knob_that_is_off_or_missing(qc):
+    assert qc("FAIL-lint FAIL-types\n", lint="", types="no-such-binary-517").returncode == 0
+    r = qc("FAIL-lint FAIL-types\n", lint="no-such-binary-517")
+    assert r.returncode == 2 and "types: " in r.stderr and "lint: " not in r.stderr
+
+
+def test_quality_check_ignores_a_file_that_is_not_there(shared):
+    r = call("quality-check.sh", shared["wt"], "Write", env={"LINT_CMD": "false", "TYPECHECK_CMD": "false"}, file_path="/no/such/dir/a.py", content="x")
+    assert (r.returncode, r.stderr) == (0, "")
+
+
+def test_quality_check_reads_the_knobs_from_the_local_env_file(qc, tmp_path):
+    local = tmp_path / "local.env"
+    local.write_text('LINT_CMD="false"\nTYPECHECK_CMD=\n')
+    env = {"AI_TOOLKIT_LOCAL_ENV": str(local)}
+    f = tmp_path / "a.py"
+    f.write_text("x = 1\n")
+    r = call("quality-check.sh", tmp_path, "Write", env=env, file_path=str(f), content="x")   # no knob in the caller env: the local file decides
+    assert r.returncode == 2
+
+
+def test_the_shipped_knobs_are_ruff_check_and_pyright():
+    env = (V2 / "settings/ai-toolkit.env").read_text().splitlines()
+    assert 'LINT_CMD="ruff check --quiet"' in env and "TYPECHECK_CMD=pyright" in env
+
+
 # --- fail closed --------------------------------------------------------------------------------
 @pytest.mark.parametrize("script", ["push-guard.sh", "danger-guard.sh", "secrets-scan.sh"])
 def test_unparseable_payload_or_missing_jq_is_a_deny(shared, tmp_path, script):
@@ -708,7 +787,7 @@ def test_unparseable_payload_or_missing_jq_is_a_deny(shared, tmp_path, script):
 
 def test_settings_register_the_hooks_at_the_synced_path(shared, tmp_path):
     cfg = json.loads((V2 / "settings/claude/settings.json").read_text())
-    assert "permissions" not in cfg and set(cfg["hooks"]) == {"PreToolUse", "PermissionRequest"}  # no auto-allow, no TDD/plan hooks (D2/D8)
+    assert "permissions" not in cfg and set(cfg["hooks"]) == {"PreToolUse", "PostToolUse", "PermissionRequest"}  # no auto-allow, no TDD/plan hooks (D2/D8)
     assert cfg["disableAllHooks"] is False  # the --settings scope outranks a project's settings.local.json: without this key a project could switch every guard off
     tk = tmp_path / "proj/.ai-toolkit"
     shutil.copytree(CLAUDE, tk / "hooks/claude")  # what sync puts in a target, run from the main checkout's copy: a worker cannot edit the guards that judge it
@@ -826,3 +905,17 @@ def test_hook_line_budgets():
     n = lambda *g: sum(len(f.read_text().splitlines()) for q in g for f in HOOKS.glob(q))  # noqa: E731
     assert n("claude/*.sh") <=      240 and n("git/*") <= 40
     assert len((V2 / "settings/claude/settings.json").read_text().splitlines()) <= 40
+
+
+def test_settings_register_quality_check_after_the_edit_and_it_runs_from_the_synced_layout(shared, tmp_path):
+    (post,) = json.loads((V2 / "settings/claude/settings.json").read_text())["hooks"]["PostToolUse"]
+    assert post["matcher"] == "Write|Edit|MultiEdit" and post["hooks"][0]["command"] == 'bash "$AI_TOOLKIT_DIR/hooks/claude/quality-check.sh"'   # no "|| exit 2": the edit is made, a crash must not read as a finding
+    tk = tmp_path / "proj/.ai-toolkit"
+    shutil.copytree(CLAUDE, tk / "hooks/claude")
+    (tk / "scripts").mkdir()
+    shutil.copy(V2 / "scripts/lib.sh", tk / "scripts/lib.sh")   # the hook finds lib.sh next to hooks/, in the toolkit checkout and in a host
+    f = tmp_path / "a.py"
+    f.write_text("x\n")
+    r = subprocess.run(["sh", "-c", post["hooks"][0]["command"]], capture_output=True, text=True, cwd=shared["wt"], input=json.dumps({"tool_name": "Write", "tool_input": {"file_path": str(f)}}),
+                       env={**os.environ, "AI_TOOLKIT_DIR": str(tk), "LINT_CMD": "false", "TYPECHECK_CMD": ""})
+    assert r.returncode == 2 and str(f) in r.stderr

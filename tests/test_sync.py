@@ -24,6 +24,8 @@ def src(tmp_path):
     shutil.copy(V2 / "settings" / "ai-toolkit.env", root / "v2" / "settings")
     write(root / "v2" / "settings" / "claude" / "settings.json", '{"hooks": {}}\n')
     write(root / "v2" / "settings" / "claude" / "mcp.json", '{"mcpServers": {}}\n')
+    write(root / "v2" / "ruff.toml", '# toolkit ruff\ntarget-version = "py312"\n')
+    write(root / "v2" / "pyrightconfig.json", '{"typeCheckingMode": "standard"}\n')
     write(root / "v2" / "hooks" / "claude" / "guard.sh", "#!/bin/sh\n").chmod(0o755)
     write(root / "v2" / "hooks" / "git" / "commit-msg", "#!/bin/sh\n").chmod(0o755)
     sh = root / "shared"
@@ -515,3 +517,84 @@ def test_no_commit_local_only_and_the_toolkit_itself_commit_nothing(host_sync, h
     assert r.returncode == 0, r.stderr
     assert (history(h), history(origin, "main")) == before and history(src / "v2") == []   # no commit anywhere, no push
     assert (h / "orca.yaml").exists() == (not how.startswith("the-toolkit"))   # orca.yaml is written (no-commit) or written and excluded (local-only), never committed
+
+
+# --- base lint and typecheck config: proposed to a Python host that has none, never overwritten ---
+CONFIGS = ("ruff.toml", "pyrightconfig.json")
+OWN = {
+    "ruff.toml": ({"ruff.toml": "line-length = 79\n"}, {"pyrightconfig.json"}),
+    ".ruff.toml": ({".ruff.toml": "line-length = 79\n"}, {"pyrightconfig.json"}),
+    "tool.ruff": ({"pyproject.toml": "[project]\nname = 'x'\n[tool.ruff.lint]\nselect = ['E']\n"}, {"pyrightconfig.json"}),
+    "pyrightconfig": ({"pyrightconfig.json": "{}\n"}, {"ruff.toml"}),
+    "tool.pyright": ({"pyproject.toml": "[tool.pyright]\nstrict = ['.']\n"}, {"ruff.toml"}),
+    "tool.mypy": ({"pyproject.toml": "[tool.mypy]\nstrict = true\n"}, {"ruff.toml"}),
+    "mypy.ini": ({"mypy.ini": "[mypy]\nstrict = True\n"}, {"ruff.toml"}),
+    ".mypy.ini": ({".mypy.ini": "[mypy]\nstrict = True\n"}, {"ruff.toml"}),
+    "setup.cfg": ({"setup.cfg": "[metadata]\nname = x\n[mypy]\nstrict = True\n"}, {"ruff.toml"}),
+    "pyproject-without-tools": ({"pyproject.toml": "[project]\nname = 'x'\n"}, {"ruff.toml", "pyrightconfig.json"}),
+    "setup.cfg-without-mypy": ({"setup.cfg": "[metadata]\nname = x\n"}, {"ruff.toml", "pyrightconfig.json"}),
+    "both": ({"ruff.toml": "a\n", "mypy.ini": "[mypy]\n"}, set()),
+}
+
+
+def python_host(t, **own):
+    write(t / "pkg" / "app.py", "x = 1\n")
+    for rel, text in own.items():
+        write(t / rel, text)
+    git(t, "add", ".")
+
+
+def test_the_base_configs_are_proposed_once_to_a_python_host_that_has_none(sync, src, target):
+    python_host(target)
+    r = sync()
+    assert r.returncode == 0, r.stderr
+    for c in CONFIGS:
+        assert (target / c).read_bytes() == (src / "v2" / c).read_bytes() and f"proposed {c}" in r.stdout
+        assert c not in manifest(target) and f"/{c}" not in exclude(target).splitlines()   # the project's from now on: to commit, never updated or dropped by a sync
+    assert not list(target.rglob("*.bak")) and not list(target.rglob("*.new.*"))
+
+
+@pytest.mark.parametrize("case", OWN)
+def test_a_hosts_own_lint_or_typecheck_config_is_kept_byte_for_byte_and_only_the_missing_half_is_proposed(sync, src, target, case):
+    own, proposed = OWN[case]
+    python_host(target, **own)
+    r = sync()
+    assert r.returncode == 0, r.stderr
+    assert all((target / rel).read_text() == t for rel, t in own.items())
+    assert {c for c in CONFIGS if (target / c).is_file() and c not in own} == proposed
+    assert all((target / c).read_bytes() == (src / "v2" / c).read_bytes() for c in proposed)
+    assert not list(target.rglob("*.bak")) and not list(target.rglob("*.new.*"))
+
+
+def test_a_second_sync_never_rewrites_a_proposed_file_the_project_edited(sync, src, target):
+    python_host(target)
+    sync()
+    write(target / "ruff.toml", "line-length = 79\n")
+    (src / "v2" / "ruff.toml").write_text("# toolkit ruff, changed\n")
+    (src / "v2" / "pyrightconfig.json").write_text("{}\n")
+    before = tree(target)
+    r = sync()
+    assert r.returncode == 0 and "proposed" not in r.stdout
+    assert {k: v for k, v in tree(target).items() if k in CONFIGS} == {k: v for k, v in before.items() if k in CONFIGS}
+    assert (target / "ruff.toml").read_text() == "line-length = 79\n" and not list(target.rglob("*.bak"))
+
+
+@pytest.mark.parametrize("files", [{}, {"README.md": "x\n", "pyproject.toml": "[project]\nname = 'x'\n"}])
+def test_a_host_with_no_tracked_python_is_proposed_nothing(sync, target, files):
+    for rel, text in files.items():
+        write(target / rel, text)
+    write(target / "untracked.py", "x = 1\n")   # tracked is what counts
+    if files:
+        git(target, "add", *files)
+    r = sync()
+    assert r.returncode == 0 and not any((target / c).exists() for c in CONFIGS) and "proposed" not in r.stdout
+
+
+def test_the_toolkit_syncing_into_itself_writes_nothing_of_the_base_configs(sync, src):
+    toolkit = src / "v2"
+    write(toolkit / "scripts" / "helper.py", "x = 1\n")
+    git(toolkit, "add", "scripts/helper.py")
+    before = {c: (toolkit / c).read_bytes() for c in CONFIGS}
+    r = sync(tgt=toolkit)
+    assert r.returncode == 0 and {c: (toolkit / c).read_bytes() for c in CONFIGS} == before
+    assert not list(toolkit.rglob("*.bak")) and "proposed" not in r.stdout
