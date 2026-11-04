@@ -14,7 +14,7 @@ MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-ha
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 EDIT_TOOLS = {"Edit", "Write", "NotebookEdit"}
 CLAUDE_TOOLS = EDIT_TOOLS | {"Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Agent"}
-READ_ONLY_AGENTS = {"architect", "planner", "code-review", "security-reviewer", "bug-scoper", "followup-scoper"}
+READ_ONLY_AGENTS = {"code-review", "security-reviewer", "bug-scoper", "followup-scoper"}
 RULE_KEYS = {"description", "paths"}
 SKILL_KEYS = {"name", "description", "argument-hint", "disable-model-invocation", "user-invocable", "allowed-tools",
               "paths", "context", "agent", "when_to_use", "arguments", "model", "effort", "hooks", "shell"}
@@ -26,7 +26,7 @@ DELETED = re.compile(r"spoke-ready|review-stamp|approve_review|tmux|\bgate/|\.re
                      r"|red-proof|reviewer-sep|commit-gauntlet|commit-quality|Tested-RED|todo-ledger|hub-guard|\bready/|/source\b"
                      r"|ai-toolkit\.yml|issue_routing|hub-(status|notify|inject|agent)|transition-log|verify-(skills|rules|agents)"
                      r"|bootstrap-test-suite|sync-to-repo|Cursor|Copilot")
-LINE_CAPS = {"skills/solo-cycle/SKILL.md": 120, "skills/coordinate/SKILL.md": 130, "skills/hub/SKILL.md": 60, "skills/afk/SKILL.md": 40,
+LINE_CAPS = {"skills/solo-cycle/SKILL.md": 120, "skills/coordinate/SKILL.md": 130, "skills/hub/SKILL.md": 60,
              "skills/land/SKILL.md": 30, "skills/start-task/SKILL.md": 60,
              "rules/on-demand/workflow.md": 100, "rules/on-demand/planning-hub.md": 50,
              "rules/on-demand/afk-answering.md": 120, "agents/code-review.md": 110}

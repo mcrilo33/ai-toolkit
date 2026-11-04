@@ -41,7 +41,7 @@ def src(tmp_path):
     write(sh / "skills" / "land" / "scripts" / "__pycache__" / "x.pyc")
     write(sh / "skills" / "land" / ".DS_Store")
     write(sh / "skills" / "hub" / "SKILL.md", "---\nname: hub\ndescription: d\n---\n")
-    write(sh / "agents" / "debug.md", "---\nname: debug\n---\n")
+    write(sh / "agents" / "code-review.md", "---\nname: code-review\n---\n")
     write(sh / "prompts" / "commit-msg.md", "---\ndescription: d\n---\n")
     git(root / "v2", "init", "-q")
     git(root / "v2", "remote", "add", "origin", "git@github.com:acme/toolkit.git")
@@ -130,7 +130,7 @@ def test_layout_in_target(sync, target):
     assert not (target / "CLAUDE.md").exists() and not (target / "CLAUDE.md.bak").exists()
     assert (target / ".ai-toolkit" / "rules" / "workflow.md").is_file()  # on-demand: never auto-loaded
     assert (target / ".claude" / "skills" / "land" / "references" / "r.md").is_file()
-    assert (target / ".claude" / "agents" / "debug.md").is_file()
+    assert (target / ".claude" / "agents" / "code-review.md").is_file()
     assert (target / ".claude" / "commands" / "commit-msg.md").is_file()
     assert (target / ".ai-toolkit" / "claude-settings.json").read_text() == '{"hooks": {}}\n'   # the toolkit's own registrations; the project's .claude/settings.json is never written
     assert (target / ".ai-toolkit" / "mcp.json").read_text() == '{"mcpServers": {}}\n'   # the workers' server list (bin/claude-spoke passes it with --mcp-config)
@@ -232,10 +232,26 @@ def test_every_sync_excludes_what_it_wrote_under_claude_and_only_local_only_also
     sync("--local-only")
     ex = exclude(target)
     assert ex.count("# >>> ai-toolkit sync") == 1 and ex.startswith("mine\n")
-    assert {"/.ai-toolkit/", "/.claude/skills/land/SKILL.md", "/.claude/rules/ai-toolkit/security.md", "/orca.yaml"} <= set(ex.splitlines())
+    assert {"/.ai-toolkit/", "/tmp.*", "/.claude/skills/land/SKILL.md", "/.claude/rules/ai-toolkit/security.md", "/orca.yaml"} <= set(ex.splitlines())
+    assert ex.splitlines().count("/tmp.*") == 1   # worker scratch at the worktree root, once however many syncs
     sync()
     lines = exclude(target).splitlines()   # a normal run keeps the .claude/ paths it wrote, one by one (never the whole folder), and drops orca.yaml
-    assert {"/.ai-toolkit/", "/.claude/skills/land/SKILL.md", "mine"} <= set(lines) and not {"/.claude/", "/CLAUDE.md", "/orca.yaml"} & set(lines)
+    assert {"/.ai-toolkit/", "/tmp.*", "/.claude/skills/land/SKILL.md", "mine"} <= set(lines) and not {"/.claude/", "/CLAUDE.md", "/orca.yaml"} & set(lines)
+
+
+def test_a_linked_worktrees_tmp_scratch_is_ignored_but_other_untracked_files_are_not(sync, target):
+    sync()
+    git(target, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init")
+    wt = target.parent / "wt"
+    git(target, "worktree", "add", "-q", str(wt))
+    write(wt / "tmp.suite.out")
+    write(wt / "tmp.AbC123" / "x")
+    write(wt / "notes.txt")
+    assert git(wt, "status", "--porcelain").splitlines() == ["?? notes.txt"]   # a file that is not scratch still stops the removal and reaches the human
+    (wt / "notes.txt").unlink()
+    assert git(wt, "status", "--porcelain") == ""
+    git(target, "worktree", "remove", str(wt))   # no --force
+    assert not wt.exists()
 
 
 def test_local_env_override_is_never_tracked(sync, target):
@@ -364,15 +380,15 @@ def test_otel_sh_stays_in_the_toolkit_checkout(sync, src, target):
 
 
 def test_a_hosts_own_files_are_never_touched(sync, target):
-    own = {"CLAUDE.md": "the project's\n", ".claude/rules/security.md": "its own security\n", ".claude/agents/debug.md": "its own agent\n",
+    own = {"CLAUDE.md": "the project's\n", ".claude/rules/security.md": "its own security\n", ".claude/agents/code-review.md": "its own agent\n",
            ".claude/settings.json": '{"hooks": {"mine": 1}}\n', ".claude/hooks/mine.sh": "#!/bin/sh\n"}
     for rel, text in own.items():
         write(target / rel, text)
-    git(target, "add", "-f", ".claude/agents/debug.md", ".claude/settings.json")   # .claude/ files the project tracks itself
+    git(target, "add", "-f", ".claude/agents/code-review.md", ".claude/settings.json")   # .claude/ files the project tracks itself
     r = sync()
-    assert r.returncode == 0 and ".claude/agents/debug.md is tracked" in r.stderr
+    assert r.returncode == 0 and ".claude/agents/code-review.md is tracked" in r.stderr
     assert {rel: (target / rel).read_text() for rel in own} == own and not list(target.rglob("*.bak"))   # byte for byte, no backup of what the sync never writes
-    assert ".claude/agents/debug.md" not in manifest(target) and "/.claude/agents/debug.md" not in exclude(target).splitlines()
+    assert ".claude/agents/code-review.md" not in manifest(target) and "/.claude/agents/code-review.md" not in exclude(target).splitlines()
     assert (target / ".claude" / "rules" / "ai-toolkit" / "security.md").is_file() and (target / ".ai-toolkit" / "claude-settings.json").is_file()
 
 

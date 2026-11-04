@@ -44,11 +44,11 @@ unconfirmed; those change shared state and are hard to undo.
 - **Dispatch**: `.ai-toolkit/scripts/dispatch.sh <n>` or `--next` (picks the next ready issue).
 - **Answer a gate, handle a finished worker**: `/coordinate` (`coordinate` skill): this session holds the Run, discusses the plan with the user, replies.
 - **Land**: `.ai-toolkit/scripts/land.sh --review <n>` (the independent review, then CI on the exact tip, then FF).
-- **Unattended**: `/coordinate auto` (alias `/afk`) hands the Run to the coordinator loop instead of hand-driving each step.
+- **Unattended**: `/coordinate auto` hands the Run to the coordinator loop instead of hand-driving each step.
 - **Teardown** (abandoned or finished by hand): `orca worktree rm --worktree issue:<n> --run-hooks`.
 
 ## Rules of thumb
 
 - One recommendation, not a menu. One holder per Run (`coordinator.sh --status` says who): never start a second consumer, switch with `/coordinate`.
-- Ambiguous scope stays here: use `brainstorming`, write the issue, then dispatch.
+- Ambiguous scope stays here: clarify it with the user, write the issue, then dispatch.
 - Surface what the human must decide (blocked issues, `revise` loops) before what is running fine.

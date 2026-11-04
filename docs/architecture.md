@@ -67,7 +67,7 @@ A script that still reads a worker-controlled source, or a worker that can still
 
 One coordinator, the loop (`coordinator.sh`), holds the Run in its own Orca terminal in either mode and does the routine work (dispatch to the cap, land with the independent review, retry, block,
 route leftovers). A Claude session never binds the Run, `check`s or reads the inbox. The modes differ in what the loop decides alone and how the user is reached. The switch is explicit, never inferred from presence:
-`/coordinate attended` and `/coordinate auto [--until HH:MM] [--drain]` (alias `/afk`) each start their loop in an Orca terminal bound to the SAME Run after `coordinator.sh --stop --run <run>` took it back.
+`/coordinate attended` and `/coordinate auto [--until HH:MM] [--drain]` each start their loop in an Orca terminal bound to the SAME Run after `coordinator.sh --stop --run <run>` took it back.
 
 | | auto | attended |
 |---|---|---|

@@ -49,12 +49,12 @@ never use one to encode file overlap. A chain with colliding `Scope:` is one iss
 It starts one worker (`orca orchestration worker-start`, worktree `<n>-<slug>`, seed prompt from
 `Gate:`), links the issue, and sets the workspace status. Report the issue URL, the branch, and the worktree to
 the user; open the worktree in Orca to watch. A `Gate: plan` worker blocks in `ask` until someone replies: the
-coordinator (`afk`) or you via `hub`.
+coordinator (`coordinate`) or you via `hub`.
 
 ## Edge cases
 
 | Situation | Action |
 |-----------|--------|
-| Scope still fuzzy | stay in the hub; use `brainstorming` first |
+| Scope still fuzzy | stay in the hub; clarify with the user first |
 | Issue already exists | skip to step 3 |
 | `dispatch.sh` fails | it retries once; the failing stage is printed; do not re-run blindly |

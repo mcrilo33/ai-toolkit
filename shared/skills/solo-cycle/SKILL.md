@@ -6,7 +6,7 @@ argument-hint: "[subtask description or issue number]"
 # Solo Cycle
 
 The cycle of a **spoke**: one Orca worktree, one branch `<n>-<slug>`, one issue. There is no PR: the push is
-the ship gate for a subtask, and `worker_done` ends the task. The coordinator (`coordinator.sh`, see `afk`)
+the ship gate for a subtask, and `worker_done` ends the task. The coordinator (`coordinator.sh`, see `coordinate`)
 then runs the independent review, waits for CI, and lands it (`land`). A spoke never merges, never lands,
 and never pushes the base branch.
 
@@ -50,8 +50,7 @@ Then the next subtask, from step 2.
 
 ### RED and GREEN
 
-Extend the test that covers the area, or write a new failing test, first, and run it. Delegating to `tdd-red` / `tdd-green` / `tdd-refactor` is optional
-(clean context for larger work; each runs on the model in its own frontmatter). Commit RED and GREEN
+Extend the test that covers the area, or write a new failing test, first, and run it. Commit RED and GREEN
 separately, and stage GREEN by path. Only a `test:` commit may change a test file (`commit-msg` rejects the rest, `land.sh` rechecks every pushed commit): a test fix made while going green goes in its own `test(<scope>): ... #<n>` commit. Never weaken a test to get green: no deleted or loosened assertions (removing a test is weakening unless `code-review` Tests and TDD allows it; say why in the commit), no `skip`/`xfail`, no
 `sys.exit(0)`. The independent reviewer reports `tdd_followed` and `tests_weakened`, and either one blocks
 the land.
@@ -98,5 +97,4 @@ On a `Land: human` issue (your seed or address text says so, and so does the iss
 
 ## Related
 
-`tdd-workflow` (RED/GREEN/REFACTOR guidance), `verification-loop` (pre-review pass), `git-commit` (message
-format), `land` (what happens after `worker_done`).
+`verification-loop` (pre-review pass), `land` (what happens after `worker_done`).

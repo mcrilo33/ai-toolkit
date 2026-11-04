@@ -65,7 +65,7 @@ pick_next() {   # $only: restrict the pick to that issue (--next <issue>)
 
 ROUND_NOTE="Land: human. The issue is worked in rounds and only the human decides when it lands. Each round ends with worker_done --outcome succeeded whose body is a round report instead of the 3-sentence summary: the measurements, which acceptance items are still open (left for a next round, never marked DEFERRED), and the absolute paths of the artefacts the human should look at (gitignored ones included). Never land or merge. An address: re-engagement is the human's guidance for the next round: follow it, then report the new round the same way."
 seed() {   # $1 = gate: plan = full cycle; none = light lane (no PLAN gate, no in-worker review)
-  local s="Read .ai-toolkit/task.md." review=" -> in-spoke code-review" key="" rounds=""
+  local s="Read .ai-toolkit/task.md. Run /solo-cycle." review=" -> in-spoke code-review" key="" rounds=""
   [ -z "$tracker" ] || key="Put the tracker key in every commit subject, keeping the #$n anchor: type(scope): subject ($tracker, #$n). "
   [ "$1" = none ] || s="$s Gate: plan. Explore, write the plan, then run your preamble's ask command with the plan as the question and options approve,revise; do not edit code before approve. The reply is one of: approve (start work); approve with: <change> (apply the change and start work, do NOT ask again; if you cannot apply it without altering the approach, say so in your worker_done report instead of re-asking); revise: <change>, amend the plan and ask again (max 2 rounds)."
   [ "$1" != none ] || review=""

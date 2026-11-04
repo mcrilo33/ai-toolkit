@@ -4,7 +4,7 @@ description: "What a dispatchable issue must contain so `dispatch.sh --next` can
 # Issue Hygiene
 
 Defines what a **dispatchable issue** must contain so it can be scheduled automatically.
-The coordinator (`coordinator.sh`, see `afk`) drains the backlog as fast as the dependency graph allows, but
+The coordinator (`coordinator.sh`, see `coordinate`) drains the backlog as fast as the dependency graph allows, but
 `dispatch.sh --next` is only as good as the metadata on each issue: it runs issues in parallel when they
 touch disjoint files and holds issues that genuinely depend on one another. Both decisions are
 read off the issue body, so **every dispatchable issue must declare what it touches, how it

@@ -44,14 +44,14 @@ parallel up to `CONCURRENCY_CAP` (~3-4: the usage window saturates).
 |---------|-------|---------|
 | `/hub` | `hub` | survey in-flight work, propose the next move |
 | `/start-task` | `start-task` | file the issue, dispatch the spoke |
-| `/afk` | `afk` | run the coordinator loop unattended |
+| `/coordinate auto` | `coordinate` | run the coordinator loop unattended |
 | `/land <n>` | `land` | review, CI, merge, teardown |
 | `/cycle` | `solo-cycle` | the spoke's per-subtask cycle |
 
 ## Checklists
 
-- **DEFINE**: acceptance criteria specific and testable; scope boundaries stated; `planner` for unclear or
-  cross-boundary work (see `agent-orchestration`); failing test first for behavior changes.
+- **DEFINE**: acceptance criteria specific and testable; scope boundaries stated;
+  failing test first for behavior changes.
 - **EXECUTE**: one change at a time; stay in `Scope:`; tests and docs updated with behavior (`code-quality`).
 - **VERIFY** (`verification-loop`): build, types, lint, tests, secrets, diff review, then `code-review`.
 - **PUSH**: conventional commits anchored `#<n>`; no debug leftovers; never push the base branch or `--no-verify`.

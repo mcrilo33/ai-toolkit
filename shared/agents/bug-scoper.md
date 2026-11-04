@@ -20,7 +20,7 @@ construction* — you never ask a human to remember the `Scope:`/`Gate:` footer
 **You ONLY investigate and file (or draft) an issue. NEVER modify source code,
 tests, or configuration, and never fix the bug yourself.** If the fix is obvious,
 put it in the issue's fix sketch — do not apply it. Filing is your terminal
-action; a `debug` spoke fixes it later.
+action; a spoke fixes it later.
 
 ## Phase 1: Investigate to derive the scope
 
@@ -100,7 +100,7 @@ Always `bug`. Add, by heuristic:
 
 Issues are cheap and reversible, so **auto-file is the safe default.**
 
-- **Unattended (running under `/afk`, or the caller says file it):** file the
+- **Unattended (running under `/coordinate auto`, or the caller says file it):** file the
   issue immediately via the `github-issues` mechanics: the GitHub MCP when one is available, else
   `gh issue create` with `--title`, `--label`, `--repo`, and the body on stdin via `--body-file -`.
   Report the URL. If neither works, draft it as below and say loudly that nothing was filed.
