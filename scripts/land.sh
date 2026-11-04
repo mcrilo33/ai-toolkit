@@ -172,9 +172,9 @@ ci_poll() {   # 0 once the runs for $1 have settled (ci_state = green|red), 1 wh
   [ "$ci_state" != pending ]
 }
 digest_bytes=4000
-ci_digest() {   # stdin: a failed step's log (job TAB step TAB timestamp message) or plain check output; prints CI_FAILURE: lines: the failed job / step, the pytest FAILED / ERROR ids, the last 40 lines
-  LC_ALL=C awk -F'\t' '
-    { job = ""; if (NF >= 3) { job = $1 " / " $2; sub(/^[^\t]*\t[^\t]*\t/, "") }
+ci_digest() {   # stdin: a failed step's log (job TAB step TAB timestamp message; pass `rows`) or plain check output; prints CI_FAILURE: lines: the failed job / step, the pytest FAILED / ERROR ids, the last 40 lines
+  LC_ALL=C awk -F'\t' -v rows="${1:-}" '
+    { job = ""; if (rows != "" && NF >= 3) { job = $1 " / " $2; sub(/^[^\t]*\t[^\t]*\t/, "") }
       gsub(/\033\[[0-9;]*m/, ""); sub(/^[0-9T:.-]+Z /, "")
       if (job != "" && !(job in seen) && nj < 3) { seen[job] = 1; jobs[++nj] = job }
       if ($0 ~ /^(ERROR|FAILED) / && nf < 20) fails[++nf] = $0
@@ -183,16 +183,16 @@ ci_digest() {   # stdin: a failed step's log (job TAB step TAB timestamp message
           for (i = 1; i <= nf; i++) print "CI_FAILURE: " fails[i]
           for (i = (NR > 40 ? NR - 39 : 1); i <= NR; i++) print "CI_FAILURE: " last[i % 40] }'
 }
+ci_cap() { LC_ALL=C awk -v max="$digest_bytes" '{ n += length($0) + 1; if (n > max) exit; print }'; }   # whole lines only: a cut line would glue to the refusal line that follows on the same capture
 ci_failure() {   # the digest of each red run, on stdout ahead of the refusal line; a log that cannot be fetched adds nothing
   local id log
-  { for id in $ci_red; do log="$(gh run view "$id" --log-failed 2> /dev/null)" && ci_digest <<< "$log"; done; } | head -c "$digest_bytes" || true
+  { for id in $ci_red; do log="$(gh run view "$id" --log-failed 2> /dev/null)" && ci_digest rows <<< "$log"; done; } | ci_cap || true
 }
 gate() {   # $1 = the exact sha under test
   local o rc=0
   if [ "$local_gate" = 1 ]; then
-    o="$(cd "$wt" && bash -c "$CHECK_CMD" 2>&1)" || rc=$?   # held to build the digest: shown once the check ends, on stderr
-    [ -z "$o" ] || printf '%s\n' "$o" >&2
-    [ "$rc" = 0 ] || { printf '%s\n' "$o" | ci_digest | head -c "$digest_bytes" || true; bail 4 "local gate ($CHECK_CMD) failed on $1"; }
+    o="$( (cd "$wt" && bash -c "$CHECK_CMD" 2>&1) | tee /dev/stderr)" || rc=$?   # live on stderr, and kept for the digest
+    [ "$rc" = 0 ] || { printf '%s\n' "$o" | ci_digest | ci_cap || true; bail 4 "local gate ($CHECK_CMD) failed on $1"; }
   else
     wait_until "${CI_TRIES:-120}" "${AI_TOOLKIT_POLL:-15}" ci_poll "$1" || bail 4 "CI for $1 timed out"
     [ "$ci_state" = green ] || { ci_failure; bail 4 "CI is red for $1"; }
