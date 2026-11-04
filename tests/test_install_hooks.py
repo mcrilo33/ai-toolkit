@@ -4,14 +4,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
 from conftest import V2
 
 
 @pytest.fixture
 def tool(tmp_path, stubs):
     root = tmp_path / "tool"
-    shutil.copytree(V2, root)
+    for d in ("scripts", "bin", "settings"):   # all install.sh reads: never the whole checkout (.git, .venv), which costs seconds per test
+        shutil.copytree(V2 / d, root / d)
     stubs.reply("orca", "1.4.246")
     return root
 
