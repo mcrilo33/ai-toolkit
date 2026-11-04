@@ -606,3 +606,10 @@ def test_the_toolkit_syncing_into_itself_writes_nothing_of_the_base_configs(sync
     assert r.returncode == 0 and {c: (toolkit / c).read_bytes() for c in CONFIGS} == before
     assert not list(toolkit.rglob("*.bak")) and "proposed" not in r.stdout
     assert (toolkit / ".ai-toolkit" / "ai-toolkit.env").read_text() == (toolkit / "settings" / "ai-toolkit.env").read_text().replace("TOOLKIT_DIR=", f"TOOLKIT_DIR={toolkit.resolve()}")   # no upstream recorded though the toolkit has an origin, and its own path as TOOLKIT_DIR
+
+
+def test_the_base_pyrightconfig_keeps_pyrights_default_excludes():
+    """Setting `exclude` drops pyright's built-in ones, so a whole-project run would check .venv and node_modules."""
+    defaults = {"**/.*", "**/node_modules", "**/__pycache__"}
+    config = json.loads((V2 / "pyrightconfig.json").read_text())
+    assert defaults <= set(config.get("exclude", defaults))

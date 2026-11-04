@@ -1,6 +1,6 @@
 {
   "pythonVersion": "3.12",
   "typeCheckingMode": "standard",
-  "exclude": [".claude", ".ai-toolkit"],
+  "exclude": ["**/.*", "**/node_modules", "**/__pycache__"],
   "extraPaths": ["tests"]
 }
