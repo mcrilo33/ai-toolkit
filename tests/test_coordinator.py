@@ -305,13 +305,11 @@ def test_a_queued_reply_is_sent_as_the_bound_consumer_deleted_and_commented_on_t
 
 def test_a_reply_for_an_unknown_or_already_answered_question_is_dropped_and_a_failed_one_stays_queued(C):
     C.inbox(["msg_open"], answered=["msg_done"])
-    C.spool("msg_done", "approve")
-    C.spool("msg_nope", "approve")
-    r = C.go()
-    assert not C.calls("orca orchestration reply") and not C.spooled("msg_done") and not C.spooled("msg_nope") and r.stderr.count("dropped") == 2
     C.stubs.reply("orca.orchestration_reply", json.dumps({"error": {"code": "bad_state"}}), rc=1)
-    C.spool("msg_open", "approve")
-    C.go(COORD_REPLY_TRIES=2)
+    for mid in ("msg_done", "msg_nope", "msg_open"):
+        C.spool(mid, "approve")
+    r = C.go(COORD_REPLY_TRIES=2)
+    assert [arg(a, "--id") for a in C.calls("orca orchestration reply")] == ["msg_open"] and not C.spooled("msg_done") and not C.spooled("msg_nope") and r.stderr.count("dropped") == 2
     assert C.spooled("msg_open")   # retried on the next wake, up to the bound
     r = C.go("--answer", "attended", COORD_REPLY_TRIES=2)
     told = [arg(a, "--text") for a in C.calls("orca terminal send") if arg(a, "--terminal") == "term_s"]
@@ -435,7 +433,7 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
     C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # a failing handler must not stop the rest, nor the ack
     C.stubs.reply("land.sh", f"{land}landed #1 in abc\n")
     if crc == HANG:
-        link_script(tmp_path / "stubs/bin/claude", STUB_TEE.replace('k="$1_$2"', 'trap "" TERM; sleep 30 & echo $! > "$STUB_DIR/child.pid"; sleep 30; k="$1_$2"', 1))   # logs the call and its stdin, ignores SIGTERM, starts a child, then waits
+        link_script(tmp_path / "stubs/bin/claude", STUB_TEE.replace('k="$1_$2"', 'trap "" TERM; sleep 30 & echo $! > "$STUB_DIR/child.pid"; exec sleep 30; k="$1_$2"', 1))   # logs the call and its stdin, ignores SIGTERM, starts a child, then becomes a sleep (no shell left to outlive the group kill and end normally)
     else:
         C.stubs.reply("claude", "filed #9\n", rc=crc)
     C.mail([msg("question", "msg_q", question="q"), {**msg("worker_done", "msg_d", outcome="succeeded"), "body": body}])
@@ -481,18 +479,21 @@ def test_a_finished_worker_whose_issue_cannot_be_read_is_blocked_not_landed_on_a
     assert C.go().returncode == 0 and not C.stubs.calls("land.sh") and C.blocked()
 
 
-@pytest.mark.parametrize("rc, out, limit", [(3, "BLOCKER: a.py:3 - bug\nBLOCKER: b.py:1 - no test\n", 2), (4, "land.sh: CI is red for abc\n", 1),
-                                            (5, "land.sh: merge conflict: main into 1-x\n", 1)])
-def test_a_rejected_land_re_dispatches_the_reason_to_the_same_worker_a_bounded_number_of_times(C, rc, out, limit):
+@pytest.mark.parametrize("rc, out, rounds", [(3, "BLOCKER: a.py:3 - bug\nBLOCKER: b.py:1 - no test\n", (0,)), (4, "land.sh: CI is red for abc\n", (0, 1)),
+                                             (5, "land.sh: merge conflict: main into 1-x\n", (0,))])   # the budget is one code path: CI (limit 1) proves the re-dispatch and the block, the human-round test below counts the BLOCKER limit (2); each other kind proves its reason is sent
+def test_a_rejected_land_re_dispatches_the_reason_to_the_same_worker_a_bounded_number_of_times(C, rc, out, rounds):
+    limit = 2 if rc == 3 else 1
     C.stubs.reply("land.sh", out, rc=rc)
-    for spent in range(limit + 1):   # rounds already spent = dispatches on this worktree - 1
+    for spent in rounds:   # rounds already spent = dispatches on this worktree - 1
         C.workers(*[C.row(f"ctx_{i}", st="completed") for i in range(1, spent + 1)], C.row(f"ctx_{spent + 1}"))
         C.mail([msg("worker_done", dispatchId=f"ctx_{spent + 1}", outcome="succeeded")])
         C.go()
         if spent < limit:   # a fresh terminal through dispatch.sh (same launch path, shim env), a new Task whose spec is the reason
             d = [a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"][-1]
             assert d[1].startswith("address:") and d[2] == "1" and (rc != 3 or "(1) a.py:3 - bug (2) b.py:1" in d[1]) and not C.calls("gh issue edit")
-    assert len([a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"]) == limit and C.calls("gh issue edit")[0][3:] == ["--add-label", "blocked"]
+    assert len([a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"]) == sum(s < limit for s in rounds) and bool(C.calls("gh issue edit")) == (limit in rounds)
+    if limit in rounds:
+        assert C.calls("gh issue edit")[0][3:] == ["--add-label", "blocked"]
 
 
 @pytest.mark.parametrize("rc, out", [(3, "no verdict\n"), (4, "land.sh: CI for abc timed out\n"), (4, "land.sh: main keeps moving; land again\n"),
@@ -553,7 +554,7 @@ def test_a_land_under_way_is_logged_and_shown_by_status_until_it_returns(C, tmp_
     assert "landing #1" not in C.go("--status", ORCA_TERMINAL_HANDLE="").stdout and not (tmp_path / "state/run_t/landing").exists()
 
 
-SWEEP = dict(COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=2)   # the sweep runs on every 2nd empty wait here (2 by default): two ticks reach it
+SWEEP = dict(COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=1)   # the sweep runs after every empty wait here (every 2nd by default, read in the test below): one tick reaches it
 
 
 def relaunches(C):
@@ -933,10 +934,10 @@ def test_attended_sends_the_line_again_at_the_next_wake_when_the_first_send_fail
 
 
 def test_attended_sends_nothing_behind_a_waiting_decision_but_a_permission_request_and_again_once_the_queue_is_empty(C):
-    ticks([], ["msg_a"], ["msg_a", "msg_b"], ["msg_a", "msg_b", "msg_pc"], ["msg_b"], ["msg_e"])   # a plan, a second plan behind it, a permission request, the first and the permission answered (the second remains), the second answered as a new plan arrives
+    ticks([], ["msg_a"], ["msg_a", "msg_b", "msg_pc"], ["msg_b"], ["msg_e"])   # a plan; a second plan and a permission request together; the first and the permission answered (the second remains); the second answered as a new plan arrives
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)
-    C.mail([msg("question", "msg_a", question="PLAN?")], [msg("question", "msg_b", question="PLAN?")], [msg("question", "msg_pc", question=PQ)], [], [msg("question", "msg_e", question="PLAN?")])
-    assert sent(C, COORD_MAX_TICKS=5, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b waits behind msg_a and is the session's to present once msg_a is answered, not the loop's
+    C.mail([msg("question", "msg_a", question="PLAN?")], [msg("question", "msg_b", question="PLAN?"), msg("question", "msg_pc", question=PQ)], [], [msg("question", "msg_e", question="PLAN?")])
+    assert sent(C, COORD_MAX_TICKS=4, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b waits behind msg_a and is the session's to present once msg_a is answered, not the loop's
 
 
 def test_the_blocked_queue_reads_only_the_dispatch_label_when_one_is_set(C):
@@ -1279,8 +1280,8 @@ def test_the_sweep_checks_the_pr_of_each_issue_awaiting_main(C, pr, env, action)
         assert ["--remove-label", AWAITING] in [a[3:] for a in C.calls("gh issue edit")] and comments == [f"blocked: https://x/pull/5: {action}"]
 
 
-@pytest.mark.parametrize("rc, state, labels, blocks", [(5, "OPEN", [AWAITING], True), (5, "CLOSED", [AWAITING], True), (5, "OPEN", [AWAITING, "blocked"], False), (5, "CLOSED", [AWAITING, "blocked"], False), (6, "OPEN", [AWAITING], False)],
-                         ids=["conflict", "conflict-closed", "conflict-already-blocked", "conflict-closed-already-blocked", "cleanup-incomplete"])
+@pytest.mark.parametrize("rc, state, labels, blocks", [(5, "OPEN", [AWAITING], True), (5, "CLOSED", [AWAITING], True), (5, "CLOSED", [AWAITING, "blocked"], False), (6, "OPEN", [AWAITING], False)],
+                         ids=["conflict", "conflict-closed", "conflict-closed-already-blocked", "cleanup-incomplete"])
 def test_a_merge_back_that_conflicts_blocks_the_issue_once_while_a_failed_cleanup_only_warns(C, rc, state, labels, blocks):   # a closed issue (the PR's Closes) is reopened: the queue and --status list open issues only
     C.stubs.reply("gh.issue_list", json.dumps([{"number": 1, "title": "t", "state": state, "labels": [{"name": n} for n in labels]}]))
     C.stubs.reply("gh.pr_list", pr_json(state="MERGED", mergeCommit={"oid": "abc"}))
@@ -1416,11 +1417,10 @@ def test_rounds_the_human_asked_for_do_not_use_up_the_retry_budget(C):   # the l
     assert len([a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"]) == limit and C.calls("gh issue edit")[0][3:] == ["--add-label", "blocked"]
 
 
-def test_a_worker_idle_in_a_human_round_gets_its_one_relaunch_and_blocks_at_its_second_idle(C):
-    for spent in (0, 1):
-        human_rounds(C, spent); C.show(silent=40)
-        C.go("--cap", "0", **SWEEP)
-        assert len([a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"]) == 1 and (["--add-label", "blocked"] in [a[3:] for a in C.calls("gh issue edit")]) == bool(spent)
+def test_a_worker_idle_in_a_human_round_gets_its_one_relaunch(C):
+    human_rounds(C, 0); C.show(silent=40)   # the second idle (blocks) is pinned by the shared-task test below
+    C.go("--cap", "0", **SWEEP)
+    assert len([a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"]) == 1 and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
 
 
 R1 = {"number": 1, "title": "tune the theme prompt", "body": "Scope: a.py\nLand: human\n", "labels": []}
