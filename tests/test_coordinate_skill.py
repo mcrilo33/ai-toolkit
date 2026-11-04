@@ -140,6 +140,7 @@ def test_a_held_finished_issue_is_read_with_gh_not_status_and_only_a_terminal_se
     assert "finished issue held: land now" not in chat and "gh issue list --label hold --state open" in chat and "Finished but held" in chat
     assert "an approval: start it (remove `hold`), keep held or close, with its `Hold:` reason" in chat and "also labelled `blocked` is parked on purpose" in chat   # a held issue is an approval with the filer's reason, a parked one is no decision
     assert "never a start/later decision" in chat and "held follow-ups" not in chat
+    assert "then each open `hold` issue" in SKILL and "never on an issue the human asked for" in (SHARED / "skills/start-task/SKILL.md").read_text()   # a terminal session also presents them; the hub never holds an issue the human asked for
 
 
 def test_a_finished_land_human_round_is_presented_as_two_levels_with_a_three_option_card_that_warns_about_the_land():
