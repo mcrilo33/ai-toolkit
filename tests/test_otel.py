@@ -144,6 +144,12 @@ def test_transform_keeps_session_and_token_mapping_and_drops_the_bridge_machiner
     assert "Concat([\"tool:\"" in stmts
     assert 'set(attributes["langfuse.observation.metadata.toolkit_version"], resource.attributes["toolkit_version"]) where resource.attributes["toolkit_version"] != nil' in stmts
     assert 'set(attributes["langfuse.environment"], resource.attributes["repo"]) where resource.attributes["repo"] != nil' in stmts
+    assert 'set(attributes["langfuse.observation.metadata.role"], resource.attributes["role"]) where resource.attributes["role"] != nil' in stmts
+    assert 'set(attributes["langfuse.observation.metadata.role"], "worker") where resource.attributes["spoke_run_id"] != nil and resource.attributes["role"] == nil' in stmts
+    assert 'set(attributes["langfuse.session.id"], attributes["session.id"]) where resource.attributes["role"] == "coordinator" and attributes["session.id"] != nil' in stmts
+    lines = stmts.splitlines()
+    skill = 'set(name, Concat(["skill:", attributes["skill_name"]], "")) where attributes["tool_name"] == "Skill" and attributes["skill_name"] != nil'
+    assert skill in lines and lines.index(skill) > next(i for i, s in enumerate(lines) if s.startswith('set(name, Concat(["tool:"')), "the generic tool: rename runs first"
     env_sets = [s for s in stmts.splitlines() if "langfuse.environment" in s]
     assert env_sets and all(s.endswith('where resource.attributes["repo"] != nil') for s in env_sets), "a session without repo stays on Langfuse's default, never a guessed value"
     raw = (V2 / "langfuse/otelcol.yaml").read_text().lower()

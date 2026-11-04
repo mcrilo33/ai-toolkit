@@ -72,9 +72,23 @@ def test_spoke_tags_the_toolkit_version_only_from_a_well_formed_stamp(run, stubs
 
 def test_spoke_is_a_plain_claude_without_a_run_id_or_when_opted_out(run, stubs, repo):
     assert run([SPOKE, "-p", "hi"], cwd=repo.wt("plain")).returncode == 0
+    assert "TELEMETRY" not in stubs.env("claude")   # an unsynced project: no guards, no OTel
     tk = synced(repo)
     run([SPOKE], cwd=in_spoke(repo), AI_TOOLKIT_OTEL=0)
     assert [c[len(MCP(tk)) + 2:] for c in stubs.calls("claude")[1:]] == [[]] and stubs.calls("claude")[0] == ["-p", "hi"] and "TELEMETRY" not in stubs.env("claude")
+
+
+@pytest.mark.parametrize("stamp,suffix", [("abcdef012345\n", ",toolkit_version=abcdef012345"), (None, "")])
+def test_spoke_tags_a_session_in_a_synced_main_checkout_as_the_coordinator(run, stubs, repo, stamp, suffix):
+    tk = synced(repo)
+    if stamp is not None:
+        (tk / "toolkit-version").write_text(stamp)
+    (repo.root / ".ai-toolkit/task.md").write_text("# #464 feat(otel): never read for a coordinator\n")
+    assert run([SPOKE], cwd=repo.root).returncode == 0
+    env = stubs.env("claude")
+    assert "CLAUDE_CODE_ENABLE_TELEMETRY=1" in env and f"OTEL_RESOURCE_ATTRIBUTES=role=coordinator,repo=origin{suffix}\n" in env + "\n"
+    assert "spoke_run_id" not in env and "issue=" not in env
+    assert run([SPOKE], cwd=repo.root, AI_TOOLKIT_OTEL=0).returncode == 0 and "TELEMETRY" not in stubs.env("claude")   # the opt-out covers the coordinator too
 
 
 @pytest.mark.parametrize("project,worker,args,ok,passed,fwd", [
