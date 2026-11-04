@@ -165,12 +165,12 @@ LC_ALL=C sort -u "$NEW" > "$TMP"
 cmp -s "$TMP" "$OLD" || cp "$TMP" "$OLD"
 
 # Per-clone ignores, as a marked block in .git/info/exclude (never the tracked .gitignore): .ai-toolkit/ (holds
-# ai-toolkit.local.env) and every .claude/ path written, on every sync; --local-only also orca.yaml (written, never committed).
+# ai-toolkit.local.env), /tmp.* (worker scratch at the worktree root, so a land's worktree removal does not stop on it) and every .claude/ path written, on every sync; --local-only also orca.yaml (written, never committed).
 ex="$(git -C "$TARGET" rev-parse --path-format=absolute --git-path info/exclude)"
 mkdir -p "$(dirname "$ex")"
 {
   sed '/^# >>> ai-toolkit sync/,/^# <<< ai-toolkit sync/d' "$ex" 2> /dev/null || true
-  echo '# >>> ai-toolkit sync'; echo '/.ai-toolkit/'
+  echo '# >>> ai-toolkit sync'; echo '/.ai-toolkit/'; echo '/tmp.*'
   grep '^\.claude/' "$NEW" | sed 's|^|/|' || true   # what this run wrote there, path by path: a file the project tracks or owns is never swept in
   if [ "$LOCAL" -eq 1 ]; then echo /orca.yaml; fi
   if [ -e "$TARGET/orca.yaml.bak" ]; then echo /orca.yaml.bak; fi   # the project's own, kept once: out of git status, never committed
