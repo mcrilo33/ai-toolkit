@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Claude Code launcher. In a project synced by ai-toolkit it passes the toolkit's guards (--settings, below). In a spoke worktree (.ai-toolkit/spoke-run-id,
 # written by setup.sh) it also limits MCP to the toolkit's list (.ai-toolkit/mcp.json), then execs the real claude. In a synced project it exports Claude's native OTel to the collector:
-# a worker with a spoke_run_id resource attribute, any other session (the coordinator or hub session on the main checkout) with role=coordinator and no run id or issue.
+# a worker with a spoke_run_id resource attribute, any other session (the coordinator or hub session on the main checkout) with role=coordinator and no run id or issue; a headless claude -p it spawns inherits the tag.
 # Privacy: with the OTEL_LOG_* opt-ins below, the raw JSONL the collector keeps (AITK_OTEL_RAW_DIR, 1.1 GB / 30 days) holds prompts and tool output in plaintext,
 # a coordinator's too, which include the human's own messages. In an unsynced project it is a plain claude, so it is safe to point Orca's agentCmdOverrides.claude at it.
 # AI_TOOLKIT_OTEL=0 opts out of the OTel. No auth header here.
