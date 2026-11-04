@@ -93,9 +93,7 @@ Always `bug`. Add, by heuristic:
 - **`priority`** — when the defect is a correctness bug, risks data loss, or is a
   fail-open (a gate or guard that silently passes when it should block). These jump
   the queue.
-- **`hold`** — (dispatch outcome: `bug-triage` rule) when `Scope:` touches `coordinator.sh`, `dispatch.sh`, or `land.sh`. These are
-  self-modify hazards that must land attended, so the issue is held out of the
-  autonomous drain.
+- **`hold`** — not by default, whatever the `Scope:`; only when the bar in the `bug-triage` rule is met, with a `Hold: <reason>` line in the body. Say in your report: no hold, or held with the reason.
 - **`DISPATCH_LABEL`** — when set, on every issue filed to this repo. An issue filed upstream always carries `ai-toolkit`, also when `DISPATCH_LABEL` is empty (`bug-triage` rule). Create the label first if missing.
 
 ## Phase 5: File or draft

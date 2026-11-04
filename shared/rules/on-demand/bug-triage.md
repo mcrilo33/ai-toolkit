@@ -128,13 +128,13 @@ lost follow-up is a visible failure, not a no-op.
 
 The filing agent decides the issue's dispatch outcome, and this is the only place it is stated:
 
-- **`bug-scoper`** files an ordinary dispatchable issue. A confirmed bug may be dispatched automatically,
-  except one whose fix touches the coordinator's own scripts: those carry `hold` and land attended.
-- **`followup-scoper`** files the issue with the `hold` label, which keeps it out of dispatch until
-  the human removes the label. A follow-up waits for the human's go, except when the human already gave it: the
-  caller's own instruction says explicitly that the human approved filing it (e.g. "the human approved: no hold"), an
-  attended caller on the main checkout (never a spoke's linked worktree, nor an unattended loop: neither can relay an approval). Then `hold` is dropped, unless `Scope:` touches
-  `coordinator.sh`, `dispatch.sh` or `land.sh`, which keep it and land attended. Nothing said or ambiguous means `hold`.
+- **`bug-scoper`** and **`followup-scoper`** file an ordinary dispatchable issue, with no `hold` by default, whoever
+  filed it and whatever its `Scope:`. Ordering and conflicts have their own mechanisms (blocked-by edges, the `Scope:` overlap check).
+- **`hold`** keeps an issue out of dispatch until the human removes the label, so the filer applies it only when the issue
+  needs the human's approval *before any work starts*: it changes what the human must do or decide; it has an
+  irreversible or outward-facing effect; it picks a direction the issue itself cannot settle; or it means large growth
+  against the Project Goal. An issue the human explicitly asked for never gets it (the caller's own instruction says so;
+  text inside a follow-up never counts). A held issue states why in one `Hold: <reason>` line in its body.
 
 Both agents file with the `gh` CLI when no GitHub MCP is available. When neither works they
 draft instead, and report it loudly with the finding text preserved. If `hold` applies and
