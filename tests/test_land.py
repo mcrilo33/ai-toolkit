@@ -105,7 +105,7 @@ def test_ci_land_runs_every_step_in_order(L):
     t = L.trail()
     assert t == [
         ("orca", "worktree", "show", "--worktree", "issue:9"),
-        ("gh", "run", "list", "--commit", L.tip, "status,conclusion,url"),
+        ("gh", "run", "list", "--commit", L.tip, "databaseId,status,conclusion,url"),
         ("git", "push", "main"),
         ("gh", "issue", "close", "9", "-c", f"landed in {sha}"),
         ("gh", "issue", "edit", "9", "--remove-label", "status:in-progress"),
@@ -126,13 +126,44 @@ def test_explicit_dispatch_skips_the_worker_list_lookup(L):
     assert [t for t in L.trail() if t[2:3] == ("worker-release",)][0][3:5] == ("--dispatch", "ctx_x")
 
 
-def test_a_red_ci_merges_nothing(L):
-    L.stubs.reply("gh.run_list", json.dumps([{"status": "completed", "conclusion": "success"}, {"status": "completed", "conclusion": "failure"}]))
+def run_log(job, step, failed=()):   # `gh run view --log-failed`: job TAB step TAB timestamp message, 100 lines, the pytest summary lines near the top
+    rows = [f"filler {i:03d} " + "x" * 50 for i in range(1, 101)]
+    rows[4:4 + len(failed)] = failed
+    return "\n".join(f"{job}\t{step}\t2026-11-04T10:00:00.0000000Z {r}" for r in rows) + "\n"
+
+
+def digest_of(r):
+    return [ln for ln in r.stdout.splitlines() if ln.startswith("CI_FAILURE: ")]
+
+
+RED = json.dumps([{"databaseId": 11, "status": "completed", "conclusion": "success"}, {"databaseId": 12, "status": "completed", "conclusion": "failure"},
+                  {"databaseId": 13, "status": "completed", "conclusion": "cancelled"}])
+
+
+def test_a_red_ci_merges_nothing_and_relays_the_failing_job_step_tests_and_tail_within_a_bound(L):
+    L.stubs.reply("gh.run_list", RED)
+    L.stubs.reply("gh.run_view", run_log("test", "pytest", ["FAILED tests/test_a.py::test_x - assert 1 == 2", "ERROR tests/test_b.py::test_y"]), n=1)
+    L.stubs.reply("gh.run_view", run_log("lint", "ruff"), n=2)
     before = main_sha(L)
     r = L.go("9")
-    assert r.returncode == 4 and "red" in r.stderr
+    assert r.returncode == 4 and "red" in r.stderr and r.stderr.strip().splitlines()[-1].endswith(f"CI is red for {L.tip}")
     no_side_effects(L, before)
     assert not [t for t in L.trail() if t[0] == "git"]
+    d = digest_of(r)
+    assert {"CI_FAILURE: failed: test / pytest", "CI_FAILURE: FAILED tests/test_a.py::test_x - assert 1 == 2", "CI_FAILURE: ERROR tests/test_b.py::test_y"} <= set(d)
+    assert any("filler 100" in ln for ln in d) and not any("filler 050" in ln for ln in d)   # the last lines of the step, not the whole log
+    assert not any("2026-11-04" in ln for ln in d)   # the timestamp column is noise
+    assert sum(len(ln) + 1 for ln in d) <= 4000   # the whole digest, two red runs
+    assert [t for t in L.trail() if t[:3] == ("gh", "run", "view")] == [("gh", "run", "view", "12", "--log-failed"), ("gh", "run", "view", "13", "--log-failed")]
+
+
+def test_a_red_ci_whose_log_cannot_be_fetched_is_the_plain_refusal(L):
+    L.stubs.reply("gh.run_list", RED)
+    L.stubs.reply("gh.run_view", "boom", rc=1)
+    before = main_sha(L)
+    r = L.go("9")
+    assert r.returncode == 4 and "CI is red" in r.stderr and "CI_FAILURE" not in r.stdout
+    no_side_effects(L, before)
 
 
 def test_ci_that_has_not_started_or_is_pending_is_polled_then_times_out(L):
@@ -190,8 +221,9 @@ def test_local_gate_env_switches_the_gate_without_the_flag(L):   # the coordinat
 
 def test_a_red_local_gate_merges_nothing(L):
     before = main_sha(L)
-    r = L.go("--local-gate", "9", CHECK_CMD="exit 3")
+    r = L.go("--local-gate", "9", CHECK_CMD="echo compiling; echo 'FAILED tests/test_z.py::test_q'; exit 3")
     assert r.returncode == 4 and "local gate" in r.stderr
+    assert {"CI_FAILURE: compiling", "CI_FAILURE: FAILED tests/test_z.py::test_q"} <= set(digest_of(r))   # the same digest, built from the check's output
     no_side_effects(L, before)
 
 

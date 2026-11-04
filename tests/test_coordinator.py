@@ -480,6 +480,7 @@ def test_a_finished_worker_whose_issue_cannot_be_read_is_blocked_not_landed_on_a
 
 
 @pytest.mark.parametrize("rc, out, rounds", [(3, "BLOCKER: a.py:3 - bug\nBLOCKER: b.py:1 - no test\n", (0,)), (4, "land.sh: CI is red for abc\n", (0, 1)),
+                                             (4, "CI_FAILURE: failed: test / pytest\nCI_FAILURE: FAILED tests/a.py::t\nland.sh: CI is red for abc\n", (0,)),
                                              (5, "land.sh: merge conflict: main into 1-x\n", (0,))])   # the budget is one code path: CI (limit 1) proves the re-dispatch and the block, the human-round test below counts the BLOCKER limit (2); each other kind proves its reason is sent
 def test_a_rejected_land_re_dispatches_the_reason_to_the_same_worker_a_bounded_number_of_times(C, rc, out, rounds):
     limit = 2 if rc == 3 else 1
@@ -491,6 +492,7 @@ def test_a_rejected_land_re_dispatches_the_reason_to_the_same_worker_a_bounded_n
         if spent < limit:   # a fresh terminal through dispatch.sh (same launch path, shim env), a new Task whose spec is the reason
             d = [a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"][-1]
             assert d[1].startswith("address:") and d[2] == "1" and (rc != 3 or "(1) a.py:3 - bug (2) b.py:1" in d[1]) and not C.calls("gh issue edit")
+            assert d[1].endswith(" CI failure: failed: test / pytest | FAILED tests/a.py::t") == ("CI_FAILURE" in out) and "CI_FAILURE" not in d[1]
     assert len([a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"]) == sum(s < limit for s in rounds) and bool(C.calls("gh issue edit")) == (limit in rounds)
     if limit in rounds:
         assert C.calls("gh issue edit")[0][3:] == ["--add-label", "blocked"]
