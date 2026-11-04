@@ -701,15 +701,15 @@ echo "$0 $*" >> "$STUB_LOG"; grep -q "FAIL-${0##*/}" "${@: -1}" && { echo "${0##
 
 @pytest.fixture
 def qc(tmp_path, link_script, shared):
-    """qc(content, name=, lint=, types=, tool=, env=) runs quality-check.sh on a file in tmp_path; the knobs are stub commands, so neither ruff nor pyright is needed."""
-    stubs = {k: link_script(tmp_path / k, STUB_CHECK + f"# {k}\n") for k in ("lint", "types")}
+    """qc(content, name=, lint=, types=, shell=, tool=, env=) runs quality-check.sh on a file in tmp_path; the knobs are stub commands, so neither ruff, pyright nor shellcheck is needed."""
+    stubs = {k: link_script(tmp_path / k, STUB_CHECK + f"# {k}\n") for k in ("lint", "types", "shell")}
     log = tmp_path / "stub.log"
     log.touch()
 
-    def run(content, name="a.py", lint="{lint} --quiet", types="{types}", tool="Write", env=None):
+    def run(content, name="a.py", lint="{lint} --quiet", types="{types}", shell="{shell}", tool="Write", env=None):
         f = tmp_path / name
         f.write_text(content)
-        knobs = {"LINT_CMD": lint.format(**stubs), "TYPECHECK_CMD": types.format(**stubs)}
+        knobs = {"LINT_CMD": lint.format(**stubs), "TYPECHECK_CMD": types.format(**stubs), "SHELLCHECK_CMD": shell.format(**stubs)}
         r = call("quality-check.sh", shared["wt"], tool, env={"STUB_LOG": str(log), **knobs, **(env or {})}, file_path=str(f), content=content)
         return SimpleNamespace(returncode=r.returncode, stdout=r.stdout, stderr=r.stderr, file=str(f), log=log.read_text())
     return run
@@ -738,10 +738,34 @@ def test_quality_check_reads_the_path_of_every_edit_tool(qc, tool):
     {"content": "FAIL-lint FAIL-types\n", "name": "notes.md"},                          # not python
     {"content": "FAIL-lint FAIL-types\n", "lint": "", "types": ""},                    # both knobs off
     {"content": "FAIL-lint FAIL-types\n", "lint": "no-such-binary-517 --x", "types": "no-such-binary-517"},   # the binaries are not installed: skipped, never failed
+    {"content": "FAIL-shell\n", "name": "a.sh", "shell": ""},                          # the shell knob is off
+    {"content": "FAIL-shell\n", "name": "a.sh", "shell": "no-such-binary-517"},        # shellcheck is not installed
 ])
 def test_quality_check_lets_the_edit_through(qc, kw):
     r = qc(kw.pop("content"), **kw)
     assert (r.returncode, r.stderr) == (0, "")
+
+
+@pytest.mark.parametrize("name,content", [
+    ("a.sh", "FAIL-shell\n"),                                       # by extension, no shebang needed
+    ("commit-msg", "#!/usr/bin/env bash\nFAIL-shell\n"),            # extension-less, by shebang
+    ("hook", "#!/bin/sh\nFAIL-shell\n"), ("hook", "#!/bin/dash -e\nFAIL-shell\n"), ("hook", "#!/usr/bin/env -S ksh\nFAIL-shell\n"),
+])
+def test_quality_check_sends_a_shell_file_to_shellcheck_and_exits_2_on_a_finding(qc, name, content):
+    r = qc(content, name=name)
+    assert r.returncode == 2 and f"shell: {r.file}: finding" in r.stderr and r.log.split() == [r.log.split()[0], r.file]
+
+
+@pytest.mark.parametrize("name,content", [
+    ("tool", "#!/usr/bin/env python3\nFAIL-shell\n"),              # another language
+    ("tool", "#!/bin/zsh\nFAIL-shell\n"), ("tool", "#!/usr/bin/env zsh\nFAIL-shell\n"),   # shellcheck cannot parse zsh
+    ("tool", "FAIL-shell\n"),                                       # no shebang
+    ("tool.txt", "#!/bin/bash\nFAIL-shell\n"),                      # has an extension that is not .sh
+    ("a.py", "#!/bin/bash\nFAIL-shell\n"),                         # python route only
+])
+def test_quality_check_does_not_route_a_file_that_is_not_shell(qc, name, content):
+    r = qc(content, name=name)
+    assert (r.returncode, r.stderr) == (0, "") and "shell" not in r.log
 
 
 def test_quality_check_skips_only_the_knob_that_is_off_or_missing(qc):
@@ -765,9 +789,9 @@ def test_quality_check_reads_the_knobs_from_the_local_env_file(qc, tmp_path):
     assert r.returncode == 2
 
 
-def test_the_shipped_knobs_are_ruff_check_and_pyright():
+def test_the_shipped_knobs_are_ruff_check_pyright_and_shellcheck():
     env = (V2 / "settings/ai-toolkit.env").read_text().splitlines()
-    assert 'LINT_CMD="ruff check --quiet"' in env and "TYPECHECK_CMD=pyright" in env
+    assert 'LINT_CMD="ruff check --quiet"' in env and "TYPECHECK_CMD=pyright" in env and "SHELLCHECK_CMD=shellcheck" in env
 
 
 # --- fail closed --------------------------------------------------------------------------------
