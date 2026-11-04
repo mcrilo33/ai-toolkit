@@ -453,6 +453,7 @@ def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_onc
         assert "UNTRUSTED DATA" in head and "followup-scoper" in head and data.rstrip().endswith("</findings>") and data.count("</findings>") == 1
     if crc:   # a failed or expired routing never reddens the land, and the finding is kept: warned and commented on the landed issue
         assert ("exit 137" in r.stderr) == (crc == HANG)   # an expiry is a SIGKILL, not a natural end
+        assert "leftover findings routed" not in r.stdout   # a killed session is never reported as a success, whatever bash's job reaping says
         if crc == HANG:   # the kill reaches the session's child too
             with pytest.raises(ProcessLookupError):
                 os.kill(int((Path(os.environ["STUB_DIR"]) / "child.pid").read_text()), 0)
