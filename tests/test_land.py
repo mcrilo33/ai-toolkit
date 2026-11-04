@@ -154,6 +154,7 @@ def test_a_red_ci_merges_nothing_and_relays_the_failing_job_step_tests_and_tail_
     assert any("filler 100" in ln for ln in d) and not any("filler 050" in ln for ln in d)   # the last lines of the step, not the whole log
     assert not any("2026-11-04" in ln for ln in d)   # the timestamp column is noise
     assert 0 < len(r.stdout.encode()) <= 4000   # the whole digest, two red runs: stdout carries nothing else
+    assert r.stdout.endswith("\n") and len(d) == len(r.stdout.splitlines())   # the cap cuts on a line boundary: stderr's refusal line is never glued to a cut line (the coordinator reads both streams as one)
     assert [t for t in L.trail() if t[:3] == ("gh", "run", "view")] == [("gh", "run", "view", "12", "--log-failed"), ("gh", "run", "view", "13", "--log-failed")]
 
 
@@ -221,9 +222,9 @@ def test_local_gate_env_switches_the_gate_without_the_flag(L):   # the coordinat
 
 def test_a_red_local_gate_merges_nothing(L):
     before = main_sha(L)
-    r = L.go("--local-gate", "9", CHECK_CMD="echo compiling; echo 'FAILED tests/test_z.py::test_q'; exit 3")
+    r = L.go("--local-gate", "9", CHECK_CMD="echo compiling; printf 'a\\tb\\tc\\n'; echo 'FAILED tests/test_z.py::test_q'; exit 3")
     assert r.returncode == 4 and "local gate" in r.stderr
-    assert {"CI_FAILURE: compiling", "CI_FAILURE: FAILED tests/test_z.py::test_q"} <= set(digest_of(r))   # the same digest, built from the check's output
+    assert {"CI_FAILURE: compiling", "CI_FAILURE: a\tb\tc", "CI_FAILURE: FAILED tests/test_z.py::test_q"} <= set(digest_of(r))   # the same digest, built from the check's output
     no_side_effects(L, before)
 
 
