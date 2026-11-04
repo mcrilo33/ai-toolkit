@@ -4,7 +4,7 @@
 # (--run re-binds it with run-use; none creates one). Loop: fill slots to --cap (dispatch.sh) -> check --wait -> route each message
 # -> ack the delivery. question: answer.sh (auto) or the human, who types the answer on this terminal; worker_done succeeded: land.sh
 # --review inline (lands are serialized by construction); a rejected review, red CI or a conflict goes back to the SAME worker for a
-# bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked. Every 2nd empty wait (COORD_SWEEP_EVERY,
+# bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked (a needs-input stop is not one: it is left to the permission relay and the sweep). Every 2nd empty wait (COORD_SWEEP_EVERY,
 # ~10 min): a sweep of the workers that died or went idle without worker_done: one relaunch, then blocked. Idle = silent (no terminal output, heartbeat or
 # liveness change) for COORD_IDLE_MIN minutes (15) with no open question: worst-case detection = that bound + the sweep period (~25 min). A silent worker Orca shows parked on a human-only prompt, or cannot prove (absent agentWait, null terminal), is blocked at once, never relaunched: the loop cannot answer it, and its slot and Scope must not be held without bound, in either --answer mode (the block comment is the notice). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
@@ -417,7 +417,8 @@ handle() {
   case "$(jq -r .type <<< "$1")" in
     question) on_question "$1" ;;
     worker_done) on_done "$1" ;;
-    escalation) ctx "$(pj "$1" dispatchId)" && block "escalation: $(jq -r '.body // ""' <<< "$1")" ;;
+    escalation) ctx "$(pj "$1" dispatchId)" || return   # needs-input: Orca saw the worker parked on a prompt (often the one the permission relay is posting): not a failure, on_permission queues it or the sweep blocks it after COORD_IDLE_MIN
+      if [ "$(pj "$1" stopReason)" = needs-input ]; then log "#$issue: worker $disp is at a prompt (needs-input), left to the permission relay and the sweep"; else block "escalation: $(jq -r '.body // ""' <<< "$1")"; fi ;;
   esac
 }
 

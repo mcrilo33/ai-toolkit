@@ -380,7 +380,7 @@ def test_a_pending_human_question_does_not_stop_dispatch_or_land(C):
     assert ["5"] in C.stubs.calls("dispatch.sh") and C.stubs.calls("land.sh") == [["--review", "1"]]
 
 
-@pytest.mark.parametrize("kind, extra, link", [("worker_done", {"outcome": "failed"}, "ok"), ("escalation", {}, "ok"),
+@pytest.mark.parametrize("kind, extra, link", [("worker_done", {"outcome": "failed"}, "ok"), ("escalation", {}, "ok"), ("escalation", {"stopReason": "exited"}, "ok"),
                                               ("worker_done", {"outcome": "succeeded"}, "relinked"), ("worker_done", {"outcome": "succeeded"}, "dup"),
                                               ("worker_done", {"outcome": "succeeded"}, "norecord")])   # a done worker is never landed under a moved link or none recorded
 def test_a_failed_or_escalating_worker_blocks_the_issue(C, kind, extra, link):
@@ -393,6 +393,29 @@ def test_a_failed_or_escalating_worker_blocks_the_issue(C, kind, extra, link):
         assert (not C.calls("gh issue edit") and not C.calls("gh issue comment")) if link == "norecord" else moved(C, link)
         return
     assert C.blocked() and not C.stubs.calls("land.sh") and C.calls("orca orchestration check ack")
+
+
+def left_alive(C):   # not blocked, not stopped, not fenced, not released
+    ks = C.kinds()
+    return not C.calls("gh issue edit") and not any(k in ks for k in ("orca orchestration worker-stop", "orca orchestration worker-abandon", "orca orchestration worker-release"))
+
+
+@pytest.mark.parametrize("mode", ["attended", "auto"])
+def test_a_needs_input_escalation_batched_with_its_permission_request_neither_blocks_nor_abandons_the_worker(C, mode, tmp_path):
+    C.mail([msg("escalation", "msg_stop", stopReason="needs-input"), msg("question", "msg_p", question=PQ)])
+    r = C.go("--answer", mode)
+    assert r.returncode == 0 and left_alive(C) and "needs-input" in r.stdout and C.calls("orca orchestration check ack")
+    if mode == "auto":
+        assert [arg(a, "--body") for a in C.calls("orca orchestration reply")] == ["deny"]
+    else:
+        assert not C.calls("orca orchestration reply") and REPLY_P in C.calls("gh issue comment")[0][-1] and "permission request waiting" in r.stdout
+        assert "msg_p" in (tmp_path / "state/run_t/held").read_text().split()   # queued for --status and the human, not orphaned
+
+
+def test_a_needs_input_escalation_alone_is_logged_and_blocks_nothing_at_once(C):
+    C.mail([msg("escalation", "msg_stop", stopReason="needs-input")])
+    r = C.go()
+    assert r.returncode == 0 and left_alive(C) and "#1: worker ctx_1 is at a prompt (needs-input)" in r.stdout and not C.calls("gh issue comment")
 
 
 W = "WARNING: a.py:3 - "   # a review warning as land.sh prints it
