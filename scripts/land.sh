@@ -27,6 +27,8 @@
 # merges into MAIN_BRANCH. --merged <n>: the PR that carries #n is MERGED (a squash merge defeats the landed check, the PR state is the proof; else exit 2, nothing touched): close
 # each issue still awaiting main in it (`merged into <MAIN_BRANCH> in <merge sha>`), drop the label, run POST_LAND_CMD <n> <key> <merge sha> (BASE_BRANCH and MAIN_BRANCH in its
 # environment), then remove the branch and worktree (pr) or merge origin/MAIN_BRANCH back into BASE_BRANCH and push it (integration: a squash merge leaves the base diverged).
+# A red gate (exit 4) first prints a digest on stdout, `CI_FAILURE: ` lines (the failed job / step, the pytest FAILED / ERROR ids, the last 40 lines; 4000 bytes at most, from `gh run view --log-failed`
+# once per red run, or from the CHECK_CMD output): the coordinator puts it in the worker's address. A log that cannot be fetched adds nothing.
 # Exit: 0 landed, 1 error, 2 refused (precondition), 3 review not approved, 4 gate red/timeout, 5 merge conflict (the merge-back of MAIN_BRANCH included: by hand, then --merged again),
 #       6 landed but a cleanup step failed, a failed refresh of the installed copies included (main is already pushed; finish by hand,
 #         --cleanup-only retries the refresh too), 7 landed, awaiting the merge into MAIN_BRANCH (the PR url is the `PR:` line).
