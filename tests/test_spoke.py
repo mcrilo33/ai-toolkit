@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from conftest import V2
 
@@ -7,6 +9,12 @@ SPOKE = str(V2 / "bin/claude-spoke")
 def MCP(tk, *local):
     """What the launcher puts in front of a worker's arguments: only the toolkit's server list (and the host's own), no Chrome."""
     return ["--strict-mcp-config", "--mcp-config", f"{tk}/mcp.json", *[a for f in local for a in ("--mcp-config", f"{tk}/{f}")], "--no-chrome"]
+
+
+def WORKER_SETTINGS(tk):
+    """What a worker gets in place of the guard file's path: the same file inline, with Claude's own notifications off (only the coordinator alerts the human)."""
+    base = json.loads((tk / "claude-settings.json").read_text())
+    return json.dumps({**base, "preferredNotifChannel": "notifications_disabled"}, separators=(",", ":"))
 
 
 def in_spoke(repo, run_id="abc-123"):
@@ -31,7 +39,7 @@ def test_spoke_exports_native_otel_env_and_passes_args_through(run, stubs, repo,
     (wt / ".ai-toolkit/task.md").write_text("# #464 feat(otel): tag spoke telemetry\n\nbody mentioning # #7\n")
     r = run([SPOKE, "--model", "m"], cwd=wt, OTEL_ENDPOINT="http://collector:4317", AI_TOOLKIT_LOCAL_ENV=tmp_path / "l.env")
     env = stubs.env("claude")
-    assert r.returncode == 0 and stubs.calls("claude") == [[*MCP(tk), "--settings", f"{tk}/claude-settings.json", "--model", "m"]], r.stderr   # main's files, from a worker's worktree
+    assert r.returncode == 0 and stubs.calls("claude") == [[*MCP(tk), "--settings", WORKER_SETTINGS(tk), "--model", "m"]], r.stderr   # main's files, from a worker's worktree
     assert "CLAUDE_CODE_ENABLE_TELEMETRY=1" in env and "OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317" in env
     assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=abc-123,repo=origin,issue=464" in env and "OTLP_HEADERS" not in env
     assert "SECRET_PROBE" not in env and "s3cret" not in env
@@ -75,6 +83,8 @@ def test_spoke_is_a_plain_claude_without_a_run_id_or_when_opted_out(run, stubs, 
     ("unsynced", True, ["-p", "x"], False, None, None),                # a worker with no settings file is refused, never started guardless
     ("synced", False, ["--settings", "mine.json"], False, None, None),    # two --settings do not merge (the last wins and the toolkit's hooks vanish): refused
     ("synced", False, ["--settings=mine.json"], False, None, None),
+    ("synced", True, ["--settings", "mine.json"], False, None, None),     # the same refusal for a worker, whose settings are inline JSON
+    ("synced", True, ["--settings=mine.json"], False, None, None),
     ("synced", False, ["--settings", '{"disableAllHooks":true}'], False, None, None),   # what Orca's Chat UI adds on its own: every hook off
     ("synced", False, ['--settings={"disableAllHooks":true}'], False, None, None),
     ("synced", False, ["--settings", "ai-toolkit", "--settings", "mine.json"], False, None, None),   # the sentinel does not license a second --settings
@@ -126,7 +136,16 @@ def test_a_worker_starts_with_only_the_toolkit_mcp_list(run, stubs, repo, local,
         (tk / local).write_text('{"mcpServers": {"mine": {"command": "true"}}}\n')
     r = run([SPOKE, *args], cwd=in_spoke(repo))
     assert (r.returncode == 0) == ok, r.stderr
-    assert stubs.calls("claude") == ([[*MCP(tk, *[local] * bool(local)), "--settings", f"{tk}/claude-settings.json", *fwd]] if ok else []) and (ok or "mcp" in r.stderr)
+    assert stubs.calls("claude") == ([[*MCP(tk, *[local] * bool(local)), "--settings", WORKER_SETTINGS(tk), *fwd]] if ok else []) and (ok or "mcp" in r.stderr)
+
+
+def test_a_worker_gets_the_guards_with_notifications_disabled_and_a_human_the_plain_path(run, stubs, repo):
+    tk = synced(repo)
+    assert run([SPOKE, "-p"], cwd=in_spoke(repo)).returncode == 0 and run([SPOKE, "-p"], cwd=repo.wt("h")).returncode == 0
+    worker, human = stubs.calls("claude")
+    cfg = json.loads(worker[worker.index("--settings") + 1])
+    assert cfg["preferredNotifChannel"] == "notifications_disabled" and cfg["disableAllHooks"] is False and cfg["hooks"]["PreToolUse"]   # the guards ride along
+    assert human == ["--settings", f"{tk}/claude-settings.json", "-p"]   # no run id: the path, no override
 
 
 def test_a_human_session_keeps_its_own_mcp_servers(run, stubs, repo):
