@@ -15,6 +15,12 @@
         "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/secrets-scan.sh\" || exit 2" }]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [{ "type": "command", "command": "bash \"$AI_TOOLKIT_DIR/hooks/claude/quality-check.sh\"" }]
+      }
+    ],
     "PermissionRequest": [
       {
         "matcher": "*",

@@ -124,6 +124,14 @@ if [ -f "$V2/settings/claude/mcp.json" ]; then put "$V2/settings/claude/mcp.json
 else warn "$V2/settings/claude/mcp.json is missing: .ai-toolkit/mcp.json (the workers' MCP servers) not synced"; fi
 orca_yaml > "$TMP"
 [ "$TARGET" = "$V2" ] || put "$TMP" orca.yaml bak   # the toolkit syncing into itself keeps its tracked ./scripts/setup.sh orca.yaml
+# A Python host with no linter (typechecker) config is offered the base ruff.toml (pyrightconfig.json), once: a plain copy of a file that is absent, never a backup or a replace, and no
+# manifest entry, so like the project's own orca.yaml it is the project's to commit and a later sync neither updates nor drops it. The toolkit itself has both, so it gets nothing.
+has() { local f; for f in "${@:2}"; do [ -f "$TARGET/$f" ] && grep -qE "$1" "$TARGET/$f" 2> /dev/null && return 0; done; return 1; }   # has <regex> <file>...: one of the files has a line matching
+propose() { [ -f "$V2/$1" ] || return 0; cp "$V2/$1" "$TARGET/$1" && echo "proposed $1 (no config of the project's own found): commit it, a sync never updates it"; }
+if [ -n "$(tg ls-files -- '*.py')" ]; then
+  if ! has '^\[tool\.ruff[].]' pyproject.toml && [ ! -e "$TARGET/ruff.toml" ] && [ ! -e "$TARGET/.ruff.toml" ]; then propose ruff.toml; fi
+  if ! has '^\[tool\.(pyright|mypy)[].]' pyproject.toml && ! has '^\[mypy[].-]' setup.cfg && [ ! -e "$TARGET/pyrightconfig.json" ] && [ ! -e "$TARGET/mypy.ini" ] && [ ! -e "$TARGET/.mypy.ini" ]; then propose pyrightconfig.json; fi
+fi
 
 # drop <rel>: remove one synced file and its now-empty parents. An absolute or climbing path is
 # never touched (a manifest is data in the target, not trusted).

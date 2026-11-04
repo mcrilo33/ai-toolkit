@@ -36,7 +36,7 @@ The footer is the dispatch contract (see `.ai-toolkit/rules/issue-hygiene.md`):
 | `Tracker:` | optional external ticket key; the worker puts it in every commit subject |
 | `Land:` | optional `auto` (default: the loop lands the finished worker) or `human`. Propose `human` for open-ended iteration where only the human knows when to stop: eval or prompt tuning, a human annotator in the loop. Each `worker_done` is then a round report, the worktree is kept, and `coordinate` presents the round; any other value is refused at dispatch |
 
-Labels: `priority` (dispatched first), `hold` (never dispatched), and `DISPATCH_LABEL` when set (create it if missing; see `bug-triage`). **Blocked-by**: answer "does this depend on
+Labels: `priority` (dispatched first), `hold` (only when the `bug-triage` bar says the issue needs the human's approval before work starts, never on an issue the human asked for; the reason is in the body; never dispatched), and `DISPATCH_LABEL` when set (create it if missing; see `bug-triage`). **Blocked-by**: answer "does this depend on
 open work?" for every issue and declare a real native edge if yes (`github-issues/references/dependencies.md`);
 never use one to encode file overlap. A chain with colliding `Scope:` is one issue with subtasks.
 
