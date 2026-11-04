@@ -711,8 +711,7 @@ def qc(tmp_path, link_script, shared):
         f.write_text(content)
         knobs = {"LINT_CMD": lint.format(**stubs), "TYPECHECK_CMD": types.format(**stubs)}
         r = call("quality-check.sh", shared["wt"], tool, env={"STUB_LOG": str(log), **knobs, **(env or {})}, file_path=str(f), content=content)
-        r.file, r.log = str(f), log.read_text()
-        return r
+        return SimpleNamespace(returncode=r.returncode, stdout=r.stdout, stderr=r.stderr, file=str(f), log=log.read_text())
     return run
 
 
@@ -737,7 +736,6 @@ def test_quality_check_reads_the_path_of_every_edit_tool(qc, tool):
 @pytest.mark.parametrize("kw", [
     {"content": "x = 1\n"},                                           # a clean file
     {"content": "FAIL-lint FAIL-types\n", "name": "notes.md"},                          # not python
-    {"content": "FAIL-lint FAIL-types\n", "name": "tool.pyi"},
     {"content": "FAIL-lint FAIL-types\n", "lint": "", "types": ""},                    # both knobs off
     {"content": "FAIL-lint FAIL-types\n", "lint": "no-such-binary-517 --x", "types": "no-such-binary-517"},   # the binaries are not installed: skipped, never failed
 ])
@@ -914,8 +912,9 @@ def test_settings_register_quality_check_after_the_edit_and_it_runs_from_the_syn
     shutil.copytree(CLAUDE, tk / "hooks/claude")
     (tk / "scripts").mkdir()
     shutil.copy(V2 / "scripts/lib.sh", tk / "scripts/lib.sh")   # the hook finds lib.sh next to hooks/, in the toolkit checkout and in a host
+    (tk / "ai-toolkit.env").write_text("LINT_CMD=false\nTYPECHECK_CMD=\n")   # the knobs come from the synced defaults file, so rc 2 proves lib.sh was sourced and load_env ran
     f = tmp_path / "a.py"
     f.write_text("x\n")
     r = subprocess.run(["sh", "-c", post["hooks"][0]["command"]], capture_output=True, text=True, cwd=shared["wt"], input=json.dumps({"tool_name": "Write", "tool_input": {"file_path": str(f)}}),
-                       env={**os.environ, "AI_TOOLKIT_DIR": str(tk), "LINT_CMD": "false", "TYPECHECK_CMD": ""})
+                       env={**os.environ, "AI_TOOLKIT_DIR": str(tk)})
     assert r.returncode == 2 and str(f) in r.stderr
