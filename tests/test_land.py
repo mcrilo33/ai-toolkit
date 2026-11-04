@@ -153,7 +153,7 @@ def test_a_red_ci_merges_nothing_and_relays_the_failing_job_step_tests_and_tail_
     assert {"CI_FAILURE: failed: test / pytest", "CI_FAILURE: FAILED tests/test_a.py::test_x - assert 1 == 2", "CI_FAILURE: ERROR tests/test_b.py::test_y"} <= set(d)
     assert any("filler 100" in ln for ln in d) and not any("filler 050" in ln for ln in d)   # the last lines of the step, not the whole log
     assert not any("2026-11-04" in ln for ln in d)   # the timestamp column is noise
-    assert sum(len(ln) + 1 for ln in d) <= 4000   # the whole digest, two red runs
+    assert 0 < len(r.stdout.encode()) <= 4000   # the whole digest, two red runs: stdout carries nothing else
     assert [t for t in L.trail() if t[:3] == ("gh", "run", "view")] == [("gh", "run", "view", "12", "--log-failed"), ("gh", "run", "view", "13", "--log-failed")]
 
 
