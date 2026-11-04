@@ -405,7 +405,8 @@ on_done() {
        else block "the independent review gave no usable verdict"; fi ;;
     4 | 5) case "$last" in
         *"timed out"* | *"keeps moving"*) block "$last" ;;
-        *) redispatch 1 "address: the land was refused ($last). Fix it on your branch (merge origin/$BASE_BRANCH and resolve conflicts, or fix the failing checks), push, then send worker_done again." "$last" ;;
+        *) bl="$(sed -n 's/^CI_FAILURE: //p' <<< "$out" | awk '{ printf "%s%s", (NR > 1 ? " | " : ""), $0 }')"   # land.sh's bounded digest of the red CI: the failed job and step, the test ids, the last lines
+           redispatch 1 "address: the land was refused ($last). Fix it on your branch (merge origin/$BASE_BRANCH and resolve conflicts, or fix the failing checks), push, then send worker_done again.${bl:+ CI failure: $bl}" "$last" ;;
       esac ;;
     6) if [ -z "$br" ]; then block "landed, but Orca gives no branch for worktree $wtp, so cleanup cannot name it (finish with land.sh --cleanup-only --branch <name> $issue); blocked so the still-open issue is not dispatched again"
        else landing; RUN="$run" "$LAND_CMD" --cleanup-only --branch "$br" --tip "$(git rev-parse HEAD)" --dispatch "$disp" "$issue" \
