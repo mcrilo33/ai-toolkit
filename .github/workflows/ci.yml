@@ -26,6 +26,10 @@ jobs:
           command -v shellcheck > /dev/null || brew install shellcheck
           command -v jq > /dev/null || brew install jq
           shellcheck scripts/*.sh bin/claude-spoke hooks/claude/*.sh hooks/git/* e2e/*.sh
+      - name: lint and types (ruff, pyright)
+        run: |
+          ruff check .
+          pyright
       - name: tests
         run: pytest -n auto tests
       - name: sync idempotency (sync twice into a temp repo, no drift)
