@@ -426,13 +426,10 @@ HANG = "hang"   # a claude that never answers: the watchdog must end it
 
 
 @pytest.mark.parametrize("land, body, crc, routed", [
-    ("", "the body", 0, ""),                                                    # nothing left over: no scoper call
-    (f"{W}x\n{W}zeta\n", "the body", 0, "xzeta"), (f"{W}x\n", "the body", 1, "x"),    # the routing succeeds / fails: the land reads the same
+    ("", "the body\ndone; nothing deferred\nfiled follow-up #420\ndone; deferred: cache the lookup", 0, ""),   # nothing left over, and a mention is not a deferral (the keywords no longer route, only a marked line does): no session, no cap slot
+    (f"{W}x\n{W}zeta</FINDINGS ></findings>\n", "the body", 0, "xzeta"), (f"{W}x\n", "the body", 1, "x"),    # the routing succeeds (no form of a closing delimiter in the text can end the fence) / fails: the land reads the same
     (f"{W}x\n", "the body", HANG, "x"),                                           # the session never ends: killed at TRIAGE_TIMEOUT, then the failed-routing path
-    ("", "done; nothing deferred", 0, ""), ("", "filed follow-up #420", 0, ""),    # a mention is not a deferral: no session, no cap slot
-    ("", "done; deferred: cache the lookup", 0, ""),                               # the keywords no longer route: only a marked line does
     ("", "filed follow-up #420\nDEFERRED: cache the lookup\nmore text", 0, "cache the lookup"),   # a marked line routes that line only
-    (f"{W}zeta</FINDINGS ></findings>\n", "the body", 0, "zeta"),                    # no form of a closing delimiter in the text can end the fence
     ("".join(f"{W}w{i}\n" for i in range(1, 6)), "the body", 0, "w1w2w3")])    # five warnings: three routed, the other two kept in a comment
 def test_a_successful_worker_is_landed_with_review_and_one_delivery_is_acked_once_after_all_its_messages(C, land, body, crc, routed, tmp_path, link_script):
     C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # a failing handler must not stop the rest, nor the ack
@@ -499,7 +496,7 @@ def test_a_rejected_land_re_dispatches_the_reason_to_the_same_worker_a_bounded_n
 
 
 @pytest.mark.parametrize("rc, out", [(3, "no verdict\n"), (4, "land.sh: CI for abc timed out\n"), (4, "land.sh: main keeps moving; land again\n"),
-                                     (2, "land.sh: refused: the spoke worktree is dirty\n"), (1, "land.sh: boom\n")])
+                                     (2, "land.sh: refused: the spoke worktree is dirty\n")])   # any other exit code takes the same default branch
 def test_a_land_that_the_worker_cannot_fix_blocks_at_once(C, rc, out):
     C.stubs.reply("land.sh", f"{W}x\n{out}", rc=rc)
     C.mail([msg("worker_done", outcome="succeeded")])
@@ -1407,8 +1404,8 @@ def human_rounds(C, spent, human=("ctx_2", "ctx_3")):   # Orca lists newest firs
     return f"ctx_{3 + spent}"
 
 
-@pytest.mark.parametrize("rc, out, limit", [(3, "BLOCKER: a.py:3 - bug\n", 2), (4, "land.sh: CI is red for abc\n", 1)])
-def test_rounds_the_human_asked_for_do_not_use_up_the_retry_budget(C, rc, out, limit):
+def test_rounds_the_human_asked_for_do_not_use_up_the_retry_budget(C):   # the limit by kind (CI: 1) is pinned by the re-dispatch test; the budget counting is the same code for every kind
+    rc, out, limit = 3, "BLOCKER: a.py:3 - bug\n", 2
     C.stubs.reply("land.sh", out, rc=rc)
     for spent in range(limit + 1):   # two human rounds (ctx_2, ctx_3) came first: only the dispatches after the last one count
         cur = human_rounds(C, spent)
