@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 
@@ -31,13 +32,33 @@ def commit(cwd, name, text="x", push=None, msg=None):
     return git(cwd, "rev-parse", "HEAD")
 
 
+@pytest.fixture(scope="session")
+def origin_template(origin_template, tmp_path_factory):   # per xdist worker: the shared origin and clone plus BRANCH, one feature commit ahead of main and pushed; each test gets a worktree of it
+    base = tmp_path_factory.mktemp("land_template")
+    for d in ("origin.git", "root"):
+        shutil.copytree(origin_template / d, base / d)
+    root, env = base / "root", {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def sh(*a):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=root, env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+    sh("remote", "set-url", "origin", str(base / "origin.git"))
+    sh("checkout", "-q", "-b", BRANCH)
+    (root / "feature.txt").write_text("x")
+    for a in (["add", "feature.txt"], ["commit", "-qm", "add feature.txt"], ["push", "-q", "origin", BRANCH], ["checkout", "-q", "main"]):
+        sh(*a)
+    (base / "tip").write_text(sh("rev-parse", BRANCH))
+    return base
+
+
 @pytest.fixture
-def L(stubs, repo, run, tmp_path, link_script):
+def L(stubs, repo, run, tmp_path, link_script, origin_template):
     origin = tmp_path / "origin.git"
+    (origin / "hooks").mkdir()   # the template has no sample hooks
     link_script(origin / "hooks/post-receive", HOOK)
-    wt = repo.wt(BRANCH)
-    tip = commit(wt, "feature.txt", push=BRANCH)
-    git(repo.root, "fetch", "-q")
+    wt = tmp_path / BRANCH
+    git(repo.root, "worktree", "add", "-q", str(wt), BRANCH)
+    tip = (origin_template / "tip").read_text()
     log = tmp_path / "stubs/calls.log"
     log.write_text("")   # drop the setup pushes: only land's own calls count
     stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(wt), "branch": f"refs/heads/{BRANCH}"}}}))

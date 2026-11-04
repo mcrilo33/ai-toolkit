@@ -126,12 +126,12 @@ def origin_template(tmp_path_factory):  # per xdist worker: a bare origin with `
     def sh(*a, cwd=base):
         subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, env=env, check=True, capture_output=True)
 
-    sh("init", "-q", "--bare", "-b", "main", "origin.git")
-    sh("clone", "-q", "origin.git", "seed")
+    sh("init", "-q", "--bare", "--template=", "-b", "main", "origin.git")   # no template: a git dir without its 16 sample files is copied per test in a fraction of the time
+    sh("clone", "-q", "--template=", "origin.git", "seed")
     (base / "seed" / "README").write_text("x")
     for a in (["add", "."], ["commit", "-qm", "init"], ["push", "-q", "origin", "main"]):
         sh(*a, cwd=base / "seed")
-    sh("clone", "-q", "origin.git", "root")   # after the push, so origin/HEAD is set as in a real clone
+    sh("clone", "-q", "--template=", "origin.git", "root")   # after the push, so origin/HEAD is set as in a real clone
     return base
 
 
