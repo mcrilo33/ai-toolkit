@@ -2,8 +2,9 @@
 # Traces go to Langfuse after a transform; logs + metrics are kept raw as rotated JSONL in /raw
 # (host dir AITK_OTEL_RAW_DIR, outside any worktree) for later analysis. Langfuse reads usage only
 # from gen_ai.usage.*, so tokens are remapped (else cost reads $0). Every spoke trace carries the
-# spoke_run_id resource attribute (bin/claude-spoke) and becomes one Langfuse session.
-# Its Langfuse environment is its bare repo name; without a repo attribute it stays on Langfuse's "default".
+# spoke_run_id resource attribute (bin/claude-spoke) and becomes one Langfuse session. A coordinator or hub session on
+# a synced main checkout carries role=coordinator instead (no run id) and uses Claude's own session.id as its session.
+# The Langfuse environment is the bare repo name for both; without a repo attribute it stays on Langfuse's "default".
 # Retention: logs keep 11 x 100MB = 1.1GB at most (and nothing older than 30 days), the only copy of what
 # Langfuse lacks. That is 2-4 weeks at the normal ~17MB/day with bursty /afk drain days, but only ~4 days
 # of sustained peak (~260MB/day). The files hold prompts and tool output in plaintext, so the cap is deliberate.
@@ -24,13 +25,17 @@ processors:
           - set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil
           - set(attributes["gen_ai.usage.cache_read_input_tokens"], attributes["cache_read_tokens"]) where attributes["cache_read_tokens"] != nil
           - set(attributes["gen_ai.usage.cache_creation_input_tokens"], attributes["cache_creation_tokens"]) where attributes["cache_creation_tokens"] != nil
-          # span names encode the dimension, so Langfuse "group by name" = per tool / hook / sub-agent
+          # span names encode the dimension, so Langfuse "group by name" = per tool / hook / sub-agent / skill
           - set(name, Concat(["tool:", attributes["tool_name"]], "")) where name == "claude_code.tool" and attributes["tool_name"] != nil
           - set(name, Concat(["hook:", attributes["hook_name"]], "")) where name == "claude_code.hook" and attributes["hook_name"] != nil
           - set(name, "sub-agent:llm") where name == "claude_code.llm_request" and attributes["agent_id"] != nil
           - set(name, Concat(["sub-agent:", attributes["subagent_type"]], "")) where attributes["tool_name"] == "Agent" and attributes["subagent_type"] != nil
+          - set(name, Concat(["skill:", attributes["skill_name"]], "")) where attributes["tool_name"] == "Skill" and attributes["skill_name"] != nil
           # one spoke (across resumes) = one session; langfuse.session.id beats Claude's own session.id
           - set(attributes["langfuse.session.id"], resource.attributes["spoke_run_id"]) where resource.attributes["spoke_run_id"] != nil
+          - set(attributes["langfuse.session.id"], attributes["session.id"]) where resource.attributes["role"] == "coordinator" and attributes["session.id"] != nil
+          - set(attributes["langfuse.observation.metadata.role"], resource.attributes["role"]) where resource.attributes["role"] != nil
+          - set(attributes["langfuse.observation.metadata.role"], "worker") where resource.attributes["spoke_run_id"] != nil and resource.attributes["role"] == nil
           - set(attributes["langfuse.observation.metadata.repo"], resource.attributes["repo"]) where resource.attributes["repo"] != nil
           - set(attributes["langfuse.environment"], resource.attributes["repo"]) where resource.attributes["repo"] != nil
           - set(attributes["langfuse.observation.metadata.issue"], resource.attributes["issue"]) where resource.attributes["issue"] != nil

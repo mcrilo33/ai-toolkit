@@ -19,7 +19,7 @@ git, and GitHub labels. The only files ai-toolkit keeps are the human-reply spoo
 
 ```text
 scripts/   lib.sh dispatch.sh land.sh review.sh answer.sh coordinator.sh reply.sh setup.sh archive.sh sync.sh install.sh otel.sh cutover.sh
-bin/claude-spoke           launcher: the project's guards (--settings .ai-toolkit/claude-settings.json), OTel env + spoke_run_id in a spoke, then exec claude (plain claude in an unsynced project)
+bin/claude-spoke           launcher: the project's guards (--settings .ai-toolkit/claude-settings.json), OTel env (spoke_run_id in a spoke, role=coordinator in any other synced session), then exec claude (plain claude in an unsynced project)
 hooks/claude/              push-guard.sh danger-guard.sh judge.sh secrets-scan.sh permission-relay.sh (synced to .ai-toolkit/hooks/claude/, registered by settings/claude/settings.json; judge.sh is danger-guard's second stage)
 hooks/git/                 commit-msg (conventional type + #N anchor; only a test: commit may change a test file, rechecked by land.sh), pre-commit (no commit on the base branch in the main checkout)
 langfuse/                  otelcol.yaml compose.yaml (collector only; dashboards and scores are a later batch)
@@ -193,7 +193,7 @@ or re-bind after a restart: everything else is re-derived from `worker-list`, `w
    model ids, `LANGFUSE_*`. Precedence: caller env > local env > `.ai-toolkit/ai-toolkit.env`. CI must run on **every branch push** (`land.sh` waits for the run of the exact tip).
 5. The first Claude start in a new repo root shows the workspace-trust dialog (default "No, exit"): `dispatch.sh` answers it (Down+Enter); a human can pre-trust the root.
 6. The toolkit repo itself: `scripts/sync.sh .` generates `.claude/` (the rules and `guidelines.md` under `rules/ai-toolkit/`; no root `CLAUDE.md`) and `.ai-toolkit/`; it never overwrites the tracked `orca.yaml`.
-7. Optional telemetry (D1): `scripts/otel.sh up` (Langfuse keys in the local env) starts the collector; spokes launched by `dispatch.sh` already export to it.
+7. Optional telemetry (D1): `scripts/otel.sh up` (Langfuse keys in the local env) starts the collector; spokes launched by `dispatch.sh` and the coordinator session on a synced main checkout (`role=coordinator`) already export to it.
 
 ## Testing
 
