@@ -27,7 +27,10 @@ if [ -f "$tk/claude-settings.json" ]; then
     || die "$tk/claude-settings.json is unreadable or does not register the guards (disableAllHooks false, PreToolUse hooks): sync ai-toolkit again, never a session without them"
   for a in "$@"; do case "$a" in --settings | --settings=*) die "the launcher owns --settings (the toolkit's guards): do not pass one" ;; esac; done
   AI_TOOLKIT_DIR="$(cd "$tk" && pwd -P)"; export AI_TOOLKIT_DIR   # the hooks run from here, and /coordinate reads it to know its session has the guards
-  set -- --settings "$AI_TOOLKIT_DIR/claude-settings.json" "$@"
+  s="$AI_TOOLKIT_DIR/claude-settings.json"
+  # a worker gets the same file inline (--settings takes a file or JSON) with Claude's own notifications off: only the coordinator alerts the human
+  if [ -s "$top/.ai-toolkit/spoke-run-id" ]; then s="$(jq -c '. + {preferredNotifChannel: "notifications_disabled"}' "$s")"; fi
+  set -- --settings "$s" "$@"
 elif [ -s "$top/.ai-toolkit/spoke-run-id" ]; then die "no $tk/claude-settings.json: sync ai-toolkit into the main checkout, a worker never starts without its guards"
 else unset AI_TOOLKIT_DIR; fi   # an inherited one would tell /coordinate this session has guards it does not have
 if [ -s "$top/.ai-toolkit/spoke-run-id" ]; then   # a worker has only the servers on the toolkit's list (plus the host's own mcp.local.json), never the human's connectors, and no Chrome
