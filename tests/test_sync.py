@@ -232,10 +232,26 @@ def test_every_sync_excludes_what_it_wrote_under_claude_and_only_local_only_also
     sync("--local-only")
     ex = exclude(target)
     assert ex.count("# >>> ai-toolkit sync") == 1 and ex.startswith("mine\n")
-    assert {"/.ai-toolkit/", "/.claude/skills/land/SKILL.md", "/.claude/rules/ai-toolkit/security.md", "/orca.yaml"} <= set(ex.splitlines())
+    assert {"/.ai-toolkit/", "/tmp.*", "/.claude/skills/land/SKILL.md", "/.claude/rules/ai-toolkit/security.md", "/orca.yaml"} <= set(ex.splitlines())
+    assert ex.splitlines().count("/tmp.*") == 1   # worker scratch at the worktree root, once however many syncs
     sync()
     lines = exclude(target).splitlines()   # a normal run keeps the .claude/ paths it wrote, one by one (never the whole folder), and drops orca.yaml
-    assert {"/.ai-toolkit/", "/.claude/skills/land/SKILL.md", "mine"} <= set(lines) and not {"/.claude/", "/CLAUDE.md", "/orca.yaml"} & set(lines)
+    assert {"/.ai-toolkit/", "/tmp.*", "/.claude/skills/land/SKILL.md", "mine"} <= set(lines) and not {"/.claude/", "/CLAUDE.md", "/orca.yaml"} & set(lines)
+
+
+def test_a_linked_worktrees_tmp_scratch_is_ignored_but_other_untracked_files_are_not(sync, target):
+    sync()
+    git(target, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init")
+    wt = target.parent / "wt"
+    git(target, "worktree", "add", "-q", str(wt))
+    write(wt / "tmp.suite.out")
+    write(wt / "tmp.AbC123" / "x")
+    write(wt / "notes.txt")
+    assert git(wt, "status", "--porcelain").splitlines() == ["?? notes.txt"]   # a file that is not scratch still stops the removal and reaches the human
+    (wt / "notes.txt").unlink()
+    assert git(wt, "status", "--porcelain") == ""
+    git(target, "worktree", "remove", str(wt))   # no --force
+    assert not wt.exists()
 
 
 def test_local_env_override_is_never_tracked(sync, target):
