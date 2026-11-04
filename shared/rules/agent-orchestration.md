@@ -1,81 +1,34 @@
 ---
-description: "When to spawn specialist agents, parallel execution, multi-perspective review, and delegation protocol"
+description: "Which agents exist, when to spawn each, and the independent review before ship"
 ---
 # Agent Orchestration
 
-Delegate to specialist agents when a task matches their expertise. Over-delegating
-costs a little time; under-delegating on a complex task is the failure worth avoiding.
-When in doubt, spawn.
+Four agents exist. Everything else (planning, design, debugging, TDD, docs) is done inline.
 
 ## Routing Table
 
-The single source of truth for who handles what. A matching row names the specialist;
-whether to spawn it or work inline is governed by the rubric and enforcement split below.
-
 | Situation | Agent | Trigger signals |
 | --------- | ----- | --------------- |
-| Complex multi-file feature | `planner` | path unclear, crosses module/API/data boundaries, DEFINE phase |
-| System design or structure decision | `architect` | "design the architecture", new service/module, data model |
-| Security audit or vulnerability check | `security-reviewer` | "audit security", auth/payments/PII changes |
-| PR or diff review requested | `code-review` | "review this", PR link, "check my changes" |
-| Bug report, error, stack trace | `debug` | "it's broken", stack trace, `FAILED`, unexpected behavior |
-| New feature — write tests first | `tdd-red` | TDD mode, "write tests for X", DEFINE phase |
-| Make failing tests pass | `tdd-green` | "make tests pass", GREEN phase, failing test output |
-| Tests pass — clean up | `tdd-refactor` | "refactor", REFACTOR phase, all tests green |
-| Cross-cutting rename/restructure | `refactor` | "rename X to Y across the codebase", pattern migration |
-| CI/CD, infra, deployment | `devops` | workflow files, Docker, deploy, pipeline |
-| Write or update docs only | `documentation` | "document this", docs-only task |
-
-Spawn `planner` when the **path is unclear** (real unknowns, multiple viable designs) or
-the **blast radius** is wide (crosses module/service boundaries, a public API, a data
-model, or shared state). Skip it for large-but-mechanical work — a rename, find/replace,
-or dependency bump — and do that directly or via `refactor`. File count is a smell, not a
-trigger: a 5-file rename needs no planner; a 1-file auth change needs review. The
-`delegation-gate-warn` hook nudges on file count but no longer blocks the ship on it — the
-hard ship gate is `code-review`.
+| Diff, branch or PR review; the ship gate | `code-review` | "review this", PR link, "check my changes", before every push |
+| Security audit or vulnerability check | `security-reviewer` | auth, payments, PII, secrets, public API changes |
+| A defect found outside the issue's Scope | `bug-scoper` | see `bug-triage` |
+| A deferred follow-up found outside the issue's Scope | `followup-scoper` | see `bug-triage` |
 
 ### When not to spawn
 
-- Single file, or exactly 2 files with trivial scope — do it yourself.
 - User said "don't use agents" or "do it inline".
-- Internal refactor with no behavior change.
+- Anything outside the table: work it inline.
 
-## Watch for multi-turn drift
-
-Small requests accumulate into a multi-file change across turns. Re-assess each turn
-against the rubric above using the *cumulative* scope of the whole task, not just the
-current request: once the change crosses a boundary or the path stops being obvious,
-pause and spawn `planner` with full context of what's done and what remains. Gradual
-scope growth is the most common miss.
-
-## What's enforced vs. how you do it
+## What's enforced
 
 The machinery enforces *outcomes*, not which agent produced them: CI green on the branch, and an independent
 `code-review` (run by the coordinator with a different model) whose verdict reports `tdd_followed` and
-`tests_weakened`. Within the spoke, TDD and the PLAN gate are policy. So the one load-bearing delegation is an
-independent `code-review` before you ship.
+`tests_weakened`. So the one load-bearing delegation is an independent `code-review` before you ship: an
+independent reader catches what the implementer is blind to. **Always separate, before ship.**
 
-That splits the agents by what separation actually buys:
-
-- `code-review` / `security-reviewer` — high value: an independent reader catches what the implementer is blind
-  to. **Always separate, before ship.**
-- `planner` / `architect` — real value on hard or uncertain work. Spawn by the rubric above.
-- `tdd-red` / `tdd-green` / `tdd-refactor` — low value as a separate agent: the test is written first, so there is
-  nothing to leak. **Inline is fine**; what the machinery enforces is the commit split: only a `test:` commit may
-  change a test file, whoever writes it.
-
-**Solo / PR-less work (`solo-cycle`):** write the RED test, GREEN implementation, and any refactor inline. The one
-non-negotiable separate agent is `code-review` before each push. Reach for the `tdd-*` agents only when you want a
-clean context boundary (larger or collaborative work).
-
-## Parallel vs sequential
-
-- Independent sub-tasks (no shared data) → run in parallel: e.g. `code-review` +
-  `security-reviewer` + `documentation` on one diff.
-- One agent's output feeds the next → sequential: `architect` → `planner` →
-  `tdd-red` → `tdd-green` → `tdd-refactor`.
-- Don't parallelize work whose outputs must be merged back together — the coordination
-  cost outweighs the speedup.
+TDD is inline: write the RED test, the GREEN implementation and any refactor yourself. The test is written
+first, so a separate agent has nothing to add. What the machinery enforces is the commit split: only a `test:`
+commit may change a test file, whoever writes it.
 
 ## Review depth
 
@@ -86,15 +39,8 @@ Every `code-review` runs two stages, and the first gates the second:
 2. **Code quality** — only once intent is confirmed: correctness, quality, security.
 
 For high-stakes changes (auth, payments, PII, public API, schema migrations, wide blast
-radius), split the review across perspectives — `code-review` (correctness), `security-reviewer`
-(vulnerabilities), `architect` (coupling/scale) — rather than a single pass. An internal
-refactor, docs-only, or test-only change needs just one review.
-
-## Hook signals
-
-The `delegation-gate-warn` hook emits routing hints in tool output. The `code-review` ship
-hint is a **hard gate** — resolve it before pushing (`git push`, PR create). The planner
-and `tdd-*` hints are advisory nudges: act on them when the rubric agrees, not reflexively.
+radius), run `security-reviewer` next to `code-review`, in parallel (they share no data).
+An internal refactor, docs-only, or test-only change needs just one review.
 
 ## When spawning an agent
 

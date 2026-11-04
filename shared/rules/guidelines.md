@@ -44,7 +44,7 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 ### Autonomy Threshold
 - 1-2 files with clear scope → proceed without confirmation
 - Ambiguous scope or destructive operations → confirm plan first
-- **When to delegate (the planner/review rubric, mode-aware TDD, and hook signals) is defined in the `agent-orchestration` rule. Follow it there; do not restate it here.**
+- **When to delegate (which agents exist and the review before ship) is defined in the `agent-orchestration` rule. Follow it there; do not restate it here.**
 
 ### Prohibitions
 - Do not create new files unless explicitly requested or absolutely necessary
@@ -53,7 +53,7 @@ description: "Agent behavior, clarification, autonomy, prohibitions, and respons
 - Do not modify, refactor, or remove code unrelated to the task — see `code-quality` (Surgical Changes) for the binding rule
 - Do not remove or modify existing functionality unless explicitly asked
 - Do not make assumptions about missing context — ask instead, unless a sensible default settles it
-- Do not hallucinate APIs, functions, imports, signatures, or parameters — verify before use (mechanics in `code-quality` → External API Verification; `library-research` for fetching docs)
+- Do not hallucinate APIs, functions, imports, signatures, or parameters — verify before use (mechanics in `code-quality` → External API Verification)
 
 ### Tool Unavailability
 - If a task requires a specific tool (API, CLI, or an MCP server the toolkit lists in `.ai-toolkit/mcp.json`) that is unavailable or inaccessible, **stop immediately**; an MCP server that is not listed is not a stop condition

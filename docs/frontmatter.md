@@ -20,10 +20,10 @@ The frontmatter lives in each source file under `shared/`; `scripts/sync.sh` cop
   (Cursor/Copilot syntax) do not exist any more. Policy an agent must read on demand (workflow, planning-hub, afk-answering, issue-hygiene, bug-triage) goes in `on-demand/`
   and is referenced by path from the skills that need it.
 - **Agents.** `model` is one of `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5-20251001` (never a `[1m]` variant); `effort` is
-  `low|medium|high|xhigh|max`. The read-only agents (`architect`, `planner`, `code-review`, `security-reviewer`, `bug-scoper`, `followup-scoper`) declare
+  `low|medium|high|xhigh|max`. The read-only agents (`code-review`, `security-reviewer`, `bug-scoper`, `followup-scoper`) declare
   `disallowedTools: Edit, Write, NotebookEdit`. Tool names are Claude Code's (`Bash`, `Read`, `Grep`, `Glob`, `WebFetch`, `WebSearch`, `Agent`, `Edit`, `Write`, `NotebookEdit`).
 - **The `code-review` agent's last message is one JSON object** `{verdict, blockers, warnings, tdd_followed, tests_weakened, summary}`; `review.sh` rejects anything else.
-- **Size caps** (lines): `solo-cycle` 120, `hub` 60, `start-task` 60, `afk` 40, `land` 30, `workflow` 100, `planning-hub` 50, `afk-answering` 120, `code-review` 110.
+- **Size caps** (lines): `solo-cycle` 120, `hub` 60, `start-task` 60, `land` 30, `workflow` 100, `planning-hub` 50, `afk-answering` 120, `code-review` 110.
 - **No deleted mechanism.** Nothing under `shared/` may name `spoke-ready`, `review-stamp`, `tmux`, `.review/`, `hub-afk`, `metadata.yml`, Cursor or Copilot, and so on (the regex is `DELETED` in the lint).
   Nothing may point at a doc other than `docs/architecture.md` and `docs/frontmatter.md`.
 

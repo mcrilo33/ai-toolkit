@@ -29,7 +29,7 @@ solves the problem. Write new code only when every rung above it has come up emp
    already present (built-in HTTP client, env loader, scheduler) over a hand-rolled one.
 4. **Already-installed dependency?** Solve it with a library the project already depends
    on before adding a new one. (Adopting a *new* dependency is governed by
-   Dependency Management below; verifying its API by `library-research`.)
+   Dependency Management below; verify its API under External API Verification.)
 5. **One line?** If a small expression or existing helper does it, write that — not a
    new function, class, or abstraction.
 6. **Only then, minimal code.** Author the smallest version that meets the requirement.
@@ -126,7 +126,7 @@ Minimize everything *except* the following — never trade these away for brevit
 ### External API Verification
 
 - Verify framework/library API usage against current, authoritative docs before writing code
-- Fetch version-specific docs proactively before coding — don't wait for the user to ask; see `library-research` for the workflow
+- Fetch version-specific docs proactively before coding — don't wait for the user to ask
 - Never assume an API exists, kept its name, or behaves the same across versions
 - Cite the source when a decision relies on external documentation
 

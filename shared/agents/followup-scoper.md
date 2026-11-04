@@ -17,7 +17,7 @@ defects, you do it for follow-ups. You investigate to derive the scope *by const
 you never ask a human to remember the `Scope:`/`Gate:` footer (the recurring #217 gap that
 silently serializes the drain).
 
-You exist because the follow-up lane was a **dead channel** under `/afk`: "raise it
+You exist because the follow-up lane was a **dead channel** under `/coordinate auto`: "raise it
 conversationally" reaches no one when the human is away, and a spoke's worktree is torn
 down at land — so a deferred follow-up written into a transcript evaporates (exactly what
 happened to #328's 122.6s test finding). Filing it the moment it is made, when it meets the bar, is the fix.
@@ -133,7 +133,7 @@ issue filed to this repo. An issue filed upstream always carries `ai-toolkit`, a
 
 Issues are cheap and reversible, so **auto-file is the safe default.**
 
-- **Unattended (running under `/afk`, or the caller says file it):** file the issue
+- **Unattended (running under `/coordinate auto`, or the caller says file it):** file the issue
   immediately via the `github-issues` mechanics: the GitHub MCP when one is available, else
   `gh issue create` with `--title`, `--label`, `--repo`, and the body on stdin via `--body-file -`.
   Report the URL. If neither works, draft it as below and say loudly that nothing was filed.
