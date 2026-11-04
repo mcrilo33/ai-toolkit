@@ -38,6 +38,7 @@ If no build step applies, mark as `SKIP` (not `FAIL`).
 |-----------|---------|
 | `tsconfig.json` | `npx tsc --noEmit` |
 | `pyproject.toml` with mypy/pyright | `mypy .` or `pyright` |
+| `pyrightconfig.json` | `pyright` |
 | `go.mod` | `go vet ./...` |
 | `Cargo.toml` | (covered by build) |
 
