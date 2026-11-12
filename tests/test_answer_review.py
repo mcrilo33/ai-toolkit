@@ -364,7 +364,7 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
     R.stubs.reply("orca.worktree_show", R.show)
     R.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": "/other-project", "linkedIssue": 9, "repoId": "other"}]}}))
     r = R.go(OK)   # only another repo's worktree carries #9: the review fails closed instead of reviewing it (#531)
-    assert r.returncode == 1 and "this repo" in r.stderr and not any(c[:2] == ["worktree", "show"] for c in R.stubs.calls("orca")[-2:])
+    assert r.returncode == 1 and "this repo" in r.stderr and R.stubs.calls("orca")[-1][:2] == ["worktree", "list"]
     R.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": str(R.wt), "linkedIssue": 9, "branch": "refs/heads/9-feat"}]}}))
     assert R.go(OK, rc=1).returncode == 1
     n = len(R.stubs.calls("claude"))

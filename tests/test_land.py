@@ -301,13 +301,13 @@ def test_review_runs_first_and_a_non_approval_exits_3(L, tmp_path, link_script):
     r = L.go("--review", "9", REVIEW_CMD=rev, REVIEW_RC=1)
     assert r.returncode == 3 and "review" in r.stderr
     no_side_effects(L, before)
-    assert [t[:2] for t in L.trail()] == [("orca", "worktree"), ("gh", "review")]
+    assert [t[:2] for t in L.trail()] == [("orca", "worktree"), ("orca", "worktree"), ("gh", "review")]   # the repo-scoped resolve, then the show
     n = len(L.trail())
     assert L.go("--review", "9", REVIEW_CMD=rev).returncode == 0
-    assert [t[:3] for t in L.trail()[n:n + 3]] == [("orca", "worktree", "show"), ("gh", "review", "9"), ("gh", "run", "list")]
+    assert [t[:3] for t in L.trail()[n:n + 4]] == [("orca", "worktree", "list"), ("orca", "worktree", "show"), ("gh", "review", "9"), ("gh", "run", "list")]
     # the review judges the exact tip: the sha it gets is the sha gated and the sha fast-forwarded onto main
-    reviewed = L.trail()[n + 1]
-    assert reviewed == ("gh", "review", "9", L.tip) and L.trail()[n + 2][4] == L.tip and main_sha(L) == L.tip
+    reviewed = L.trail()[n + 2]
+    assert reviewed == ("gh", "review", "9", L.tip) and L.trail()[n + 3][4] == L.tip and main_sha(L) == L.tip
 
 
 @pytest.mark.parametrize("msg", ["feat: green #9", "Merge sneaky #9"])   # a single-parent commit titled Merge is no merge
@@ -410,7 +410,7 @@ def test_cleanup_only_finishes_the_post_push_steps_after_exit_6(L):
     assert r.returncode == 0, r.stderr
     assert "status:in-progress" in r.stderr
     t = L.trail()[n:]
-    assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close"), ("gh", "issue", "edit")] and t[1][3:] == ("9", "-c", f"landed in {L.tip}")
+    assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close"), ("gh", "issue", "edit")] and t[2][3:] == ("9", "-c", f"landed in {L.tip}")
     assert ("gh", "issue", "edit", "9", "--remove-label", "status:in-progress") in t
     assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "list"), ("orca", "worktree", "show"), ("orca", "orchestration", "worker-list"),
                                                       ("orca", "orchestration", "worker-release"), ("orca", "worktree", "rm")]
@@ -439,7 +439,7 @@ def test_cleanup_only_works_when_the_worktree_is_gone_given_the_branch_and_tip(L
     assert r.returncode == 0, r.stderr
     t = L.trail()[gone:]
     assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close"), ("gh", "issue", "edit")] and t[-2][3:] == ("9", "-c", f"landed in {L.tip}")
-    assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "show")]   # no worker-list, release or rm
+    assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "list")]   # the resolve found no worktree of this repo: no show, worker-list, release or rm
 
 
 def test_cleanup_only_derives_the_tip_from_a_surviving_remote_branch_and_deletes_it(L, gone):
