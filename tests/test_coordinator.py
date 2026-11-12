@@ -139,7 +139,7 @@ def relink(C, link):   # the worker's Orca link as the coordinator reads it: as 
     if link == "relinked":
         C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 2, "branch": "refs/heads/1-x"}]}}))
     if link == "foreign":   # another Orca repo's worktree links #1 too (#531): outside this repo, it must not block
-        C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 1, "branch": "refs/heads/1-x"},
+        C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 1, "branch": "refs/heads/1-x", "repoId": "this"},
                                                                                  {"path": "/other-project", "linkedIssue": 1, "repoId": "other"}]}}))
 
 
@@ -759,6 +759,10 @@ def test_a_queued_dispatch_request_runs_ahead_of_the_automatic_pick_within_the_c
     req.write_text(c["text"] + "\n")
     wts = [{"path": C.wt, "linkedIssue": 1, "branch": "refs/heads/1-x"}] + ([{"path": "/k7", "linkedIssue": 7, "branch": "refs/heads/7-x"}] if c.get("kept") else [])
     C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": wts}}), rc=1 if c.get("no_worktrees") else 0)
+    if c.get("fails"):   # the failed fresh dispatch left a half-made worktree: the kept check predates it (call 1), the cleanup's own read sees it plus another repo's #7 (#531)
+        C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": wts}}), n=1)
+        C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [*wts, {"path": "/k7", "linkedIssue": 7, "branch": "refs/heads/7-x"},
+                                                                                 {"path": "/o7", "linkedIssue": 7, "repoId": "other"}]}}))
     if c.get("running"):
         C.workers(C.row(), {**C.row("ctx_7"), "resource": {"worktreeId": "r::/k7"}})
     C.stubs.reply("gh.issue_view", "boom" if c.get("unreadable") else c["v7"], rc=1 if c.get("unreadable") else 0)
@@ -776,7 +780,7 @@ def test_a_queued_dispatch_request_runs_ahead_of_the_automatic_pick_within_the_c
     else:
         asked = c.get("fails") or c.get("refuses")   # dispatch.sh was asked and said no: its own last line (and exit code, when it is a refusal) is the reason
         assert len(ran()) == int(bool(asked)) and req.read_text().splitlines() == [c["text"], c["why"]]   # line 2 is the reason, --status shows it
-        assert not C.calls("orca worktree rm")   # the cleanup removes only a worktree Orca lists for #7 in this repo; none here, so nothing is removed (#531)
+        assert [a[2:4] for a in C.calls("orca worktree rm")] == ([["--worktree", "path:/k7"]] if c.get("fails") else [])   # a failed fresh dispatch removes this repo's half-made worktree by path, never another repo's #7 (#531)
         if asked:
             C.go("--answer", "attended")
             assert len(ran()) == (1 if c.get("fails") else 2)   # a failed dispatch is not retried on every tick (the human asks again or cancels); a refusal is asked again at the next wake: the board may have changed

@@ -37,17 +37,21 @@ def test_issue_footer_reads_the_last_matching_line(run):
     assert r.stdout.splitlines() == ["hello.py tests/", "end"]
 
 
+MAIN_ROW = {"path": "MAIN", "repoId": "this", "isMainWorktree": True}   # the main checkout's own row, as a real scoped list returns it
+
+
 @pytest.mark.parametrize("rows, want", [
-    ([{"path": "/w5", "linkedIssue": 5}, {"path": "/other", "linkedIssue": 5, "repoId": "other"}], "path:/w5"),
-    ([{"path": "/w1", "linkedIssue": 1}], None),
-    ([{"path": "/w5", "linkedIssue": 5}, {"path": "/w5b", "linkedIssue": 5}], None),
-    ([{"path": "/other", "linkedIssue": 5, "repoId": "other"}], None),
+    ([MAIN_ROW, {"path": "/w5", "linkedIssue": 5, "repoId": "this"}, {"path": "/other", "linkedIssue": 5, "repoId": "other"}], "path:/w5"),
+    ([MAIN_ROW, {"path": "/w1", "linkedIssue": 1, "repoId": "this"}], None),
+    ([MAIN_ROW, {"path": "/w5", "linkedIssue": 5, "repoId": "this"}, {"path": "/w5b", "linkedIssue": 5, "repoId": "this"}], None),
+    ([MAIN_ROW, {"path": "/other", "linkedIssue": 5, "repoId": "other"}], None),
     (None, None),
 ], ids=["one", "none", "two-in-this-repo", "another-repo-only", "orca-failed"])   # #531: a worktree of another Orca repo linked to the same number never resolves
 def test_worktree_of_resolves_only_this_repos_worktree_for_an_issue(run, stubs, repo, rows, want):
     if rows is None:
         stubs.reply("orca.worktree_list", "boom", rc=1)
     else:
+        rows = [{**r, "path": str(repo.root.resolve()) if r["path"] == "MAIN" else r["path"]} for r in rows]
         stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": rows}}))
     r = run(["bash", "-euo", "pipefail", "-c", f". {V2}/scripts/lib.sh; worktree_of 5"], cwd=repo.root)
     assert (r.returncode, r.stdout) == ((0, want) if want else (1, ""))
