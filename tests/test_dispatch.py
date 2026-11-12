@@ -348,7 +348,9 @@ def test_nothing_ready_dispatches_nothing(d):
 
 def stale_worktree(d):
     """A kept worktree provisioned before main's .claude moved on; setup.local.sh in main marks WHEN the refresh ran in the call log."""
-    d.stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(d.wt), "branch": f"refs/heads/{NAME}"}}}))
+    d.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": str(d.wt), "linkedIssue": 7, "branch": f"refs/heads/{NAME}"},
+                                                                             {"path": "/other-project", "linkedIssue": 7, "repoId": "other"}]}}))   # another repo's #7 must never be relaunched (#531)
+    d.stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(d.wt), "branch": f"refs/heads/{NAME}"}}}))   # setup.sh --refresh reads the link by path
     (d.wt / ".claude/hooks").mkdir(parents=True)
     (d.wt / ".claude/hooks/guard.sh").write_text("stale\n")
     (d.wt / ".ai-toolkit/spoke-run-id").write_text("keep-me\n")
@@ -372,7 +374,8 @@ def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d)
     assert r.returncode == 0, r.stderr
     assert_refreshed_before_the_agent_starts(d, r)
     calls = d.orca()
-    assert [c[:2] for c in calls] == [["worktree", "show"], ["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
+    assert [c[:2] for c in calls] == [["worktree", "list"], ["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
+    assert calls[0][2:4] == ["--repo", f"path:{d.root}"] and calls[1][2:4] == ["--worktree", f"path:{d.wt}"]   # the issue is resolved within this repo only (#531)
     assert calls[2][2:6] == ["--worktree", f"path:{d.wt}", "--title", f"{NAME}-agent"] and calls[2][7].endswith(
         "/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")   # keeps the shim's OTel env
     assert calls[4] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}",
@@ -392,9 +395,9 @@ def test_a_failed_refresh_keeps_the_agent_off_the_worktree(d, args):
 
 def test_retry_needs_a_task_and_an_existing_worktree(d):
     assert d.go("--retry-of", "ctx_old", "7").returncode == 2
-    d.stubs.reply("orca.worktree_show", "no such worktree", rc=1)
+    d.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": "/other-project", "linkedIssue": 7, "repoId": "other"}]}}))   # only another repo has a #7 worktree: fail closed (#531)
     r = d.go("--retry-of", "ctx_old", "--task", "task_7", "7")
-    assert r.returncode == 1 and not any(c[:2] == ["terminal", "create"] for c in d.orca())
+    assert r.returncode == 1 and "this repo" in r.stderr and not any(c[:2] == ["terminal", "create"] for c in d.orca())
 
 
 def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_the_existing_worktree(d):
@@ -407,7 +410,7 @@ def test_address_starts_a_new_task_with_the_given_spec_on_a_fresh_terminal_in_th
     assert "warning" in r.stderr and ["issue", "edit", "7", "--add-label", "status:in-progress"] in d.stubs.calls("gh") and ["label", "create", "status:in-progress", "--color", "FBCA04"] in d.stubs.calls("gh")
     assert_refreshed_before_the_agent_starts(d, r)
     calls = d.orca()
-    assert [c[:2] for c in calls] == [["worktree", "show"], ["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
+    assert [c[:2] for c in calls] == [["worktree", "list"], ["worktree", "show"], ["terminal", "create"], ["terminal", "show"], ["orchestration", "worker-start"], ["worktree", "set"]]
     assert calls[2][7].endswith("/bin/claude-spoke --model claude-sonnet-5-5 --effort high --dangerously-skip-permissions")
     assert calls[4] == ["orchestration", "worker-start", "--run", "run_t", "--from", "term_coord", "--worktree", f"path:{d.wt}", "--terminal", "term_agent",
                         "--task-title", "#7 address", "--spec", "address: fix the blocker", "--timeout-ms", "120000"]

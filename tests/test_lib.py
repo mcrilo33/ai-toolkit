@@ -1,3 +1,6 @@
+import json
+
+import pytest
 from conftest import V2
 
 
@@ -32,6 +35,23 @@ def test_orca_mutate_does_not_replay_a_definite_failure(run, stubs):
 def test_issue_footer_reads_the_last_matching_line(run):
     r = lib(run, 'b=$(printf "t\\nScope: a.py\\nScope: hello.py tests/\\n"); issue_footer "$b" Scope; issue_footer "$b" Model; echo end')
     assert r.stdout.splitlines() == ["hello.py tests/", "end"]
+
+
+@pytest.mark.parametrize("rows, want", [
+    ([{"path": "/w5", "linkedIssue": 5}, {"path": "/other", "linkedIssue": 5, "repoId": "other"}], "path:/w5"),
+    ([{"path": "/w1", "linkedIssue": 1}], None),
+    ([{"path": "/w5", "linkedIssue": 5}, {"path": "/w5b", "linkedIssue": 5}], None),
+    ([{"path": "/other", "linkedIssue": 5, "repoId": "other"}], None),
+    (None, None),
+], ids=["one", "none", "two-in-this-repo", "another-repo-only", "orca-failed"])   # #531: a worktree of another Orca repo linked to the same number never resolves
+def test_worktree_of_resolves_only_this_repos_worktree_for_an_issue(run, stubs, repo, rows, want):
+    if rows is None:
+        stubs.reply("orca.worktree_list", "boom", rc=1)
+    else:
+        stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": rows}}))
+    r = run(["bash", "-euo", "pipefail", "-c", f". {V2}/scripts/lib.sh; worktree_of 5"], cwd=repo.root)
+    assert (r.returncode, r.stdout) == ((0, want) if want else (1, ""))
+    assert stubs.calls("orca")[0][:4] == ["worktree", "list", "--repo", f"path:{repo.root.resolve()}"]
 
 
 def test_gh_binary_can_be_swapped_by_env_for_stubbed_runs(run, stubs, tmp_path, link_script):
