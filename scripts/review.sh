@@ -21,7 +21,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 . "$here/lib.sh"
 load_env
 n="${1:-}"; sha="${2:-}"; [ -n "$n" ] || usage_exit "usage: review.sh <issue> [<sha>]"
-o="$(orca_json worktree show --worktree "issue:$n")" || die "no Orca worktree is linked to issue $n"
+sel="$(worktree_of "$n")" || die "no Orca worktree of this repo is linked to issue $n"   # never the cross-repo issue:<n> selector (#531)
+o="$(orca_json worktree show --worktree "$sel")" || die "worktree show failed for $sel"
 case "$here" in   # the one place of this install layout: the checkout's shared/, or the synced repo's .claude/ (rules under rules/ai-toolkit/)
   */.ai-toolkit/scripts) agents_d="$here/../../.claude/agents"; rules_d="$here/../../.claude/rules/ai-toolkit"; inventory_ds=("$rules_d" "$here/../rules") ;;
   *) agents_d="$here/../shared/agents"; rules_d="$here/../shared/rules"; inventory_ds=("$rules_d" "$rules_d/on-demand") ;;

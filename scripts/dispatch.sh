@@ -92,8 +92,9 @@ launch_twostep() {
   start_worker --worktree "path:$wt" --terminal "$term"; sel="path:$wt"
 }
 launch_retry() {
-  wt="$(orca_json worktree show --worktree "issue:$n")" || die "retry: no worktree for issue $n"
-  wt="$(printf '%s' "$wt" | jq -r '.result.worktree.path // empty')"; [ -n "$wt" ] || die "retry: no worktree path for issue $n"
+  local s
+  s="$(worktree_of "$n")" || die "retry: no worktree of this repo for issue $n"   # never the cross-repo issue:<n> selector (#531)
+  wt="${s#path:}"
   # A kept worktree still holds the copies it was created with: bring them up to date first, as a new worktree's setup does.
   # stderr, so a host's setup.local.sh output never precedes dispatch's one JSON line.
   ORCA_ROOT_PATH="$main" ORCA_WORKTREE_PATH="$wt" bash "$here/setup.sh" --refresh >&2 || die "refresh of $wt failed: no agent was started in it"

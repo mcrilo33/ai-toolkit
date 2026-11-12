@@ -99,7 +99,7 @@ awaiting_main() {   # the issue stays OPEN and labelled until the PR into MAIN_B
   return "$rc"
 }
 land_merged() {   # --merged <n>: exits; every step but the proof is retried by running it again
-  local pr sha ids m v o bad=0
+  local pr sha ids m v o sel bad=0
   [ -n "$main_kind" ] || bail 2 "refused: MAIN_BRANCH is $BASE_BRANCH, the base itself: nothing waits for a merge"
   pr="$(pr_of "$n")" || bail 2 "refused: no pull request into $MAIN_BRANCH carries #$n (or gh failed)"
   [ "$(jq -r .state <<< "$pr")" = MERGED ] || bail 2 "refused: $(jq -r .url <<< "$pr") is not merged"
@@ -108,10 +108,10 @@ land_merged() {   # --merged <n>: exits; every step but the proof is retried by 
   git merge-base --is-ancestor HEAD "origin/$BASE_BRANCH" || bail 2 "refused: local $BASE_BRANCH is not at origin/$BASE_BRANCH (ahead or diverged)"
   git merge -q --ff-only "origin/$BASE_BRANCH"
   # The cleanup comes first and the label goes last: the label is what the loop's next sweep retries from, so a step that fails here leaves every issue awaiting main.
-  if [ "$main_kind" = pr ] && o="$(orca_json worktree show --worktree "issue:$n" 2> /dev/null)"; then
+  if [ "$main_kind" = pr ] && sel="$(worktree_of "$n" 2> /dev/null)" && o="$(orca_json worktree show --worktree "$sel" 2> /dev/null)"; then
     branch="$(jq -r '.result.worktree.branch | sub("^refs/heads/"; "")' <<< "$o")"
     if git rev-parse -q --verify "refs/remotes/origin/$branch" > /dev/null; then git push -q origin ":refs/heads/$branch" || { warn "cannot delete origin/$branch"; bad=1; }; fi
-    orca_json worktree rm --worktree "issue:$n" --run-hooks > /dev/null || ! orca_json worktree show --worktree "issue:$n" > /dev/null 2>&1 || { warn "cleanup failed: worktree rm issue:$n"; bad=1; }
+    orca_json worktree rm --worktree "$sel" --run-hooks > /dev/null || ! orca_json worktree show --worktree "$sel" > /dev/null 2>&1 || { warn "cleanup failed: worktree rm $sel"; bad=1; }
   fi
   if [ "$main_kind" = integration ] && ! git merge-base --is-ancestor "origin/$MAIN_BRANCH" HEAD; then   # a squash merge leaves the base diverged: bring the true main back so the next rolling PR shows only new work
     if ! git merge -q --no-edit "origin/$MAIN_BRANCH" > /dev/null; then   # a content conflict does not resolve itself: its own exit, the loop blocks the issue
@@ -140,7 +140,7 @@ abs() { git rev-parse --path-format=absolute "$1"; }
 [ "$(git branch --show-current)" = "$BASE_BRANCH" ] || bail 2 "refused: the main checkout is not on $BASE_BRANCH"
 [ -z "$(git status --porcelain --untracked-files=no)" ] || bail 2 "refused: the main checkout has uncommitted changes"
 [ "$merged" = 0 ] || land_merged
-if o="$(orca_json worktree show --worktree "issue:$n" 2> /dev/null)"; then
+if sel="$(worktree_of "$n" 2> /dev/null)" && o="$(orca_json worktree show --worktree "$sel" 2> /dev/null)"; then   # this repo's worktree only, never the cross-repo issue:<n> selector (#531)
   wt="$(printf '%s' "$o" | jq -r '.result.worktree.path')"
   branch="$(printf '%s' "$o" | jq -r '.result.worktree.branch | sub("^refs/heads/"; "")')"
   [ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] || bail 2 "refused: the spoke worktree is dirty"
@@ -272,8 +272,8 @@ if [ "$gone" = 0 ]; then
   [ -n "$disp" ] || { warn "no dispatch found for $wt: worker-release skipped"; bad=1; }
   # The CLI can drop a long rm (~30 s) while Orca finishes it: a worktree that is gone counts as removed.
   if [ "$main_kind" != pr ]; then   # pr: the worktree is kept for --address
-    orca_json worktree rm --worktree "issue:$n" --run-hooks > /dev/null || ! orca_json worktree show --worktree "issue:$n" > /dev/null 2>&1 \
-      || { warn "cleanup failed: worktree rm issue:$n"; bad=1; }
+    orca_json worktree rm --worktree "path:$wt" --run-hooks > /dev/null || ! orca_json worktree show --worktree "path:$wt" > /dev/null 2>&1 \
+      || { warn "cleanup failed: worktree rm path:$wt"; bad=1; }
   fi
 fi
 if [ -n "$main_kind" ]; then printf 'landed #%s at %s, awaiting merge into %s\nPR: %s\n' "$n" "$sha" "$MAIN_BRANCH" "${pr_url:-}"

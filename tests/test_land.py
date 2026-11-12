@@ -62,6 +62,8 @@ def L(stubs, repo, run, tmp_path, link_script, origin_template):
     log = tmp_path / "stubs/calls.log"
     log.write_text("")   # drop the setup pushes: only land's own calls count
     stubs.reply("orca.worktree_show", json.dumps({"result": {"worktree": {"path": str(wt), "branch": f"refs/heads/{BRANCH}"}}}))
+    stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": str(wt), "linkedIssue": 9, "branch": f"refs/heads/{BRANCH}"},
+                                                                           {"path": "/other-project", "linkedIssue": 9, "repoId": "other"}]}}))   # another repo's #9 must never be picked (#531)
     stubs.reply("orca.orchestration_worker_list",
                 json.dumps({"result": {"workers": [{"dispatchId": "ctx_other", "resource": {"worktreeId": "r::/elsewhere"}},
                                                    {"dispatchId": "ctx_nowt", "resource": {"worktreeId": None}},   # one row without a worktree id must not drop the lookup
@@ -104,17 +106,18 @@ def test_ci_land_runs_every_step_in_order(L):
     assert sha == L.tip and git(L.root, "rev-parse", "HEAD") == sha
     t = L.trail()
     assert t == [
-        ("orca", "worktree", "show", "--worktree", "issue:9"),
+        ("orca", "worktree", "list", "--repo", f"path:{L.root.resolve()}"),
+        ("orca", "worktree", "show", "--worktree", f"path:{L.wt}"),
         ("gh", "run", "list", "--commit", L.tip, "databaseId,status,conclusion,url"),
         ("git", "push", "main"),
         ("gh", "issue", "close", "9", "-c", f"landed in {sha}"),
         ("gh", "issue", "edit", "9", "--remove-label", "status:in-progress"),
         ("git", "delete", BRANCH),
         ("orca", "orchestration", "worker-list", "--full"),
-        ("orca", "orchestration", "worker-release", "--dispatch", "ctx_9", *t[7][5:]),
-        ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks"),
+        ("orca", "orchestration", "worker-release", "--dispatch", "ctx_9", *t[8][5:]),
+        ("orca", "worktree", "rm", "--worktree", f"path:{L.wt}", "--run-hooks"),
     ]
-    assert "--retry-request" in t[7]
+    assert "--retry-request" in t[8]
     assert "no dispatch found" not in r.stderr
     # a repo without the sync sources is no toolkit checkout: land installs nothing and touches no installed copy
     assert not (L.root / ".ai-toolkit").exists() and (L.root / ".claude/hooks/guard.sh").read_text() == "#!/bin/sh\n"
@@ -252,7 +255,7 @@ def test_cleanup_failures_are_reported_after_landing_and_do_not_stop_the_rest(L)
     r = L.go("9")
     assert r.returncode == 6 and "cleanup" in r.stderr
     assert main_sha(L) == L.tip
-    assert ("git", "delete", BRANCH) in L.trail() and ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks") in L.trail()
+    assert ("git", "delete", BRANCH) in L.trail() and ("orca", "worktree", "rm", "--worktree", f"path:{L.wt}", "--run-hooks") in L.trail()
 
 
 def test_usage_errors_exit_2(L):
@@ -298,13 +301,13 @@ def test_review_runs_first_and_a_non_approval_exits_3(L, tmp_path, link_script):
     r = L.go("--review", "9", REVIEW_CMD=rev, REVIEW_RC=1)
     assert r.returncode == 3 and "review" in r.stderr
     no_side_effects(L, before)
-    assert [t[:2] for t in L.trail()] == [("orca", "worktree"), ("gh", "review")]
+    assert [t[:2] for t in L.trail()] == [("orca", "worktree"), ("orca", "worktree"), ("gh", "review")]   # the repo-scoped resolve, then the show
     n = len(L.trail())
     assert L.go("--review", "9", REVIEW_CMD=rev).returncode == 0
-    assert [t[:3] for t in L.trail()[n:n + 3]] == [("orca", "worktree", "show"), ("gh", "review", "9"), ("gh", "run", "list")]
+    assert [t[:3] for t in L.trail()[n:n + 4]] == [("orca", "worktree", "list"), ("orca", "worktree", "show"), ("gh", "review", "9"), ("gh", "run", "list")]
     # the review judges the exact tip: the sha it gets is the sha gated and the sha fast-forwarded onto main
-    reviewed = L.trail()[n + 1]
-    assert reviewed == ("gh", "review", "9", L.tip) and L.trail()[n + 2][4] == L.tip and main_sha(L) == L.tip
+    reviewed = L.trail()[n + 2]
+    assert reviewed == ("gh", "review", "9", L.tip) and L.trail()[n + 3][4] == L.tip and main_sha(L) == L.tip
 
 
 @pytest.mark.parametrize("msg", ["feat: green #9", "Merge sneaky #9"])   # a single-parent commit titled Merge is no merge
@@ -407,9 +410,9 @@ def test_cleanup_only_finishes_the_post_push_steps_after_exit_6(L):
     assert r.returncode == 0, r.stderr
     assert "status:in-progress" in r.stderr
     t = L.trail()[n:]
-    assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close"), ("gh", "issue", "edit")] and t[1][3:] == ("9", "-c", f"landed in {L.tip}")
+    assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close"), ("gh", "issue", "edit")] and t[2][3:] == ("9", "-c", f"landed in {L.tip}")
     assert ("gh", "issue", "edit", "9", "--remove-label", "status:in-progress") in t
-    assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "show"), ("orca", "orchestration", "worker-list"),
+    assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "list"), ("orca", "worktree", "show"), ("orca", "orchestration", "worker-list"),
                                                       ("orca", "orchestration", "worker-release"), ("orca", "worktree", "rm")]
     assert not [x for x in t if x[0] == "git"]   # branch already deleted: nothing to push, main untouched
 
@@ -427,7 +430,7 @@ def gone(L):
     L.stubs.reply("gh.issue_close", "boom", rc=1)
     assert L.go("9").returncode == 6
     L.stubs.reply("gh.issue_close", "")
-    L.stubs.reply("orca.worktree_show", "no such worktree", rc=1)
+    L.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": "/other-project", "linkedIssue": 9, "repoId": "other"}]}}))   # only another repo's #9 is left: this repo's is gone (#531)
     return len(L.trail())
 
 
@@ -436,7 +439,7 @@ def test_cleanup_only_works_when_the_worktree_is_gone_given_the_branch_and_tip(L
     assert r.returncode == 0, r.stderr
     t = L.trail()[gone:]
     assert [x[:3] for x in t if x[0] == "gh"] == [("gh", "issue", "close"), ("gh", "issue", "edit")] and t[-2][3:] == ("9", "-c", f"landed in {L.tip}")
-    assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "show")]   # no worker-list, release or rm
+    assert [x[:3] for x in t if x[0] == "orca"] == [("orca", "worktree", "list")]   # the resolve found no worktree of this repo: no show, worker-list, release or rm
 
 
 def test_cleanup_only_derives_the_tip_from_a_surviving_remote_branch_and_deletes_it(L, gone):
@@ -540,7 +543,7 @@ def test_a_failing_post_land_cmd_comments_on_the_issue_and_never_changes_the_exi
     assert r.returncode == 0 and "warning" in r.stderr
     t = L.trail()
     assert ("gh", "issue", "comment", "9", "-b", f"tracker update failed, do it by hand: PM-17 {L.tip}") in t
-    assert ("gh", "issue", "close", "9", "-c", f"landed in {L.tip}") in t and ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks") in t
+    assert ("gh", "issue", "close", "9", "-c", f"landed in {L.tip}") in t and ("orca", "worktree", "rm", "--worktree", f"path:{L.wt}", "--run-hooks") in t
 
 
 @pytest.mark.parametrize("tail", ["\r", " "])
@@ -586,7 +589,7 @@ def test_integration_land_pushes_the_base_leaves_the_issue_open_awaiting_main_an
     assert create[create.index("--head") + 1] == "main" and create[create.index("--base") + 1] == "develop"
     body = create[create.index("--body") + 1]
     assert "Closes #9" in body and "Closes #4" in body   # this issue and the ones already waiting
-    assert ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks") in t and ("git", "delete", BRANCH) in t   # the work is on the base: nothing needs the worktree
+    assert ("orca", "worktree", "rm", "--worktree", f"path:{L.wt}", "--run-hooks") in t and ("git", "delete", BRANCH) in t   # the work is on the base: nothing needs the worktree
     assert "PR: https://x/pull/5" in r.stdout
 
 
@@ -664,7 +667,7 @@ def test_merged_in_pr_mode_closes_the_issue_and_removes_the_branch_and_the_workt
     assert r.returncode == 0, r.stderr
     t = L.trail()
     assert ("gh", "issue", "close", "9", "-c", "merged into main in abc123") in t and calls_of(L, "post-land")[0][1:4] == ("9", "PM-17", "abc123")
-    assert ("git", "delete", BRANCH) in t and ("orca", "worktree", "rm", "--worktree", "issue:9", "--run-hooks") in t and ("git", "push", "main") not in t
+    assert ("git", "delete", BRANCH) in t and ("orca", "worktree", "rm", "--worktree", f"path:{L.wt}", "--run-hooks") in t and ("git", "push", "main") not in t
 
 
 @pytest.mark.parametrize("env, state", [({"MAIN_BRANCH": "develop"}, "OPEN"), ({"MAIN_BRANCH": "develop"}, "CLOSED"), ({}, "MERGED")], ids=["open", "closed", "nothing-waits"])

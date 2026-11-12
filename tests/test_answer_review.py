@@ -201,6 +201,8 @@ def R(stubs, repo, link_script, lean_rules):
     stdin, wt = tee_stdin(link_script), repo.wt("9-feat")
     show = json.dumps({"result": {"worktree": {"path": str(wt), "branch": "refs/heads/9-feat"}}})
     stubs.reply("orca.worktree_show", show)
+    stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": str(wt), "linkedIssue": 9, "branch": "refs/heads/9-feat"},
+                                                                           {"path": "/other-project", "linkedIssue": 9, "repoId": "other"}]}}))   # another repo's #9 must never be reviewed (#531)
     stubs.reply("gh", ISSUE)
 
     def go(verdict, rc=0, sha=None, **env):
@@ -360,6 +362,10 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
     R.stubs.reply("orca.worktree_show", "nope", rc=1)
     assert R.go(OK).returncode == 1
     R.stubs.reply("orca.worktree_show", R.show)
+    R.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": "/other-project", "linkedIssue": 9, "repoId": "other"}]}}))
+    r = R.go(OK)   # only another repo's worktree carries #9: the review fails closed instead of reviewing it (#531)
+    assert r.returncode == 1 and "this repo" in r.stderr and R.stubs.calls("orca")[-1][:2] == ["worktree", "list"]
+    R.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": str(R.wt), "linkedIssue": 9, "branch": "refs/heads/9-feat"}]}}))
     assert R.go(OK, rc=1).returncode == 1
     n = len(R.stubs.calls("claude"))
     r = R.go(OK, BASE_BRANCH="nope")   # the changed files cannot be listed: no rule selection to trust, so no review
