@@ -234,7 +234,7 @@ ctx() {
   [ -n "$r" ] || { warn "unknown dispatch '$1'"; return 1; }
   task="$(jq -r '.taskId // empty' <<< "$r")"; term="$(jq -r '.agentTerminalHandle // empty' <<< "$r")"
   wtp="$(jq -r '.resource.worktreeId | sub("^.*::"; "")' <<< "$r")"
-  r="$(okread worktree list)" || return 1
+  r="$(okread worktree list --repo "path:$PWD")" || return 1   # scoped: another repo's worktree linked to the same number must not count (#531)
   rows="$(jq -c '.result.worktrees' <<< "$r")"; r="$(jq -c --arg p "$wtp" '[.result.worktrees[] | select(.path == $p)][0] // {}' <<< "$r")"
   issue="$(jq -r '.linkedIssue // empty' <<< "$r")"
   br="$(jq -r '(.branch // "") | sub("^refs/heads/"; "")' <<< "$r")"   # Orca's branch for the worktree, never the worker's own HEAD (it can switch or rename it)
@@ -243,9 +243,13 @@ ctx() {
   # the human answers it by hand), and blames no issue, since the link is the one thing not trusted.
   rec="$(recorded_issue "$run" "$1")" || { warn "no dispatch record for $1: not trusting the link to #$issue of $wtp"; return 1; }
   [ "$rec" = "$issue" ] || { local linked="$issue"; issue="$rec"; block "Orca now links $wtp to #$linked but it was dispatched for #$rec: nothing is answered or landed until a human checks"; return 2; }
-  # review.sh and land.sh find the worktree by issue:<n>: a second worktree linked to this issue could be landed in this one's place.
-  [ "$(jq --argjson i "$issue" '[.[] | select(.linkedIssue == $i)] | length' <<< "$rows")" = 1 ] \
+  # review.sh and land.sh resolve the worktree for #n within this repo (worktree_of): a second worktree of this repo linked to it could be landed in this one's place.
+  [ "$(jq --argjson i "$issue" --arg p "$wtp" '([.[] | select(.path == $p)][0].repoId) as $r | [.[] | select(.repoId == $r and .linkedIssue == $i)] | length' <<< "$rows")" = 1 ] \
     || { block "more than one worktree is linked to #$issue in Orca: nothing is answered or landed until a human checks"; return 2; }
+}
+rm_wt() {   # <n>: remove the half-made worktree a failed fresh dispatch may leave. Only this repo's worktree for #n is ever removed; none resolved: nothing is (#531).
+  local s
+  s="$(worktree_of "$1" 2> /dev/null)" && orca_json worktree rm --worktree "$s" --force > /dev/null 2>&1 || true
 }
 nlive() { jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length'; }   # the workers of one wl reply that are live
 rounds() {   # dispatches of the worktree since its last human-requested round (a task titled "#<n> round", see named()), else all of them - 1; a relaunch shares its task, so the base is that task's oldest dispatch
@@ -449,7 +453,7 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
       if [ -n "$path" ]; then old="$(jq -r --arg p "::$path" '[.result.workers[] | select(.resource.worktreeId | endswith($p))][0].agentTerminalHandle // empty' <<< "$all")"
         [ -z "$old" ] || orca terminal close --terminal "$old" --json > /dev/null 2>&1 || true   # the previous agent's terminal (as redispatch does): two agents must not share the worktree
         out="$(RUN="$run" "$DISPATCH_CMD" --address "${spec:-address: continue from the pushed branch (git log), push, then send worker_done.}" --round "$n" 2>&1)" && rc=0 || rc=$?
-      else out="$(RUN="$run" "$DISPATCH_CMD" --next "$n" 2>&1)" && rc=0 || rc=$?; [ "$rc" = 0 ] || [ "$rc" = 3 ] || orca_json worktree rm --worktree "issue:$n" --force > /dev/null 2>&1 || true; fi   # a failed fresh dispatch may leave a half-made worktree (as fill() does)
+      else out="$(RUN="$run" "$DISPATCH_CMD" --next "$n" 2>&1)" && rc=0 || rc=$?; [ "$rc" = 0 ] || [ "$rc" = 3 ] || rm_wt "$n"; fi   # a failed fresh dispatch may leave a half-made worktree (as fill() does)
       if [ "$rc" = 0 ]; then
         ! jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null || gh issue edit "$n" --remove-label blocked > /dev/null 2>&1 || warn "cannot remove the blocked label of #$n"
         log "dispatched #$n on request"; rm -f "$f"; continue
@@ -468,7 +472,7 @@ fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --n
     case $rc in 0) ;; 3) ready=0; break ;; *) warn "dispatch --next failed ($rc)"; break ;; esac
     if out="$(RUN="$run" "$DISPATCH_CMD" "$n" 2>&1)"; then log "dispatched #$n"
     else   # may have left a half-made worktree behind: remove it and park the issue
-      warn "dispatch #$n failed: $out"; yield; orca_json worktree rm --worktree "issue:$n" --force > /dev/null 2>&1 || true
+      warn "dispatch #$n failed: $out"; yield; rm_wt "$n"
       issue="$n"; disp=""; wtp=""; block "dispatch failed: $(tail -n 1 <<< "$out")"
     fi
   done

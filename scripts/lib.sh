@@ -80,6 +80,21 @@ issue_of() {
   printf '%s' "$n"
 }
 
+# worktree_of <n>: the `path:<p>` selector of this repo's one worktree linked to issue n (the inverse of issue_of). The list is scoped to the
+# main checkout's repo (--repo), and rows are kept only when their repoId matches the main checkout's row, so another Orca project's worktree
+# linked to the same number is never matched (#531). rc 1 when Orca could not answer, or when this repo has zero or several matches: the
+# caller fails closed instead of falling back to the cross-repo `issue:<n>` selector.
+worktree_of() {
+  local main rows k
+  main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" || return 1
+  rows="$(orca_json worktree list --repo "path:$main" 2> /dev/null | jq -c --arg p "$main" --argjson n "$1" \
+    '.result.worktrees as $all | ([$all[] | select(.path == $p)][0].repoId) as $r | [$all[] | select(.repoId == $r and .linkedIssue == $n) | .path]')" \
+    && [ -n "$rows" ] || { printf '%s: Orca could not list the worktrees of %s\n' "${0##*/}" "$main" >&2; return 1; }
+  k="$(jq length <<< "$rows")"
+  [ "$k" = 1 ] || { printf '%s: %s worktrees of this repo are linked to #%s in Orca\n' "${0##*/}" "$k" "$1" >&2; return 1; }
+  printf 'path:%s' "$(jq -r '.[0]' <<< "$rows")"
+}
+
 # issue_text <n>: the live issue text for a gate's prompt, from GitHub only. The worker's worktree copy is its own to rewrite, so no gate judges it
 # and none falls back to it. A gh that fails (or returns nothing) is retried every AI_TOOLKIT_POLL seconds, ORCA_LINK_TRIES times (the same bound as
 # issue_of: about 2 minutes), then rc 1 names the issue on stderr: the gate declines rather than judging a weaker source.
