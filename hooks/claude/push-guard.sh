@@ -14,7 +14,7 @@ cwd="$(jq -r '.cwd // empty' <<<"$in")"; cwd="${cwd:-$PWD}"
 base="${BASE_BRANCH:-$(git -C "$cwd" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)}"; base="${base#origin/}"; base="${base:-main}"
 g() { git -C "$1" rev-parse --path-format=absolute "$2" 2>/dev/null || true; }
 hooks_re='hookspath|include\.path|includeif' hooks_msg="core.hooksPath override or config include" # an include file can set core.hooksPath
-[[ $cmd =~ GIT_CONFIG_(COUNT|KEY_|PARAMETERS|GLOBAL|SYSTEM) ]] && deny "$hooks_msg (GIT_CONFIG_* environment)"
+[[ ${cmd//[\"\'\\]/} =~ GIT_CONFIG_(COUNT|KEY_|PARAMETERS|GLOBAL|SYSTEM) ]] && deny "$hooks_msg (GIT_CONFIG_* environment)"
 
 check() { # the words of one command segment
   while [ $# -gt 0 ] && [[ ${1##*/} != git ]]; do shift; done
