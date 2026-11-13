@@ -45,7 +45,7 @@ unconfirmed; those change shared state and are hard to undo.
 - **Answer a gate, handle a finished worker**: `/coordinate` (`coordinate` skill): this session holds the Run, discusses the plan with the user, replies.
 - **Land**: `.ai-toolkit/scripts/land.sh --review <n>` (the independent review, then CI on the exact tip, then FF).
 - **Unattended**: `/coordinate auto` hands the Run to the coordinator loop instead of hand-driving each step.
-- **Teardown** (abandoned or finished by hand): `orca worktree rm --worktree issue:<n> --run-hooks`.
+- **Teardown** (abandoned or finished by hand): resolve this repo's worktree with `bash -c '. .ai-toolkit/scripts/lib.sh && worktree_of <n>'` (prints `path:<p>`), then `orca worktree rm --worktree path:<p> --run-hooks`. Zero or several matches (exit 1): stop and ask, never fall back to the cross-repo `issue:<n>` selector.
 
 ## Rules of thumb
 
