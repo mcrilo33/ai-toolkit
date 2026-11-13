@@ -1,5 +1,5 @@
 ---
-description: "Recurring mechanical traps a spoke hits on this host: merge origin/main before pushing, locale-sensitive system-tool output (LC_ALL=C), scratch files kept inside the worktree, restarting an expired gcloud login yourself, and ship discipline. Teaches how to satisfy the guard hooks, never to bypass them."
+description: "Recurring mechanical traps a spoke hits on this host: merge origin/main before pushing, locale-sensitive system-tool output (LC_ALL=C), scratch files kept inside the worktree, restarting an expired gcloud login yourself, landing inline work through land.sh --review when no coordinator runs, and ship discipline. Teaches how to satisfy the guard hooks, never to bypass them."
 paths:
   - '**'
 ---
@@ -32,7 +32,8 @@ When an urgent toolkit fix is done inline because no coordinator terminal runs (
 `land.sh --review <n>` still lands it with every gate, provided the work sits in an Orca worktree linked to the issue:
 
 - Do the work in `orca worktree create --name <n>-<slug> --issue <n> --setup skip`, not on a branch of the main checkout. If a branch
-  already exists, put the main checkout back on the base and attach it with `--branch <name> --issue <n>` (it checks out the existing branch; `land.sh` needs the issue link).
+  already exists, put the main checkout back on the base and attach it with `orca worktree create --name <n>-<slug> --branch <name> --issue <n> --setup skip` (it checks out the
+  existing branch; `land.sh` needs the issue link).
 - Commit with the usual split (`test:` commits for test files), push the branch, and let CI run.
 - From the main checkout, on the base and clean, run `bash .ai-toolkit/scripts/land.sh --review <n>`. Exit 6 whose only warning is
   `no dispatch found ... worker-release skipped` is expected: there was no worker to release.
