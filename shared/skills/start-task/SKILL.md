@@ -14,7 +14,7 @@ Restate the task as a draft issue: **title**, **body** (problem, proposal, accep
 conversation). Get an OK before filing; do not invent scope. If the work falls into independent file groups,
 draft one issue per group (`issue-hygiene`, Split what does not collide) and tell the user. An external ticket key
 as the argument (e.g. `PM-17`): read the ticket with the project's own tool (e.g. the Atlassian connector), draft from
-it, and add `Tracker: <KEY>` to the footer.
+it, and add `Tracker: <KEY>` to the footer. A spend cap in an issue is a priced estimate (units x the unit cost measured on the last comparable run x draws) plus about 50% headroom, with the arithmetic written next to it, never a round guess; with no comparable run, say so and leave the pricing to the PLAN.
 
 ## 2. File the issue
 
