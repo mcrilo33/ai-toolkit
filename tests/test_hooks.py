@@ -117,6 +117,7 @@ PUSH_DENY = [
         "git --config-env=core.hooksPath=X commit -m x", "git --config-env core.hooksPath=X commit -m x",
         "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/x git commit -m x",
         "export GIT_CONFIG_COUNT=1; git commit -m x", "GIT_CONFIG_GLOBAL=x git commit -m x",
+        'env GIT_CONF""IG_GLOBAL=x git commit -m x',
         "git -C . push -f", "git -C . push origin main", 'bash -c "git push --force"', "sh -c 'git push -f'",
         "bash -c'git push -f'", 'git pu""sh -f', 'git push origin "ma""in"', "cd sub && git push origin main",
         "echo ok; git push -f", "FOO=1 git push -f", "env git push -f", "/usr/bin/git push -f", "echo $(git push -f)",
