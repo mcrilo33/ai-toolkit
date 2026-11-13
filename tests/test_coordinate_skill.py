@@ -152,7 +152,7 @@ def test_a_finished_land_human_round_is_presented_as_two_levels_with_a_three_opt
 
 
 @pytest.mark.parametrize("path, needles", [
-    ("skills/start-task/SKILL.md", ["`Land:`", "`human`", "eval", "prompt", "annotator", "refused at dispatch"]),
+    ("skills/start-task/SKILL.md", ["`Land:`", "`human`", "eval", "prompt", "annotator", "refused at dispatch", "priced estimate", "never a round guess"]),
     ("skills/solo-cycle/SKILL.md", ["`Land: human`", "round report", "absolute paths", "guidance for the next round", "Deferred"]),
     ("rules/on-demand/issue-hygiene.md", ["`Land:`", "`human`", "round report", "`auto`"]),
 ])
