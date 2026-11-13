@@ -112,6 +112,11 @@ PUSH_DENY = [
         "git commit --no-verify -m x", "git commit -nm x", "git commit -an -m x", "git merge --no-verify x",
         "git -c core.hooksPath=/dev/null commit -m x", "git -c core.HOOKSpath=x commit -m x",
         "git config core.hooksPath /dev/null", "git config --global core.hooksPath x", "git -C . config core.hookspath x",
+        "git -c include.path=x commit -m x", "git -c includeIf.gitdir:/r/.path=x commit -m x", "git -c INCLUDE.PATH=x commit -m x",
+        "git config include.path x", "git config --local includeIf.onbranch:main.path x",
+        "git --config-env=core.hooksPath=X commit -m x", "git --config-env core.hooksPath=X commit -m x",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/x git commit -m x",
+        "export GIT_CONFIG_COUNT=1; git commit -m x", "GIT_CONFIG_GLOBAL=x git commit -m x",
         "git -C . push -f", "git -C . push origin main", 'bash -c "git push --force"', "sh -c 'git push -f'",
         "bash -c'git push -f'", 'git pu""sh -f', 'git push origin "ma""in"', "cd sub && git push origin main",
         "echo ok; git push -f", "FOO=1 git push -f", "env git push -f", "/usr/bin/git push -f", "echo $(git push -f)",
@@ -127,7 +132,7 @@ PUSH_ALLOW = [
         "git push origin feature-main", "git status", "git log --oneline -3", 'git commit -m "feat: running tests #1"',
         "git commit -am wip", "git commit --amend --no-edit", "git commit -mrunning", "git checkout -b new",
         "git checkout 2-y", "git checkout main -- README", "git fetch origin main", "git pull origin main",
-        "git -C . log", "git config user.name x", "ls -la", "gh pr list", "grep -rn force src", "git",
+        "git -C . log", "git -c color.ui=never log", "git config user.name x", "ls -la", "gh pr list", "grep -rn force src", "git",
     ]
 ] + [("root", c) for c in ["git checkout main", "git checkout -b x", "git push -u origin topic", "git status"]]
 
