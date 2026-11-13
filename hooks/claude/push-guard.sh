@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2086  # `check $seg` splits a segment into words on purpose (globbing is off: set -f)
 # push-guard: PreToolUse(Bash). Denies pushes to the base branch, force pushes, --no-verify, core.hooksPath
-# overrides and `git checkout <base>` from a linked worktree. Exit 2 + stderr = deny; any crash (bad JSON, no jq)
+# overrides (also through config includes, --config-env and GIT_CONFIG_*) and `git checkout <base>` from a linked worktree. Exit 2 + stderr = deny; any crash (bad JSON, no jq)
 # is exit 2 too, since every other code is non-blocking. A pattern deny-list, not a sandbox (D8).
 set -Eeuo pipefail
 deny() { echo "push-guard: blocked: $*" >&2; exit 2; }
@@ -13,6 +13,8 @@ cwd="$(jq -r '.cwd // empty' <<<"$in")"; cwd="${cwd:-$PWD}"
 [ -n "$cmd" ] || exit 0
 base="${BASE_BRANCH:-$(git -C "$cwd" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)}"; base="${base#origin/}"; base="${base:-main}"
 g() { git -C "$1" rev-parse --path-format=absolute "$2" 2>/dev/null || true; }
+hooks_re='hookspath|include\.path|includeif' hooks_msg="core.hooksPath override or config include" # an include file can set core.hooksPath
+[[ $cmd =~ GIT_CONFIG_(COUNT|KEY_|PARAMETERS|GLOBAL|SYSTEM) ]] && deny "$hooks_msg (GIT_CONFIG_* environment)"
 
 check() { # the words of one command segment
   while [ $# -gt 0 ] && [[ ${1##*/} != git ]]; do shift; done
@@ -20,7 +22,8 @@ check() { # the words of one command segment
   shift; local d="$cwd" sub="" a r dst cur refs="" n=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      -c | -C) [[ ${2:-} =~ hookspath ]] && deny "core.hooksPath override"; [ "$1" != -C ] || d="${2:-.}"; shift;; # case-sensitive [
+      -c | -C) [[ ${2:-} =~ $hooks_re ]] && deny "$hooks_msg"; [ "$1" != -C ] || d="${2:-.}"; shift;; # case-sensitive [
+      --config-env | --config-env=*) [[ $1${2:-} =~ $hooks_re ]] && deny "$hooks_msg"; [[ $1 == *=* ]] || shift;; # K=V is $1 or the next word
       --git-dir | --work-tree | --namespace | --exec-path) shift;;
       -*) ;;
       *) sub="$1"; shift; break;;
@@ -30,7 +33,7 @@ check() { # the words of one command segment
   case "$d" in /*) ;; *) d="$cwd/$d";; esac
   for a in "$@"; do case "$a" in --no-verify) deny "--no-verify";; esac; done
   case "$sub" in
-    config) [[ $* =~ hookspath ]] && deny "core.hooksPath override";;
+    config) [[ $* =~ $hooks_re ]] && deny "$hooks_msg";;
     commit) for a in "$@"; do [[ $a =~ ^-[^-mFCct][a-zA-Z]*$ && $a == *n* ]] && deny "commit -n skips the hooks"; done;;
     push)
       for a in "$@"; do
