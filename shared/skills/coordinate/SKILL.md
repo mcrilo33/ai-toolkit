@@ -68,7 +68,7 @@ loop shows, what bears on it (the files, the acceptance criteria, conflicts with
 
 The loop holds the Run, so this session neither dispatches nor lands itself: it asks the loop.
 
-- **What is running / status**: `coordinator.sh --status --run <run>` (holder, live workers and how long each is silent, the queue, dispatch requests with their reason), plus `gh issue list --state open --json number,title,labels`.
+- **What is running / status**: `coordinator.sh --status --run <run>` (holder, live workers and how long each is silent, the queue, dispatch requests with their reason), plus `gh issue list --state open --json number,title,labels`. A `telemetry:` line there means the OTel collector is down or degraded and spoke cost/latency telemetry is being lost: relay it to the user once, as a heads-up (the fix is `otel.sh up`), not as a queue item.
   A worker silent past 15 minutes (`COORD_IDLE_MIN`, no output or heartbeat, no open question) is relaunched once, then blocked by the loop; `observation.agentWait` in `orca orchestration worker-show --dispatch <id> --full` set means a prompt only the user can answer: tell them.
 - **Dispatch this issue**: `coordinator.sh --run <run> --dispatch <n> ['<message>']` queues it; the loop starts it at its next wake ahead of its own pick, within the cap (`CONCURRENCY_CAP`, 3) and the Scope rule. A kept worktree is re-dispatched
   with the message (`--address`; it loses its `blocked` label once started), a new one is dispatched plainly (a fresh worker reads only the issue body: put guidance there, the request is refused with a message). A request that cannot start (on hold, blocked with no message, a Scope overlap, no free slot,

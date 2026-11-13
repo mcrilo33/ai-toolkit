@@ -40,6 +40,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     for n in ("dispatch.sh", "land.sh", "answer.sh"):   # sub-commands are stubs that also record their stdin
         link_script(cmds / n, STUB_TEE)
     link_script(tmp_path / "stubs/bin/claude", STUB_TEE)   # the post-land triage prompt goes on its stdin
+    link_script(cmds / "otel.sh", STUB)   # healthy unless a test replies otherwise: no test starts the real otel.sh (docker)
 
     def row(d="ctx_1", st="dispatched", lv="live", rec=1):   # the dispatch record dispatch.sh keeps for every id a row uses: the issue it was given (None = none was written)
         (tmp_path / "state/run_t/dispatch").mkdir(parents=True, exist_ok=True)
@@ -98,7 +99,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     mail()
 
     def go(*args, run_id="run_t", co=CO, **env):
-        cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh")}
+        cmd_env = {f"{n.split('.')[0].upper()}_CMD": cmds / n for n in ("dispatch.sh", "land.sh", "answer.sh", "otel.sh")}
         return run(["bash", co, *(["--run", run_id] if run_id else []), "--session", "term_s", *args], cwd=repo.root,
                    **{"ORCA_TERMINAL_HANDLE": "term_c", "AI_TOOLKIT_POLL": 0, "COORD_MAX_TICKS": 1, "AITK_STATE_DIR": tmp_path / "state", **cmd_env, **env})
 
@@ -652,6 +653,31 @@ def test_slots_are_filled_up_to_the_cap_and_a_failed_dispatch_is_cleaned_up_and_
     assert C.go("--cap", "2").returncode == 0
     assert C.calls("orca worktree rm")[0][2:4] == ["--worktree", "path:/k5"] and C.calls("gh issue edit")[0][:3] == ["issue", "edit", "5"]
     assert not C.calls("orca worktree set")   # the worktree is gone: never a comment on a stale one
+
+
+OTEL_WARN = {1: ("down", "telemetry down: spokes will not be measured; run {c}/otel.sh up"),
+             3: ("degraded: 4 export failures in 15m (last: 401)", "telemetry degraded: 4 export failures in 15m (last: 401); the collector is up but failing to export to Langfuse, spoke telemetry may be lost")}
+
+
+@pytest.mark.parametrize("rc, env, called", [(1, {}, True), (3, {}, True), (0, {}, True), (1, {"AI_TOOLKIT_OTEL": "0"}, False)])   # #538
+def test_the_loop_warns_once_at_start_when_telemetry_is_down_or_degraded_and_dispatch_goes_on(C, tmp_path, rc, env, called):
+    C.stubs.reply(key("otel.sh", "status"), OTEL_WARN.get(rc, ("up",))[0], rc=rc)
+    C.stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "5\n")
+    C.stubs.reply(key("dispatch.sh", "5"), '{"issue":5}')
+    assert C.go("--cap", "2", COORD_MAX_TICKS=2, **env).returncode == 0
+    warned = [ln for ln in (tmp_path / "state/run_t/loop.log").read_text().splitlines() if "telemetry" in ln]
+    want = OTEL_WARN[rc][1].format(c=tmp_path / "cmds") if rc and not env else None
+    assert [ln.split("warning: ", 1)[1] for ln in warned] == ([want] if want else [])   # once per start, not per wake
+    assert C.stubs.calls("otel.sh") == ([["status"]] if called else [])
+    assert ["5"] in C.stubs.calls("dispatch.sh")   # never blocks a dispatch
+
+
+@pytest.mark.parametrize("rc", [1, 3, 0])
+def test_status_prints_the_telemetry_line_only_when_telemetry_is_not_up(C, tmp_path, rc):   # #538
+    C.stubs.reply(key("otel.sh", "status"), OTEL_WARN.get(rc, ("up",))[0], rc=rc)
+    r = C.go("--status", ORCA_TERMINAL_HANDLE="")
+    assert r.returncode == 0
+    assert [ln for ln in r.stdout.splitlines() if "telemetry" in ln] == ([f"telemetry: {OTEL_WARN[rc][1].split(' ', 1)[1].format(c=tmp_path / 'cmds')}"] if rc else [])
 
 
 def test_drain_stops_when_nothing_is_ready_and_no_worker_is_live_but_not_before(C, tmp_path, link_script):

@@ -1,5 +1,5 @@
 ---
-description: "Recurring mechanical traps a spoke hits on this host: merge origin/main before pushing, locale-sensitive system-tool output (LC_ALL=C), scratch files kept inside the worktree, restarting an expired gcloud login yourself, and ship discipline. Teaches how to satisfy the guard hooks, never to bypass them."
+description: "Recurring mechanical traps a spoke hits on this host: merge origin/main before pushing, locale-sensitive system-tool output (LC_ALL=C), scratch files kept inside the worktree, restarting an expired gcloud login yourself, landing inline work through land.sh --review when no coordinator runs, and ship discipline. Teaches how to satisfy the guard hooks, never to bypass them."
 paths:
   - '**'
 ---
@@ -25,6 +25,19 @@ one subject line and one line per body paragraph, and avoid backticks inside a `
 naming the paths. Satisfy it by splitting: stage the implementation by path (never `git add .`) and put the test change in its
 own `test(<scope>): ... #<n>` commit. A cross-cutting rename that must change src and tests together may carry a
 `Test-Change: <why>` line in the message. `land.sh` rechecks every pushed commit and refuses (exit 2) one that bypassed the hook.
+
+## Landing inline work when no coordinator runs
+
+When an urgent toolkit fix is done inline because no coordinator terminal runs (`dispatch.sh` needs `ORCA_TERMINAL_HANDLE`),
+`land.sh --review <n>` still lands it with every gate, provided the work sits in an Orca worktree linked to the issue:
+
+- Do the work in `orca worktree create --name <n>-<slug> --issue <n> --setup skip`, not on a branch of the main checkout. If a branch
+  already exists, put the main checkout back on the base and attach it with `orca worktree create --name <n>-<slug> --branch <name> --issue <n> --setup skip` (it checks out the
+  existing branch; `land.sh` needs the issue link).
+- Commit with the usual split (`test:` commits for test files), push the branch, and let CI run.
+- From the main checkout, on the base and clean, run `bash .ai-toolkit/scripts/land.sh --review <n>`. Exit 6 whose only warning is
+  `no dispatch found ... worker-release skipped` is expected: there was no worker to release.
+- Never push the base directly and never `gh pr merge`: both skip the recorded review, the commit recheck and the refresh of the installed copies.
 
 ## Locale traps in system-tool output
 

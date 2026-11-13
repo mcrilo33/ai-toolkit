@@ -8,7 +8,7 @@
 # ~10 min): a sweep of the workers that died or went idle without worker_done: one relaunch, then blocked. Idle = silent (no terminal output, heartbeat or
 # liveness change) for COORD_IDLE_MIN minutes (15) with no open question: worst-case detection = that bound + the sweep period (~25 min). A silent worker Orca shows parked on a human-only prompt, or cannot prove (absent agentWait, null terminal), is blocked at once, never relaunched: the loop cannot answer it, and its slot and Scope must not be held without bound, in either --answer mode (the block comment is the notice). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
-# back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD.
+# back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD OTEL_CMD.
 # --answer attended (the /coordinate attended loop, #450): the routine work out of sight, the human only for a decision. A routine plan is approved by answer.sh; a plan it hands over (exit 3, a reason) and every permission
 # request stay OPEN (the loop never approves one), queued for the human with the other open questions and the blocked issues; the session is told by ONE line typed into its terminal (--session <handle>, orca terminal send) when a decision arrives on an empty queue, and for every permission request; the loop rings nothing. --show <message-id> prints one open question whole. --dispatch <issue> [message]
 # queues a dispatch request the loop runs ahead of its own pick (cap and Scope rule apply). auto and human are unchanged.
@@ -53,6 +53,12 @@ if [ "$dreq" = 1 ]; then   # a dispatch request: <issue> = its one-line message 
   echo "dispatch request for #$dreq_n queued: the loop starts it at its next wake, or --status says why not"; exit 0
 fi
 DISPATCH_CMD="${DISPATCH_CMD:-$here/dispatch.sh}"; LAND_CMD="${LAND_CMD:-$here/land.sh}"; ANSWER_CMD="${ANSWER_CMD:-$here/answer.sh}"
+telemetry() {   # #538: otel.sh status once (OTEL_CMD, else the toolkit's own, else TOOLKIT_DIR's: hosts have no copy). Prints the state and fails when the collector is down or degraded; silent and 0 when up, opted out (AI_TOOLKIT_OTEL=0) or no otel.sh. Never starts, stops or retries anything
+  local c="${OTEL_CMD:-}" o rc=0; [ "${AI_TOOLKIT_OTEL:-1}" != 0 ] || return 0
+  [ -n "$c" ] || for c in "$here/otel.sh" "${TOOLKIT_DIR:-/nonexistent}/scripts/otel.sh" ""; do [ ! -f "$c" ] || break; done; [ -n "$c" ] || return 0
+  o="$("$c" status 2> /dev/null)" || rc=$?; [ "$rc" != 0 ] || return 0
+  if [ "$rc" = 3 ]; then echo "$o; the collector is up but failing to export to Langfuse, spoke telemetry may be lost"; else echo "down: spokes will not be measured; run $c up"; fi; return 1
+}
 cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
 log() { printf '%s coordinator: %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -140,6 +146,7 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
   [ -n "$run" ] || run="$(orca_json orchestration run-current --full | jq -r '.result.run.id // empty')"; if [ -n "$show_id" ]; then m="$(open_q | jq -c --arg i "$show_id" 'select(.id == $i)')" && [ -n "$m" ] || die "no open question $show_id on run $run"; show_q "$(question_of "$m")" 1000000; exit 0; fi
   log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold eq "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
   lm="$(live_hold ne "")" || { echo "no coordinator.sh loop is running for this Run"; [ ! -s "$(spool_dir "$run")/loop.log" ] || { echo "its last log lines:"; tail -n 3 "$(spool_dir "$run")/loop.log" | LC_ALL=C tr -d '\000-\010\013-\037\177' | sed 's/^/  /'; }; }; q=""; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || q="$q${f##*/} "; done; [ -z "$q" ] || echo "replies queued in the spool: $q"
+  if ! t="$(telemetry)"; then echo "telemetry: $t"; fi
   echo "live workers:"   # verdict, the agent's activity and the silence: `unverifiable` for a long run tells a stuck worker from a working one
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "\(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict) \(.projection.stage.activity // "-")"' | while read -r d w v a; do
     read -r age how <<< "$(silent "$d")" || true; echo "  $d $w $v $a, silent ${age:-?}m$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done || echo "  (Orca did not answer)"
@@ -226,6 +233,7 @@ sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$
 log() { local t; t="$(date '+%F %T')"; printf '%s coordinator: %s\n' "$t" "$*" >> "$lf" || true; printf '%s coordinator: %s\n' "${t#* }" "$*" || true; }
 warn() { local t; t="$(date '+%F %T')"; printf '%s coordinator: warning: %s\n' "$t" "$*" >> "$lf" || true; printf '%s: warning: %s\n' "${0##*/}" "$*" >&2 || true; }
 log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
+tel="$(telemetry)" || warn "telemetry $tel"   # #538: once per start, a heads-up only
 
 # ctx <dispatch>: sets disp task term wtp issue br (its Orca branch) from the worker's Orca row and the issue linked to its worktree.
 ctx() {
