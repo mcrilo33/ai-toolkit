@@ -209,8 +209,9 @@ H="$ORCA_TERMINAL_HANDLE"
 prev=""; [ -z "$run" ] || prev="$(holder)"
 if [ -n "$run" ]; then out="$(orca_mutate orchestration run-use --id "$run" --from "$H" 2>&1)" || die "run-use failed: $out"
 else
-  run="$(orca_mutate orchestration run-create --objective "ai-toolkit coordinator" --from "$H" | jq -r '.result.run.id // empty')"
-  [ -n "$run" ] || die "run-create failed"
+  out="$(orca_mutate orchestration run-create --objective "ai-toolkit coordinator" --from "$H" --full 2>&1)" || die "run-create failed: $out"   # --full: the concise view has no .result.run.id (#539)
+  run="$(jq -r '.result.run.id // empty' <<< "$out" 2> /dev/null || true)"
+  [ -n "$run" ] || die "run-create returned no run id: $out"
 fi
 if [ "$stop" = 1 ]; then   # the caller holds the Run now: the loop's wait returned consumer_fenced and it exits 0 at the end of its current step.
   for ((i = 0; i < ${COORD_STOP_TRIES:-900}; i++)); do   # Wait on the loop's own holder.<pid>, never on run-show: a second --stop already finds itself the holder
