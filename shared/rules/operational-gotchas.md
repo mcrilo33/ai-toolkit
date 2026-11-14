@@ -54,11 +54,11 @@ force `LC_ALL=C`:
 
 ## Keep debug scratch inside the worktree
 
-Write probe output, repro scripts, and temp dirs under your own worktree (`mktemp -d ./tmp.XXXXXX`, a single file as
+Write probe output, repro scripts, and temp dirs under your own worktree (a fixed-name dir `./tmp.<name>/` such as `mkdir -p ./tmp.home`, a single file as
 `./tmp.<name>` such as `tmp.suite.out`, not the `/tmp` default) or in the session scratchpad the system prompt names, never a hard-coded `/tmp/<name>`, `$HOME/...`,
-or a sibling worktree. When removing the scratchpad (or any temp dir) with `rm -r`, write the path literally, copied
-from the system prompt, never through a shell variable (`S=...; rm -rf "$S"`): `danger-guard` asks on an unexpanded
-`rm -r` target, and in auto mode that ask blocks the issue. In pytest, use the `tmp_path` fixture, not a hard-coded
+or a sibling worktree. When removing a scratch dir with `rm -r`, write the path literally (`rm -r ./tmp.home`, or the scratchpad's path copied
+from the system prompt), never through a shell variable, `$(...)` or `$PWD/...` (`S=...; rm -rf "$S"`): `danger-guard` asks on an unexpanded
+`rm -r` target, and in auto mode that ask blocks the issue; removing a `./tmp.*` dir is optional, since `/tmp.*` is git-ignored and goes away with the worktree. In pytest, use the `tmp_path` fixture, not a hard-coded
 `/tmp/<name>` path.
 
 For a read-only look at another revision, use `git show <rev>:<path>`, `git diff <a> <b> -- <path>` or `git archive <rev> | tar -x -C <scratch>`,
