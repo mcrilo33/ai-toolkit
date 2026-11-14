@@ -209,7 +209,7 @@ H="$ORCA_TERMINAL_HANDLE"
 prev=""; [ -z "$run" ] || prev="$(holder)"
 if [ -n "$run" ]; then out="$(orca_mutate orchestration run-use --id "$run" --from "$H" 2>&1)" || die "run-use failed: $out"
 else
-  out="$(orca_mutate orchestration run-create --objective "ai-toolkit coordinator" --from "$H" --full 2>&1)" || die "run-create failed: $out"   # --full: the concise view has no .result.run.id (#539)
+  out="$(orca_mutate orchestration run-create --objective "ai-toolkit coordinator" --from "$H" --full)" || die "run-create failed: $out"   # --full: the concise view has no .result.run.id (#539)
   run="$(jq -r '.result.run.id // empty' <<< "$out" 2> /dev/null || true)"
   [ -n "$run" ] || die "run-create returned no run id: $out"
 fi
