@@ -173,6 +173,7 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
   done < <(jq -j '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | [.id, ($p.question // ""), (.body // "")] | map(tostring | gsub("\u0000"; "") + "\u0000") | add' <<< "$oq")
   me="$(gh api user --jq .login 2> /dev/null)" || me=""   # the reason is the loop's own last "blocked:" comment (this gh login): the repo may be public, any other author's text is not shown
   bq="$(blocked_q || true)"; while IFS=$'\t' read -r n t <&3; do   # one line each, no control byte, capped: the text is somebody else's, it must not forge a queue item or move the cursor
+    [ -n "$n" ] || continue   # the here-string of an empty list is one empty line
     if grep -qxF "b:$n" "$hfile" 2> /dev/null; then hov="$hov #$n"; continue; fi   # handed over to the webhook (#546)
     w="$(gh issue view "$n" --json comments 2> /dev/null | jq -r --arg me "$me" '[.comments[] | select(.author.login == $me and (.body | startswith("blocked: "))) | .body] | last // "" | .[9:]' 2> /dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-160)" || w=""
     echo "  blocked #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)${w:+: $w}"
@@ -591,7 +592,7 @@ announce() {   # away: POST each decision the loop left open ($held) and each bl
     [ -n "$id" ] || continue; n="$id"; mid=""
     if [ "$ev" != blocked ]; then case " $held " in *" $id "*) ;; *) continue ;; esac; mid="$id"; n="$(recorded_issue "$run" "$d")" || n=""; fi
     now="$now$ev:$id "; case " $sent " in *" $ev:$id "*) continue ;; esac; [ "$fail" = 0 ] || continue
-    if [ "$answer" = attended ]; then lim="$HANDOVER_PLAN_S"; [ "$ev" != permission_request ] || lim="$HANDOVER_PERMISSION_S"; [ "$age" -ge "$lim" ] || continue; fi
+    if [ "$answer" = attended ]; then [ -z "$mid" ] || [ ! -e "$sd/replies/$id" ] || continue; lim="$HANDOVER_PLAN_S"; [ "$ev" != permission_request ] || lim="$HANDOVER_PERMISSION_S"; [ "$age" -ge "$lim" ] || continue; fi
     if ! [[ $id =~ ^[A-Za-z0-9_-]+$ && $n =~ ^[0-9]+$ ]]; then warn "webhook: no issue is recorded for $ev $id, so it cannot be announced: reply by hand, see --status"; sent="$sent$ev:$id "
     elif post "$ev" "$n" "$mid"; then sent="$sent$ev:$id "; [ "$answer" != attended ] || printf '%s:%s\n' "$(case "$ev" in plan) echo q ;; permission_request) echo p ;; *) echo b ;; esac)" "$id" >> "$sd/handed"; else [ $? = 22 ] || fail=1; fi   # curl 22 = the receiver answered with an HTTP error: the next decision is still sent; any other failure (down, timeout) stops this wake
   done 3<<< "$items"
