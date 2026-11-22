@@ -333,6 +333,14 @@ def test_a_reply_for_an_unknown_or_already_answered_question_is_dropped_and_a_fa
     assert not C.spooled("msg_open") and "dropped" in r.stderr and "bad_state" in r.stderr and any("reply to msg_open was dropped" in t for t in told)   # the human hears about it
 
 
+def test_away_announces_a_decision_again_when_the_reply_to_it_was_dropped(C, tmp_path):
+    C.inbox(["msg_open"])
+    C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # the reply fails twice: kept at the first wake, dropped at the second, and the question is still open
+    C.spool("msg_open", "approve")
+    _, bodies, _ = posted(C, tmp_path, COORD_REPLY_TRIES=2, COORD_MAX_TICKS=2)
+    assert not C.spooled("msg_open") and [b["message_id"] for b in bodies] == ["msg_open"] * 2   # the first wake announced it, the drop made the second announce it again
+
+
 def test_a_reply_dropped_after_the_bound_is_not_announced_to_the_session_outside_attended_mode(C):
     C.inbox(["msg_open"])
     C.stubs.reply("orca.orchestration_reply", "boom", rc=1)
@@ -1059,7 +1067,8 @@ def test_outside_away_nothing_is_posted_even_with_the_webhook_set(C, tmp_path, m
 START_RULES = {   # (arguments, the webhook, what the start does)
     "away-without-webhook": (["--answer", "away"], "", "refused"), "away-with-a-bad-webhook": (["--answer", "away"], "ftp://x y", "refused"),
     "away-types-nothing-into-a-session": (["--answer", "away", "--session", "term_s"], URL, "refused"),
-    "no-position-with-webhook": ([], URL, "answer away"), "no-position-without-webhook": ([], "", "answer auto"), "explicit-auto-with-webhook": (["--answer", "auto"], URL, "answer auto"),
+    "no-position-with-webhook": ([], URL, "cap 3, answer away"), "no-position-without-webhook": ([], "", "cap 3, answer auto"), "explicit-auto-with-webhook": (["--answer", "auto"], URL, "cap 3, answer auto"),
+    "a-bad-webhook-leaves-the-one-shot-commands-alone": (["--status"], "ftp://x y", "run: run_t"),
 }
 
 
@@ -1069,7 +1078,7 @@ def test_a_loop_started_with_no_position_is_away_only_when_a_webhook_is_set_and_
     if outcome == "refused":
         assert r.returncode == 2 and len(r.stderr.splitlines()) == 1 and (not url or url not in r.stderr) and r.stdout == ""   # refused before the loop starts
     else:
-        assert r.returncode == 0 and f"cap 3, {outcome}" in r.stdout
+        assert r.returncode == 0 and outcome in r.stdout
 
 
 POSITIONS = {"no-loop": (None, "term_c", "none"), "attended": ("attended until 23:00", "term_c", "attended"), "away": ("away", "term_c", "away"), "auto": ("auto drain", "term_c", "auto"),
