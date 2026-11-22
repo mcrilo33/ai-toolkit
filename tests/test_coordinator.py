@@ -744,6 +744,7 @@ def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply
     C.stubs.reply("orca.orchestration_run_current", '{"result":{"run":{"id":"run_t"}}}')
     r = C.go("--status", run_id="run_t" if given else None, ORCA_TERMINAL_HANDLE="")   # read-only: no coordinator terminal needed
     assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and REPLY in r.stdout and "msg_a" not in r.stdout
+    assert "blocked #" not in r.stdout   # no blocked issue, no blocked entry
     assert re.search(rf"ctx_1 \S+ live working, {line}", r.stdout, re.M)
     reads = ("worker-list", "worker-show", "worker-read", "inbox", "run-show") + (() if given else ("run-current",))
     assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in reads] == []
@@ -1066,7 +1067,7 @@ def test_away_retries_a_failed_post_at_the_next_wake_never_stops_the_loop_and_dr
 
 
 @pytest.mark.parametrize("mode", ["attended", "auto", "human"])
-def test_outside_away_nothing_is_posted_even_with_the_webhook_set(C, tmp_path, mode):
+def test_outside_away_nothing_is_posted_even_with_the_webhook_set_and_attended_not_before_a_delay(C, tmp_path, mode):
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)
     C.stubs.reply("gh.issue_list", BLOCKED)
     ticks([], ["msg_a", "msg_pb"])
@@ -1102,6 +1103,14 @@ def test_attended_hands_an_unanswered_decision_over_to_the_webhook_once_after_it
     r, bodies, seen = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=3, **settings)   # three wakes: handed over once, not at each
     assert r.returncode == 0 and bodies == ([handed(**post)] if post else []) and URL not in seen
     assert (tmp_path / "state/run_t/handed").exists() == bool(post)
+
+
+def test_a_decision_whose_reply_is_queued_in_the_spool_is_never_handed_over(C, tmp_path):
+    aged(C, msg_a=700)
+    C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # the reply cannot be sent yet: it stays queued and the question stays open in Orca
+    C.spool("msg_a", "approve")
+    r, bodies, _ = posted(C, tmp_path, pos="attended")
+    assert r.returncode == 0 and C.spooled("msg_a") and bodies == []
 
 
 def test_a_decision_handed_over_is_left_out_of_the_queue_the_session_presents(C, tmp_path):
