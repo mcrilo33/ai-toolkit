@@ -1,5 +1,5 @@
 ---
-description: "Recurring mechanical traps a spoke hits on this host: merge origin/main before pushing, locale-sensitive system-tool output (LC_ALL=C), scratch files kept inside the worktree, restarting an expired gcloud login yourself, landing inline work through land.sh --review when no coordinator runs, and ship discipline. Teaches how to satisfy the guard hooks, never to bypass them."
+description: "Recurring mechanical traps a spoke hits on this host: merge origin/main before pushing, locale-sensitive system-tool output (LC_ALL=C), scratch files kept inside the worktree, restarting an expired gcloud or aws sso login yourself, landing inline work through land.sh --review when no coordinator runs, and ship discipline. Teaches how to satisfy the guard hooks, never to bypass them."
 paths:
   - '**'
 ---
@@ -65,9 +65,11 @@ For a read-only look at another revision, use `git show <rev>:<path>`, `git diff
 never `git worktree add`: it registers in the main repo, shows in Orca as a project worktree, and outlives the session. If a full checkout is
 unavoidable, `git worktree remove --force <literal path>` it in the same step that used it.
 
-## Google Cloud: expired gcloud tokens
+## Expired cloud logins: gcloud and aws sso
 
-Where interactive 2-step reauthentication is enforced, gcloud tokens expire and a refresh fails in a non-interactive shell with `Reauthentication failed. cannot prompt during non-interactive execution`. When that happens, or when `gcloud auth print-access-token --quiet` fails before a GCP task: run `gcloud auth login --update-adc` yourself in the background, poll `gcloud auth print-access-token --quiet` until it succeeds, then carry on. The user validates the browser prompt; do not ask them to run the command and do not stop to ask. `--update-adc` refreshes the Python ADC in the same flow. If the token is still invalid after about 5 minutes, stop polling and say so.
+Where interactive 2-step reauthentication is enforced, gcloud tokens expire and a refresh fails in a non-interactive shell with `Reauthentication failed. cannot prompt during non-interactive execution`. When that happens, or when `gcloud auth print-access-token --quiet` fails before a GCP task: run `gcloud auth login --update-adc` yourself in the background, poll `gcloud auth print-access-token --quiet` until it succeeds, then carry on. The user validates the browser prompt. In a chat session, do not ask them to run the command and do not stop to ask; a spoke has no attended chat, so it sends one `ask` naming the URL or device code to validate and waits for the reply (`solo-cycle`). `--update-adc` refreshes the Python ADC in the same flow. In a chat session, if the token is still invalid after about 5 minutes, stop polling and say so; a spoke restarts the flow and re-asks with the fresh URL or device code (`solo-cycle`).
+
+AWS SSO is the same pattern: when `aws sts get-caller-identity --profile <p>` reports an expired token, start `aws sso login --profile <p> --no-browser` in the background, let the human validate the URL and device code, and poll `aws sts get-caller-identity --profile <p>` until it succeeds. A device code lasts about 10 minutes: when it expired or the poll still fails, a chat session stops and says so as above, and a spoke restarts the flow and re-asks (`solo-cycle`). This says how to start the flow; `solo-cycle` says how to reach the human (through its `ask`).
 
 ## Ship discipline
 

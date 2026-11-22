@@ -47,7 +47,7 @@ Three forms; this section is the only place that says which to pick, and every o
 | Reply | Pick it when | The spoke |
 |-------|--------------|-----------|
 | `approve` | the plan is correct, complete, in `Scope:`, with a proportionate test strategy | starts work |
-| `approve with: <change>` | approach, files and `Scope:` are right and one minimal correction remains, applicable without re-planning (drop or rename one test, extend one named test, reword, drop one out-of-scope file) | applies it, starts work, never asks again |
+| `approve with: <change>` | approach, files and `Scope:` are right and one minimal correction remains, applicable without re-planning (drop or rename one test, extend one named test, reword, drop one out-of-scope file), or the reply to a human-only step (`done`, `the human is away`) | applies it, starts work, never asks again |
 | `revise: <change>` | the plan itself is wrong or incomplete: wrong approach, a missing step or file, an uncovered criterion, or a change that makes the spoke re-derive the plan | amends the plan, asks again (max 2 rounds) |
 
 Test: if you would want to read the corrected plan again, `revise:`; if you would approve it unseen, `approve with:`.
@@ -73,6 +73,10 @@ allow one; if one reaches you anyway, never allow it. `allow` and `deny` are rep
 - **auto**: replies `deny` at once, without calling you or any model. Only the user allows a permission, and a `deny` is the only unattended outcome.
 - **attended**: the loop never approves one either: it leaves every request open, queued for the human, who has the relay's 9 minutes (the worker's relay denies itself after that; with the webhook set, a request still open after `HANDOVER_PERMISSION_S` is handed over to it). The loop has no containment check and no second judge; the guard and its judge already decide what reaches the human.
 - **human**: leaves it open; the human replies `allow` or `deny`.
+
+## A step only the human can do
+
+A spoke's ask for a login, token or setting only the human can do is no plan. `Mode: auto`: nobody can do it, so reply `approve with: the human is away, end with worker_done --outcome failed naming the step` (not `revise:`, so it does not re-ask; the issue blocks through the normal channel, with no fence). `Mode: attended`: `ANSWER: human: <the step>`.
 
 ## Irreversible, outward-facing, or scope-changing asks
 

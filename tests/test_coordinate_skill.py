@@ -1,5 +1,8 @@
 """Policy lint of the /coordinate skill (WP7): the session only converses and decides, every mechanic it names must exist."""
+import json
+import os
 import re
+import subprocess
 
 import pytest
 from conftest import ROOT, V2
@@ -29,9 +32,37 @@ def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
     "land.sh --review", "blocked", "hold", "PERMISSION REQUEST", "allow", "deny", "COORD_IDLE_MIN", "orca orchestration worker-show --dispatch <id> --full", "observation.agentWait", "orca terminal read",
     "orca orchestration run-list", "afk-answering", "Scope:", "git log --since", "worker-list",
     "AI_TOOLKIT_DIR", "no toolkit guards", "bin/claude-spoke", "--wait", "run_in_background", "COORD_WATCH_SEC", "7200000",
+    "CLAUDE_CODE_SESSION_ID", "cache_read_input_tokens", "orca agent launch", "/coordinate attended --run <run>",
     "/coordinate away", "--answer away", "NOTIFY_WEBHOOK_URL", "--position", "never both", "handed over to the webhook", "HANDOVER_PLAN_S", "attended --until"])   # the guards precondition: a session not started through the launcher says so
 def test_the_skill_covers_each_mechanic_of_the_brief(needle):
     assert needle in SKILL
+
+
+def _usage(n: int, side: bool) -> dict:
+    return {"type": "assistant", "isSidechain": side, "message": {"usage": {"input_tokens": n, "cache_read_input_tokens": 10 * n, "cache_creation_input_tokens": 100 * n}}}
+
+
+def test_the_handover_is_measured_from_the_transcript_at_an_idle_point_and_never_starts_a_second_loop(tmp_path):
+    h = section("Handover")
+    assert "200k" in h and re.search(r"state lives in Orca, git and the issue labels, not in the chat", h)   # the threshold and why a fresh session loses nothing
+    assert re.search(r"unknown.{0,60}no handover", h) and "`null`" in h   # the probe prints null when it finds no transcript: no guessing
+    assert re.search(r"idle point.{0,120}no decision on screen.{0,80}no `--stop`", h, re.S)   # never mid-decision or mid-switch
+    assert re.search(r"never a second loop", h) and "held by: coordinator.sh (attended" in h and "--session" in h   # attach to the running loop; only a terminal successor re-points it
+    assert re.search(r"--surface .{0,200}ORCA_TERMINAL_HANDLE", h, re.S)   # a terminal session hands to a terminal: the loop types only into one
+    assert re.search(r"launch succeeded.{0,80}TaskStop.{0,60}(watcher|--wait)", h, re.S) and "--retry-launch" in h   # the old watcher would present every decision twice, but only once the successor exists
+    assert re.search(r"finished.{0,80}never re-arms `--wait` and never presents again", h, re.S)   # the old chat can still get a turn (a typed loop line, a notification)
+    assert re.search(r"presents `--status` while it runs", h)   # no silent window while a terminal successor waits out a land
+    block = re.search(r"```bash\n(.*?)```", h, re.S)   # the probe itself, on a fixture: main thread only, the last entry, the three input counters summed
+    assert block
+    d = tmp_path / ".claude/projects/p"
+    d.mkdir(parents=True)
+    (d / "sid.jsonl").write_text("\n".join(json.dumps(e) for e in [_usage(1, False), {"type": "user"}, _usage(2, False), _usage(9, True)]))
+
+    def run(sid: str) -> str:
+        env = {**os.environ, "HOME": str(tmp_path), "CLAUDE_CODE_SESSION_ID": sid}
+        return subprocess.run(["bash", "-c", block.group(1)], env=env, capture_output=True, text=True).stdout.strip()
+
+    assert run("sid") == "222" and run("no-such-session") == "null"
 
 
 def test_every_script_and_flag_the_skill_names_exists():
@@ -157,6 +188,10 @@ def test_a_finished_land_human_round_is_presented_as_two_levels_with_a_three_opt
     ("skills/start-task/SKILL.md", ["`Land:`", "`human`", "eval", "prompt", "annotator", "refused at dispatch", "priced estimate", "never a round guess"]),
     ("skills/solo-cycle/SKILL.md", ["`Land: human`", "round report", "absolute paths", "guidance for the next round", "Deferred"]),
     ("rules/on-demand/issue-hygiene.md", ["`Land:`", "`human`", "round report", "`auto`"]),
+    ("skills/solo-cycle/SKILL.md", ["only the human can do", "never escalate", "restart the flow", "fresh URL or device code"]),
+    ("rules/operational-gotchas.md", ["aws sso login", "aws sts get-caller-identity", "through its `ask`", "In a chat session, if the token", "a spoke restarts the flow"]),
+    ("skills/coordinate/SKILL.md", ["never tells the worker to \"escalate\""]),
+    ("rules/on-demand/afk-answering.md", ["the human is away", "worker_done --outcome failed"]),
 ])
 def test_the_land_human_footer_is_taught_where_issues_are_filed_worked_and_documented(path, needles):
     text = (SHARED / path).read_text()
