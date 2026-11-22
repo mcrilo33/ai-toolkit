@@ -553,17 +553,17 @@ tell() {   # $1 kind (p|q|b|h = a finished issue held|r = a dropped reply), $2 i
 post() {   # $1 event, $2 issue, $3 message id (none for blocked): ONE POST of ids to NOTIFY_WEBHOOK_URL. The body is built from ids only (a worker's text never enters it) and the URL goes in through a config file descriptor: in no argv, log, comment or warning
   local body rc=0; [ -n "${nwo:-}" ] || nwo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2> /dev/null)" || nwo=""; [ -n "$nwo" ] || { warn "webhook: cannot read the repository name, retried at the next wake"; return 1; }
   body="$(jq -nc --arg e "$1" --arg r "$nwo" --argjson i "$2" --arg run "$run" --arg m "${3:-}" '{event: $e, repo: $r, issue: $i, run: $run} + (if $m == "" then {} else {message_id: $m} end) + {position: "away", handed_over: false}')" || return 1
-  printf '%s' "$body" | curl -s -f -m 5 -X POST -H 'Content-Type: application/json' --data-binary @- --config <(printf 'url = "%s"\n' "$NOTIFY_WEBHOOK_URL") > /dev/null 2>&1 || { rc=$?; warn "cannot POST the decision to the webhook (curl exit $rc): sent again at the next wake"; return 1; }
+  printf '%s' "$body" | curl -q -s -f -m 5 -X POST -H 'Content-Type: application/json' --data-binary @- --config <(printf 'url = "%s"\n' "$NOTIFY_WEBHOOK_URL") > /dev/null 2>&1 || { rc=$?; warn "cannot POST the decision to the webhook (curl exit $rc): sent again at the next wake"; return "$rc"; }
 }
 announce() {   # away: POST each decision the loop left open ($held) and each blocked issue ($bids) once; $sent holds the delivered ones (no file: a restart sends again, the receiver dedupes). A failed POST stops this wake's sends (a dead webhook costs 5 s, not 5 s each) and is retried at the next; an id no longer in the queue is dropped from $sent
-  local items ev id d n mid fail=0 now="" keep="" i; items="$(open_q | jq -r '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | "\(if ($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") then "permission_request" else "plan" end) \(.id) \($p.dispatchId // "-")"')" || return 0
+  local items ev id d n mid fail=0 now="" keep="" i; items="$(open_q | jq -r '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | [(if ($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") then "permission_request" else "plan" end), .id, ($p.dispatchId // "-")] | @tsv')" || return 0   # @tsv: a field a worker wrote cannot start a line of its own
   for i in $bids; do items="$items"$'\n'"blocked ${i#b:} -"; done
   while read -r ev id d <&3; do
     [ -n "$id" ] || continue; n="$id"; mid=""
     if [ "$ev" != blocked ]; then case " $held " in *" $id "*) ;; *) continue ;; esac; mid="$id"; n="$(recorded_issue "$run" "$d")" || n=""; fi
     now="$now$ev:$id "; case " $sent " in *" $ev:$id "*) continue ;; esac; [ "$fail" = 0 ] || continue
-    if ! [[ $id =~ ^[A-Za-z0-9_-]+$ && $n =~ ^[0-9]+$ ]]; then warn "webhook: no issue is recorded for $ev $id, not announced: it is in --status"; sent="$sent$ev:$id "
-    elif post "$ev" "$n" "$mid"; then sent="$sent$ev:$id "; else fail=1; fi
+    if ! [[ $id =~ ^[A-Za-z0-9_-]+$ && $n =~ ^[0-9]+$ ]]; then warn "webhook: no issue is recorded for $ev $id, so it cannot be announced (away): reply by hand, see --status"; sent="$sent$ev:$id "
+    elif post "$ev" "$n" "$mid"; then sent="$sent$ev:$id "; else [ $? = 22 ] || fail=1; fi   # curl 22 = the receiver answered with an HTTP error: the next decision is still sent; any other failure (down, timeout) stops this wake
   done 3<<< "$items"
   for i in $now; do case " $sent " in *" $i "*) keep="$keep$i " ;; esac; done; sent=" $keep"
 }
