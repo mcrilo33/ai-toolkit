@@ -7,7 +7,7 @@
 # copies from the main checkout (setup.sh --refresh), keeping its spoke-run-id; a failed refresh starts no agent.
 # --round (with --address): the new task is titled "#<n> round", a round the human asked for (coordinator.sh counts the retry budget from the last one).
 # --next <issue>: the same pick restricted to that issue, so it starts only if it is ready (exit 3 and a message when it is not).
-# Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready.
+# Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready, 4 Claude's folder-trust dialog is still up after being answered once (the repo root is not trusted: no issue is at fault).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
@@ -77,8 +77,15 @@ start_worker() {   # worker-start with the common flags; $@ = placement flags. S
   local out what=(--task-title "#$n $title" --spec "$(seed "$gate")")
   [ -z "$retry_of" ] || what=(--task "$task" --retry-of "$retry_of")
   [ -z "$address" ] || what=(--task-title "#$n $([ "$round" = 1 ] && echo round || echo address)" --spec "$address$([ "$land" != human ] || echo " $ROUND_NOTE")")   # a fresh agent reads no seed: a Land: human issue repeats the report reminder
-  out="$(orca_mutate orchestration worker-start --run "$run" --from "$ORCA_TERMINAL_HANDLE" "$@" "${what[@]}" --timeout-ms 120000)" \
-    || die "worker-start failed: $(printf '%s' "$out" | jq -c '{state: .result.state, stage: .result.failedStage}' 2> /dev/null)"
+  local tried=0
+  until out="$(orca_mutate orchestration worker-start --run "$run" --from "$ORCA_TERMINAL_HANDLE" "$@" "${what[@]}" --timeout-ms 120000)"; do
+    # Orca can report claude while the folder-trust dialog is still up, so worker-start meets it (#547): answered once, then the root needs trusting by hand.
+    if [ "$tried" = 0 ] && [ -n "${term:-}" ] && [ "$(jq -r '.result.failedStage // empty' <<< "$out" 2> /dev/null)" = agent_readiness ] && _trust_dialog_up "$term"; then
+      tried=1; _answer_trust_dialog "$term"; continue
+    fi
+    if [ "$tried" = 1 ] && _trust_dialog_up "$term"; then echo "dispatch.sh: trust the repo root first: run claude once in $main and accept the folder-trust dialog, then dispatch again" >&2; exit 4; fi
+    die "worker-start failed: $(printf '%s' "$out" | jq -c '{state: .result.state, stage: .result.failedStage}' 2> /dev/null)"
+  done
   disp="$(printf '%s' "$out" | jq -r '.result.dispatchId // empty')"; [ -n "$disp" ] || die "worker-start returned no dispatch id: nothing could verify this worker"
 }
 # --- launch path (06 Q1): DISPATCH_LAUNCH=twostep. After Orca's agentCmdOverrides.claude

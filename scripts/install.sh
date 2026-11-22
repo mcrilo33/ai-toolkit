@@ -28,6 +28,12 @@ if root="$(git -C "${1:-.}" rev-parse --show-toplevel 2> /dev/null)"; then
   else
     warn "$root has no .ai-toolkit/hooks/git: run sync.sh into it first, then re-run install.sh"
   fi
+  # The labels the loop relies on, so a new project needs no manual step; an existing one is left as it is.
+  missing=""
+  for spec in ${DISPATCH_LABEL:+"$DISPATCH_LABEL:0E8A16"} hold:D4C5F9 blocked:B60205 priority:D93F0B status:in-progress:FBCA04 "$AWAITING_LABEL:FBCA04"; do
+    out="$(cd "$root" && gh label create "${spec%:*}" --color "${spec##*:}" 2>&1)" || case "$out" in *"already exists"*) ;; *) missing="$missing ${spec%:*}" ;; esac
+  done
+  [ -z "$missing" ] || die "could not create the labels:$missing (run gh label create <name> in $root, then install again)"
 else
   warn "not in a git repository: run install.sh <repo> to wire its native git hooks"
 fi

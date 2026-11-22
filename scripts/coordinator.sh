@@ -510,7 +510,8 @@ fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --n
     case $rc in 0) ;; 3) ready=0; break ;; *) warn "dispatch --next failed ($rc)"; break ;; esac
     if out="$(RUN="$run" "$DISPATCH_CMD" "$n" 2>&1)"; then log "dispatched #$n"
     else   # may have left a half-made worktree behind: remove it and park the issue
-      warn "dispatch #$n failed: $out"; yield; rm_wt "$n"
+      rc=$?; warn "dispatch #$n failed: $out"; yield; rm_wt "$n"
+      [ "$rc" != 4 ] || exit 1   # the repo root is not trusted by Claude (the warning above says how): no issue is at fault, and every other dispatch would fail the same way
       issue="$n"; disp=""; wtp=""; block "dispatch failed: $(tail -n 1 <<< "$out")"
     fi
   done
