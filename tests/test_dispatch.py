@@ -213,6 +213,14 @@ def test_a_trust_dialog_without_the_no_exit_choice_is_not_answered_and_asks_for_
     assert not [c for c in d.orca() if c[:2] == ["terminal", "send"]] and len([c for c in d.orca() if c[:2] == ["orchestration", "worker-start"]]) == 1
 
 
+def test_a_trust_dialog_without_the_no_exit_choice_while_claude_is_not_up_yet_exits_4_without_waiting(d):
+    d.stubs.reply("orca.terminal_show", '{"result":{"terminal":{}}}')
+    d.stubs.reply("orca.terminal_read", '{"result":{"terminal":{"tail":["Do you trust this folder?","1. Yes, I trust this folder","2. No, continue without these permissions"]}}}')
+    r = d.go("7", DISPATCH_TRIES=2)
+    assert r.returncode == 4 and "claude once in " + d.root in r.stderr
+    assert not any(c[:2] in (["terminal", "send"], ["orchestration", "worker-start"]) for c in d.orca())
+
+
 ZSH_ERROR = "zsh: no such file or directory: Users/x/.ai-toolkit/bin/claude-spoke"
 
 
