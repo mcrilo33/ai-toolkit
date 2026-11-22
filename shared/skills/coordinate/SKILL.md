@@ -1,7 +1,7 @@
 ---
 name: coordinate
 description: "Run the Orca coordinator from this Claude session, in one of two modes: 'attended' (the coordinator.sh loop does the routine work out of sight and queues every real decision for the user, this session presents them one at a time and rings only for a decision it has just written) or 'auto' (the loop answers everything itself, for when the user is away). Use on the main checkout for '/coordinate', '/coordinate attended', '/coordinate auto [--until HH:MM] [--drain]', or when the user asks what needs them."
-argument-hint: "[attended | auto [--until HH:MM] [--drain] | status]"
+argument-hint: "[attended [--run <run>] | auto [--until HH:MM] [--drain] | status]"
 ---
 # Coordinate
 
@@ -88,3 +88,15 @@ Only on the user's explicit word. Stop the running loop, then start the other on
 
 This terminal (from a chat session, a `coordinator-stop` terminal it opens) takes the Run (Orca fences the loop, which exits 0 with "taken back by") and the command waits until the loop is gone; exit 1 = still finishing a step (a land): run it again until it exits 0. A land takes minutes, longer than a foreground Bash call lives: from either kind of session run `--stop` as ONE Bash call with `run_in_background` and `timeout: 7200000` (as Start arms `--wait`), and read its exit when the call returns. Never start the other loop before it exits 0: the first may be mid-land and a second land would race it.
 Nothing is lost: state lives in Orca, git and the issue labels, live workers keep running, and the new loop replays what the old one left unacked. Going back to attended after auto, summarize from "What landed" since the switch time, blocked issues first.
+
+## Handover
+
+Every request re-reads this whole chat, so a long one costs more per decision and the loop needs none of it: the Run's state lives in Orca, git and the issue labels, not in the chat. Past about 200k tokens of context, hand the Run to a fresh session at the next idle point (no decision on screen or open card, no `--stop` in flight, your last `--reply` gone from `--status`). Measure it when you present a decision and when the `--wait` watcher returns, from this chat's transcript:
+
+```bash
+tail -n 200 ~/.claude/projects/*/$CLAUDE_CODE_SESSION_ID.jsonl | jq -s '[.[] | select(.type=="assistant" and .isSidechain!=true and .message.usage)] | last | .message.usage | .input_tokens + .cache_read_input_tokens + .cache_creation_input_tokens'
+```
+
+An empty or failed read is unknown: no handover, never a guess. To hand over, `TaskStop` the running `--wait` watcher (it would wake you and present every decision twice), then open the successor with the run id (and `--cap N` if it is not the default): `orca agent launch --agent claude --worktree path:$PWD --prompt "/coordinate attended --run <run> [--cap N]"` (a chat or a terminal as the user's Chat | CLI setting says; the prompt is the whole brief, a chat cannot be messaged later). Say the run id and "handed over to a fresh session" in one line, then present nothing more.
+
+The successor started with `/coordinate attended --run <run>` and `--status` showing `held by: coordinator.sh (attended ...)` attaches, never a second loop: a chat arms `--wait`; a terminal session runs the `--stop` of **Switching** and restarts the loop with its own `--session`. It then presents `--status` from the top: the queue lives in Orca, so nothing queued is lost.
