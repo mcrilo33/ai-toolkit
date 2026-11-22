@@ -47,7 +47,7 @@ Three forms; this section is the only place that says which to pick, and every o
 | Reply | Pick it when | The spoke |
 |-------|--------------|-----------|
 | `approve` | the plan is correct, complete, in `Scope:`, with a proportionate test strategy | starts work |
-| `approve with: <change>` | approach, files and `Scope:` are right and one minimal correction remains, applicable without re-planning (drop or rename one test, extend one named test, reword, drop one out-of-scope file) | applies it, starts work, never asks again |
+| `approve with: <change>` | approach, files and `Scope:` are right and one minimal correction remains, applicable without re-planning (drop or rename one test, extend one named test, reword, drop one out-of-scope file), or the reply to a human-only step (`done`, `the human is away`) | applies it, starts work, never asks again |
 | `revise: <change>` | the plan itself is wrong or incomplete: wrong approach, a missing step or file, an uncovered criterion, or a change that makes the spoke re-derive the plan | amends the plan, asks again (max 2 rounds) |
 
 Test: if you would want to read the corrected plan again, `revise:`; if you would approve it unseen, `approve with:`.
