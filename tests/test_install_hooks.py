@@ -58,6 +58,18 @@ def test_install_outside_a_git_repo_warns_and_still_succeeds(run, tool, tmp_path
     assert r.returncode == 0 and "native git hooks" in r.stderr
 
 
+LABELS = ["ai-toolkit", "hold", "blocked", "priority", "status:in-progress", "status:awaiting-main"]
+
+
+@pytest.mark.parametrize("out, rc, want", [("", 0, 0), ("label already exists", 1, 0), ("HTTP 403", 1, 1)])   # a new project needs no manual label step (#547)
+def test_install_creates_the_labels_the_loop_uses_and_fails_naming_those_it_could_not(run, tool, repo, stubs, out, rc, want):
+    synced(repo)
+    stubs.reply("gh.label_create", out, rc=rc)
+    r = run(["bash", str(tool / "scripts" / "install.sh"), str(repo.root)], cwd=repo.root)
+    assert [c[2] for c in stubs.calls("gh")] == LABELS and r.returncode == want
+    assert (all(label in r.stderr for label in LABELS) and "HTTP 403" not in r.stderr) == bool(want)
+
+
 def test_install_explains_why_jq_is_mandatory(run, tool, tmp_path, link_script):
     bin_ = tmp_path / "nojq"
     bin_.mkdir()

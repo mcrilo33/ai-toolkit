@@ -680,6 +680,16 @@ def test_slots_are_filled_up_to_the_cap_and_a_failed_dispatch_is_cleaned_up_and_
     assert not C.calls("orca worktree set")   # the worktree is gone: never a comment on a stale one
 
 
+def test_a_dispatch_refused_for_the_untrusted_repo_root_blocks_no_issue_and_ends_the_loop(C, tmp_path):   # exit 4: Claude's trust dialog, nothing wrong with the issue (#547)
+    C.stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "5\n")
+    C.stubs.reply(key("dispatch.sh", "5"), "dispatch.sh: trust the repo root first: run claude once in /r and accept the folder-trust dialog", rc=4)
+    C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": C.wt, "linkedIssue": 1, "branch": "refs/heads/1-x"}, {"path": "/k5", "linkedIssue": 5}]}}))
+    r = C.go("--cap", "2", COORD_MAX_TICKS=2)
+    assert r.returncode == 1 and len(C.stubs.calls("dispatch.sh")) == 2   # the second wake never tries again
+    assert C.calls("orca worktree rm")[0][2:4] == ["--worktree", "path:/k5"] and not C.calls("gh issue edit") and not C.calls("gh issue comment")
+    assert "trust the repo root first" in (tmp_path / "state/run_t/loop.log").read_text()
+
+
 OTEL_WARN = {1: ("down", "telemetry down: spokes will not be measured; run {c}/otel.sh up"),
              3: ("degraded: 4 export failures in 15m (last: 401)", "telemetry degraded: 4 export failures in 15m (last: 401); the collector is up but failing to export to Langfuse, spoke telemetry may be lost")}
 

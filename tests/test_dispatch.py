@@ -187,6 +187,24 @@ def test_trust_dialog_is_dismissed_with_down_then_enter(d):
                      ["terminal", "send", "--terminal", "term_agent", "--enter"]]
 
 
+AGENT_READINESS_FAILED = '{"result":{"state":"failed","failedStage":"agent_readiness"}}'
+TRUST_DIALOG = '{"result":{"terminal":{"tail":["Do you trust this folder?","1. Yes","2. No, exit"]}}}'
+
+
+@pytest.mark.parametrize("retry_ok, rc", [(True, 0), (False, 4)])   # Orca can report claude while the dialog is still up: worker-start then meets it (#547)
+def test_a_worker_start_that_meets_the_trust_dialog_answers_it_retries_once_then_asks_for_the_trust(d, retry_ok, rc):
+    d.stubs.reply("orca.orchestration_worker_start", AGENT_READINESS_FAILED, rc=1, n=1)
+    d.stubs.reply("orca.orchestration_worker_start", '{"result":{"dispatchId":"ctx_1","state":"ready"}}' if retry_ok else AGENT_READINESS_FAILED, rc=0 if retry_ok else 1, n=2)
+    d.stubs.reply("orca.terminal_read", TRUST_DIALOG)
+    r = d.go("7")
+    assert r.returncode == rc, r.stderr
+    assert [c for c in d.orca() if c[:2] == ["terminal", "send"]] == [["terminal", "send", "--terminal", "term_agent", "--text", "\x1b[B"],
+                                                                      ["terminal", "send", "--terminal", "term_agent", "--enter"]]
+    assert len([c for c in d.orca() if c[:2] == ["orchestration", "worker-start"]]) == 2
+    assert (any(c[:2] == ["worktree", "set"] for c in d.orca()), d.record.exists(), any(c[:2] == ["issue", "edit"] for c in d.stubs.calls("gh"))) == (retry_ok,) * 3   # a refused dispatch touches no issue
+    assert ("claude once in " + d.root in r.stderr) == (not retry_ok)
+
+
 ZSH_ERROR = "zsh: no such file or directory: Users/x/.ai-toolkit/bin/claude-spoke"
 
 
