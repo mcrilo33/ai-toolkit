@@ -79,11 +79,12 @@ start_worker() {   # worker-start with the common flags; $@ = placement flags. S
   [ -z "$address" ] || what=(--task-title "#$n $([ "$round" = 1 ] && echo round || echo address)" --spec "$address$([ "$land" != human ] || echo " $ROUND_NOTE")")   # a fresh agent reads no seed: a Land: human issue repeats the report reminder
   local tried=0
   until out="$(orca_mutate orchestration worker-start --run "$run" --from "$ORCA_TERMINAL_HANDLE" "$@" "${what[@]}" --timeout-ms 120000)"; do
-    # Orca can report claude while the folder-trust dialog is still up, so worker-start meets it (#547): answered once, then the root needs trusting by hand.
-    if [ "$tried" = 0 ] && [ -n "${term:-}" ] && [ "$(jq -r '.result.failedStage // empty' <<< "$out" 2> /dev/null)" = agent_readiness ] && _trust_dialog_up "$term"; then
-      tried=1; _answer_trust_dialog "$term"; continue
+    # worker-start met the folder-trust dialog (#547): Orca may report claude while it is still up, or it ignored the keys sent as it opened. Answered once
+    # (only the layout the keys are known for), then the root needs trusting by hand: exit 4, never a defect of the issue.
+    if [ -n "${term:-}" ] && [ "$(jq -r '.result.failedStage // empty' <<< "$out" 2> /dev/null)" = agent_readiness ] && _trust_dialog_up "$term" "trust this folder|No, exit"; then
+      if [ "$tried" = 0 ] && _trust_dialog_up "$term"; then tried=1; _answer_trust_dialog "$term"; continue; fi
+      echo "dispatch.sh: trust the repo root first: run claude once in $main and accept the folder-trust dialog, then dispatch again" >&2; exit 4
     fi
-    if [ "$tried" = 1 ] && _trust_dialog_up "$term"; then echo "dispatch.sh: trust the repo root first: run claude once in $main and accept the folder-trust dialog, then dispatch again" >&2; exit 4; fi
     die "worker-start failed: $(printf '%s' "$out" | jq -c '{state: .result.state, stage: .result.failedStage}' 2> /dev/null)"
   done
   disp="$(printf '%s' "$out" | jq -r '.result.dispatchId // empty')"; [ -n "$disp" ] || die "worker-start returned no dispatch id: nothing could verify this worker"

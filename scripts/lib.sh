@@ -172,7 +172,7 @@ wait_until() {
 # (OTel env), waited on until claude is up; prints its handle. The first run in a repo root meets Claude's trust dialog
 # (default "No, exit"): Down+Enter. A shell startup prompt (oh-my-zsh's update question) can eat the typed launch line's first byte and leave
 # the shell failing to run the launcher: the line is re-typed once, never on a timeout alone (it would land in claude's TUI). dispatch.sh uses it for a new worker and for a retry, so a retried worker keeps the shim's env.
-_trust_dialog_up() { orca_json terminal read --terminal "$1" | jq -e '.result.terminal.tail | join(" ") | test("No, exit")' > /dev/null; }
+_trust_dialog_up() { orca_json terminal read --terminal "$1" | jq -e --arg re "${2:-No, exit}" '.result.terminal.tail | join(" ") | test($re)' > /dev/null; }   # $2: what the dialog shows (default: the choice the keys below act on)
 _answer_trust_dialog() {
   orca terminal send --terminal "$1" --text $'\e[B' --json > /dev/null; sleep "${AI_TOOLKIT_POLL:-3}"
   orca terminal send --terminal "$1" --enter --json > /dev/null
