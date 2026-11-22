@@ -177,9 +177,11 @@ _answer_trust_dialog() {
   orca terminal send --terminal "$1" --text $'\e[B' --json > /dev/null; sleep "${AI_TOOLKIT_POLL:-3}"
   orca terminal send --terminal "$1" --enter --json > /dev/null
 }
+trust_root_exit() { echo "${0##*/}: trust the repo root first: run claude once in ${main:-the repo root} and accept the folder-trust dialog, then dispatch again" >&2; exit 4; }   # exit 4: no issue is at fault
 _agent_up() {
   [ "$(orca_json terminal show --terminal "$1" | jq -r '.result.terminal.agentIdentity // empty')" = claude ] && return 0
   if _trust_dialog_up "$1"; then _answer_trust_dialog "$1"
+  elif _trust_dialog_up "$1" "trust this folder"; then trust_root_exit   # a layout the keys are not known for
   elif [ -z "$retyped" ] && orca_json terminal read --terminal "$1" \
     | jq -e '.result.terminal.tail | any(.[]; test("claude-spoke"; "i") and test("no such file or directory|not found"; "i"))' > /dev/null; then
     retyped=1; orca terminal send --terminal "$1" --text "$2" --enter --json > /dev/null

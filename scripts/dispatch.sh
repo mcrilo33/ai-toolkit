@@ -7,7 +7,7 @@
 # copies from the main checkout (setup.sh --refresh), keeping its spoke-run-id; a failed refresh starts no agent.
 # --round (with --address): the new task is titled "#<n> round", a round the human asked for (coordinator.sh counts the retry budget from the last one).
 # --next <issue>: the same pick restricted to that issue, so it starts only if it is ready (exit 3 and a message when it is not).
-# Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready, 4 Claude's folder-trust dialog is still up after being answered once (the repo root is not trusted: no issue is at fault).
+# Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready, 4 Claude's folder-trust dialog blocks the start (still up after one answer, or a layout the keys are not known for): the repo root is not trusted, no issue is at fault.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
@@ -83,7 +83,7 @@ start_worker() {   # worker-start with the common flags; $@ = placement flags. S
     # (only the layout the keys are known for), then the root needs trusting by hand: exit 4, never a defect of the issue.
     if [ -n "${term:-}" ] && [ "$(jq -r '.result.failedStage // empty' <<< "$out" 2> /dev/null)" = agent_readiness ] && _trust_dialog_up "$term" "trust this folder|No, exit"; then
       if [ "$tried" = 0 ] && _trust_dialog_up "$term"; then tried=1; _answer_trust_dialog "$term"; continue; fi
-      echo "dispatch.sh: trust the repo root first: run claude once in $main and accept the folder-trust dialog, then dispatch again" >&2; exit 4
+      trust_root_exit
     fi
     die "worker-start failed: $(printf '%s' "$out" | jq -c '{state: .result.state, stage: .result.failedStage}' 2> /dev/null)"
   done
