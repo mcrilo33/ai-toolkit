@@ -291,7 +291,7 @@ rm_wt() {   # <n>: remove the half-made worktree a failed fresh dispatch may lea
 nlive() { jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length'; }   # the workers of one wl reply that are live
 rounds() {   # dispatches of the worktree since its last human-requested round (a task titled "#<n> round", see named()), else all of them - 1; a relaunch shares its task, so the base is that task's oldest dispatch
   local hr; hr="$(okread orchestration task-list --run "$run" --brief --full | jq -c '[.result.tasks[] | select(.task_title | test("^#[0-9]+ round$")) | .id]')" || return 1
-  wl | jq --arg p "::$wtp" --argjson h "$hr" '[.result.workers[] | select(.resource.worktreeId | endswith($p))] as $w   # worker-list is newest first
+  wl | jq --arg p "::$wtp" --argjson h "$hr" '[.result.workers[] | select((.resource.worktreeId // "") | endswith($p))] as $w   # worker-list is newest first
     | ([$w[] | select(.taskId as $t | $h | index($t))][0].taskId) as $t
     | if $t == null then ($w | length) - 1 else [$w | to_entries[] | select(.value.taskId == $t) | .key] | last end'
 }
@@ -488,7 +488,7 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
     fi
     [ -n "$why" ] || [ -n "$path" ] || [ -z "$spec" ] || why="no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"
     if [ -z "$why" ]; then   # a kept worktree is re-dispatched (--address, a default message when none was given); none yet: dispatch.sh --next <n> starts it only if it is ready (its rule: hold, blocked, in flight, Scope)
-      if [ -n "$path" ]; then old="$(jq -r --arg p "::$path" '[.result.workers[] | select(.resource.worktreeId | endswith($p))][0].agentTerminalHandle // empty' <<< "$all")"
+      if [ -n "$path" ]; then old="$(jq -r --arg p "::$path" '[.result.workers[] | select((.resource.worktreeId // "") | endswith($p))][0].agentTerminalHandle // empty' <<< "$all")"
         [ -z "$old" ] || orca terminal close --terminal "$old" --json > /dev/null 2>&1 || true   # the previous agent's terminal (as redispatch does): two agents must not share the worktree
         out="$(RUN="$run" "$DISPATCH_CMD" --address "${spec:-address: continue from the pushed branch (git log), push, then send worker_done.}" --round "$n" 2>&1)" && rc=0 || rc=$?
       else out="$(RUN="$run" "$DISPATCH_CMD" --next "$n" 2>&1)" && rc=0 || rc=$?; [ "$rc" = 0 ] || [ "$rc" = 3 ] || rm_wt "$n"; fi   # a failed fresh dispatch may leave a half-made worktree (as fill() does)
