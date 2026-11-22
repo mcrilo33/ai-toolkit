@@ -65,7 +65,7 @@ LABELS = ["ai-toolkit", "hold", "blocked", "priority", "status:in-progress", "st
 def test_install_creates_the_labels_the_loop_uses_and_fails_naming_those_it_could_not(run, tool, repo, stubs, out, rc, want):
     synced(repo)
     stubs.reply("gh.label_create", out, rc=rc)
-    r = run(["bash", str(tool / "scripts" / "install.sh"), str(repo.root)], cwd=repo.root)
+    r = run(["bash", str(tool / "scripts" / "install.sh"), str(repo.root)], cwd=repo.root, DISPATCH_LABEL="ai-toolkit")
     assert [c[2] for c in stubs.calls("gh")] == LABELS and r.returncode == want
     assert (all(label in r.stderr for label in LABELS) and "HTTP 403" not in r.stderr) == bool(want)
 
