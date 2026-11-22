@@ -63,17 +63,19 @@ A script that still reads a worker-controlled source, or a worker that can still
    `dispatch.sh --address` / `--retry-of` refresh the kept worktree's installed copies first (`setup.sh --refresh`, output to stderr): the synced `.claude/` set listed in main's `sync-manifest`
    is copied, what main's sync has dropped since is removed, and files outside that set (`settings.local.json`, locks, anything the worker made) are left alone.
 
-## Two modes, one switch
+## Three positions, one switch
 
-One coordinator, the loop (`coordinator.sh`), holds the Run in its own Orca terminal in either mode and does the routine work (dispatch to the cap, land with the independent review, retry, block,
-route leftovers). A Claude session never binds the Run, `check`s or reads the inbox. The modes differ in what the loop decides alone and how the user is reached. The switch is explicit, never inferred from presence:
-`/coordinate attended` and `/coordinate auto [--until HH:MM] [--drain]` each start their loop in an Orca terminal bound to the SAME Run after `coordinator.sh --stop --run <run>` took it back.
+One coordinator, the loop (`coordinator.sh`), holds the Run in its own Orca terminal in every position and does the routine work (dispatch to the cap, land with the independent review, retry, block,
+route leftovers). A Claude session never binds the Run, `check`s or reads the inbox. The positions differ in what the loop decides alone and how the user is reached. The switch is explicit, never inferred from presence:
+`/coordinate attended`, `/coordinate away [--until HH:MM] [--drain]` and `/coordinate auto [--until HH:MM] [--drain]` each start their loop in an Orca terminal bound to the SAME Run after `coordinator.sh --stop --run <run>` took it back.
 
-| | auto | attended |
-|---|---|---|
-| PLAN gate | `answer.sh` always answers (`Mode: auto`) | a routine plan is approved by `answer.sh` (`Mode: attended`); any other plan is its third outcome, `human: <reason>` (exit 3): left open on the Run, the worker waits |
-| Permission request | `deny` at once, no model | never answered by the loop: left open for the user, who has the relay's 9 minutes (it denies itself after that) |
-| What reaches the user | blocked issues, each flagged with a worktree comment | the **queue**: open questions (oldest first), blocked issues without `hold`, in `--status`; one line typed into the session's terminal (`--session`) when a decision arrives on an empty queue, and one for every permission request |
+| | auto | attended | away |
+|---|---|---|---|
+| PLAN gate | `answer.sh` always answers (`Mode: auto`) | a routine plan is approved by `answer.sh` (`Mode: attended`); any other plan is its third outcome, `human: <reason>` (exit 3): left open on the Run, the worker waits | as attended |
+| Permission request | `deny` at once, no model | never answered by the loop: left open for the user, who has the relay's 9 minutes (it denies itself after that) | as attended |
+| What reaches the user | blocked issues, each flagged with a worktree comment | the **queue**: open questions (oldest first), blocked issues without `hold`, in `--status`; one line typed into the session's terminal (`--session`) when a decision arrives on an empty queue, and one for every permission request | the same queue, sent to the webhook instead of a session (below); nothing is typed anywhere |
+
+**Away (#543).** `NOTIFY_WEBHOOK_URL` (per machine, in `.ai-toolkit/ai-toolkit.local.env`, never synced or committed) turns the third position on: `coordinator.sh --answer away` is refused without it and with a `--session`, and a loop started with no `--answer` runs as away when it is set (else auto, as before; every documented start names its position, so none changes). Each plan the loop leaves open, each permission request and each blocked issue is POSTed once (`curl -m 5`) as `{"event":"plan"|"permission_request"|"blocked","repo":"<owner/name>","issue":<n>,"run":"<run id>","message_id":"<id>","position":"away","handed_over":false}`: ids only, `message_id` absent for a blocked issue, never text a worker wrote (it lands in an agent's prompt), and the URL is in no argv, log or comment. Delivery is at-least-once, since the webhook is the only channel: a failed POST is one warning, never fatal, and is sent again at the next wake until it is delivered or the decision is answered or expired (a receiver that answers with an HTTP error does not hold back the others; a webhook that is down ends that wake's sends); the sent ids live in one shell variable, so a restart sends again what is still open and the receiver dedupes on repo, issue and message id. Answers come back through the existing `coordinator.sh --reply <id> ...` and `--dispatch`: no new path. `coordinator.sh --position` prints one word, `attended`, `away`, `auto` or `none`, for the loop holding this project's Run (no Run id needed; an unreadable Orca is exit 1, not `none`), so an external sweep skips a project the user is attending. A decision lives in one place: attended shows it in a session (which Remote Control, #540, can push to a phone), away sends it to the webhook, never both.
 
 The session in attended mode only presents the queue, one decision at a time, relays each answer with `coordinator.sh --reply`, writes into the issue any answer that changes what it asks, and shows no routine event.
 Its other requests go through the loop too: `coordinator.sh --run R --dispatch <issue> ['<message>']` queues a request (a file in the reply spool's `requests/`, line 1 the message, line 2 the reason it cannot run yet) that the loop runs
@@ -153,7 +155,7 @@ answer only, never the command or content. The relay is **fail-closed**: exactly
 `deny`; only a timeout (nobody answered in 9 minutes) lets the worker make the same call again, up to 3 requests in total (an instruction to the worker: every request still needs a human `allow`), every other deny, an explicit one included, is final. A hook that exceeds its own timeout is killed with no decision and the local dialog stays waiting, so the relay bounds its ask with its own timer (`--timeout-ms` 540000, kill at 570 s) under the hook timeout (600 s).
 While it waits, the dialog is drawn in the worker too; the relay's answer dismisses it. Orca leaves a question pending after its ask times out, so a question the relay already denied stays open in the Run until replied: a late reply changes nothing (the coordinate skill ignores a stale one). Outside a worker (no `.ai-toolkit/spoke-run-id`) the hook prints nothing and the local prompt stays.
 
-**The loop never approves a permission request (#450).** In attended mode every relayed request stays open and is queued for the user, who answers with `--reply <id> allow|deny` inside the relay's 9 minutes (an expired request can come back, up to 3 times); in auto mode it is denied at once. There is no containment check in the loop and no second judge mode:
+**The loop never approves a permission request (#450).** In attended and away mode every relayed request stays open and is queued for the user (away: sent to the webhook), who answers with `--reply <id> allow|deny` inside the relay's 9 minutes (an expired request can come back, up to 3 times); in auto mode it is denied at once. There is no containment check in the loop and no second judge mode:
 the guard and its judge (below) already allow a recursive delete of a literal path inside the worktree or below the temp root and clear a command that only mentions an operation, so few requests reach the queue.
 
 ## Coordinator runbook
@@ -164,7 +166,7 @@ orca terminal create --worktree path:<main-checkout> --title coordinator \
 ```
 
 One foreground process in an Orca terminal on the main checkout, the single consumer of one Run (`run-create`, or `--run R` to take it over from a session
-or re-bind after a restart: everything else is re-derived from `worker-list`, `worktree list` and labels). Flags: `--answer auto|attended|human`, `--session <terminal-handle>` (attended: the session's terminal, where the loop types its line), `--cap N` (default `CONCURRENCY_CAP`),
+or re-bind after a restart: everything else is re-derived from `worker-list`, `worktree list` and labels). Flags: `--answer auto|attended|away|human`, `--position`, `--session <terminal-handle>` (attended only: the session's terminal, where the loop types its line), `--cap N` (default `CONCURRENCY_CAP`),
 `--until HH:MM`, `--drain` (stop when nothing is ready and no worker is live), `--status` (read-only: Run, who holds it, live workers, the queue in the order to present it with each reply line, dispatch requests), `--run R --show <message-id>` (one open question whole),
 `--run R --reply <message-id> <answer>` and `--run R --dispatch <issue> ['<message>']` (queue a human answer or a dispatch request for the loop),
 `--run R --stop` (take the Run from this terminal and wait for the loop to exit).
