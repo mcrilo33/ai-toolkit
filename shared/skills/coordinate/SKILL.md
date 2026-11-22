@@ -1,13 +1,14 @@
 ---
 name: coordinate
-description: "Run the Orca coordinator from this Claude session, in one of two modes: 'attended' (the coordinator.sh loop does the routine work out of sight and queues every real decision for the user, this session presents them one at a time and rings only for a decision it has just written) or 'auto' (the loop answers everything itself, for when the user is away). Use on the main checkout for '/coordinate', '/coordinate attended', '/coordinate auto [--until HH:MM] [--drain]', or when the user asks what needs them."
-argument-hint: "[attended [--run <run>] | auto [--until HH:MM] [--drain] | status]"
+description: "Run the Orca coordinator from this Claude session, in one of three positions: 'attended' (the coordinator.sh loop does the routine work out of sight and queues every real decision for the user, this session presents them one at a time and rings only for a decision it has just written) 'away' (attended's decisions, sent to the NOTIFY_WEBHOOK_URL webhook instead of a session) or 'auto' (the loop answers everything itself, for when nobody is reachable). Use on the main checkout for '/coordinate', '/coordinate attended', '/coordinate away [--until HH:MM] [--drain]', '/coordinate auto [--until HH:MM] [--drain]', or when the user asks what needs them."
+argument-hint: "[attended [--run <run>] | away [--until HH:MM] [--drain] | auto [--until HH:MM] [--drain] | status]"
 ---
 # Coordinate
 
-One Run, and the loop (`coordinator.sh`, in its own Orca terminal) always holds it and does the routine work: dispatch to the cap, land, retry, block, route leftovers. Two modes, switched only on the user's explicit word, never inferred:
+One Run, and the loop (`coordinator.sh`, in its own Orca terminal) always holds it and does the routine work: dispatch to the cap, land, retry, block, route leftovers. Three positions, switched only on the user's explicit word, never inferred from presence:
 
 - **attended**: the loop answers only what is routine (approves a routine plan; `afk-answering`) and **queues everything else for the user**: a plan it handed over, every permission request (the loop never approves one), a blocked issue. This session only presents that queue.
+- **away** (needs `NOTIFY_WEBHOOK_URL` in `.ai-toolkit/ai-toolkit.local.env`): the loop decides exactly as in attended, but there is no session to type into: each plan it leaves open, permission request and blocked issue is POSTed once to the webhook, as ids only, and an external supervisor presents it and relays the answer with `--reply` or `--dispatch`. This session presents none of it unless the user asks, so a decision lives in one place, never both a session and the webhook.
 - **auto**: the loop answers every plan itself, denies every permission request and labels `blocked`; the user decides when back.
 
 This session never binds the Run, `check`s or reads the inbox, never writes task code (`.ai-toolkit/rules/planning-hub.md`), keeps no state: ids live in the conversation. Scripts are in `.ai-toolkit/scripts/` (`coordinator.sh`, `dispatch.sh`, `land.sh`).
@@ -29,6 +30,9 @@ orca terminal create --worktree path:$PWD --title coordinator \
 # attended, chat session: no --session (its warning is expected), then arm the watcher: ONE Bash call with run_in_background and timeout: 7200000 (the background maximum)
 orca terminal create --worktree path:$PWD --title coordinator --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended [--cap N]"
 .ai-toolkit/scripts/coordinator.sh --run <run> --wait [--seen '<ids still waiting>']   # exits 0 printing the id of a new decision; polls every COORD_WATCH_SEC (5) s
+# away: no --session, no --wait watcher; refused without NOTIFY_WEBHOOK_URL
+orca terminal create --worktree path:$PWD --title coordinator \
+  --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer away [--until HH:MM] [--drain] [--cap N]"
 # auto
 date -u +%FT%TZ        # the switch time: say it, it anchors the summary of what happened while away
 orca terminal create --worktree path:$PWD --title coordinator \
@@ -37,6 +41,7 @@ orca terminal create --worktree path:$PWD --title coordinator \
 
 Without `--run` the loop creates a Run: find it with `orca orchestration run-list --json`, say it back. It takes the Run over (`run-use`), so no other terminal consumes: check with `coordinator.sh --status --run <run>`
 (`held by: coordinator.sh (attended ...)`); if it never shows, read the terminal (`orca terminal read --terminal <handle>`). `--until` stops the loop at that time (live workers keep running, their messages wait), `--drain` when nothing is ready and no worker is live.
+A loop started with no `--answer` runs as away when `NOTIFY_WEBHOOK_URL` is set, else as auto. `coordinator.sh --position` prints the position of the loop holding this project's Run (`attended`, `away`, `auto` or `none`, one word): a sweep uses it to skip a project the user is attending.
 Before switching to auto tell the user that gates are then answered by `answer.sh` under `afk-answering`, not by them.
 
 ## The queue (attended)
