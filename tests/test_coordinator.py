@@ -908,7 +908,7 @@ def test_status_lists_the_queue_in_the_order_to_present_it_and_the_dispatch_requ
 
 LOOPS = {   # a live attended/auto loop answers what it has not left open; a human-mode loop or none: every open question is the human's
     "attended-held-a": ("attended until 23:00", ["msg_a"], "msg_b msg_c msg_oldplan"), "auto": ("auto", [], "msg_a msg_b msg_c msg_oldplan"),
-    "human": ("human", [], ""), "no-loop": (None, [], ""), "attended-no-held-file": ("attended", None, ""),
+    "away": ("away", [], "msg_a msg_b msg_c msg_oldplan"), "human": ("human", [], ""), "no-loop": (None, [], ""), "attended-no-held-file": ("attended", None, ""),
 }
 
 
@@ -1054,6 +1054,43 @@ def test_outside_away_nothing_is_posted_even_with_the_webhook_set(C, tmp_path, m
     C.mail([msg("question", "msg_a", question="PLAN?"), msg("question", "msg_pb", question=PQ)])
     r = C.go("--answer", mode, "--session", "", NOTIFY_WEBHOOK_URL=URL, COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=99)
     assert r.returncode == 0 and C.calls("orca orchestration check ack") and not C.calls("curl")
+
+
+START_RULES = {   # (arguments, the webhook, what the start does)
+    "away-without-webhook": (["--answer", "away"], "", "refused"), "away-with-a-bad-webhook": (["--answer", "away"], "ftp://x y", "refused"),
+    "away-types-nothing-into-a-session": (["--answer", "away", "--session", "term_s"], URL, "refused"),
+    "no-position-with-webhook": ([], URL, "answer away"), "no-position-without-webhook": ([], "", "answer auto"), "explicit-auto-with-webhook": (["--answer", "auto"], URL, "answer auto"),
+}
+
+
+@pytest.mark.parametrize(("args", "url", "outcome"), START_RULES.values(), ids=list(START_RULES))
+def test_a_loop_started_with_no_position_is_away_only_when_a_webhook_is_set_and_away_needs_one_and_no_session(C, args, url, outcome):
+    r = C.go("--session", "", *args, NOTIFY_WEBHOOK_URL=url)
+    if outcome == "refused":
+        assert r.returncode == 2 and len(r.stderr.splitlines()) == 1 and (not url or url not in r.stderr) and r.stdout == ""   # refused before the loop starts
+    else:
+        assert r.returncode == 0 and f"cap 3, {outcome}" in r.stdout
+
+
+POSITIONS = {"no-loop": (None, "term_c", "none"), "attended": ("attended until 23:00", "term_c", "attended"), "away": ("away", "term_c", "away"), "auto": ("auto drain", "term_c", "auto"),
+             "human-is-attended": ("human", "term_c", "attended"), "a-session-holds-the-run": ("auto", "term_s", "none")}
+
+
+@pytest.mark.parametrize(("mode", "holder", "word"), POSITIONS.values(), ids=list(POSITIONS))
+def test_position_prints_the_one_word_of_the_loop_holding_the_run_without_a_run_id_and_fails_when_orca_does_not_answer(C, tmp_path, mode, holder, word):
+    C.stubs.reply("orca.orchestration_run_current", '{"result":{"run":{"id":"run_t"}}}')
+    C.stubs.reply("orca.orchestration_run_show", json.dumps({"result": {"run": {"coordinator_handle": holder}}}))
+    loop = live_loop(tmp_path, mode, []) if mode else None   # its holder file says "term_c <mode>": the loop of terminal term_c
+    try:
+        r = C.go("--position", run_id=None, ORCA_TERMINAL_HANDLE="")
+        assert (r.returncode, r.stdout) == (0, word + "\n")
+        C.stubs.reply("orca.orchestration_run_show", "boom", rc=1)
+        r = C.go("--position", run_id=None, ORCA_TERMINAL_HANDLE="")
+        assert r.returncode == 1 and r.stdout == "" and r.stderr   # unknown is not "none": a sweep must not mistake a failed read for a project nobody attends
+    finally:
+        if loop:
+            loop.kill()
+            loop.wait()
 
 
 def test_the_blocked_queue_reads_only_the_dispatch_label_when_one_is_set(C):
