@@ -12,9 +12,15 @@ def MCP(tk, *local):
 
 
 def WORKER_SETTINGS(tk):
-    """What a worker gets in place of the guard file's path: the same file inline, with Claude's own notifications off (only the coordinator alerts the human)."""
+    """What a worker gets in place of the guard file's path: the same file inline, with Claude's own notifications off (only the coordinator alerts the human) and Remote Control pinned off."""
     base = json.loads((tk / "claude-settings.json").read_text())
-    return json.dumps({**base, "preferredNotifChannel": "notifications_disabled"}, separators=(",", ":"))
+    return json.dumps({**base, "preferredNotifChannel": "notifications_disabled", "remoteControlAtStartup": False}, separators=(",", ":"))
+
+
+def COORD_SETTINGS(tk):
+    """What any other session in a synced project (the coordinator or hub) gets: the same file inline, with Remote Control on so its PushNotification reaches the phone."""
+    base = json.loads((tk / "claude-settings.json").read_text())
+    return json.dumps({**base, "remoteControlAtStartup": True}, separators=(",", ":"))
 
 
 def in_spoke(repo, run_id="abc-123"):
@@ -118,7 +124,7 @@ def test_the_launcher_passes_the_settings_file_of_the_project_it_starts_in(run, 
     calls = stubs.calls("claude")
     assert (r.returncode == 0) == ok and len(calls) == int(ok), r.stderr
     if passed == "settings":
-        assert calls == [["--settings", f"{tk}/claude-settings.json", *fwd]] and f"AI_TOOLKIT_DIR={tk}" in stubs.env("claude")
+        assert calls == [["--settings", COORD_SETTINGS(tk), *fwd]] and f"AI_TOOLKIT_DIR={tk}" in stubs.env("claude")
     if passed == "plain":
         assert calls == [fwd] and "AI_TOOLKIT_DIR" not in stubs.env("claude")   # not even the inherited one
     if not ok:
@@ -154,19 +160,21 @@ def test_a_worker_starts_with_only_the_toolkit_mcp_list(run, stubs, repo, local,
     assert stubs.calls("claude") == ([[*MCP(tk, *[local] * bool(local)), "--settings", WORKER_SETTINGS(tk), *fwd]] if ok else []) and (ok or "mcp" in r.stderr)
 
 
-def test_a_worker_gets_the_guards_with_notifications_disabled_and_a_human_the_plain_path(run, stubs, repo):
+def test_a_worker_gets_notifications_disabled_and_remote_control_off_a_coordinator_remote_control_on(run, stubs, repo):
     tk = synced(repo)
     assert run([SPOKE, "-p"], cwd=in_spoke(repo)).returncode == 0 and run([SPOKE, "-p"], cwd=repo.wt("h")).returncode == 0
     worker, human = stubs.calls("claude")
     cfg = json.loads(worker[worker.index("--settings") + 1])
-    assert cfg["preferredNotifChannel"] == "notifications_disabled" and cfg["disableAllHooks"] is False and cfg["hooks"]["PreToolUse"]   # the guards ride along
-    assert human == ["--settings", f"{tk}/claude-settings.json", "-p"]   # no run id: the path, no override
+    assert cfg["preferredNotifChannel"] == "notifications_disabled" and cfg["remoteControlAtStartup"] is False and cfg["disableAllHooks"] is False and cfg["hooks"]["PreToolUse"]   # the guards ride along; off even when the user's own settings turn it on
+    hcfg = json.loads(human[human.index("--settings") + 1])
+    assert hcfg["remoteControlAtStartup"] is True and "preferredNotifChannel" not in hcfg and hcfg["disableAllHooks"] is False and hcfg["hooks"]["PreToolUse"]   # no run id: its own alerts stay on
+    assert human == ["--settings", COORD_SETTINGS(tk), "-p"]
 
 
 def test_a_human_session_keeps_its_own_mcp_servers(run, stubs, repo):
     tk = synced(repo)
     assert run([SPOKE, "--mcp-config", "mine.json", "-p"], cwd=repo.wt("h")).returncode == 0
-    assert stubs.calls("claude") == [["--settings", f"{tk}/claude-settings.json", "--mcp-config", "mine.json", "-p"]]   # no run id: nothing added, nothing refused
+    assert stubs.calls("claude") == [["--settings", COORD_SETTINGS(tk), "--mcp-config", "mine.json", "-p"]]   # no run id: nothing added, nothing refused
 
 
 def test_install_checks_prerequisites_then_prints_the_orca_override_without_a_path_shim(run, stubs, tmp_path):
