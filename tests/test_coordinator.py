@@ -1017,13 +1017,13 @@ URL = "https://hooks.example.test/s3cr3t-token"
 BLOCKED = json.dumps([{"number": 1, "title": "t", "labels": [{"name": "blocked"}]}])
 
 
-def posted(C, tmp_path, *args, rcs=(), **env):   # one away loop run with a webhook (the harness gives it an empty --session): (result, the JSON bodies POSTed, everything the run printed, logged or commented)
+def posted(C, tmp_path, *args, rcs=(), pos="away", **env):   # one loop run in a position (away by default) with a webhook (the harness gives it an empty --session): (result, the JSON bodies POSTed, everything the run printed, logged or commented)
     d = Path(os.environ["STUB_DIR"])
     for f in ("calls.log", "curl.n", "curl.bodies", "curl.urls", "curl.rcs"):
         (d / f).unlink(missing_ok=True)
     (d / "curl.rcs").write_text("".join(f"{rc}\n" for rc in rcs))
     C.stubs.reply("gh.repo_view", "o/r\n")
-    r = C.go("--answer", "away", "--session", "", *args, NOTIFY_WEBHOOK_URL=URL, COORD_SWEEP_EVERY=99, **{"COORD_MAX_TICKS": 1, **env})
+    r = C.go("--answer", pos, "--session", "", *args, **{"NOTIFY_WEBHOOK_URL": URL, "COORD_SWEEP_EVERY": 99, "COORD_MAX_TICKS": 1, **env})
     bodies = [json.loads(ln) for ln in (d / "curl.bodies").read_text().splitlines()] if (d / "curl.bodies").exists() else []
     seen = r.stdout + r.stderr + "".join(f.read_text() for f in (tmp_path / "state/run_t/loop.log", d / "calls.log") if f.exists())
     return r, bodies, seen
@@ -1075,17 +1075,71 @@ def test_outside_away_nothing_is_posted_even_with_the_webhook_set(C, tmp_path, m
     assert r.returncode == 0 and C.calls("orca orchestration check ack") and not C.calls("curl")
 
 
+def aged(C, **ages):   # the Run's open questions at the loop's start ("msg_p*" ones are permission requests), each created that many seconds ago
+    ago = lambda s: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - s))  # noqa: E731
+    rows = [{**msg("question", q, question=PQ if q.startswith("msg_p") else "PLAN?"), "run_id": "run_t", "thread_id": q, "sequence": ord(q[-1]), "created_at": ago(s)} for q, s in ages.items()]
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
+
+
+def handed(**kw):
+    return {"repo": "o/r", "issue": 1, "run": "run_t", "position": "attended", "handed_over": True, **kw}
+
+
+HANDOVER = {   # (the open decisions and their age in seconds, the settings, the one POST it is handed over with, or None)
+    "plan-past-its-delay": ({"msg_a": 700}, {}, {"event": "plan", "message_id": "msg_a"}), "plan-before-its-delay": ({"msg_a": 400}, {}, None),
+    "plan-delay-overridden": ({"msg_a": 400}, {"HANDOVER_PLAN_S": 300}, {"event": "plan", "message_id": "msg_a"}),
+    "permission-past-its-shorter-delay": ({"msg_pb": 400}, {}, {"event": "permission_request", "message_id": "msg_pb"}), "permission-before-its-delay": ({"msg_pb": 200}, {}, None),
+    "permission-delay-overridden": ({"msg_pb": 200}, {"HANDOVER_PERMISSION_S": 100}, {"event": "permission_request", "message_id": "msg_pb"}),
+    "blocked-issue-after-the-plan-delay": ({}, {"HANDOVER_PLAN_S": 0, "BLOCKED": 1}, {"event": "blocked"}), "blocked-issue-before-it": ({}, {"BLOCKED": 1}, None),
+    "no-webhook": ({"msg_a": 700}, {"NOTIFY_WEBHOOK_URL": ""}, None),
+}
+
+
+@pytest.mark.parametrize(("open_", "settings", "post"), HANDOVER.values(), ids=list(HANDOVER))
+def test_attended_hands_an_unanswered_decision_over_to_the_webhook_once_after_its_delay_and_not_before(C, tmp_path, open_, settings, post):
+    aged(C, **open_)
+    C.stubs.reply("gh.issue_list", BLOCKED if settings.pop("BLOCKED", 0) else "[]")
+    r, bodies, seen = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=3, **settings)   # three wakes: handed over once, not at each
+    assert r.returncode == 0 and bodies == ([handed(**post)] if post else []) and URL not in seen
+    assert (tmp_path / "state/run_t/handed").exists() == bool(post)
+
+
+def test_a_decision_handed_over_is_left_out_of_the_queue_the_session_presents(C, tmp_path):
+    aged(C, msg_a=700)
+    C.stubs.reply("gh.issue_list", BLOCKED)
+    r, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=0)   # the plan and the blocked issue are both handed over
+    assert [b["event"] for b in bodies] == ["plan", "blocked"] and not C.calls("orca terminal send")   # and the session is told nothing about them
+    assert (tmp_path / "state/run_t/handed").read_text().split() == ["q:msg_a", "b:1"]
+    C.inbox(["msg_a"])
+    out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
+    assert "handed over to the webhook: msg_a #1" in out and "reply:" not in out and "blocked #1" not in out   # one line, no reply command, no decision to present
+    assert watched(C, ([], []), (["msg_a"], []), (["msg_a"], [])).stdout == ""   # the --wait watcher of a chat session does not wake for it
+    assert watched(C, ([], []), (["msg_a", "msg_b"], [])).stdout.split() == ["msg_b"]   # a new decision still does
+
+
+@pytest.mark.parametrize(("url", "switches"), [(URL, True), ("", False), ("ftp://x y", False)], ids=["webhook", "no-webhook", "malformed-webhook"])
+def test_attended_until_switches_to_away_on_the_same_run_only_when_hand_over_is_active(C, tmp_path, url, switches):
+    aged(C, msg_a=0)   # a fresh plan: attended would hold it back until its delay
+    r, bodies, _ = posted(C, tmp_path, "--until", "10:00", pos="attended", AI_TOOLKIT_NOW="10:00", COORD_MAX_TICKS=2, NOTIFY_WEBHOOK_URL=url)   # the time is already up at the first wake
+    assert r.returncode == 0 and bool(C.calls("orca orchestration check")) == switches   # else the loop ends there, as before
+    assert ("switching to away" in (tmp_path / "state/run_t/loop.log").read_text()) == switches
+    assert bodies == ([{"event": "plan", "repo": "o/r", "issue": 1, "run": "run_t", "message_id": "msg_a", "position": "away", "handed_over": False}] if switches else [])
+
+
 START_RULES = {   # (arguments, the webhook, what the start does)
     "away-without-webhook": (["--answer", "away"], "", "refused"), "away-with-a-bad-webhook": (["--answer", "away"], "ftp://x y", "refused"),
     "away-types-nothing-into-a-session": (["--answer", "away", "--session", "term_s"], URL, "refused"),
     "no-position-with-webhook": ([], URL, "cap 3, answer away"), "no-position-without-webhook": ([], "", "cap 3, answer auto"), "explicit-auto-with-webhook": (["--answer", "auto"], URL, "cap 3, answer auto"),
     "a-bad-webhook-leaves-the-one-shot-commands-alone": (["--status"], "ftp://x y", "run: run_t"),
+    "attended-handover-delay-not-a-number": (["--answer", "attended"], URL, "refused", {"HANDOVER_PLAN_S": "soon"}),
+    "attended-handover-delays-are-not-read-without-a-webhook": (["--answer", "attended"], "", "cap 3, answer attended", {"HANDOVER_PLAN_S": "soon"}),
 }
 
 
-@pytest.mark.parametrize(("args", "url", "outcome"), START_RULES.values(), ids=list(START_RULES))
-def test_a_loop_started_with_no_position_is_away_only_when_a_webhook_is_set_and_away_needs_one_and_no_session(C, args, url, outcome):
-    r = C.go("--session", "", *args, NOTIFY_WEBHOOK_URL=url)
+@pytest.mark.parametrize("case", START_RULES.values(), ids=list(START_RULES))
+def test_a_loop_started_with_no_position_is_away_only_when_a_webhook_is_set_and_away_needs_one_and_no_session(C, case):
+    args, url, outcome, *env = case
+    r = C.go("--session", "", *args, NOTIFY_WEBHOOK_URL=url, **(env[0] if env else {}))
     if outcome == "refused":
         assert r.returncode == 2 and len(r.stderr.splitlines()) == 1 and (not url or url not in r.stderr) and r.stdout == ""   # refused before the loop starts
     else:
