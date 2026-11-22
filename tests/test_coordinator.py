@@ -1031,10 +1031,15 @@ def test_away_posts_each_decision_the_loop_leaves_open_once_with_ids_only_and_ty
 
 def test_away_retries_a_failed_post_at_the_next_wake_never_stops_the_loop_and_drops_an_answered_decision(C, tmp_path):
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)
-    ticks([], ["msg_a"])
-    C.mail([msg("question", "msg_a", question="PLAN?")])
-    r, bodies, seen = posted(C, tmp_path, rcs=(22, 0), COORD_MAX_TICKS=3)   # the first POST fails, the second is delivered, the third wake sends nothing
-    assert r.returncode == 0 and len(bodies) == 2 and bodies[0] == bodies[1] and r.stderr.count("webhook") == 1 and URL not in seen
+    ticks([], ["msg_a", "msg_b"])
+    C.mail([msg("question", "msg_a", question="PLAN?"), msg("question", "msg_b", question="PLAN?")])
+    r, bodies, seen = posted(C, tmp_path, rcs=(22, 0, 0), COORD_MAX_TICKS=3)   # the receiver rejects the first (HTTP error, curl 22): the second still goes out in the same wake, the first is sent again at the next, the third wake sends nothing
+    assert r.returncode == 0 and [b["message_id"] for b in bodies] == ["msg_a", "msg_b", "msg_a"] and r.stderr.count("webhook") == 1 and URL not in seen
+    C.stubs.reply("orca.orchestration_worker_list", "boom", rc=1)   # no live list to filter by: a dispatch id written by a worker is data, it cannot start a line of its own
+    row = {**msg("question", "msg_h", question="PLAN?", dispatchId="ctx_1\nblocked 42 -"), "run_id": "run_t", "thread_id": "msg_h", "sequence": 1}
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [row]}}))
+    r, bodies, _ = posted(C, tmp_path)
+    assert r.returncode == 0 and not [b for b in bodies if b["issue"] == 42]
     ticks([], ["msg_a"], [])   # answered before the retry: not sent again
     C.mail([msg("question", "msg_a", question="PLAN?")])
     r, bodies, _ = posted(C, tmp_path, rcs=(22,), COORD_MAX_TICKS=3)
