@@ -39,10 +39,7 @@ while [ $# -gt 0 ]; do
     *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|attended|away|human] [--cap N] [--until HH:MM] [--drain] [--status] | --position | --run R --stop | --run R --wait [--seen '<ids>'] | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny | --run R --dispatch <issue> [message] | --run R --show <message-id> (--session <terminal-handle> with the loop)" ;;
   esac; shift
 done
-[ -n "$answer" ] || { [ -n "${NOTIFY_WEBHOOK_URL:-}" ] && answer=away || answer=auto; }   # no position given: away when a webhook is set (#543), else auto as before; a given one is never changed
-case "$answer" in auto | attended | away | human) ;; *) usage_exit "--answer takes auto, attended, away or human" ;; esac
-[ "$answer" != away ] || [ -z "$session" ] || usage_exit "--answer away types nothing into a session: drop --session"
-[ "$answer" != away ] || [[ ${NOTIFY_WEBHOOK_URL:-} =~ ^https?://[^[:space:]\"\\]+$ ]] || usage_exit "--answer away needs NOTIFY_WEBHOOK_URL, an http(s) URL, in .ai-toolkit/ai-toolkit.local.env"
+case "$answer" in "" | auto | attended | away | human) ;; *) usage_exit "--answer takes auto, attended, away or human" ;; esac
 [ "$stop" = 0 ] || [ -n "$run" ] || usage_exit "--stop needs --run <run-id>"
 [ "$watch" = 0 ] || [ -n "$run" ] || usage_exit "--wait needs --run <run-id>"
 [ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"; [[ -z $session || $session =~ ^term_[A-Za-z0-9_-]+$ ]] || usage_exit "--session takes an Orca terminal handle"; [ "$answer" != attended ] || [ -n "$session" ] || warn "attended without --session: the loop cannot tell the session of a decision, only --status shows the queue"
@@ -214,6 +211,11 @@ if [ "$stop" = 1 ] && [ -z "${ORCA_TERMINAL_HANDLE:-}" ]; then   # a chat sessio
   [ -n "$s" ] || die "terminal $t reported no exit status"
   log "run $run: --stop in terminal $t exited $s"; exit "$s"
 fi
+if [ "$stop" = 0 ]; then   # a loop start only (#543): the one-shot commands above never depend on the webhook setting. No position given: away when a webhook is set, else auto as before; a given one is never changed
+  [ -n "$answer" ] || { [ -n "${NOTIFY_WEBHOOK_URL:-}" ] && answer=away || answer=auto; }
+  [ "$answer" != away ] || [ -z "$session" ] || usage_exit "--answer away types nothing into a session: drop --session"
+  [ "$answer" != away ] || [[ ${NOTIFY_WEBHOOK_URL:-} =~ ^https?://[^[:space:]\"\\]+$ ]] || usage_exit "--answer away needs NOTIFY_WEBHOOK_URL, an http(s) URL, in .ai-toolkit/ai-toolkit.local.env"
+fi
 : "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal on the main checkout}"
 H="$ORCA_TERMINAL_HANDLE"
 prev=""; [ -z "$run" ] || prev="$(holder)"
@@ -326,6 +328,7 @@ drain_replies() {   # send the queued human replies as the bound consumer. Dropp
       tries="$(sed -n 2p "$f")"; [[ $tries =~ ^[0-9]+$ ]] || tries=0; tries=$((tries + 1)); code="$(jq -r '.error.code // empty' <<< "$out" 2> /dev/null)" || code=""
       if [ "$tries" -lt "${COORD_REPLY_TRIES:-5}" ]; then printf '%s\n%s\n' "$body" "$tries" > "$f"; warn "reply to $id failed (orca error: ${code:-none}), it stays queued"; continue; fi
       warn "reply to $id dropped after $tries failed sends (orca error: ${code:-none})"; [ "$answer" != attended ] || tell r "$id" || true
+      sent="${sent/ plan:$id / }"; sent="${sent/ permission_request:$id / }"   # away: the question is still open, the webhook announces it again at this wake
     fi
     rm -f "$f"
   done
