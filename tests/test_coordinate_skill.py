@@ -28,7 +28,8 @@ def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
     "one decision at a time", "never binds the Run", "Never show a heartbeat", "/coordinate auto", "--answer auto", "--until HH:MM", "--drain", "/coordinate attended", "coordinator.sh --stop --run",
     "land.sh --review", "blocked", "hold", "PERMISSION REQUEST", "allow", "deny", "COORD_IDLE_MIN", "orca orchestration worker-show --dispatch <id> --full", "observation.agentWait", "orca terminal read",
     "orca orchestration run-list", "afk-answering", "Scope:", "git log --since", "worker-list",
-    "AI_TOOLKIT_DIR", "no toolkit guards", "bin/claude-spoke", "--wait", "run_in_background", "COORD_WATCH_SEC", "7200000"])   # the guards precondition: a session not started through the launcher says so
+    "AI_TOOLKIT_DIR", "no toolkit guards", "bin/claude-spoke", "--wait", "run_in_background", "COORD_WATCH_SEC", "7200000",
+    "/coordinate away", "--answer away", "NOTIFY_WEBHOOK_URL", "--position", "never both"])   # the guards precondition: a session not started through the launcher says so
 def test_the_skill_covers_each_mechanic_of_the_brief(needle):
     assert needle in SKILL
 
@@ -79,6 +80,7 @@ def test_hub_points_at_coordinate_instead_of_duplicating_it():
 def test_the_architecture_doc_describes_both_modes_the_switch_and_the_attended_flow():
     doc = next(p for p in (ROOT / "docs/architecture.md", ROOT / "docs/v2/architecture.md") if p.exists()).read_text()  # before/after cutover
     assert all(w in doc for w in ("/coordinate", "attended", "--stop", "taken back", "```mermaid"))
+    assert all(w in doc for w in ("Three positions", "away", "NOTIFY_WEBHOOK_URL", "--position", "at-least-once", "ids only"))
     assert all(w in doc for w in ("PermissionRequest", "permission-relay.sh", "PERMISSION REQUEST", "fail-closed", "allow"))  # the permission relay and how it fails
 
 
