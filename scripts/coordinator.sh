@@ -141,7 +141,7 @@ round_q() {   # "<n>\t<title>" of each finished Land: human round (the human dec
 }
 awaiting_q() { gh issue list --label "$AWAITING_LABEL" --state "$1" --limit 100 --json number,title,state,labels; }   # $1 open|all: the issues waiting for their merge into MAIN_BRANCH (all: GitHub may have closed one with its PR's Closes)
 queue_ids() {   # the decisions waiting for the human, in the order to present them, one word each: q:<message id> (a plan: a worker waits, a slot is held) or p:<message id> (a permission request), then b:<issue> (blocked; a review that kept rejecting is one)
-  local q; q="$(open_q | jq -r '"\(if ((.payload // "{}" | if type == "string" then fromjson else . end).question // .body // "") | test("^\\s*PERMISSION REQUEST") then "p" else "q" end):\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
+  local q h; q="$(open_q | jq -r '"\(if ((.payload // "{}" | if type == "string" then fromjson else . end).question // .body // "") | test("^\\s*PERMISSION REQUEST") then "p" else "q" end):\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d' | { h="$(spool_dir "$run")/handed"; if [ -s "$h" ]; then grep -vxFf "$h" || true; else cat; fi; }   # the blocked ids are the last read (see notify_queue); a decision handed over to the webhook (#546) is no longer waiting for this session
 }
 hold() { held="$held $1 "; printf '%s\n' "$1" >> "$sd/held"; }   # $1 message id: left open for the human, in the loop's memory and in the spool for --status (a plan outside it is the loop's to answer)
 by_loop() { case "${lm%% *}" in attended | auto | away) ! is_perm "$2" && [ -f "$(spool_dir "$run")/held" ] && ! grep -qxF "$1" "$(spool_dir "$run")/held" ;; *) false ;; esac; }   # $1 message id, $2 its question, $lm the live loop's mode (none, human or no held file, e.g. an older loop: every open question is the human's)
@@ -163,16 +163,20 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
     echo "  $d $w $v $a, silent ${age:-?}m${tcall:+, tool call running ${tcall}m}$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done || echo "  (Orca did not answer)"
   { [ -z "$lm" ] || ! read -r li _ lt 2> /dev/null < "$(spool_dir "$run")/landing"; } || echo "landing #$li since $lt"   # only a live loop can be landing: a file left by a killed one is not shown
   echo "queue (the order to present it):"
-  oq="$(open_q)"; mine=""; nl=$'\n'   # one jq for the whole queue: id, payload question, body, each NUL-ended (a spawn per question and field is what made --status slow)
+  oq="$(open_q)"; mine=""; hov=""; hd="$(spool_dir "$run")/handed"; nl=$'\n'   # one jq for the whole queue: id, payload question, body, each NUL-ended (a spawn per question and field is what made --status slow)
   while IFS= read -r -d '' id && IFS= read -r -d '' q && IFS= read -r -d '' b; do q="${q%"${q##*[!"$nl"]}"}"; b="${b%"${b##*[!"$nl"]}"}"; [ -n "$q" ] || q="$b"   # question_of's rule: the payload question, else the body, trailing newlines dropped
-    if by_loop "$id" "$q"; then mine="$mine $id"; continue; fi; echo "  $id"; show_q "$q"
+    if by_loop "$id" "$q"; then mine="$mine $id"; continue; fi
+    if is_perm "$q"; then k=p; else k=q; fi; if grep -qxF "$k:$id" "$hd" 2> /dev/null; then hov="$hov $id"; continue; fi   # handed over to the webhook (#546): not a decision to present
+    echo "  $id"; show_q "$q"
     if is_perm "$q"; then echo "    reply: $(replycmd "$id" allow)   (or deny)"; else echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; fi
   done < <(jq -j '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | [.id, ($p.question // ""), (.body // "")] | map(tostring | gsub("\u0000"; "") + "\u0000") | add' <<< "$oq")
   me="$(gh api user --jq .login 2> /dev/null)" || me=""   # the reason is the loop's own last "blocked:" comment (this gh login): the repo may be public, any other author's text is not shown
-  { blocked_q || true; } | while IFS=$'\t' read -r n t; do   # one line each, no control byte, capped: the text is somebody else's, it must not forge a queue item or move the cursor
+  bq="$(blocked_q || true)"; while IFS=$'\t' read -r n t <&3; do   # one line each, no control byte, capped: the text is somebody else's, it must not forge a queue item or move the cursor
+    if grep -qxF "b:$n" "$hd" 2> /dev/null; then hov="$hov #$n"; continue; fi   # handed over to the webhook (#546)
     w="$(gh issue view "$n" --json comments 2> /dev/null | jq -r --arg me "$me" '[.comments[] | select(.author.login == $me and (.body | startswith("blocked: "))) | .body] | last // "" | .[9:]' 2> /dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-160)" || w=""
     echo "  blocked #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)${w:+: $w}"
-    echo "    decide: re-dispatch (comment the guidance, then remove the blocked label, or --dispatch $n '<message>'), park it with the hold label, or close it"; done
+    echo "    decide: re-dispatch (comment the guidance, then remove the blocked label, or --dispatch $n '<message>'), park it with the hold label, or close it"; done 3<<< "$bq"
+  [ -z "$hov" ] || echo "handed over to the webhook:$hov"   # not decisions: the receiver answers them (--reply), the first answer wins
   { round_q || true; } | while IFS=$'\t' read -r n t; do   # a finished Land: human round: the report is the issue's last comment
     echo "  finished round #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)"
     echo "    decide: read the report (gh issue view $n --comments), then the next round: bash $here/coordinator.sh --run $run --dispatch $n '<guidance>'; or land (it removes the worktree and its gitignored artefacts): gh issue view $n --json body -q .body | sed 's/^Land:.*/Land: auto/' | gh issue edit $n --body-file -  then  --dispatch $n 'address: send worker_done again'"; done
@@ -215,10 +219,14 @@ if [ "$stop" = 1 ] && [ -z "${ORCA_TERMINAL_HANDLE:-}" ]; then   # a chat sessio
   [ -n "$s" ] || die "terminal $t reported no exit status"
   log "run $run: --stop in terminal $t exited $s"; exit "$s"
 fi
+handover=0
 if [ "$stop" = 0 ]; then   # a loop start only (#543): the one-shot commands above never depend on the webhook setting. No position given: away when a webhook is set, else auto as before; a given one is never changed
   [ -n "$answer" ] || { [ -n "${NOTIFY_WEBHOOK_URL:-}" ] && answer=away || answer=auto; }
   [ "$answer" != away ] || [ -z "$session" ] || usage_exit "--answer away types nothing into a session: drop --session"
   [ "$answer" != away ] || [[ ${NOTIFY_WEBHOOK_URL:-} =~ ^https?://[^[:space:]\"\\]+$ ]] || usage_exit "--answer away needs NOTIFY_WEBHOOK_URL, an http(s) URL, in .ai-toolkit/ai-toolkit.local.env"
+  if [ "$answer" = attended ] && [[ ${NOTIFY_WEBHOOK_URL:-} =~ ^https?://[^[:space:]\"\\]+$ ]]; then   # #546: attended hands a decision nobody answered over to the webhook; a webhook that is unset or malformed leaves attended as it was
+    for v in HANDOVER_PERMISSION_S HANDOVER_PLAN_S; do [[ ${!v:-} =~ ^[0-9]+$ ]] || usage_exit "$v takes a number of seconds"; done; handover=1
+  fi
 fi
 : "${ORCA_TERMINAL_HANDLE:?run me from an Orca terminal on the main checkout}"
 H="$ORCA_TERMINAL_HANDLE"
@@ -245,11 +253,12 @@ died() {   # the EXIT trap, $1 = the exit status, $2 = the last command: every e
   { [ "$1" = 0 ] || [ "$1" = 130 ] || [ "$answer" != attended ] || [ -z "$session" ]; } || orca_json terminal send --terminal "$session" --text "[coordinator loop] stopped $how: nothing coordinates Run $run, $rd and start it again." --enter > /dev/null 2>&1 || true
   [ "$1" != 0 ] || orca_json terminal close --terminal "$H" > /dev/null 2>&1 || true   # a normal exit leaves a dead shell in this pane (Start types the command into a login shell); any other status keeps it, it holds the die text
 }
-sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$BASH_COMMAND"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (umask 077; mkdir -p "$sd"); lf="$sd/loop.log"; rm -f "$sd/held" "$sd/landing"; printf '%s %s\n' "$H" "$mode" > "$hf"
+sd="$(spool_dir "$run")"; errf="$(mktemp)"; hf="$sd/holder.$$"; trap 'died $? "$BASH_COMMAND"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (umask 077; mkdir -p "$sd"); lf="$sd/loop.log"; rm -f "$sd/held" "$sd/landing" "$sd/handed"; printf '%s %s\n' "$H" "$mode" > "$hf"
 [ ! -f "$lf" ] || { tail -n 200 "$lf" > "$lf.t" && mv "$lf.t" "$lf"; }   # the loop's own record, kept when its pane is gone: the last 200 lines of the earlier loops, then this one's; written before the pane (a closed pty fails the print)
 log() { local t; t="$(date '+%F %T')"; printf '%s coordinator: %s\n' "$t" "$*" >> "$lf" || true; printf '%s coordinator: %s\n' "${t#* }" "$*" || true; }
 warn() { local t; t="$(date '+%F %T')"; printf '%s coordinator: warning: %s\n' "$t" "$*" >> "$lf" || true; printf '%s: warning: %s\n' "${0##*/}" "$*" >&2 || true; }
 log "run $run, cap $cap, answer $answer${until:+, until $until}${prev:+ (was held by $prev)}"
+[ "$answer" != attended ] || [ -z "${NOTIFY_WEBHOOK_URL:-}" ] || [ "$handover" = 1 ] || warn "NOTIFY_WEBHOOK_URL is not an http(s) URL: no hand-over to the webhook, and --until ends the loop"
 tel="$(telemetry)" || warn "telemetry $tel"   # #538: once per start, a heads-up only
 
 # ctx <dispatch>: sets disp task term wtp issue br (its Orca branch) from the worker's Orca row and the issue linked to its worktree.
@@ -568,24 +577,29 @@ tell() {   # $1 kind (p|q|b|h = a finished issue held|r = a dropped reply), $2 i
 }
 post() {   # $1 event, $2 issue, $3 message id (none for blocked): ONE POST of ids to NOTIFY_WEBHOOK_URL. The body is built from ids only (a worker's text never enters it) and the URL goes in through a config file descriptor: in no argv, log, comment or warning
   local body rc=0; [ -n "${nwo:-}" ] || nwo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2> /dev/null)" || nwo=""; [ -n "$nwo" ] || { warn "webhook: cannot read the repository name, retried at the next wake"; return 1; }
-  body="$(jq -nc --arg e "$1" --arg r "$nwo" --argjson i "$2" --arg run "$run" --arg m "${3:-}" '{event: $e, repo: $r, issue: $i, run: $run} + (if $m == "" then {} else {message_id: $m} end) + {position: "away", handed_over: false}')" || return 1
+  body="$(jq -nc --arg e "$1" --arg r "$nwo" --argjson i "$2" --arg run "$run" --arg m "${3:-}" --arg pos "$answer" '{event: $e, repo: $r, issue: $i, run: $run} + (if $m == "" then {} else {message_id: $m} end) + {position: $pos, handed_over: ($pos == "attended")}')" || return 1
   printf '%s' "$body" | curl -q -s -f -m 5 -X POST -H 'Content-Type: application/json' --data-binary @- --config <(printf 'url = "%s"\n' "$NOTIFY_WEBHOOK_URL") > /dev/null 2>&1 || { rc=$?; warn "cannot POST the decision to the webhook (curl exit $rc): sent again at the next wake"; return "$rc"; }
 }
-announce() {   # away: POST each decision the loop left open ($held) and each blocked issue ($bids) once; $sent holds the delivered ones (no file: a restart sends again, the receiver dedupes). A failed POST stops this wake's sends (a dead webhook costs 5 s, not 5 s each) and is retried at the next; an id no longer in the queue is dropped from $sent
-  local items ev id d n mid fail=0 now="" keep="" i; items="$(open_q | jq -r '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | [(if ($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") then "permission_request" else "plan" end), .id, ($p.dispatchId // "-")] | @tsv')" || return 0   # @tsv: a field a worker wrote cannot start a line of its own
-  for i in $bids; do items="$items"$'\n'"blocked ${i#b:} -"; done
-  while read -r ev id d <&3; do
+announce() {   # away: POST each decision the loop left open ($held) and each blocked issue ($bids) once; attended with a webhook (#546, $handover): the same, for each one still unanswered after its delay (a permission request HANDOVER_PERMISSION_S, a plan or a blocked issue HANDOVER_PLAN_S), then listed in $sd/handed so the session no longer presents it. $sent holds the delivered ones (no file: a restart sends again, the receiver dedupes). A failed POST stops this wake's sends (a dead webhook costs 5 s, not 5 s each) and is retried at the next; an id no longer in the queue is dropped from $sent
+  local items ev id d n mid age lim t fail=0 now="" keep="" i nb=" " tnow; tnow="$(date +%s)"
+  items="$(open_q | jq -r --argjson now "$tnow" '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | [(if ($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") then "permission_request" else "plan" end), .id, ($p.dispatchId // "-"), ((try ((.created_at | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)) catch $now) | $now - .)] | @tsv')" || return 0   # @tsv: a field a worker wrote cannot start a line of its own; the age is in seconds, 0 when Orca gave no usable time
+  for i in $bids; do   # a blocked issue has no time of its own: its age is the time since this loop first listed it (a restart starts it again, which only delays)
+    case "$bseen" in *" $i="*) t="${bseen#* $i=}"; t="${t%% *}" ;; *) t="$tnow" ;; esac; nb="$nb$i=$t "; items="$items"$'\n'"blocked ${i#b:} - $((tnow - t))"
+  done; bseen="$nb"
+  while read -r ev id d age <&3; do
     [ -n "$id" ] || continue; n="$id"; mid=""
     if [ "$ev" != blocked ]; then case " $held " in *" $id "*) ;; *) continue ;; esac; mid="$id"; n="$(recorded_issue "$run" "$d")" || n=""; fi
     now="$now$ev:$id "; case " $sent " in *" $ev:$id "*) continue ;; esac; [ "$fail" = 0 ] || continue
-    if ! [[ $id =~ ^[A-Za-z0-9_-]+$ && $n =~ ^[0-9]+$ ]]; then warn "webhook: no issue is recorded for $ev $id, so it cannot be announced (away): reply by hand, see --status"; sent="$sent$ev:$id "
-    elif post "$ev" "$n" "$mid"; then sent="$sent$ev:$id "; else [ $? = 22 ] || fail=1; fi   # curl 22 = the receiver answered with an HTTP error: the next decision is still sent; any other failure (down, timeout) stops this wake
+    if [ "$answer" = attended ]; then lim="$HANDOVER_PLAN_S"; [ "$ev" != permission_request ] || lim="$HANDOVER_PERMISSION_S"; [ "$age" -ge "$lim" ] || continue; fi
+    if ! [[ $id =~ ^[A-Za-z0-9_-]+$ && $n =~ ^[0-9]+$ ]]; then warn "webhook: no issue is recorded for $ev $id, so it cannot be announced: reply by hand, see --status"; sent="$sent$ev:$id "
+    elif post "$ev" "$n" "$mid"; then sent="$sent$ev:$id "; [ "$answer" != attended ] || printf '%s:%s\n' "$(case "$ev" in plan) echo q ;; permission_request) echo p ;; *) echo b ;; esac)" "$id" >> "$sd/handed"; else [ $? = 22 ] || fail=1; fi   # curl 22 = the receiver answered with an HTTP error: the next decision is still sent; any other failure (down, timeout) stops this wake
   done 3<<< "$items"
   for i in $now; do case " $sent " in *" $i "*) keep="$keep$i " ;; esac; done; sent=" $keep"
 }
 notify_queue() {   # attended: tell the session of a decision that was not queued at the last look, once: the first one when nothing that was waiting at the last look still is, and every permission request (it expires in 9 minutes); the ids last seen live in $seen (no file); a failed read or send changes nothing, the next wake looks again. A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event.
   [ "$answer" = attended ] || [ "$answer" = away ] || return 0; local now i all k first=0 fail=0; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
   [ "$answer" != away ] || { announce; return 0; }
+  [ "$handover" = 0 ] || announce   # #546: what nobody answered in time goes to the webhook first, and is then no longer this session's
   all="$(queue_ids | tr '\n' ' ')" || return 0; now=""; first=1; for i in $seen; do case " $all " in *" $i "*) first=0 ;; esac; done; for i in $all; do k="${i%%:*}"; [ "$k" = b ] || case " $held " in *" ${i#?:} "*) ;; *) continue ;; esac; now="$now$i "
     case " $seen " in *" $i "*) continue ;; esac; [ "$k" = p ] || [ "$first" = 1 ] || continue; [ "$k" = p ] || first=0; tell "$k" "${i#?:}" || fail=1
   done; [ "$fail" = 1 ] || seen="$now"
@@ -604,11 +618,14 @@ autosync() {   # at a wake, where no land, dispatch or answer is under way: sync
   log "toolkit $tv0 -> $now: re-exec"; rm -f "$errf"   # the EXIT trap does not run on exec; holder.$$ stays valid, the pid is the same
   exec bash "$here/coordinator.sh" ${orig[@]+"${orig[@]}"} --run "$run"   # --run last wins: a loop started without one keeps the Run it created
 }
-tick=0; empties=0; seen=""; sent=" "; bids=""; bdirty=1; held=""; if ids="$(open_q | jq -r .id | tr '\n' ' ')"; then held=" $ids"; tr ' ' '\n' <<< "$ids" | sed '/^$/d' > "$sd/held"; fi; start="$(now_min)"; budget=0
+tick=0; empties=0; seen=""; sent=" "; bseen=" "; bids=""; bdirty=1; held=""; if ids="$(open_q | jq -r .id | tr '\n' ' ')"; then held=" $ids"; tr ' ' '\n' <<< "$ids" | sed '/^$/d' > "$sd/held"; fi; start="$(now_min)"; budget=0
 [ -z "$until" ] || budget=$(((($(mins "$until") - start) + 1440) % 1440))
 while :; do
   tick=$((tick + 1)); yield
-  if [ -n "$until" ] && [ $((($(now_min) - start + 1440) % 1440)) -ge "$budget" ]; then log "reached $until"; break; fi
+  if [ -n "$until" ] && [ $((($(now_min) - start + 1440) % 1440)) -ge "$budget" ]; then
+    [ "$answer" = attended ] && [ "$handover" = 1 ] || { log "reached $until"; break; }
+    log "reached $until: switching to away, on this Run"; answer=away; until=""; mode=away; [ "$drain" = 0 ] || mode="$mode drain"; printf '%s %s\n' "$H" "$mode" > "$hf"   # #546: the session is no longer there, what waits goes to the webhook (what was handed over is in $sent)
+  fi
   [ -z "${COORD_MAX_TICKS:-}" ] || [ "$tick" -le "$COORD_MAX_TICKS" ] || break
   autosync; fill
   if [ "$drain" = 1 ] && [ "$ready" = 0 ] && [ "$(wl | nlive)" = 0 ]; then log "drained"; break; fi
