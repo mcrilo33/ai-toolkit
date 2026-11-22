@@ -188,8 +188,8 @@ def test_a_finished_land_human_round_is_presented_as_two_levels_with_a_three_opt
     ("skills/start-task/SKILL.md", ["`Land:`", "`human`", "eval", "prompt", "annotator", "refused at dispatch", "priced estimate", "never a round guess"]),
     ("skills/solo-cycle/SKILL.md", ["`Land: human`", "round report", "absolute paths", "guidance for the next round", "Deferred"]),
     ("rules/on-demand/issue-hygiene.md", ["`Land:`", "`human`", "round report", "`auto`"]),
-    ("skills/solo-cycle/SKILL.md", ["only the human can do", "never escalate"]),
-    ("rules/operational-gotchas.md", ["aws sso login", "aws sts get-caller-identity", "through its `ask`"]),
+    ("skills/solo-cycle/SKILL.md", ["only the human can do", "never escalate", "restart the flow", "fresh URL or device code"]),
+    ("rules/operational-gotchas.md", ["aws sso login", "aws sts get-caller-identity", "through its `ask`", "In a chat session, if the token", "a spoke restarts the flow"]),
     ("skills/coordinate/SKILL.md", ["never tells the worker to \"escalate\""]),
     ("rules/on-demand/afk-answering.md", ["the human is away", "worker_done --outcome failed"]),
 ])
