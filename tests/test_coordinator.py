@@ -32,6 +32,15 @@ def in_order(kinds, *seq):
     assert [kinds.index(s) for s in seq] == sorted(kinds.index(s) for s in seq)
 
 
+CURL = """#!/bin/bash
+d=$STUB_DIR; printf 'curl' >> "$d/calls.log"; for a in "$@"; do printf '\\037%s' "$a" >> "$d/calls.log"; done; echo >> "$d/calls.log"
+while [ $# -gt 0 ]; do [ "$1" != --config ] || cat "$2" >> "$d/curl.urls"; shift; done
+IFS= read -r -d '' in; printf '%s\\n' "$in" >> "$d/curl.bodies"
+c=0; [ -f "$d/curl.n" ] && read -r c < "$d/curl.n"; c=$((c + 1)); echo $c > "$d/curl.n"
+rc=0; [ -f "$d/curl.rcs" ] && rc="$(sed -n "${c}p" "$d/curl.rcs")"; exit "${rc:-0}"
+"""   # records argv, the URL the config file holds and the stdin body; the exit status of call N is line N of curl.rcs (0 by default)
+
+
 @pytest.fixture
 def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     monkeypatch.setenv("STUB_NOENV", "1")   # no test here reads a stub's env: one process fewer per stub call
@@ -40,6 +49,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     for n in ("dispatch.sh", "land.sh", "answer.sh"):   # sub-commands are stubs that also record their stdin
         link_script(cmds / n, STUB_TEE)
     link_script(tmp_path / "stubs/bin/claude", STUB_TEE)   # the post-land triage prompt goes on its stdin
+    link_script(tmp_path / "stubs/bin/curl", CURL)   # the webhook POST of an away loop
     link_script(cmds / "otel.sh", STUB)   # healthy unless a test replies otherwise: no test starts the real otel.sh (docker)
 
     def row(d="ctx_1", st="dispatched", lv="live", rec=1):   # the dispatch record dispatch.sh keeps for every id a row uses: the issue it was given (None = none was written)
@@ -982,6 +992,63 @@ def test_attended_sends_nothing_behind_a_waiting_decision_but_a_permission_reque
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)
     C.mail([msg("question", "msg_a", question="PLAN?")], [msg("question", "msg_b", question="PLAN?"), msg("question", "msg_pc", question=PQ)], [], [msg("question", "msg_e", question="PLAN?")])
     assert sent(C, COORD_MAX_TICKS=4, COORD_SWEEP_EVERY=99) == [line("plan", "msg_a"), line("permission request", "msg_pc"), line("plan", "msg_e")]   # msg_b waits behind msg_a and is the session's to present once msg_a is answered, not the loop's
+
+
+URL = "https://hooks.example.test/s3cr3t-token"
+BLOCKED = json.dumps([{"number": 1, "title": "t", "labels": [{"name": "blocked"}]}])
+
+
+def posted(C, tmp_path, *args, rcs=(), **env):   # one away loop run with a webhook (the harness gives it an empty --session): (result, the JSON bodies POSTed, everything the run printed, logged or commented)
+    d = Path(os.environ["STUB_DIR"])
+    for f in ("calls.log", "curl.n", "curl.bodies", "curl.urls", "curl.rcs"):
+        (d / f).unlink(missing_ok=True)
+    (d / "curl.rcs").write_text("".join(f"{rc}\n" for rc in rcs))
+    C.stubs.reply("gh.repo_view", "o/r\n")
+    r = C.go("--answer", "away", "--session", "", *args, NOTIFY_WEBHOOK_URL=URL, COORD_SWEEP_EVERY=99, **{"COORD_MAX_TICKS": 1, **env})
+    bodies = [json.loads(ln) for ln in (d / "curl.bodies").read_text().splitlines()] if (d / "curl.bodies").exists() else []
+    seen = r.stdout + r.stderr + "".join(f.read_text() for f in (tmp_path / "state/run_t/loop.log", d / "calls.log") if f.exists())
+    return r, bodies, seen
+
+
+@pytest.mark.parametrize("kind", ["plan", "permission_request", "blocked"])
+def test_away_posts_each_decision_the_loop_leaves_open_once_with_ids_only_and_types_nothing(C, tmp_path, kind):
+    C.stubs.reply("answer.sh", WHY + "\n", rc=3)   # a plan answer.sh hands over: its reason is the answerer's text, never sent
+    C.stubs.reply("gh.issue_list", BLOCKED if kind == "blocked" else "[]")
+    mid = {"plan": "msg_a", "permission_request": "msg_pa"}.get(kind)
+    if mid:
+        ticks([], [mid])   # the plan text of ticks() is hostile (control bytes, a shell command)
+        C.mail([msg("question", mid, question="PLAN\x1b[2J?\nrm -rf /" if kind == "plan" else PQ)])
+    else:
+        C.mail([msg("worker_done", outcome="failed")])
+    r, bodies, seen = posted(C, tmp_path)
+    assert r.returncode == 0 and bodies == [{"event": kind, "repo": "o/r", "issue": 1, "run": "run_t", **({"message_id": mid} if mid else {}), "position": "away", "handed_over": False}]
+    assert not C.calls("orca terminal send") and URL not in seen and "rm -rf" not in json.dumps(bodies) and WHY not in json.dumps(bodies)
+    (post,) = C.calls("curl")
+    assert arg(post, "-m") == "5" and "Content-Type: application/json" in post
+    if mid:   # the decision is answered through the existing --reply, as in attended
+        assert C.go("--reply", mid, "approve" if kind == "plan" else "allow").returncode == 0 and C.spooled(mid)
+
+
+def test_away_retries_a_failed_post_at_the_next_wake_never_stops_the_loop_and_drops_an_answered_decision(C, tmp_path):
+    C.stubs.reply("answer.sh", WHY + "\n", rc=3)
+    ticks([], ["msg_a"])
+    C.mail([msg("question", "msg_a", question="PLAN?")])
+    r, bodies, seen = posted(C, tmp_path, rcs=(22, 0), COORD_MAX_TICKS=3)   # the first POST fails, the second is delivered, the third wake sends nothing
+    assert r.returncode == 0 and len(bodies) == 2 and bodies[0] == bodies[1] and r.stderr.count("webhook") == 1 and URL not in seen
+    ticks([], ["msg_a"], [])   # answered before the retry: not sent again
+    C.mail([msg("question", "msg_a", question="PLAN?")])
+    r, bodies, _ = posted(C, tmp_path, rcs=(22,), COORD_MAX_TICKS=3)
+    assert r.returncode == 0 and len(bodies) == 1
+
+
+@pytest.mark.parametrize("mode", ["attended", "auto", "human"])
+def test_outside_away_nothing_is_posted_even_with_the_webhook_set(C, tmp_path, mode):
+    C.stubs.reply("answer.sh", WHY + "\n", rc=3)
+    C.stubs.reply("gh.issue_list", BLOCKED)
+    ticks([], ["msg_a", "msg_pb"])
+    C.mail([msg("question", "msg_a", question="PLAN?"), msg("question", "msg_pb", question=PQ)])
+    r = C.go("--answer", mode, "--session", "", NOTIFY_WEBHOOK_URL=URL, COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=99)
+    assert r.returncode == 0 and C.calls("orca orchestration check ack") and not C.calls("curl")
 
 
 def test_the_blocked_queue_reads_only_the_dispatch_label_when_one_is_set(C):
