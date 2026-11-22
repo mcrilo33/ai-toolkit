@@ -61,6 +61,7 @@ loop shows, what bears on it (the files, the acceptance criteria, conflicts with
 .ai-toolkit/scripts/coordinator.sh --run <run> --reply <message-id> 'revise: <the change, one paragraph>'
 ```
 
+- **A human-only step** (a worker asks for a login, token or setting only the user can do): a gate answer never tells the worker to "escalate"; the worker asks, and the user's "done" goes back as `approve with: done`, which resumes the same worker.
 - **A plan the answerer handed over** (the issue comment says `human: <reason>`): show the plan and that reason, then say what you would answer. Never approve blindly: no reply before the user decided, unless they said in this conversation to approve a class of plans.
   Turn their answer, whatever its wording, into exactly ONE of the three replies (which one: `afk-answering`, Choosing the reply). An answer that changes what the issue asks goes into the issue body (or a comment) first: the issue is the contract.
 - **`PERMISSION REQUEST`** (not a plan gate: a worker's permission prompt; it waits at most 9 minutes and then its relay denies itself, so ignore a stale one): show the tool, the whole command, the cwd and the `reason`; reply `--reply <id> allow` or `deny` only on the user's decision

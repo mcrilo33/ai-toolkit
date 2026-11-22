@@ -74,6 +74,10 @@ allow one; if one reaches you anyway, never allow it. `allow` and `deny` are rep
 - **attended**: the loop never approves one either: it leaves every request open, queued for the human, who has the relay's 9 minutes (the worker's relay denies itself after that). The loop has no containment check and no second judge; the guard and its judge already decide what reaches the human.
 - **human**: leaves it open; the human replies `allow` or `deny`.
 
+## A step only the human can do
+
+A spoke's ask for a login, token or setting only the human can do is no plan. `Mode: auto`: nobody can do it, so reply `approve with: the human is away, end with worker_done --outcome failed naming the step` (not `revise:`, so it does not re-ask; the issue blocks through the normal channel, with no fence). `Mode: attended`: `ANSWER: human: <the step>`.
+
 ## Irreversible, outward-facing, or scope-changing asks
 
 These are answered too, with the **reversible alternative**, so nothing irreversible happens unattended.
