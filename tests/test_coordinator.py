@@ -1110,10 +1110,13 @@ def test_a_decision_handed_over_is_left_out_of_the_queue_the_session_presents(C,
     r, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=0)   # the plan and the blocked issue are both handed over
     assert [b["event"] for b in bodies] == ["plan", "blocked"] and not C.calls("orca terminal send")   # and the session is told nothing about them
     assert (tmp_path / "state/run_t/handed").read_text().split() == ["q:msg_a", "b:1"]
+    (Path(os.environ["STUB_DIR"]) / "calls.log").unlink(missing_ok=True)   # what follows is read-only: the loop's own calls are behind us
     C.inbox(["msg_a"])
     out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
     assert "handed over to the webhook: msg_a #1" in out and "reply:" not in out and "blocked #1" not in out   # one line, no reply command, no decision to present
     assert watched(C, ([], []), (["msg_a"], []), (["msg_a"], [])).stdout == ""   # the --wait watcher of a chat session does not wake for it
+    for n in ("orca.orchestration_inbox", "gh.issue_list"):
+        (Path(os.environ["STUB_DIR"]) / f"{n}.count").unlink(missing_ok=True)   # the stubs number their replies per call: start again at the first
     assert watched(C, ([], []), (["msg_a", "msg_b"], [])).stdout.split() == ["msg_b"]   # a new decision still does
 
 
@@ -1131,7 +1134,7 @@ START_RULES = {   # (arguments, the webhook, what the start does)
     "away-types-nothing-into-a-session": (["--answer", "away", "--session", "term_s"], URL, "refused"),
     "no-position-with-webhook": ([], URL, "cap 3, answer away"), "no-position-without-webhook": ([], "", "cap 3, answer auto"), "explicit-auto-with-webhook": (["--answer", "auto"], URL, "cap 3, answer auto"),
     "a-bad-webhook-leaves-the-one-shot-commands-alone": (["--status"], "ftp://x y", "run: run_t"),
-    "attended-handover-delay-not-a-number": (["--answer", "attended"], URL, "refused", {"HANDOVER_PLAN_S": "soon"}),
+    "attended-handover-delay-not-a-number": (["--answer", "attended", "--session", "term_s"], URL, "refused", {"HANDOVER_PLAN_S": "soon"}),
     "attended-handover-delays-are-not-read-without-a-webhook": (["--answer", "attended"], "", "cap 3, answer attended", {"HANDOVER_PLAN_S": "soon"}),
 }
 
