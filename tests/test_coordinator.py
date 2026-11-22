@@ -1122,7 +1122,7 @@ def test_a_decision_whose_reply_is_queued_in_the_spool_is_never_handed_over(C, t
 def test_a_decision_handed_over_is_left_out_of_the_queue_the_session_presents(C, tmp_path):
     aged(C, msg_a=700)
     C.stubs.reply("gh.issue_list", BLOCKED)
-    r, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=0)   # the plan and the blocked issue are both handed over
+    _, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=0)   # the plan and the blocked issue are both handed over
     assert [b["event"] for b in bodies] == ["plan", "blocked"] and not C.calls("orca terminal send")   # and the session is told nothing about them
     assert (tmp_path / "state/run_t/handed").read_text().split() == ["q:msg_a", "b:1"]
     (Path(os.environ["STUB_DIR"]) / "calls.log").unlink(missing_ok=True)   # what follows is read-only: the loop's own calls are behind us
