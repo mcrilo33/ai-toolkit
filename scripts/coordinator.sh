@@ -13,6 +13,7 @@
 # request stay OPEN (the loop never approves one), queued for the human with the other open questions and the blocked issues; the session is told by ONE line typed into its terminal (--session <handle>, orca terminal send) when a decision arrives on an empty queue, and for every permission request; the loop rings nothing. --show <message-id> prints one open question whole. --dispatch <issue> [message]
 # queues a dispatch request the loop runs ahead of its own pick (cap and Scope rule apply). auto and human are unchanged.
 # --answer away (#543, needs NOTIFY_WEBHOOK_URL and no --session; a loop started with no --answer is away when it is set, else auto; --position prints the position of the loop holding the Run): attended's decisions with no session to type into: a plan the loop leaves open, a permission request and a blocked issue are each POSTed to the webhook as ids only (never a worker's text), at least once: a failed POST (curl -m 5) is one warning and is sent again at the next wake until delivered or the decision is answered. Answers come back through --reply and --dispatch.
+# Hand-over (#546, attended with a valid NOTIFY_WEBHOOK_URL): a decision still unanswered after HANDOVER_PERMISSION_S (a permission request) or HANDOVER_PLAN_S (a plan, a blocked issue) is POSTed like away's, with position attended and handed_over true, and listed in the spool file `handed`: --status shows it on one line, --wait and the typed line skip it. --until then switches to away on the same Run (without a valid webhook it ends the loop).
 # `Land: human` issue (#511): each worker_done is a round report, never landed: the issue gets a "Round finished" comment carrying it, the worktree stays, and while no worker runs on it the round is a decision (--status, --wait). --dispatch <n> '<guidance>' starts the next round (a task titled "#<n> round", which rounds() counts from); the land is the footer set to `Land: auto` and --dispatch <n> 'address: send worker_done again'.
 # --run R --wait [--seen '<ids>'] (a chat session, #473): read-only, needs no terminal; polls every COORD_WATCH_SEC (5) and exits 0 printing the id of a decision that was not waiting when it started (nor in --seen), by notify_queue's rule; a failed read retries.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
@@ -163,16 +164,16 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
     echo "  $d $w $v $a, silent ${age:-?}m${tcall:+, tool call running ${tcall}m}$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done || echo "  (Orca did not answer)"
   { [ -z "$lm" ] || ! read -r li _ lt 2> /dev/null < "$(spool_dir "$run")/landing"; } || echo "landing #$li since $lt"   # only a live loop can be landing: a file left by a killed one is not shown
   echo "queue (the order to present it):"
-  oq="$(open_q)"; mine=""; hov=""; hd="$(spool_dir "$run")/handed"; nl=$'\n'   # one jq for the whole queue: id, payload question, body, each NUL-ended (a spawn per question and field is what made --status slow)
+  oq="$(open_q)"; mine=""; hov=""; hfile="$(spool_dir "$run")/handed"; nl=$'\n'   # one jq for the whole queue: id, payload question, body, each NUL-ended (a spawn per question and field is what made --status slow)
   while IFS= read -r -d '' id && IFS= read -r -d '' q && IFS= read -r -d '' b; do q="${q%"${q##*[!"$nl"]}"}"; b="${b%"${b##*[!"$nl"]}"}"; [ -n "$q" ] || q="$b"   # question_of's rule: the payload question, else the body, trailing newlines dropped
     if by_loop "$id" "$q"; then mine="$mine $id"; continue; fi
-    if is_perm "$q"; then k=p; else k=q; fi; if grep -qxF "$k:$id" "$hd" 2> /dev/null; then hov="$hov $id"; continue; fi   # handed over to the webhook (#546): not a decision to present
+    if is_perm "$q"; then k=p; else k=q; fi; if grep -qxF "$k:$id" "$hfile" 2> /dev/null; then hov="$hov $id"; continue; fi   # handed over to the webhook (#546): not a decision to present
     echo "  $id"; show_q "$q"
     if is_perm "$q"; then echo "    reply: $(replycmd "$id" allow)   (or deny)"; else echo "    reply: $(replycmd "$id")   (or 'approve with: <change>' / 'revise: <change>')"; fi
   done < <(jq -j '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | [.id, ($p.question // ""), (.body // "")] | map(tostring | gsub("\u0000"; "") + "\u0000") | add' <<< "$oq")
   me="$(gh api user --jq .login 2> /dev/null)" || me=""   # the reason is the loop's own last "blocked:" comment (this gh login): the repo may be public, any other author's text is not shown
   bq="$(blocked_q || true)"; while IFS=$'\t' read -r n t <&3; do   # one line each, no control byte, capped: the text is somebody else's, it must not forge a queue item or move the cursor
-    if grep -qxF "b:$n" "$hd" 2> /dev/null; then hov="$hov #$n"; continue; fi   # handed over to the webhook (#546)
+    if grep -qxF "b:$n" "$hfile" 2> /dev/null; then hov="$hov #$n"; continue; fi   # handed over to the webhook (#546)
     w="$(gh issue view "$n" --json comments 2> /dev/null | jq -r --arg me "$me" '[.comments[] | select(.author.login == $me and (.body | startswith("blocked: "))) | .body] | last // "" | .[9:]' 2> /dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-160)" || w=""
     echo "  blocked #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)${w:+: $w}"
     echo "    decide: re-dispatch (comment the guidance, then remove the blocked label, or --dispatch $n '<message>'), park it with the hold label, or close it"; done 3<<< "$bq"
@@ -584,7 +585,7 @@ announce() {   # away: POST each decision the loop left open ($held) and each bl
   local items ev id d n mid age lim t fail=0 now="" keep="" i nb=" " tnow; tnow="$(date +%s)"
   items="$(open_q | jq -r --argjson now "$tnow" '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | [(if ($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") then "permission_request" else "plan" end), .id, ($p.dispatchId // "-"), ((try ((.created_at | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)) catch $now) | $now - .)] | @tsv')" || return 0   # @tsv: a field a worker wrote cannot start a line of its own; the age is in seconds, 0 when Orca gave no usable time
   for i in $bids; do   # a blocked issue has no time of its own: its age is the time since this loop first listed it (a restart starts it again, which only delays)
-    case "$bseen" in *" $i="*) t="${bseen#* $i=}"; t="${t%% *}" ;; *) t="$tnow" ;; esac; nb="$nb$i=$t "; items="$items"$'\n'"blocked ${i#b:} - $((tnow - t))"
+    case "$bseen" in *" $i="*) t="${bseen#* "$i"=}"; t="${t%% *}" ;; *) t="$tnow" ;; esac; nb="$nb$i=$t "; items="$items"$'\n'"blocked ${i#b:} - $((tnow - t))"
   done; bseen="$nb"
   while read -r ev id d age <&3; do
     [ -n "$id" ] || continue; n="$id"; mid=""
