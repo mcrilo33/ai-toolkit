@@ -1105,6 +1105,12 @@ def test_attended_hands_an_unanswered_decision_over_to_the_webhook_once_after_it
     assert (tmp_path / "state/run_t/handed").exists() == bool(post)
 
 
+def test_a_decision_that_leaves_the_queue_is_no_longer_listed_as_handed_over(C, tmp_path):   # an issue number comes back: a stale entry would hide the next decision of that number
+    ticks(["msg_a"], ["msg_a"], [])
+    r, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=0)
+    assert r.returncode == 0 and len(bodies) == 1 and (tmp_path / "state/run_t/handed").read_text() == ""
+
+
 def test_a_decision_whose_reply_is_queued_in_the_spool_is_never_handed_over(C, tmp_path):
     aged(C, msg_a=700)
     C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # the reply cannot be sent yet: it stays queued and the question stays open in Orca
@@ -1425,6 +1431,15 @@ def test_a_loop_behind_the_toolkit_syncs_its_project_and_re_execs_with_its_run_a
     assert f"toolkit 0123456789ab -> {T.sha}: re-exec" in log and log.count(f"run {loop_run}, cap 2, answer attended") == 2   # one loop, restarted: the same Run and arguments
     assert len(T.C.calls("orca orchestration run-create")) == (run_id is None)   # a loop that created its Run re-binds it, never creates a second
     assert len(T.C.calls("orca orchestration run-use")) == 2 - (run_id is None)
+
+
+def test_a_loop_that_switched_to_away_at_its_until_re_execs_as_away_not_as_the_attended_loop_it_started_as(T):
+    T.stamp.write_text("0123456789ab\n")
+    aged(T.C, msg_a=0)
+    r = T.go("--answer", "attended", "--until", "10:00", "--session", "", "--cap", "2", COORD_MAX_TICKS=1, AI_TOOLKIT_NOW="10:00", NOTIFY_WEBHOOK_URL=URL)   # the time is up at the first wake, and the toolkit moved
+    log = T.log()
+    assert r.returncode == 0 and "switching to away" in log and f"{T.sha}: re-exec" in log
+    assert log.count("answer attended") == 1 and "cap 2, answer away" in log   # the restart keeps the Run, the cap and the position it had reached; no --until, no --session
 
 
 @pytest.mark.parametrize("stamp, env", [
