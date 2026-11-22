@@ -205,6 +205,14 @@ def test_a_worker_start_that_meets_the_trust_dialog_answers_it_retries_once_then
     assert ("claude once in " + d.root in r.stderr) == (not retry_ok)
 
 
+def test_a_trust_dialog_without_the_no_exit_choice_is_not_answered_and_asks_for_the_trust(d):   # the variant shown when the folder sets up hooks (#547)
+    d.stubs.reply("orca.orchestration_worker_start", AGENT_READINESS_FAILED, rc=1)
+    d.stubs.reply("orca.terminal_read", '{"result":{"terminal":{"tail":["Do you trust this folder?","1. Yes, I trust this folder","2. No, continue without these permissions"]}}}')
+    r = d.go("7")
+    assert r.returncode == 4 and "claude once in " + d.root in r.stderr
+    assert not [c for c in d.orca() if c[:2] == ["terminal", "send"]] and len([c for c in d.orca() if c[:2] == ["orchestration", "worker-start"]]) == 1
+
+
 ZSH_ERROR = "zsh: no such file or directory: Users/x/.ai-toolkit/bin/claude-spoke"
 
 
