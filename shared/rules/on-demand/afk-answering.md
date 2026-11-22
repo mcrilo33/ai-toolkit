@@ -71,7 +71,7 @@ A question whose first line is `PERMISSION REQUEST` is a worker's tool-permissio
 allow one; if one reaches you anyway, never allow it. `allow` and `deny` are replies to that question type alone; a plan gate takes `approve`, `approve with:` or `revise:`. `coordinator.sh` decides it by mode, never you:
 
 - **auto**: replies `deny` at once, without calling you or any model. Only the user allows a permission, and a `deny` is the only unattended outcome.
-- **attended**: the loop never approves one either: it leaves every request open, queued for the human, who has the relay's 9 minutes (the worker's relay denies itself after that). The loop has no containment check and no second judge; the guard and its judge already decide what reaches the human.
+- **attended**: the loop never approves one either: it leaves every request open, queued for the human, who has the relay's 9 minutes (the worker's relay denies itself after that; with the webhook set, a request still open after `HANDOVER_PERMISSION_S` is handed over to it). The loop has no containment check and no second judge; the guard and its judge already decide what reaches the human.
 - **human**: leaves it open; the human replies `allow` or `deny`.
 
 ## Irreversible, outward-facing, or scope-changing asks

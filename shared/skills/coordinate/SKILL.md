@@ -1,7 +1,7 @@
 ---
 name: coordinate
 description: "Run the Orca coordinator from this Claude session, in one of three positions: 'attended' (the coordinator.sh loop does the routine work out of sight and queues every real decision for the user, this session presents them one at a time and rings only for a decision it has just written) 'away' (attended's decisions, sent to the NOTIFY_WEBHOOK_URL webhook instead of a session) or 'auto' (the loop answers everything itself, for when nobody is reachable). Use on the main checkout for '/coordinate', '/coordinate attended', '/coordinate away [--until HH:MM] [--drain]', '/coordinate auto [--until HH:MM] [--drain]', or when the user asks what needs them."
-argument-hint: "[attended | away [--until HH:MM] [--drain] | auto [--until HH:MM] [--drain] | status]"
+argument-hint: "[attended [--until HH:MM] | away [--until HH:MM] [--drain] | auto [--until HH:MM] [--drain] | status]"
 ---
 # Coordinate
 
@@ -9,6 +9,7 @@ One Run, and the loop (`coordinator.sh`, in its own Orca terminal) always holds 
 
 - **attended**: the loop answers only what is routine (approves a routine plan; `afk-answering`) and **queues everything else for the user**: a plan it handed over, every permission request (the loop never approves one), a blocked issue. This session only presents that queue.
 - **away** (needs `NOTIFY_WEBHOOK_URL` in `.ai-toolkit/ai-toolkit.local.env`): the loop decides exactly as in attended, but there is no session to type into: each plan it leaves open, permission request and blocked issue is POSTed once to the webhook, as ids only, and an external supervisor presents it and relays the answer with `--reply` or `--dispatch`. This session presents none of it unless the user asks, so a decision lives in one place, never both a session and the webhook.
+With the webhook set, attended hands over a decision nobody answered: a permission request after `HANDOVER_PERMISSION_S` (300 s), a plan or blocked issue after `HANDOVER_PLAN_S` (600 s), POSTed with `"position":"attended","handed_over":true`. `--status` then prints `handed over to the webhook: <ids>` after the queue: not a decision, not presented (a reply from the receiver is the first reply, a second one is stale). `/coordinate attended --until HH:MM` switches the loop to away on the same Run at that time (without a valid webhook it ends the loop).
 - **auto**: the loop answers every plan itself, denies every permission request and labels `blocked`; the user decides when back.
 
 This session never binds the Run, `check`s or reads the inbox, never writes task code (`.ai-toolkit/rules/planning-hub.md`), keeps no state: ids live in the conversation. Scripts are in `.ai-toolkit/scripts/` (`coordinator.sh`, `dispatch.sh`, `land.sh`).
@@ -26,7 +27,7 @@ In a chat session, say once in the start report that a decision makes a sound on
 ```bash
 # attended: the loop types one line into THIS session's terminal when a decision arrives
 orca terminal create --worktree path:$PWD --title coordinator \
-  --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended --session $ORCA_TERMINAL_HANDLE [--cap N]"
+  --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended --session $ORCA_TERMINAL_HANDLE [--until HH:MM] [--cap N]"
 # attended, chat session: no --session (its warning is expected), then arm the watcher: ONE Bash call with run_in_background and timeout: 7200000 (the background maximum)
 orca terminal create --worktree path:$PWD --title coordinator --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended [--cap N]"
 .ai-toolkit/scripts/coordinator.sh --run <run> --wait [--seen '<ids still waiting>']   # exits 0 printing the id of a new decision; polls every COORD_WATCH_SEC (5) s
