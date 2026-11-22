@@ -60,7 +60,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",
                 "resource": {"worktreeId": f"r::{wt}"}, "projection": {"liveness": {"verdict": lv}, "stage": {"activity": "working"}}}
 
-    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim
+    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None, tool=None, ended=False):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim; tool = a tool call (the newest transcript message, read by worker-read) has run for that many minutes (ended: that call already returned its result, the turn is over)
         def ago(m):
             return time.time() - m * 60
 
@@ -74,6 +74,9 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         if noterm:
             reply["terminal"] = None
         stubs.reply("orca.orchestration_worker_show", raw if raw is not None else json.dumps({"result": reply}))
+        if tool is not None:
+            call = {"role": "tool", "blocks": [{"type": "tool-result"}], "timestamp": ago(tool) * 1000} if ended else {"role": "assistant", "blocks": [{"type": "tool-call", "name": "Bash"}], "timestamp": ago(tool) * 1000}
+            stubs.reply("orca.orchestration_worker_read", json.dumps({"result": {"source": "transcript", "sourceExact": True, "transcript": {"messages": [call]}}}))
 
     def workers(*rows):
         stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": list(rows)}}))
@@ -593,6 +596,8 @@ def relaunches(C):
     (True, {}),   # the agent is alive but silent past the 15-minute bound after a failed turn
     (True, {"beat": 25, "frac": True}),   # the same, the heartbeat carrying fractional seconds
     (True, {"born": 25, "frac": True}),   # ... or dispatchedAt
+    (True, {"tool": 25, "ended": True}),   # the newest transcript message is a tool result, not a call in flight: silence alone decides
+    (True, {"tool": 200}),   # a tool call running past the 90-minute bound shields nothing: no unbounded shield
 ])
 def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C, idle, shown):
     assert re.search(r"COORD_SWEEP_EVERY:-2\}", (V2 / "scripts/coordinator.sh").read_text())   # the defaults, read rather than waited for: a sweep every 2nd empty wait (~10 min), the idle bound 15 minutes
@@ -605,7 +610,7 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     if not idle:
         assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]]
         return
-    assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and C.stubs.calls("dispatch.sh")[0][-1] == "1" and "continue from the pushed branch" in C.stubs.calls("dispatch.sh")[0][1].replace("Continue", "continue")
+    assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and C.stubs.calls("dispatch.sh")[0][-1] == "1" and "continue from the pushed branch" in C.stubs.calls("dispatch.sh")[0][1].replace("Continue", "continue") and "after an error" not in C.stubs.calls("dispatch.sh")[0][1] and "silent for 2" in C.stubs.calls("dispatch.sh")[0][1]
     in_order(C.kinds()[first_run:], "orca orchestration worker-release", "dispatch.sh", "orca terminal close")   # the live dispatch is stopped before its replacement starts
     assert [arg(a, "--terminal") for a in C.calls("orca terminal close")] == ["term_c", "term_w", "term_c"]   # the first run's pane, the old worker's terminal, this run's pane
     assert re.search(r"silent for 2[45]m, relaunching", r.stdout) and "round 1" in C.calls("gh issue comment")[0][-1]
@@ -618,6 +623,8 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     ([{}], {"silent": 40, "beat": 1}, False),   # a worker that heartbeats
     ([{}], {"silent": 40, "beat": 1, "frac": True}, False),   # ... the heartbeat carrying fractional seconds: read, not dropped
     ([{}], {"silent": 40, "born": 1}, False),   # just (re)dispatched: the old terminal output is not the new worker's silence
+    ([{}], {"silent": 25, "tool": 25}, False),   # silent for 25 minutes inside one tool call (a long build): active, not idle
+    ([{}], {"silent": 40, "tool": 80}, False),   # ... still under the tool-call bound
     ([{}], {"silent": 14}, False),   # silent, but under the bound
     ([{}], {"silent": 14, "wait": True}, False),   # ... also with a proved human-only prompt
     ([{}], {"silent": 40}, True),   # waiting on an open gate or permission question
@@ -727,14 +734,18 @@ def test_a_loop_whose_run_was_taken_back_exits_and_closes_its_own_pane(C, tmp_pa
     closes_its_own_pane_after_its_exit_line(C, tmp_path, link_script)
 
 
-@pytest.mark.parametrize("given", [True, False])   # False: no --run, the Run is Orca's current one
-def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply_command_and_changes_nothing(C, given):
-    C.inbox(["msg_q"], answered=["msg_a"]); C.show(silent=30, wait=True)
+@pytest.mark.parametrize("given, shown, line", [
+    (True, {"wait": True}, r"silent (29|30)m, waits on a prompt"),   # verdict, activity and silence: a stuck worker is told from a working one
+    (False, {"wait": True}, r"silent (29|30)m, waits on a prompt"),   # False: no --run, the Run is Orca's current one
+    (True, {"tool": 30}, r"silent (29|30)m, tool call running (29|30)m$"),   # a worker inside one long tool call is not the same line as a stuck one
+])
+def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply_command_and_changes_nothing(C, given, shown, line):
+    C.inbox(["msg_q"], answered=["msg_a"]); C.show(silent=30, **shown)
     C.stubs.reply("orca.orchestration_run_current", '{"result":{"run":{"id":"run_t"}}}')
     r = C.go("--status", run_id="run_t" if given else None, ORCA_TERMINAL_HANDLE="")   # read-only: no coordinator terminal needed
     assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and REPLY in r.stdout and "msg_a" not in r.stdout
-    assert re.search(r"ctx_1 \S+ live working, silent (29|30)m, waits on a prompt", r.stdout)   # verdict, activity and silence: a stuck worker is told from a working one
-    reads = ("worker-list", "worker-show", "inbox", "run-show") + (() if given else ("run-current",))
+    assert re.search(rf"ctx_1 \S+ live working, {line}", r.stdout, re.M)
+    reads = ("worker-list", "worker-show", "worker-read", "inbox", "run-show") + (() if given else ("run-current",))
     assert [k for k in C.kinds() if k.startswith("orca orchestration") and k.split()[2] not in reads] == []
 
 

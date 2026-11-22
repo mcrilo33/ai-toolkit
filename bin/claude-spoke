@@ -3,7 +3,7 @@
 # written by setup.sh) it also limits MCP to the toolkit's list (.ai-toolkit/mcp.json), then execs the real claude. In a synced project it exports Claude's native OTel to the collector:
 # a worker with a spoke_run_id resource attribute, any other session (the coordinator or hub session on the main checkout) with role=coordinator and no run id or issue; a headless claude -p it spawns inherits the tag.
 # Privacy: with the OTEL_LOG_* opt-ins below, the raw JSONL the collector keeps (AITK_OTEL_RAW_DIR, 1.1 GB / 30 days) holds prompts and tool output in plaintext,
-# a coordinator's too, which include the human's own messages. In an unsynced project it is a plain claude, so it is safe to point Orca's agentCmdOverrides.claude at it.
+# a coordinator's too, which include the human's own messages. Remote Control is split the same way as the notifications: off for a worker, on for the coordinator. In an unsynced project it is a plain claude, so it is safe to point Orca's agentCmdOverrides.claude at it.
 # AI_TOOLKIT_OTEL=0 opts out of the OTel. No auth header here.
 # To use Orca's Chat UI, put --settings ai-toolkit in Orca's Claude arguments: the launcher swaps it for the project's guard file (Orca's own --settings would switch every hook off).
 set -euo pipefail
@@ -31,8 +31,10 @@ if [ -f "$tk/claude-settings.json" ]; then
   for a in "$@"; do case "$a" in --settings | --settings=*) die "the launcher owns --settings (the toolkit's guards): do not pass one" ;; esac; done
   AI_TOOLKIT_DIR="$(cd "$tk" && pwd -P)"; export AI_TOOLKIT_DIR   # the hooks run from here, and /coordinate reads it to know its session has the guards
   s="$AI_TOOLKIT_DIR/claude-settings.json"
-  # a worker gets the same file inline (--settings takes a file or JSON) with Claude's own notifications off: only the coordinator alerts the human
-  if [ -s "$top/.ai-toolkit/spoke-run-id" ]; then s="$(jq -c '. + {preferredNotifChannel: "notifications_disabled"}' "$s")"; fi
+  # the same file goes inline (--settings takes a file or JSON), one Remote Control value per role. A worker pins it off (even when the user's own settings turn it on) and has Claude's own notifications off,
+  # since only the coordinator alerts the human. Any other session in a synced project (the coordinator or hub) turns it on so its PushNotification reaches the phone (repo settings cannot enable it, inline ones can)
+  if [ -s "$top/.ai-toolkit/spoke-run-id" ]; then s="$(jq -c '. + {preferredNotifChannel: "notifications_disabled", remoteControlAtStartup: false}' "$s")"
+  else s="$(jq -c '. + {remoteControlAtStartup: true}' "$s")"; fi
   set -- --settings "$s" "$@"
 elif [ -s "$top/.ai-toolkit/spoke-run-id" ]; then die "no $tk/claude-settings.json: sync ai-toolkit into the main checkout, a worker never starts without its guards"
 else unset AI_TOOLKIT_DIR; fi   # an inherited one would tell /coordinate this session has guards it does not have
