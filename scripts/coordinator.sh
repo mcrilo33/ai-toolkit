@@ -178,10 +178,10 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
     w="$(gh issue view "$n" --json comments 2> /dev/null | jq -r --arg me "$me" '[.comments[] | select(.author.login == $me and (.body | startswith("blocked: "))) | .body] | last // "" | .[9:]' 2> /dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-160)" || w=""
     echo "  blocked #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)${w:+: $w}"
     echo "    decide: re-dispatch (comment the guidance, then remove the blocked label, or --dispatch $n '<message>'), park it with the hold label, or close it"; done 3<<< "$bq"
-  [ -z "$hov" ] || echo "handed over to the webhook:$hov"   # not decisions: the receiver answers them (--reply), the first answer wins
   { round_q || true; } | while IFS=$'\t' read -r n t; do   # a finished Land: human round: the report is the issue's last comment
     echo "  finished round #$n $(printf '%s' "$t" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)"
     echo "    decide: read the report (gh issue view $n --comments), then the next round: bash $here/coordinator.sh --run $run --dispatch $n '<guidance>'; or land (it removes the worktree and its gitignored artefacts): gh issue view $n --json body -q .body | sed 's/^Land:.*/Land: auto/' | gh issue edit $n --body-file -  then  --dispatch $n 'address: send worker_done again'"; done
+  [ -z "$hov" ] || echo "handed over to the webhook:$hov"   # not decisions: the receiver answers them (--reply), the first answer wins
   [ -z "$mine" ] || echo "being answered by the loop:$mine"   # not decisions: no text, no reply command
   [ -z "$main_kind" ] || { echo "awaiting main:"; awaiting_q open | jq -r '.[] | "\(.number)\t\(.title)"' | while IFS=$'\t' read -r n t; do
     pr="$(pr_of "$n" 2> /dev/null)" || pr="{}"   # the PR url and a requested change: the human's to decide when the PR is the rolling one
