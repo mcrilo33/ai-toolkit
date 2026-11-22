@@ -227,6 +227,7 @@ if [ "$stop" = 0 ]; then   # a loop start only (#543): the one-shot commands abo
   [ "$answer" != away ] || [ -z "$session" ] || usage_exit "--answer away types nothing into a session: drop --session"
   [ "$answer" != away ] || [[ ${NOTIFY_WEBHOOK_URL:-} =~ ^https?://[^[:space:]\"\\]+$ ]] || usage_exit "--answer away needs NOTIFY_WEBHOOK_URL, an http(s) URL, in .ai-toolkit/ai-toolkit.local.env"
   if [ "$answer" = attended ] && [[ ${NOTIFY_WEBHOOK_URL:-} =~ ^https?://[^[:space:]\"\\]+$ ]]; then   # #546: attended hands a decision nobody answered over to the webhook; a webhook that is unset or malformed leaves attended as it was
+    : "${HANDOVER_PERMISSION_S:=300}" "${HANDOVER_PLAN_S:=600}"   # a project synced before these settings existed still starts
     for v in HANDOVER_PERMISSION_S HANDOVER_PLAN_S; do [[ ${!v:-} =~ ^[0-9]+$ ]] || usage_exit "$v takes a number of seconds"; done; handover=1
   fi
 fi
@@ -582,6 +583,7 @@ post() {   # $1 event, $2 issue, $3 message id (none for blocked): ONE POST of i
   body="$(jq -nc --arg e "$1" --arg r "$nwo" --argjson i "$2" --arg run "$run" --arg m "${3:-}" --arg pos "$answer" '{event: $e, repo: $r, issue: $i, run: $run} + (if $m == "" then {} else {message_id: $m} end) + {position: $pos, handed_over: ($pos == "attended")}')" || return 1
   printf '%s' "$body" | curl -q -s -f -m 5 -X POST -H 'Content-Type: application/json' --data-binary @- --config <(printf 'url = "%s"\n' "$NOTIFY_WEBHOOK_URL") > /dev/null 2>&1 || { rc=$?; warn "cannot POST the decision to the webhook (curl exit $rc): sent again at the next wake"; return "$rc"; }
 }
+kindc() { case "$1" in plan) echo q ;; permission_request) echo p ;; *) echo b ;; esac; }   # the queue id letter of an announce event
 announce() {   # away: POST each decision the loop left open ($held) and each blocked issue ($bids) once; attended with a webhook (#546, $handover): the same, for each one still unanswered after its delay (a permission request HANDOVER_PERMISSION_S, a plan or a blocked issue HANDOVER_PLAN_S), then listed in $sd/handed so the session no longer presents it. $sent holds the delivered ones (no file: a restart sends again, the receiver dedupes). A failed POST stops this wake's sends (a dead webhook costs 5 s, not 5 s each) and is retried at the next; an id no longer in the queue is dropped from $sent
   local items ev id d n mid age lim t fail=0 now="" keep="" i nb=" " tnow; tnow="$(date +%s)"
   items="$(open_q | jq -r --argjson now "$tnow" '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | [(if ($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") then "permission_request" else "plan" end), .id, ($p.dispatchId // "-"), ((try ((.created_at | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)) catch $now) | $now - .)] | @tsv')" || return 0   # @tsv: a field a worker wrote cannot start a line of its own; the age is in seconds, 0 when Orca gave no usable time
@@ -594,9 +596,12 @@ announce() {   # away: POST each decision the loop left open ($held) and each bl
     now="$now$ev:$id "; case " $sent " in *" $ev:$id "*) continue ;; esac; [ "$fail" = 0 ] || continue
     if [ "$answer" = attended ]; then [ -z "$mid" ] || [ ! -e "$sd/replies/$id" ] || continue; lim="$HANDOVER_PLAN_S"; [ "$ev" != permission_request ] || lim="$HANDOVER_PERMISSION_S"; [ "$age" -ge "$lim" ] || continue; fi
     if ! [[ $id =~ ^[A-Za-z0-9_-]+$ && $n =~ ^[0-9]+$ ]]; then warn "webhook: no issue is recorded for $ev $id, so it cannot be announced: reply by hand, see --status"; sent="$sent$ev:$id "
-    elif post "$ev" "$n" "$mid"; then sent="$sent$ev:$id "; [ "$answer" != attended ] || printf '%s:%s\n' "$(case "$ev" in plan) echo q ;; permission_request) echo p ;; *) echo b ;; esac)" "$id" >> "$sd/handed"; else [ $? = 22 ] || fail=1; fi   # curl 22 = the receiver answered with an HTTP error: the next decision is still sent; any other failure (down, timeout) stops this wake
+    elif post "$ev" "$n" "$mid"; then sent="$sent$ev:$id "; [ "$answer" != attended ] || printf '%s:%s\n' "$(kindc "$ev")" "$id" >> "$sd/handed"; else [ $? = 22 ] || fail=1; fi   # curl 22 = the receiver answered with an HTTP error: the next decision is still sent; any other failure (down, timeout) stops this wake
   done 3<<< "$items"
   for i in $now; do case " $sent " in *" $i "*) keep="$keep$i " ;; esac; done; sent=" $keep"
+  if [ "$answer" = attended ] && [ -s "$sd/handed" ]; then   # an id that left the queue is no longer handed over: an issue number comes back
+    for i in $now; do printf '%s:%s\n' "$(kindc "${i%%:*}")" "${i#*:}"; done > "$sd/handed.t"; grep -xFf "$sd/handed.t" "$sd/handed" > "$sd/handed.n" || true; mv "$sd/handed.n" "$sd/handed"; rm -f "$sd/handed.t"
+  fi
 }
 notify_queue() {   # attended: tell the session of a decision that was not queued at the last look, once: the first one when nothing that was waiting at the last look still is, and every permission request (it expires in 9 minutes); the ids last seen live in $seen (no file); a failed read or send changes nothing, the next wake looks again. A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event.
   [ "$answer" = attended ] || [ "$answer" = away ] || return 0; local now i all k first=0 fail=0; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
@@ -626,7 +631,7 @@ while :; do
   tick=$((tick + 1)); yield
   if [ -n "$until" ] && [ $((($(now_min) - start + 1440) % 1440)) -ge "$budget" ]; then
     [ "$answer" = attended ] && [ "$handover" = 1 ] || { log "reached $until"; break; }
-    log "reached $until: switching to away, on this Run"; answer=away; until=""; mode=away; [ "$drain" = 0 ] || mode="$mode drain"; printf '%s %s\n' "$H" "$mode" > "$hf"   # #546: the session is no longer there, what waits goes to the webhook (what was handed over is in $sent)
+    log "reached $until: switching to away, on this Run"; answer=away; until=""; mode=away; [ "$drain" = 0 ] || mode="$mode drain"; orig=(--answer away --cap "$cap"); [ "$drain" = 0 ] || orig+=(--drain); printf '%s %s\n' "$H" "$mode" > "$hf"   # #546: the session is no longer there, what waits goes to the webhook (what was handed over is in $sent)
   fi
   [ -z "${COORD_MAX_TICKS:-}" ] || [ "$tick" -le "$COORD_MAX_TICKS" ] || break
   autosync; fill
