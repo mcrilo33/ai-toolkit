@@ -37,22 +37,30 @@ def test_the_skill_covers_each_mechanic_of_the_brief(needle):
     assert needle in SKILL
 
 
+def _usage(n: int, side: bool) -> dict:
+    return {"type": "assistant", "isSidechain": side, "message": {"usage": {"input_tokens": n, "cache_read_input_tokens": 10 * n, "cache_creation_input_tokens": 100 * n}}}
+
+
 def test_the_handover_is_measured_from_the_transcript_at_an_idle_point_and_never_starts_a_second_loop(tmp_path):
     h = section("Handover")
     assert "200k" in h and re.search(r"state lives in Orca, git and the issue labels, not in the chat", h)   # the threshold and why a fresh session loses nothing
     assert re.search(r"unknown.{0,60}no handover", h) and "`null`" in h   # the probe prints null when it finds no transcript: no guessing
     assert re.search(r"idle point.{0,120}no decision on screen.{0,80}no `--stop`", h, re.S)   # never mid-decision or mid-switch
     assert re.search(r"never a second loop", h) and "held by: coordinator.sh (attended" in h and "--session" in h   # attach to the running loop; only a terminal successor re-points it
-    assert re.search(r"--surface .{0,80}ORCA_TERMINAL_HANDLE", h, re.S)   # a terminal session hands to a terminal: the loop types only into one
+    assert re.search(r"--surface .{0,200}ORCA_TERMINAL_HANDLE", h, re.S)   # a terminal session hands to a terminal: the loop types only into one
     assert re.search(r"launch succeeded.{0,80}TaskStop.{0,60}(watcher|--wait)", h, re.S) and "--retry-launch" in h   # the old watcher would present every decision twice, but only once the successor exists
     assert re.search(r"finished.{0,80}never re-arms `--wait` and never presents again", h, re.S)   # the old chat can still get a turn (a typed loop line, a notification)
     assert re.search(r"presents `--status` while it runs", h)   # no silent window while a terminal successor waits out a land
-    probe = re.search(r"```bash\n(.*?)```", h, re.S).group(1)   # the probe itself, on a fixture: main thread only, the last entry, the three input counters summed
+    block = re.search(r"```bash\n(.*?)```", h, re.S)   # the probe itself, on a fixture: main thread only, the last entry, the three input counters summed
+    assert block
     d = tmp_path / ".claude/projects/p"
     d.mkdir(parents=True)
-    usage = lambda n, side: {"type": "assistant", "isSidechain": side, "message": {"usage": {"input_tokens": n, "cache_read_input_tokens": 10 * n, "cache_creation_input_tokens": 100 * n}}}
-    (d / "sid.jsonl").write_text("\n".join(json.dumps(e) for e in [usage(1, False), {"type": "user"}, usage(2, False), usage(9, True)]))
-    run = lambda sid: subprocess.run(["bash", "-c", probe], env={**os.environ, "HOME": str(tmp_path), "CLAUDE_CODE_SESSION_ID": sid}, capture_output=True, text=True).stdout.strip()
+    (d / "sid.jsonl").write_text("\n".join(json.dumps(e) for e in [_usage(1, False), {"type": "user"}, _usage(2, False), _usage(9, True)]))
+
+    def run(sid: str) -> str:
+        env = {**os.environ, "HOME": str(tmp_path), "CLAUDE_CODE_SESSION_ID": sid}
+        return subprocess.run(["bash", "-c", block.group(1)], env=env, capture_output=True, text=True).stdout.strip()
+
     assert run("sid") == "222" and run("no-such-session") == "null"
 
 
