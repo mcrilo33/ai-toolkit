@@ -60,6 +60,10 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",
                 "resource": {"worktreeId": f"r::{wt}"}, "projection": {"liveness": {"verdict": lv}, "stage": {"activity": "working"}}}
 
+    def unstarted(d="ctx_0"):   # a worker-start that failed at agent_readiness (the trust dialog, #547): Orca keeps its row, with no resource (#549)
+        return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": "failed", "agentTerminalHandle": None, "resource": None, "lastFailure": "Agent startup blocked: agent-trust-workspace",
+                "projection": {"liveness": {"verdict": "exited"}, "stage": {"detail": "agent_readiness"}, "resource": {"state": "absent", "reason": "not_materialized"}}}
+
     def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None, tool=None, ended=False):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim; tool = a tool call (the newest transcript message, read by worker-read) has run for that many minutes (ended: that call already returned its result, the turn is over)
         def ago(m):
             return time.time() - m * 60
@@ -131,7 +135,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
                 and any(arg(a, "--comment").startswith("BLOCKED #1") and arg(a, "--worktree") == f"path:{wt}" for a in calls("orca worktree set"))
                 and "orca orchestration worker-release" in ks and not any("--address" in c for c in stubs.calls("dispatch.sh")) and "orca worktree rm" not in ks)
 
-    return type("C", (), {"go": staticmethod(go), "mail": staticmethod(mail), "inbox": staticmethod(inbox), "spool": staticmethod(spool), "spooled": lambda m: (tmp_path / "state/run_t/replies" / m).exists(), "workers": staticmethod(workers), "row": staticmethod(row), "show": staticmethod(show), "wt": wt,
+    return type("C", (), {"go": staticmethod(go), "mail": staticmethod(mail), "inbox": staticmethod(inbox), "spool": staticmethod(spool), "spooled": lambda m: (tmp_path / "state/run_t/replies" / m).exists(), "workers": staticmethod(workers), "row": staticmethod(row), "unstarted": staticmethod(unstarted), "show": staticmethod(show), "wt": wt,
                               "calls": staticmethod(calls), "blocked": staticmethod(blocked), "stubs": stubs, "root": str(repo.root.resolve()), "kinds": staticmethod(lambda: [k for k, _ in trail()]),
                               "stdin": staticmethod(lambda n: (tmp_path / f"stubs/{n}.stdin").read_text())})
 
@@ -514,7 +518,7 @@ def test_a_rejected_land_re_dispatches_the_reason_to_the_same_worker_a_bounded_n
     limit = 2 if rc == 3 else 1
     C.stubs.reply("land.sh", out, rc=rc)
     for spent in rounds:   # rounds already spent = dispatches on this worktree - 1
-        C.workers(*[C.row(f"ctx_{i}", st="completed") for i in range(1, spent + 1)], C.row(f"ctx_{spent + 1}"))
+        C.workers(*[C.row(f"ctx_{i}", st="completed") for i in range(1, spent + 1)], C.row(f"ctx_{spent + 1}"), C.unstarted())   # the failed-start row (no resource) neither stops the count nor spends a round
         C.mail([msg("worker_done", dispatchId=f"ctx_{spent + 1}", outcome="succeeded")])
         C.go()
         if spent < limit:   # a fresh terminal through dispatch.sh (same launch path, shim env), a new Task whose spec is the reason
@@ -602,7 +606,7 @@ def relaunches(C):
 def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C, idle, shown):
     assert re.search(r"COORD_SWEEP_EVERY:-2\}", (V2 / "scripts/coordinator.sh").read_text())   # the defaults, read rather than waited for: a sweep every 2nd empty wait (~10 min), the idle bound 15 minutes
     assert "COORD_IDLE_MIN:-15}" in (V2 / "scripts/coordinator.sh").read_text()
-    C.workers(C.row(lv="live" if idle else "exited")); C.show(silent=25, **shown)
+    C.workers(C.row(lv="live" if idle else "exited"), C.unstarted()); C.show(silent=25, **shown)   # a failed-start row with no resource is in the Run: rounds() skips it, it is neither fatal nor a spent round
     C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
     assert not C.stubs.calls("dispatch.sh")
     first_run = len(C.kinds())   # its exit closed the loop's own pane
@@ -856,7 +860,7 @@ def test_a_kept_worktree_is_re_dispatched_after_its_old_agent_terminal_is_closed
     (tmp_path / "state/run_t/requests").mkdir(parents=True)
     (tmp_path / "state/run_t/requests/7").write_text("on another model\n")
     C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": "/k7", "linkedIssue": 7, "branch": "refs/heads/7-x"}]}}))
-    C.workers({**C.row("ctx_7", st="failed", lv="exited"), "agentTerminalHandle": "term_old", "resource": {"worktreeId": "r::/k7"}})
+    C.workers({**C.row("ctx_7", st="failed", lv="exited"), "agentTerminalHandle": "term_old", "resource": {"worktreeId": "r::/k7"}}, C.unstarted())
     C.stubs.reply("gh.issue_view", issue_json())
     C.go("--cap", "1")
     assert in_order(C.kinds(), "orca terminal close", "dispatch.sh") is None and arg(C.calls("orca terminal close")[0], "--terminal") == "term_old"
