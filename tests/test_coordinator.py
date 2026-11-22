@@ -50,7 +50,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": st, "agentTerminalHandle": "term_w",
                 "resource": {"worktreeId": f"r::{wt}"}, "projection": {"liveness": {"verdict": lv}, "stage": {"activity": "working"}}}
 
-    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None, tool=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim; tool = a tool call (the newest transcript message, read by worker-read) has run for that many minutes
+    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None, tool=None, ended=False):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim; tool = a tool call (the newest transcript message, read by worker-read) has run for that many minutes (ended: that call already returned its result, the turn is over)
         def ago(m):
             return time.time() - m * 60
 
@@ -65,7 +65,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
             reply["terminal"] = None
         stubs.reply("orca.orchestration_worker_show", raw if raw is not None else json.dumps({"result": reply}))
         if tool is not None:
-            call = {"role": "assistant", "blocks": [{"type": "tool-call", "name": "Bash"}], "timestamp": ago(tool) * 1000}
+            call = {"role": "tool", "blocks": [{"type": "tool-result"}], "timestamp": ago(tool) * 1000} if ended else {"role": "assistant", "blocks": [{"type": "tool-call", "name": "Bash"}], "timestamp": ago(tool) * 1000}
             stubs.reply("orca.orchestration_worker_read", json.dumps({"result": {"source": "transcript", "sourceExact": True, "transcript": {"messages": [call]}}}))
 
     def workers(*rows):
@@ -578,6 +578,7 @@ def relaunches(C):
     (True, {}),   # the agent is alive but silent past the 15-minute bound after a failed turn
     (True, {"beat": 25, "frac": True}),   # the same, the heartbeat carrying fractional seconds
     (True, {"born": 25, "frac": True}),   # ... or dispatchedAt
+    (True, {"tool": 25, "ended": True}),   # the newest transcript message is a tool result, not a call in flight: silence alone decides
     (True, {"tool": 200}),   # a tool call running past the 90-minute bound shields nothing: no unbounded shield
 ])
 def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C, idle, shown):
