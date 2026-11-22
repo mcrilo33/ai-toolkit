@@ -28,9 +28,19 @@ def test_the_skill_exists_within_its_size_cap_with_claude_frontmatter():
     "one decision at a time", "never binds the Run", "Never show a heartbeat", "/coordinate auto", "--answer auto", "--until HH:MM", "--drain", "/coordinate attended", "coordinator.sh --stop --run",
     "land.sh --review", "blocked", "hold", "PERMISSION REQUEST", "allow", "deny", "COORD_IDLE_MIN", "orca orchestration worker-show --dispatch <id> --full", "observation.agentWait", "orca terminal read",
     "orca orchestration run-list", "afk-answering", "Scope:", "git log --since", "worker-list",
-    "AI_TOOLKIT_DIR", "no toolkit guards", "bin/claude-spoke", "--wait", "run_in_background", "COORD_WATCH_SEC", "7200000"])   # the guards precondition: a session not started through the launcher says so
+    "AI_TOOLKIT_DIR", "no toolkit guards", "bin/claude-spoke", "--wait", "run_in_background", "COORD_WATCH_SEC", "7200000",
+    "CLAUDE_CODE_SESSION_ID", "cache_read_input_tokens", "orca agent launch", "TaskStop", "/coordinate attended --run <run>"])   # the guards precondition: a session not started through the launcher says so
 def test_the_skill_covers_each_mechanic_of_the_brief(needle):
     assert needle in SKILL
+
+
+def test_the_handover_is_measured_from_the_transcript_at_an_idle_point_and_never_starts_a_second_loop():
+    h = section("Handover")
+    assert "200k" in h and re.search(r"state lives in Orca, git and the issue labels, not in the chat", h)   # the threshold and why a fresh session loses nothing
+    assert "isSidechain" in h and re.search(r"unknown.{0,40}no handover", h)   # the main thread's last usage, and no guessing when it cannot be read
+    assert re.search(r"idle point.{0,120}no decision on screen.{0,80}no `--stop`", h, re.S)   # never mid-decision or mid-switch
+    assert re.search(r"never a second loop", h) and "held by: coordinator.sh (attended" in h and "--session" in h   # attach to the running loop; only a terminal successor re-points it
+    assert re.search(r"TaskStop.{0,80}(watcher|--wait)", h, re.S)   # the old watcher would wake and present every decision twice
 
 
 def test_every_script_and_flag_the_skill_names_exists():
