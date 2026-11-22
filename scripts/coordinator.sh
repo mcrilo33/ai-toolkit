@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# coordinator.sh [--run R] [--answer auto|attended|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop: the Run loop (06 section 4,
+# coordinator.sh [--run R] [--answer auto|attended|away|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop: the Run loop (06 section 4,
 # "The coordinator"). One foreground process in an Orca terminal on the main checkout, the single consumer of ONE Run
 # (--run re-binds it with run-use; none creates one). Loop: fill slots to --cap (dispatch.sh) -> check --wait -> route each message
 # -> ack the delivery. question: answer.sh (auto) or the human, who types the answer on this terminal; worker_done succeeded: land.sh
@@ -12,6 +12,7 @@
 # --answer attended (the /coordinate attended loop, #450): the routine work out of sight, the human only for a decision. A routine plan is approved by answer.sh; a plan it hands over (exit 3, a reason) and every permission
 # request stay OPEN (the loop never approves one), queued for the human with the other open questions and the blocked issues; the session is told by ONE line typed into its terminal (--session <handle>, orca terminal send) when a decision arrives on an empty queue, and for every permission request; the loop rings nothing. --show <message-id> prints one open question whole. --dispatch <issue> [message]
 # queues a dispatch request the loop runs ahead of its own pick (cap and Scope rule apply). auto and human are unchanged.
+# --answer away (#543, needs NOTIFY_WEBHOOK_URL): attended's decisions with no session to type into: a plan the loop leaves open, a permission request and a blocked issue are each POSTed to the webhook as ids only (never a worker's text), at least once: a failed POST (curl -m 5) is one warning and is sent again at the next wake until delivered or the decision is answered. Answers come back through --reply and --dispatch.
 # `Land: human` issue (#511): each worker_done is a round report, never landed: the issue gets a "Round finished" comment carrying it, the worktree stays, and while no worker runs on it the round is a decision (--status, --wait). --dispatch <n> '<guidance>' starts the next round (a task titled "#<n> round", which rounds() counts from); the land is the footer set to `Land: auto` and --dispatch <n> 'address: send worker_done again'.
 # --run R --wait [--seen '<ids>'] (a chat session, #473): read-only, needs no terminal; polls every COORD_WATCH_SEC (5) and exits 0 printing the id of a decision that was not waiting when it started (nor in --seen), by notify_queue's rule; a failed read retries.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
@@ -35,10 +36,11 @@ while [ $# -gt 0 ]; do
     --drain) drain=1 ;; --status) status=1 ;; --wait) watch=1 ;; --seen) seen_arg="${2:-}"; seen_given=1; shift ;; --stop) stop=1 ;; --session) session="${2:-}"; shift ;; --show) show_id="${2:-}"; shift ;;
     --dispatch) dreq=1; dreq_n="${2:-}"; dreq_text="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
     --reply) reply=1; reply_id="${2:-}"; reply_body="${3:-}"; shift $(($# > 2 ? 2 : $# - 1)) ;;
-    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|attended|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --wait [--seen '<ids>'] | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny | --run R --dispatch <issue> [message] | --run R --show <message-id> (--session <terminal-handle> with the loop)" ;;
+    *) usage_exit "usage: coordinator.sh [--run R] [--answer auto|attended|away|human] [--cap N] [--until HH:MM] [--drain] [--status] | --run R --stop | --run R --wait [--seen '<ids>'] | --run R --reply <msg-id> approve|'approve with: ...'|'revise: ...'|allow|deny | --run R --dispatch <issue> [message] | --run R --show <message-id> (--session <terminal-handle> with the loop)" ;;
   esac; shift
 done
-case "$answer" in auto | attended | human) ;; *) usage_exit "--answer takes auto, attended or human" ;; esac
+case "$answer" in auto | attended | away | human) ;; *) usage_exit "--answer takes auto, attended, away or human" ;; esac
+[ "$answer" != away ] || [[ ${NOTIFY_WEBHOOK_URL:-} =~ ^https?://[^[:space:]\"\\]+$ ]] || usage_exit "--answer away needs NOTIFY_WEBHOOK_URL, an http(s) URL, in .ai-toolkit/ai-toolkit.local.env"
 [ "$stop" = 0 ] || [ -n "$run" ] || usage_exit "--stop needs --run <run-id>"
 [ "$watch" = 0 ] || [ -n "$run" ] || usage_exit "--wait needs --run <run-id>"
 [ -z "$run" ] || valid_run "$run" || usage_exit "bad run id '$run'"; [[ -z $session || $session =~ ^term_[A-Za-z0-9_-]+$ ]] || usage_exit "--session takes an Orca terminal handle"; [ "$answer" != attended ] || [ -n "$session" ] || warn "attended without --session: the loop cannot tell the session of a decision, only --status shows the queue"
@@ -140,7 +142,7 @@ queue_ids() {   # the decisions waiting for the human, in the order to present t
   local q; q="$(open_q | jq -r '"\(if ((.payload // "{}" | if type == "string" then fromjson else . end).question // .body // "") | test("^\\s*PERMISSION REQUEST") then "p" else "q" end):\(.id)"')" || return 1; printf '%s\n%s\n' "$q" "$bids" | sed '/^$/d'   # the blocked ids are the last read (see notify_queue)
 }
 hold() { held="$held $1 "; printf '%s\n' "$1" >> "$sd/held"; }   # $1 message id: left open for the human, in the loop's memory and in the spool for --status (a plan outside it is the loop's to answer)
-by_loop() { case "${lm%% *}" in attended | auto) ! is_perm "$2" && [ -f "$(spool_dir "$run")/held" ] && ! grep -qxF "$1" "$(spool_dir "$run")/held" ;; *) false ;; esac; }   # $1 message id, $2 its question, $lm the live loop's mode (none, human or no held file, e.g. an older loop: every open question is the human's)
+by_loop() { case "${lm%% *}" in attended | auto | away) ! is_perm "$2" && [ -f "$(spool_dir "$run")/held" ] && ! grep -qxF "$1" "$(spool_dir "$run")/held" ;; *) false ;; esac; }   # $1 message id, $2 its question, $lm the live loop's mode (none, human or no held file, e.g. an older loop: every open question is the human's)
 replycmd() { printf 'bash %s --run %s --reply %s %s' "$here/coordinator.sh" "$run" "$1" "${2:-approve}"; }
 if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to; --show: one of them whole
   [ -n "$run" ] || run="$(orca_json orchestration run-current --full | jq -r '.result.run.id // empty')"; if [ -n "$show_id" ]; then m="$(open_q | jq -c --arg i "$show_id" 'select(.id == $i)')" && [ -n "$m" ] || die "no open question $show_id on run $run"; show_q "$(question_of "$m")" 1000000; exit 0; fi
@@ -337,7 +339,7 @@ on_question() {
   id="$(jq -r .id <<< "$1")"; q="$(question_of "$1")"
   if is_perm "$q"; then on_permission "$id" "$q" "$(pj "$1" dispatchId)"; return 0; fi
   ctx "$(pj "$1" dispatchId)" || { [ $? = 2 ] || { hold "$id"; log "gate question $id comes from an unknown worker: reply by hand: $(replycmd "$id")"; }; return 1; }   # 2: ctx already blocked it
-  if [ "$answer" != human ] && ans="$(printf '%s' "$q" | ANSWER_MODE="$answer" "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
+  if [ "$answer" != human ] && ans="$(printf '%s' "$q" | ANSWER_MODE="${answer/away/attended}" "$ANSWER_CMD" "$wtp")" && body="$(head -n 1 <<< "$ans")" \
     && orca_mutate orchestration reply --run "$run" --from "$H" --id "$id" --body "$body" > /dev/null; then
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; log "#$issue: $warns"; flag "$wtp" "#$issue ${warns:0:80}"; }
@@ -548,8 +550,26 @@ tell() {   # $1 kind (p|q|b|h = a finished issue held|r = a dropped reply), $2 i
   txt="new decision waiting: $kind $id. Read it whole, present it with one recommendation, then ring."; [ "$1" != r ] || txt="reply to $id was dropped after repeated send failures: its question may still be open, present it again."
   orca_json terminal send --terminal "$session" --text "[coordinator loop] $txt" --enter > /dev/null 2>&1 || { warn "cannot tell the session ($kind $2)$([ "$1" = r ] || [ "$1" = h ] || [ "$1" = f ] || echo ': retried at the next wake')"; return 1; }
 }
+post() {   # $1 event, $2 issue, $3 message id (none for blocked): ONE POST of ids to NOTIFY_WEBHOOK_URL. The body is built from ids only (a worker's text never enters it) and the URL goes in through a config file descriptor: in no argv, log, comment or warning
+  local body rc=0; [ -n "${nwo:-}" ] || nwo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2> /dev/null)" || nwo=""; [ -n "$nwo" ] || { warn "webhook: cannot read the repository name, retried at the next wake"; return 1; }
+  body="$(jq -nc --arg e "$1" --arg r "$nwo" --argjson i "$2" --arg run "$run" --arg m "${3:-}" '{event: $e, repo: $r, issue: $i, run: $run} + (if $m == "" then {} else {message_id: $m} end) + {position: "away", handed_over: false}')" || return 1
+  printf '%s' "$body" | curl -s -f -m 5 -X POST -H 'Content-Type: application/json' --data-binary @- --config <(printf 'url = "%s"\n' "$NOTIFY_WEBHOOK_URL") > /dev/null 2>&1 || { rc=$?; warn "cannot POST the decision to the webhook (curl exit $rc): sent again at the next wake"; return 1; }
+}
+announce() {   # away: POST each decision the loop left open ($held) and each blocked issue ($bids) once; $sent holds the delivered ones (no file: a restart sends again, the receiver dedupes). A failed POST stops this wake's sends (a dead webhook costs 5 s, not 5 s each) and is retried at the next; an id no longer in the queue is dropped from $sent
+  local items ev id d n mid fail=0 now="" keep="" i; items="$(open_q | jq -r '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | "\(if ($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") then "permission_request" else "plan" end) \(.id) \($p.dispatchId // "-")"')" || return 0
+  for i in $bids; do items="$items"$'\n'"blocked ${i#b:} -"; done
+  while read -r ev id d <&3; do
+    [ -n "$id" ] || continue; n="$id"; mid=""
+    if [ "$ev" != blocked ]; then case " $held " in *" $id "*) ;; *) continue ;; esac; mid="$id"; n="$(recorded_issue "$run" "$d")" || n=""; fi
+    now="$now$ev:$id "; case " $sent " in *" $ev:$id "*) continue ;; esac; [ "$fail" = 0 ] || continue
+    if ! [[ $id =~ ^[A-Za-z0-9_-]+$ && $n =~ ^[0-9]+$ ]]; then warn "webhook: no issue is recorded for $ev $id, not announced: it is in --status"; sent="$sent$ev:$id "
+    elif post "$ev" "$n" "$mid"; then sent="$sent$ev:$id "; else fail=1; fi
+  done 3<<< "$items"
+  for i in $now; do case " $sent " in *" $i "*) keep="$keep$i " ;; esac; done; sent=" $keep"
+}
 notify_queue() {   # attended: tell the session of a decision that was not queued at the last look, once: the first one when nothing that was waiting at the last look still is, and every permission request (it expires in 9 minutes); the ids last seen live in $seen (no file); a failed read or send changes nothing, the next wake looks again. A question counts once THIS loop left it open or found it open at its start ($held): one that arrived while it was busy (a land) may still be answered by it, a routine event.
-  [ "$answer" = attended ] || return 0; local now i all k first=0 fail=0; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
+  [ "$answer" = attended ] || [ "$answer" = away ] || return 0; local now i all k first=0 fail=0; [ "$bdirty" = 0 ] || { bids="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 0; bdirty=0; }   # the blocked list is read again only after a sweep or when this loop blocked something
+  [ "$answer" != away ] || { announce; return 0; }
   all="$(queue_ids | tr '\n' ' ')" || return 0; now=""; first=1; for i in $seen; do case " $all " in *" $i "*) first=0 ;; esac; done; for i in $all; do k="${i%%:*}"; [ "$k" = b ] || case " $held " in *" ${i#?:} "*) ;; *) continue ;; esac; now="$now$i "
     case " $seen " in *" $i "*) continue ;; esac; [ "$k" = p ] || [ "$first" = 1 ] || continue; [ "$k" = p ] || first=0; tell "$k" "${i#?:}" || fail=1
   done; [ "$fail" = 1 ] || seen="$now"
@@ -568,7 +588,7 @@ autosync() {   # at a wake, where no land, dispatch or answer is under way: sync
   log "toolkit $tv0 -> $now: re-exec"; rm -f "$errf"   # the EXIT trap does not run on exec; holder.$$ stays valid, the pid is the same
   exec bash "$here/coordinator.sh" ${orig[@]+"${orig[@]}"} --run "$run"   # --run last wins: a loop started without one keeps the Run it created
 }
-tick=0; empties=0; seen=""; bids=""; bdirty=1; held=""; if ids="$(open_q | jq -r .id | tr '\n' ' ')"; then held=" $ids"; tr ' ' '\n' <<< "$ids" | sed '/^$/d' > "$sd/held"; fi; start="$(now_min)"; budget=0
+tick=0; empties=0; seen=""; sent=" "; bids=""; bdirty=1; held=""; if ids="$(open_q | jq -r .id | tr '\n' ' ')"; then held=" $ids"; tr ' ' '\n' <<< "$ids" | sed '/^$/d' > "$sd/held"; fi; start="$(now_min)"; budget=0
 [ -z "$until" ] || budget=$(((($(mins "$until") - start) + 1440) % 1440))
 while :; do
   tick=$((tick + 1)); yield
