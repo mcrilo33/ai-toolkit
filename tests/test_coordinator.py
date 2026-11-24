@@ -1834,7 +1834,8 @@ def test_a_usage_limit_escalation_releases_the_worker_and_relaunches_it_on_the_n
     r = C.go(**ACCOUNTS)
     assert r.returncode == 0, r.stderr
     assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "--account", to, "1"]]   # the same task, as a sweep relaunch, on the other account
-    in_order(C.kinds(), "orca orchestration worker-release", "dispatch.sh")
+    kinds = C.kinds()
+    assert kinds.index("orca orchestration worker-release") < max(i for i, k in enumerate(kinds) if k == "dispatch.sh")   # the dispatch is stopped before its replacement starts (the last dispatch.sh call; the first is the pick)
     assert "term_w" in [arg(a, "--terminal") for a in C.calls("orca terminal close")]   # the dead agent's terminal
     assert f"usage limit on account {ran_on or 'max'}: relaunched on {to}" in C.calls("gh issue comment")[0][-1] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
     reset = int((tmp_path / "state/run_t/exhausted" / (ran_on or "max")).read_text())

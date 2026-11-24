@@ -220,18 +220,27 @@ def test_a_worker_on_a_token_account_gets_the_token_from_the_keychain_in_one_var
     assert stubs.calls("security") == [["find-generic-password", "-s", "CLAUDE_OAUTH_TOKEN_CLIENT", "-w"]]
     claude_env = stubs.env("claude")
     assert claude_env.count("tok-s3cret") == 1 and "\nCLAUDE_CODE_OAUTH_TOKEN=tok-s3cret\n" in "\n" + claude_env   # exactly one variable holds it
-    assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1" in claude_env   # Claude then drops credentials from the Bash tool, hooks and MCP servers it starts
+    assert "SUBPROCESS_ENV_SCRUB" not in claude_env   # Claude itself withholds the token from its hooks (measured); the flag would also drop SSH_AUTH_SOCK and the cloud credentials a worker pushes with
     assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=abc-123,repo=origin,account=client\n" in claude_env + "\n"
     assert "tok-s3cret" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("otel", [1, 0])
+def test_a_one_entry_list_naming_a_non_stored_account_runs_every_session_on_it_even_with_the_otel_opt_out(run, stubs, repo, tmp_path, otel):
+    synced(repo)   # the data boundary: a client-only project never falls back to the stored login
+    env = accounts(tmp_path, stubs, "client")
+    for cwd in (in_spoke(repo), repo.root):
+        assert run([SPOKE], cwd=cwd, AI_TOOLKIT_OTEL=otel, **env).returncode == 0
+        assert "\nCLAUDE_CODE_OAUTH_TOKEN=tok-s3cret\n" in "\n" + stubs.env("claude") and "account=" not in stubs.env("claude")   # one entry: no failover, so no account tag
 
 
 def test_a_stored_account_exports_no_token_and_drops_an_inherited_one(run, stubs, repo, tmp_path):
     synced(repo)
     env = accounts(tmp_path, stubs, "client max")
-    r = run([SPOKE, "--account", "max"], cwd=in_spoke(repo), CLAUDE_CODE_OAUTH_TOKEN="inherited", CLAUDE_CONFIG_DIR="/inherited", **env)
+    r = run([SPOKE, "--account", "max"], cwd=in_spoke(repo), CLAUDE_CODE_OAUTH_TOKEN="zz-probe-9", CLAUDE_CONFIG_DIR="/zz-probe-9", ANTHROPIC_API_KEY="zz-probe-9", ANTHROPIC_AUTH_TOKEN="zz-probe-9", **env)
     claude_env = stubs.env("claude")
     assert r.returncode == 0 and stubs.calls("security") == [], r.stderr
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in claude_env and "CLAUDE_CONFIG_DIR" not in claude_env and "SUBPROCESS_ENV_SCRUB" not in claude_env
+    assert "zz-probe-9" not in claude_env and "SUBPROCESS_ENV_SCRUB" not in claude_env   # a key or token in the caller's env outranks every login: the chosen account must be the one used
     assert "account=max\n" in claude_env + "\n"
 
 
