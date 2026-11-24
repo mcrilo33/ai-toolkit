@@ -47,7 +47,7 @@ canon() { local p="$1"; case "$p" in \~ | \~/*) p="$HOME${p#\~}";; esac; case "$
   while [ "$p" != / ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
   local rest="" d="$p"; while [ ! -d "$d" ]; do rest="/${d##*/}$rest"; d="$(dirname "$d")"; done
   rest="$(printf '%s' "$rest" | sed -E -e 's#(/\.)+/#/#g' -e 's#/\.$##' -e ':a' -e 's#/([^/.][^/]*|\.[^/.][^/]*|\.\.[^/]+)/\.\./#/#' -e 'ta')"; while [ "$rest" = /.. ] || [ "${rest#/../}" != "$rest" ]; do d="$(dirname "$d")"; rest="${rest#/..}"; done; printf '%s%s' "$(phys "$d")" "$rest"; }
-prot() { case "$1" in "$root/orca.yaml" | "$home/.claude/settings.json") return 0;; esac
+prot() { case "$1" in "$root/orca.yaml" | "$home/.claude/settings.json" | "$home"/.claude-*/settings.json) return 0;; esac
   [ -n "$spoke" ] && case "$1" in "$root/.claude/settings.json" | "$root/.claude/settings.local.json" | "$root/.claude/hooks" | "$root/.claude/hooks/"* | "$root/.ai-toolkit/spoke-run-id" | "$root/.ai-toolkit/claude-settings.json" | "$root/.ai-toolkit/hooks/"* | "${AI_TOOLKIT_DIR:-/nonexistent}" | "${AI_TOOLKIT_DIR:-/nonexistent}/"*) return 0;; esac
   return 1; }
 fp="$(j '.tool_input.file_path // .tool_input.notebook_path')"; re() { printf '%s' "$1" | sed 's/[^[:alnum:]_\/-]/\\&/g'; }; rr="$(re "$root")"; rh="$(re "$home")" # re: a path as a literal inside an ERE, so a "[" or "(" in it is not read as syntax
@@ -59,7 +59,7 @@ cmd="$(j .tool_input.command)"; [ -n "$cmd" ] || finish
 
 c=" $(printf '%s' "$cmd" | sed -E "s/[\"'\\\\]//g; s/[0-9&]*>+ *(\/dev\/null|&[0-9])//g; s/[[:space:]>]/& /g")" # writes to a protected path
 pre="((^|[^[:alnum:]_./-])(\./)?|$rr/|\\\$\{?(PWD|CLAUDE_PROJECT_DIR)\}?/|\\\$\(pwd\)/)"; e="([^[:alnum:]_./-]|$)" # project-root paths only: v2/orca.yaml is fine
-p="$pre(orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$rh)/\.claude/settings\.json"; ft='[^[:space:]]*\.ai-toolkit/(spoke-run-id|claude-settings\.json|hooks|bin|scripts|rules|sync-manifest|setup\.local\.sh|[^/[:space:]]*\.env)'
+p="$pre(orca\.yaml([^[:alnum:]_.-]|$))|(~|HOME\}?|$rh)/\.claude(-[a-z0-9-]+)?/settings\.json|\\\$\{?CLAUDE_CONFIG_DIR\}?/settings\.json"; ft='[^[:space:]]*\.ai-toolkit/(spoke-run-id|claude-settings\.json|hooks|bin|scripts|rules|sync-manifest|setup\.local\.sh|[^/[:space:]]*\.env)'
 if [ -n "$spoke" ]; then p="$p|$pre(\.claude/?$e|\.claude/(settings(\.local)?\.json|hooks)([^[:alnum:]_.-]|$)|\.ai-toolkit/?$e)|$pre($(re "${AI_TOOLKIT_DIR:-/nonexistent}")|(~|HOME\}?|$rh)/$(t="${AI_TOOLKIT_DIR:-/nonexistent}"; re "${t#"$home"/}")|\\\$\{?AI_TOOLKIT_DIR\}?)(/|$e)"; fi
 w="(>|[[:space:]](tee|cp|mv|rm|touch|ln|dd|install|rsync|truncate|patch|chmod|python[0-9.]*|perl|ruby|node)[[:space:]]|[[:space:]]sed[[:space:]][^;|&]*(-[a-z]*i|--in-place))"
 va="${w}[^;|&]*|[[:space:]](cd|pushd)[[:space:]][^;|&]*" # a verb before the path, or a cd into it
