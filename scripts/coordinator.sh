@@ -95,9 +95,10 @@ mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
 now_min() { mins "${AI_TOOLKIT_NOW:-$(date +%H:%M)}"; }
 
 pending() {   # {open: questions nobody has replied to (waiting for the human), answered: ids with a reply, truncated: the page was full}
-  okread orchestration inbox --limit 200 --full | jq -c --arg r "$run" '.result.messages as $all | [$all[] | select(.run_id == $r)] as $m
-    | {open: [$m[] | select(.type == "question") | select(. as $q | $m | any(.id != $q.id and .thread_id == $q.id) | not)],
-       answered: [$m[] | select(.thread_id != null and .thread_id != .id) | .thread_id], truncated: ($all | length >= 200)}'
+  okread orchestration inbox --limit 200 --full | jq -c --arg r "$run" '.result.messages as $all | [$all[] | select(.run_id == $r)] as $m   # a reply is a threaded message in the reply grammar (#558): Orca'\''s own free-prose notice on a question (same type and sender) is not one
+    | def reply: (.body // "") | test("\\A(approve|allow|deny)\\z|\\A(approve with: |revise:)");
+    {open: [$m[] | select(.type == "question") | select(. as $q | $m | any(.id != $q.id and .thread_id == $q.id and reply) | not)],
+       answered: [$m[] | select(.thread_id != null and .thread_id != .id and reply) | .thread_id], truncated: ($all | length >= 200)}'
 }
 silent() {   # $1 dispatch: "<minutes> <run|wait>": minutes since the newest sign of life (terminal output, liveness observation, heartbeat, never before dispatchedAt);
   okread orchestration worker-show --dispatch "$1" --full < /dev/null | jq -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer, or Orca could not prove the worker (never "not waiting")
