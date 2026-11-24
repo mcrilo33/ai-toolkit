@@ -463,7 +463,7 @@ def test_a_background_wait_record_of_a_dispatch_that_ended_is_removed_by_the_swe
     if not orca_up:
         C.stubs.reply("orca.orchestration_worker_list", "boom", rc=1)
     C.go("--cap", "0", **SWEEP)
-    assert (tmp_path / "state/run_t/bgwait/ctx_9").exists() != orca_up and (tmp_path / "state/run_t/bgwait/ctx_1").exists() == (orca_up or True)
+    assert (tmp_path / "state/run_t/bgwait/ctx_9").exists() != orca_up and (tmp_path / "state/run_t/bgwait/ctx_1").exists()
 
 
 @pytest.mark.parametrize("held", [True, False])   # the loop handed the plan over (exit 3), or answer.sh approved it: the #488 sequence
