@@ -107,6 +107,9 @@ silent() {   # $1 dispatch: "<minutes> <run|wait>": minutes since the newest sig
 tool_running() {   # $1 dispatch: the minutes its newest tool call has run, from Orca's exact transcript (the last message is an assistant tool-call with no result yet); empty = none, or Orca could not say (then the worker is judged by its silence alone)
   orca_json orchestration worker-read --dispatch "$1" --source transcript --limit 1 --full < /dev/null 2> /dev/null | jq -r --argjson now "$(date +%s)" '(.result.transcript.messages // []) | last // empty | select(.role == "assistant" and any(.blocks[]?; .type == "tool-call")) | [(($now - .timestamp / 1000) / 60) | floor, 0] | max' 2> /dev/null || true
 }
+bgwaited() {   # $1 dispatch: the minutes its worker has waited on its background task (#555), from the recorded escalation, which Orca sends 20 min after the turn end; empty = no record. An unreadable record counts as an old one: the existing relaunch path
+  local rec; [ -f "$sd/bgwait/$1" ] || return 0; read -r rec < "$sd/bgwait/$1" || true; [[ "${rec:-}" =~ ^[0-9]+$ ]] || rec=0; echo $((20 + ($(date +%s) - rec) / 60))
+}
 holder() { okread orchestration run-show --id "$run" --full | jq -r '.result.run.coordinator_handle // empty' || true; }   # the terminal that holds the Run
 live_hold() {   # $1 eq|ne, $2 a handle: if a live coordinator.sh (holder.<pid> = "<handle> <mode>", the pid's command must still be coordinator.sh) is bound as
   local f h  # (eq) / as anything but (ne) that handle, print its mode and succeed
@@ -458,6 +461,10 @@ on_done() {
   esac; rm -f "$sd/landing"
   case $rc in 0 | 6 | 7) triage "$out" "$(jq -r '.body // ""' <<< "$1")" || true ;; esac   # landed: what is left over goes to the scopers, after the land's own work
 }
+bgwait_record() {   # the first escalation of a wait sets its record; a repeat does not move it (the shield stays bounded), unless the worker showed life since, which makes it the next wait's
+  local w age; w="$(bgwaited "$disp")"; read -r age _ <<< "$(silent "$disp" || true)"
+  if [ -z "$w" ] || { [ -n "${age:-}" ] && [ $((age + 1)) -lt "$w" ]; }; then (umask 077; mkdir -p "$sd/bgwait"); date +%s > "$sd/bgwait/$disp"; fi
+}
 handle() {
   case "$(jq -r .type <<< "$1")" in
     question) on_question "$1" ;;
@@ -466,7 +473,7 @@ handle() {
       case "$(pj "$1" stopReason)" in
         needs-input) log "#$issue: worker $disp is at a prompt (needs-input), left to the permission relay and the sweep" ;;
         finished) log "#$issue: worker $disp ended a turn without worker_done (finished), left to the sweep" ;;
-        background-wait) (umask 077; mkdir -p "$sd/bgwait"); [ -f "$sd/bgwait/$disp" ] || date +%s > "$sd/bgwait/$disp"; log "#$issue: worker $disp waits on its background task, left to the sweep up to COORD_TOOL_MAX" ;;   # #555: Orca fires it 20 min after the turn ended; the sweep bounds the wait from the first record, a repeat never moves it
+        background-wait) bgwait_record; log "#$issue: worker $disp waits on its background task, left to the sweep up to COORD_TOOL_MAX" ;;   # #555: Orca fires it 20 min after the turn ended; the sweep bounds the wait from the first record, a repeat never moves it
         *) block "escalation: $(jq -r '.body // ""' <<< "$1")" ;;
       esac ;;
   esac
@@ -523,7 +530,7 @@ fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --n
   done
 }
 sweep() {   # a worker without worker_done whose process exited (and was not relaunched), or that is alive but silent for COORD_IDLE_MIN minutes: one relaunch, then blocked
-  local d age how open r tcall live f rec waited
+  local d age how open r tcall live f waited
   for d in $(wl | jq -r '.result.workers as $w | $w[] | select(.dispatchStatus == "dispatched" and .projection.liveness.verdict == "exited")
       | .resource.worktreeId as $p | select([$w[] | select(.resource.worktreeId == $p and .dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited")] | length == 0) | .dispatchId'); do
     ctx "$d" || continue
@@ -544,7 +551,7 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
     if [ "$how" = wait ]; then block "worker $d is silent for ${age}m and waits on a prompt only a human can answer, or Orca cannot prove it works: slot freed, worktree kept, check its terminal"; continue; fi   # never a relaunch: it may be healthy
     tcall="$(tool_running "$d")"; if [ -n "$tcall" ] && [ "$tcall" -lt "${COORD_TOOL_MAX:-90}" ]; then log "#$issue: worker $d silent for ${age}m inside a tool call running ${tcall}m, left alone"; continue; fi   # a long build or test run is activity, up to COORD_TOOL_MAX minutes
     if [ -f "$sd/bgwait/$d" ]; then   # #555: the turn ended and its own background task runs: activity for COORD_TOOL_MAX minutes from the turn end (20 min before Orca's escalation), unless the worker showed life since
-      read -r rec < "$sd/bgwait/$d" || true; [[ "${rec:-}" =~ ^[0-9]+$ ]] || rec=0; waited=$((20 + ($(date +%s) - rec) / 60))
+      waited="$(bgwaited "$d")"
       if [ $((age + 1)) -lt "$waited" ]; then rm -f "$sd/bgwait/$d"
       elif [ "$waited" -lt "${COORD_TOOL_MAX:-90}" ]; then log "#$issue: worker $d silent for ${age}m, its turn ended ${waited}m ago on a background task, left alone"; continue; fi
     fi
