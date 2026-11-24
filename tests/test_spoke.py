@@ -186,3 +186,108 @@ def test_install_checks_prerequisites_then_prints_the_orca_override_without_a_pa
     r = run(["bash", f"{V2}/scripts/install.sh"], **quick)
     assert r.returncode == 0, r.stderr
     assert f"{V2}/bin/claude-spoke" in r.stdout and not any((tmp_path / "home").rglob("claude"))
+
+
+def accounts(tmp_path, stubs, listing, security="tok-s3cret\n", sec_rc=0):
+    """A project's CLAUDE_ACCOUNTS in the per-machine env file, a throwaway HOME with a shared ~/.claude, and the Keychain answer of the stubbed `security`."""
+    home = tmp_path / "home"
+    (home / ".claude/skills").mkdir(parents=True)
+    for f in ("settings.json", "CLAUDE.md"):
+        (home / ".claude" / f).write_text("{}\n")
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {"notion": {"command": "n"}}, "oauthAccount": {}}))
+    (tmp_path / "l.env").write_text(f"CLAUDE_ACCOUNTS={listing}\n" if listing else "")
+    stubs.reply("security", security, sec_rc)
+    return {"HOME": home, "AI_TOOLKIT_LOCAL_ENV": tmp_path / "l.env"}
+
+
+@pytest.mark.parametrize("listing", [None, "max"])
+def test_an_unset_or_one_entry_account_list_leaves_the_claude_env_and_argv_unchanged(run, stubs, repo, tmp_path, listing):
+    tk = synced(repo)
+    env = accounts(tmp_path, stubs, listing)
+    r = run([SPOKE, "--model", "m"], cwd=in_spoke(repo), **env)
+    assert r.returncode == 0 and stubs.calls("claude") == [[*MCP(tk), "--settings", WORKER_SETTINGS(tk), "--model", "m"]], r.stderr
+    claude_env = stubs.env("claude")
+    assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=abc-123,repo=origin\n" in claude_env + "\n"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in claude_env and "CLAUDE_CONFIG_DIR" not in claude_env and "SUBPROCESS_ENV_SCRUB" not in claude_env and stubs.calls("security") == []
+
+
+def test_a_worker_on_a_token_account_gets_the_token_from_the_keychain_in_one_variable_and_nowhere_else(run, stubs, repo, tmp_path):
+    tk = synced(repo)
+    env = accounts(tmp_path, stubs, "max client")
+    r = run([SPOKE, "--account", "client", "--model", "m"], cwd=in_spoke(repo), **env)
+    assert r.returncode == 0, r.stderr
+    assert stubs.calls("claude") == [[*MCP(tk), "--settings", WORKER_SETTINGS(tk), "--model", "m"]]   # the launcher consumes --account; the token is not in argv
+    assert stubs.calls("security") == [["find-generic-password", "-s", "CLAUDE_OAUTH_TOKEN_CLIENT", "-w"]]
+    claude_env = stubs.env("claude")
+    assert claude_env.count("tok-s3cret") == 1 and "\nCLAUDE_CODE_OAUTH_TOKEN=tok-s3cret\n" in "\n" + claude_env   # exactly one variable holds it
+    assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1" in claude_env   # Claude then drops credentials from the Bash tool, hooks and MCP servers it starts
+    assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=abc-123,repo=origin,account=client\n" in claude_env + "\n"
+    assert "tok-s3cret" not in r.stdout + r.stderr
+
+
+def test_a_stored_account_exports_no_token_and_drops_an_inherited_one(run, stubs, repo, tmp_path):
+    synced(repo)
+    env = accounts(tmp_path, stubs, "client max")
+    r = run([SPOKE, "--account", "max"], cwd=in_spoke(repo), CLAUDE_CODE_OAUTH_TOKEN="inherited", CLAUDE_CONFIG_DIR="/inherited", **env)
+    claude_env = stubs.env("claude")
+    assert r.returncode == 0 and stubs.calls("security") == [], r.stderr
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in claude_env and "CLAUDE_CONFIG_DIR" not in claude_env and "SUBPROCESS_ENV_SCRUB" not in claude_env
+    assert "account=max\n" in claude_env + "\n"
+
+
+def test_a_coordinator_runs_on_the_account_it_names_else_on_the_first_listed(run, stubs, repo, tmp_path):
+    tk = synced(repo)
+    env = accounts(tmp_path, stubs, "client max")
+    assert run([SPOKE], cwd=repo.root, **env).returncode == 0
+    assert "CLAUDE_CODE_OAUTH_TOKEN=tok-s3cret" in stubs.env("claude") and "account=client" in stubs.env("claude")   # no --account: the first entry
+    assert run([SPOKE, "--account", "max"], cwd=repo.root, **env).returncode == 0
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in stubs.env("claude") and "account=max" in stubs.env("claude")
+    assert stubs.calls("claude")[-1] == ["--settings", COORD_SETTINGS(tk)]
+
+
+@pytest.mark.parametrize("listing,args,sec_rc,why", [
+    ("max client", ["--account", "other"], 0, "not listed"),            # an account the project does not list is never used
+    ("max client", ["--account", "cli ent"], 0, "not an account name"),
+    ("max client", ["--account=client;x"], 0, "not an account name"),
+    ("max client", ["--account", "client"], 44, "CLAUDE_OAUTH_TOKEN_CLIENT"),   # no Keychain item: refused, no fallback to another account
+    (None, ["--account", "client"], 0, "not listed"),
+])
+def test_an_unlisted_or_malformed_account_and_a_missing_keychain_item_are_refused(run, stubs, repo, tmp_path, listing, args, sec_rc, why):
+    synced(repo)
+    env = accounts(tmp_path, stubs, listing, sec_rc=sec_rc)
+    r = run([SPOKE, *args], cwd=in_spoke(repo), **env)
+    assert r.returncode != 0 and why in r.stderr and stubs.calls("claude") == []
+
+
+def test_a_config_directory_account_runs_on_its_own_login_and_shares_the_users_files(run, stubs, repo, tmp_path):
+    synced(repo)
+    env = accounts(tmp_path, stubs, "max client")
+    home = env["HOME"]
+    (home / ".claude-client").mkdir()
+    (home / ".claude-client/.claude.json").write_text('{"oauthAccount": {"emailAddress": "x"}}')
+    (home / ".claude-client/skills").mkdir()   # a real directory already there is kept, never replaced
+    r = run([SPOKE, "--account", "client"], cwd=repo.root, **env)
+    claude_env, argv = stubs.env("claude"), stubs.calls("claude")[0]
+    assert r.returncode == 0 and f"CLAUDE_CONFIG_DIR={home}/.claude-client\n" in claude_env and "CLAUDE_CODE_OAUTH_TOKEN" not in claude_env and stubs.calls("security") == [], r.stderr
+    for name in ("settings.json", "CLAUDE.md"):
+        assert (home / ".claude-client" / name).resolve() == (home / ".claude" / name).resolve() and (home / ".claude-client" / name).is_symlink()
+    assert not (home / ".claude-client/skills").is_symlink() and "skills" in r.stderr   # kept, and said so
+    assert not (home / ".claude-client/agents").exists()   # nothing to share: no dangling link
+    mcp = home / ".claude-client/aitk-user-mcp.json"   # the user-scope MCP servers of ~/.claude.json, which a config directory does not hold
+    assert argv[argv.index("--mcp-config") + 1] == str(mcp) and json.loads(mcp.read_text()) == {"mcpServers": {"notion": {"command": "n"}}} and mcp.stat().st_mode & 0o777 == 0o600
+    assert run([SPOKE, "--account", "client"], cwd=in_spoke(repo), **env).returncode == 0
+    assert str(mcp) not in stubs.calls("claude")[1]   # a worker keeps its strict toolkit list
+
+
+def test_a_config_directory_without_a_login_is_refused_with_the_login_command(run, stubs, repo, tmp_path):
+    synced(repo)
+    env = accounts(tmp_path, stubs, "max client")
+    (env["HOME"] / ".claude-client").mkdir()
+    r = run([SPOKE, "--account", "client"], cwd=repo.root, **env)
+    assert r.returncode != 0 and "auth login" in r.stderr and f"{env['HOME']}/.claude-client" in r.stderr and stubs.calls("claude") == []
+
+
+def test_an_account_flag_in_an_unsynced_project_is_refused(run, stubs, repo, tmp_path):
+    env = accounts(tmp_path, stubs, "max client")
+    r = run([SPOKE, "--account", "client"], cwd=repo.wt("plain"), **env)
+    assert r.returncode != 0 and "not listed" in r.stderr and stubs.calls("claude") == []
