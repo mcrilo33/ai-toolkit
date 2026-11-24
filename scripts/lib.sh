@@ -156,6 +156,27 @@ record_dispatch() {   # <run> <dispatch> <issue>
   _dispatch_id_ok "$2" || die "bad dispatch id '$2'"
   local d; d="$(spool_dir "$1")/dispatch"; (umask 077; mkdir -p "$d"; printf '%s\n' "$3" > "$d/$2")
 }
+# usage_limit_reset <escalation body>: rc 0 when the body reports a usage-limit stop (Orca's text: "Claude hit its usage limit ... resets 6pm (Europe/Paris)"); prints the reset text, empty when the body gives none.
+# The one detection of this stop: the account failover (#556) and the model fallback (#551) both use it, so a change in Orca's wording is fixed in one place (until then the stop blocks the issue as any escalation does).
+usage_limit_reset() {
+  local re='resets ([0-9]{1,2}(:[0-9]{2})?[ap]m( \([A-Za-z0-9_/+-]+\))?)'
+  [[ $1 == *"Claude hit its usage limit"* ]] || return 1
+  if [[ $1 =~ $re ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
+  return 0
+}
+# reset_epoch <"6pm (Europe/Paris)">: the epoch of the next such time of day in that zone; a text it cannot read (or an unknown zone) is a one-hour hold, never an unbounded one. Arithmetic on the zone's own clock, no `date -j`/`-d`: BSD and GNU alike.
+reset_epoch() {
+  local re='^([0-9]{1,2})(:([0-9]{2}))?([ap]m) \(([A-Za-z0-9_/+-]+)\)$' now h m z hh mm ss delta
+  now="$(date +%s)"
+  if [[ $1 =~ $re ]] && [ -e "/usr/share/zoneinfo/${BASH_REMATCH[5]}" ] && [ "$((10#${BASH_REMATCH[1]}))" -ge 1 ] && [ "$((10#${BASH_REMATCH[1]}))" -le 12 ]; then
+    h=$((10#${BASH_REMATCH[1]} % 12)); m=$((10#${BASH_REMATCH[3]:-0})); z="${BASH_REMATCH[5]}"; [ "${BASH_REMATCH[4]}" != pm ] || h=$((h + 12))
+    read -r hh mm ss <<< "$(TZ="$z" date '+%H %M %S')"   # the zone's time of day now
+    delta=$((h * 3600 + m * 60 - (10#$hh * 3600 + 10#$mm * 60 + 10#$ss)))
+    [ "$delta" -gt 0 ] || delta=$((delta + 86400))
+    printf '%s' $((now + delta))
+  else printf '%s' $((now + 3600)); fi
+}
+mark_exhausted() { local d; d="$(spool_dir "$1")/exhausted"; (umask 077; mkdir -p "$d"; printf '%s\n' "$3" > "$d/$2"); }   # <run> <account> <epoch of its reset>
 record_account() {   # <run> <dispatch> <account> [failover]: the account the loop launched a dispatch on (account/<d>); failover/<d> marks a relaunch that only moved to another account (coordinator.sh's rounds() leaves it out)
   _dispatch_id_ok "$2" || die "bad dispatch id '$2'"
   local d; d="$(spool_dir "$1")"; (umask 077; mkdir -p "$d/account"; printf '%s\n' "$3" > "$d/account/$2"; [ -z "${4:-}" ] || { mkdir -p "$d/failover"; : > "$d/failover/$2"; })

@@ -296,8 +296,10 @@ rm_wt() {   # <n>: remove the half-made worktree a failed fresh dispatch may lea
 }
 nlive() { jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length'; }   # the workers of one wl reply that are live
 rounds() {   # dispatches of the worktree since its last human-requested round (a task titled "#<n> round", see named()), else all of them - 1; a relaunch shares its task, so the base is that task's oldest dispatch
-  local hr; hr="$(okread orchestration task-list --run "$run" --brief --full | jq -c '[.result.tasks[] | select(.task_title | test("^#[0-9]+ round$")) | .id]')" || return 1
-  wl | jq --arg p "::$wtp" --argjson h "$hr" '[.result.workers[] | select((.resource.worktreeId // "") | endswith($p))] as $w   # worker-list is newest first
+  local hr f fo=""; hr="$(okread orchestration task-list --run "$run" --brief --full | jq -c '[.result.tasks[] | select(.task_title | test("^#[0-9]+ round$")) | .id]')" || return 1
+  for f in "$sd"/failover/*; do [ ! -f "$f" ] || fo="$fo${f##*/}"$'\n'; done   # a failover (dispatch.sh --retry-of ... --account, #556) only moved the task to another account: it is no spent relaunch, and the loop knows it from its own spool alone
+  fo="$(printf %s "$fo" | jq -Rsc 'split("\n") | map(select(. != ""))')"
+  wl | jq --arg p "::$wtp" --argjson h "$hr" --argjson fo "$fo" '[.result.workers[] | select((.resource.worktreeId // "") | endswith($p)) | select(.dispatchId as $d | $fo | index($d) | not)] as $w   # worker-list is newest first
     | ([$w[] | select(.taskId as $t | $h | index($t))][0].taskId) as $t
     | if $t == null then ($w | length) - 1 else [$w | to_entries[] | select(.value.taskId == $t) | .key] | last end'
 }
@@ -468,6 +470,23 @@ bgwait_record() {   # the first escalation of a wait sets its record; a repeat d
   local w age; w="$(bgwaited "$disp")"; read -r age _ <<< "$(silent "$disp" || true)"
   if [ -z "$w" ] || { [ -n "${age:-}" ] && [ $((age + 1)) -lt "$w" ]; }; then (umask 077; mkdir -p "$sd/bgwait"); date +%s > "$sd/bgwait/$disp"; fi
 }
+# usage_limit <reset text> <escalation body>: the worker's account is at its usage limit (#556). The loop records it exhausted until the reset (the Run's spool, never the worker's files) and, when the project lists another account that is free,
+# releases the dispatch and relaunches the same task on it; the relaunch is marked a failover (dispatch.sh), so rounds() does not count it. #551's model fallback is the next step here when no account is left.
+usage_limit() {
+  local from next why
+  from="$(head -n 1 "$sd/account/$disp" 2> /dev/null)"; from="${from:-$(first_account)}"   # a dispatch with no record ran on the first listed account
+  why="usage limit${from:+ on account $from}${1:+, resets $1}"
+  if multi_account && account_listed "$from"; then
+    mark_exhausted "$run" "$from" "$(reset_epoch "$1")"
+    next="$(free_account "$run")" || { block "$why: every other allowed account is at its limit too"; return 0; }
+    release "$disp"; [ -z "$term" ] || orca terminal close --terminal "$term" --json > /dev/null 2>&1 || true   # the dead agent's terminal
+    if RUN="$run" "$DISPATCH_CMD" --retry-of "$disp" --task "$task" --account "$next" "$issue" > /dev/null; then
+      comment "$issue" "usage limit on account $from: relaunched on $next"; log "#$issue: usage limit on account $from (resets ${1:-unknown}), relaunched on $next"
+    else block "$why: failover relaunch failed"; fi
+    return 0
+  fi
+  block "$why: $2"
+}
 handle() {
   case "$(jq -r .type <<< "$1")" in
     question) on_question "$1" ;;
@@ -477,7 +496,8 @@ handle() {
         needs-input) log "#$issue: worker $disp is at a prompt (needs-input), left to the permission relay and the sweep" ;;
         finished) log "#$issue: worker $disp ended a turn without worker_done (finished), left to the sweep" ;;
         background-wait) bgwait_record; log "#$issue: worker $disp waits on its background task, left to the sweep up to COORD_TOOL_MAX" ;;   # #555: Orca fires it 20 min after the turn ended; bgwait_record keeps a still-silent repeat from moving the bound
-        *) block "escalation: $(jq -r '.body // ""' <<< "$1")" ;;
+        *) body="$(jq -r '.body // ""' <<< "$1")"
+          if reset="$(usage_limit_reset "$body")"; then usage_limit "$reset" "$body"; else block "escalation: $body"; fi ;;
       esac ;;
   esac
 }
@@ -520,6 +540,8 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
 fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --next finds nothing
   local live n rc i out; ready=1
   named
+  if multi_account && ! free_account "$run" > /dev/null; then [ -n "${acc_wait:-}" ] || log "every account of CLAUDE_ACCOUNTS (${CLAUDE_ACCOUNTS}) is exhausted (usage limit): nothing is dispatched until a reset"; acc_wait=1; return 0; fi
+  acc_wait=""
   live="$(wl | nlive)" || return 0   # Orca did not answer: nothing is dispatched on a guess, the next wake tries again
   for ((i = live; i < cap; i++)); do
     n="$(RUN="$run" "$DISPATCH_CMD" --next --dry-run)" && rc=0 || rc=$?
