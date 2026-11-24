@@ -1819,10 +1819,10 @@ def limit_msg(**payload):
     return {**msg("escalation", "msg_lim", **payload), "body": USAGE}
 
 
-def spooled_account(tmp_path, kind, name, text="4102444800\n"):   # the loop's own records, in the Run's spool: exhausted/<account> = reset epoch, account/<dispatch>, failover/<dispatch>
+def spooled_account(tmp_path, kind, name, text=None):   # the loop's own records, in the Run's spool: exhausted/<account> = reset epoch, account/<dispatch>, failover/<dispatch>
     f = tmp_path / "state/run_t" / kind / name
     f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(text)
+    f.write_text(text if text is not None else f"{int(time.time()) + 3600}\n")
     return f
 
 
@@ -1845,12 +1845,17 @@ def test_a_usage_limit_escalation_releases_the_worker_and_relaunches_it_on_the_n
 
 
 @pytest.mark.parametrize("env, other_exhausted, dispatch_rc, why, tried, recorded", [
+    (ACCOUNTS, "budget", 0, "failover budget", False, True),   # as many failovers as the project has accounts have run for this issue: a faked or looping stop is not followed again
     ({}, False, 0, "", False, False), ({"CLAUDE_ACCOUNTS": "max"}, False, 0, "", False, False),   # a project that lists no or one account never fails over, and writes no record
     (ACCOUNTS, True, 0, "", False, True),   # the other account is at its limit too
     (ACCOUNTS, False, 1, "failover relaunch failed", True, True),
 ])
 def test_a_usage_limit_with_no_account_to_move_to_blocks_with_the_reset_time(C, tmp_path, env, other_exhausted, dispatch_rc, why, tried, recorded):
-    if other_exhausted:
+    if other_exhausted == "budget":
+        for i in (7, 8):
+            spooled_account(tmp_path, "failover", f"ctx_{i}", "")
+            spooled_account(tmp_path, "dispatch", f"ctx_{i}", "1\n")
+    elif other_exhausted:
         spooled_account(tmp_path, "exhausted", "client")
     C.stubs.reply("dispatch.sh", "boom", rc=dispatch_rc)
     C.mail([limit_msg()])

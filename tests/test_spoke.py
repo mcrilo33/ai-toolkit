@@ -1,4 +1,6 @@
 import json
+import os
+from pathlib import Path
 
 import pytest
 from conftest import V2
@@ -188,6 +190,10 @@ def test_install_checks_prerequisites_then_prints_the_orca_override_without_a_pa
     assert f"{V2}/bin/claude-spoke" in r.stdout and not any((tmp_path / "home").rglob("claude"))
 
 
+PICK_THE_ACCOUNT = ["CLAUDE_SECURESTORAGE_CONFIG_DIR", "ANTHROPIC_PROFILE", "ANTHROPIC_CONFIG_DIR", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+                    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]   # inherited variables that decide whose login Claude uses
+
+
 def accounts(tmp_path, stubs, listing, security="tok-s3cret\n", sec_rc=0):
     """A project's CLAUDE_ACCOUNTS in the per-machine env file, a throwaway HOME with a shared ~/.claude, and the Keychain answer of the stubbed `security`."""
     home = tmp_path / "home"
@@ -197,7 +203,7 @@ def accounts(tmp_path, stubs, listing, security="tok-s3cret\n", sec_rc=0):
     (home / ".claude.json").write_text(json.dumps({"mcpServers": {"notion": {"command": "n"}}, "oauthAccount": {}}))
     (tmp_path / "l.env").write_text(f"CLAUDE_ACCOUNTS={listing}\n" if listing else "")
     stubs.reply("security", security, sec_rc)
-    return {"HOME": home, "AI_TOOLKIT_LOCAL_ENV": tmp_path / "l.env"}
+    return {"HOME": home, "AI_TOOLKIT_LOCAL_ENV": tmp_path / "l.env", "AITK_SECURITY": Path(os.environ["STUB_DIR"]) / "bin/security"}   # the launcher calls /usr/bin/security, never one found on PATH; the stub stands in through this seam
 
 
 @pytest.mark.parametrize("listing", [None, "max"])
@@ -237,7 +243,7 @@ def test_a_one_entry_list_naming_a_non_stored_account_runs_every_session_on_it_e
 def test_a_stored_account_exports_no_token_and_drops_an_inherited_one(run, stubs, repo, tmp_path):
     synced(repo)
     env = accounts(tmp_path, stubs, "client max")
-    r = run([SPOKE, "--account", "max"], cwd=in_spoke(repo), CLAUDE_CODE_OAUTH_TOKEN="zz-probe-9", CLAUDE_CONFIG_DIR="/zz-probe-9", ANTHROPIC_API_KEY="zz-probe-9", ANTHROPIC_AUTH_TOKEN="zz-probe-9", **env)
+    r = run([SPOKE, "--account", "max"], cwd=in_spoke(repo), CLAUDE_CODE_OAUTH_TOKEN="zz-probe-9", CLAUDE_CONFIG_DIR="/zz-probe-9", ANTHROPIC_API_KEY="zz-probe-9", ANTHROPIC_AUTH_TOKEN="zz-probe-9", **dict.fromkeys(PICK_THE_ACCOUNT, "zz-probe-9"), **env)
     claude_env = stubs.env("claude")
     assert r.returncode == 0 and stubs.calls("security") == [], r.stderr
     assert "zz-probe-9" not in claude_env and "SUBPROCESS_ENV_SCRUB" not in claude_env   # a key or token in the caller's env outranks every login: the chosen account must be the one used
@@ -258,6 +264,8 @@ def test_a_coordinator_runs_on_the_account_it_names_else_on_the_first_listed(run
     ("max client", ["--account", "other"], 0, "not listed"),            # an account the project does not list is never used
     ("max client", ["--account", "cli ent"], 0, "not an account name"),
     ("max client", ["--account=client;x"], 0, "not an account name"),
+    ("max Client", ["--account", "Client"], 0, "not an account name"),   # one name, one Keychain service and one directory: lower case, digits and - only
+    ("max a_b", ["--account", "a_b"], 0, "not an account name"), ("max -x", ["--account=-x"], 0, "not an account name"),
     ("max client", ["--account", "client"], 44, "CLAUDE_OAUTH_TOKEN_CLIENT"),   # no Keychain item: refused, no fallback to another account
     (None, ["--account", "client"], 0, "not listed"),
 ])
@@ -275,12 +283,16 @@ def test_a_config_directory_account_runs_on_its_own_login_and_shares_the_users_f
     (home / ".claude-client").mkdir()
     (home / ".claude-client/.claude.json").write_text('{"oauthAccount": {"emailAddress": "x"}}')
     (home / ".claude-client/skills").mkdir()   # a real directory already there is kept, never replaced
+    (home / ".claude/commands").mkdir()
+    (home / "elsewhere").mkdir()
+    (home / ".claude-client/commands").symlink_to(home / "elsewhere")   # a link to somewhere else is not the share either: kept, said so
     r = run([SPOKE, "--account", "client"], cwd=repo.root, **env)
     claude_env, argv = stubs.env("claude"), stubs.calls("claude")[0]
     assert r.returncode == 0 and f"CLAUDE_CONFIG_DIR={home}/.claude-client\n" in claude_env and "CLAUDE_CODE_OAUTH_TOKEN" not in claude_env and stubs.calls("security") == [], r.stderr
     for name in ("settings.json", "CLAUDE.md"):
         assert (home / ".claude-client" / name).resolve() == (home / ".claude" / name).resolve() and (home / ".claude-client" / name).is_symlink()
     assert not (home / ".claude-client/skills").is_symlink() and "skills" in r.stderr   # kept, and said so
+    assert (home / ".claude-client/commands").resolve() == (home / "elsewhere").resolve() and "commands" in r.stderr and not (home / ".claude/commands/commands").exists()   # nothing is ever written inside ~/.claude
     assert not (home / ".claude-client/agents").exists()   # nothing to share: no dangling link
     mcp = home / ".claude-client/aitk-user-mcp.json"   # the user-scope MCP servers of ~/.claude.json, which a config directory does not hold
     assert argv[argv.index("--mcp-config") + 1] == str(mcp) and json.loads(mcp.read_text()) == {"mcpServers": {"notion": {"command": "n"}}} and mcp.stat().st_mode & 0o777 == 0o600

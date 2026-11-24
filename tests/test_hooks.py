@@ -209,6 +209,8 @@ WRITE_DENY = [
     # a Claude account token in the Keychain (#556): the launcher reads it for the worker, the worker's own Bash must not (it would land in its transcript and the OTel logs); every spelling of the service name, and a dump of the whole Keychain
     "security find-generic-password -s CLAUDE_OAUTH_TOKEN_CLIENT -w", "t=$(security find-generic-password -a $USER -w -s \"CLAUDE_OAUTH_TOKEN_$N\")", "security delete-generic-password -s CLAUDE_OAUTH_TOKEN_CLIENT",
     "/usr/bin/security find-generic-password -w -s CLAUDE_OAUTH_TOKEN_MAX", "security dump-keychain -d", "cd ~ && security dump-keychain",
+    "security -q find-generic-password -s CLAUDE_OAUTH_TOKEN_CLIENT -w", "security -q dump-keychain -d", "security -i <<< 'x'", "echo x | security -i", "security add-generic-password -U -s CLAUDE_OAUTH_TOKEN_CLIENT -w x",
+    "security find-generic-password -s 'Claude Code-credentials' -w",
 ]
 WRITE_ALLOW = [
     "touch sub/orca.yaml", "echo x > v2/orca.yaml", "cp a docs/.github/workflows/x.yml", "rm -rf .claude/cache", "ls .claude",
