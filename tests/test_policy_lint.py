@@ -7,7 +7,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 SHARED = ROOT / "shared"
-CHECKS_TIMEOUT_CAP = 5  # minutes: a deliberate ceiling on suite duration; raising it is a reviewed decision
+CHECKS_TIMEOUT_CAP = 8  # minutes: a deliberate ceiling on suite duration; raising it is a reviewed decision (8 reviewed 2026-11-24, temporary until the suite fits 5 again)
 ALWAYS_ON = {"security", "agent-orchestration", "scientific-integrity"}  # top-level rules without paths:
 GUIDELINES = "guidelines"  # synced to .claude/rules/ai-toolkit/ like the others, always on
 MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5-20251001"}

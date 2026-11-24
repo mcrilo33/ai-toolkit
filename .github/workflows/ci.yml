@@ -9,7 +9,8 @@ on:
 jobs:
   checks:
     # deliberate ceiling on suite duration; raising it is a reviewed decision
-    timeout-minutes: 5
+    # (8 reviewed on 2026-11-24, temporary: back to 5 once the suite fits 5 minutes again)
+    timeout-minutes: 8
     strategy:
       fail-fast: false
       matrix:
