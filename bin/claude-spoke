@@ -7,8 +7,8 @@
 # AI_TOOLKIT_OTEL=0 opts out of the OTel. No auth header on the OTel exporter.
 # Claude account (#556): the project's CLAUDE_ACCOUNTS (per machine, ai-toolkit.local.env) lists the accounts it may use, the first being the default; --account <name> picks another listed one (the loop names it on a worker's launch line).
 # The stored login of ~/.claude (CLAUDE_STORED_ACCOUNT, default max) exports nothing. A name with a directory ~/.claude-<name> runs on that full login (CLAUDE_CONFIG_DIR, sharing the user's settings, skills and memory by symlink). Any other name
-# is a long-lived token (claude setup-token) in the Keychain service CLAUDE_OAUTH_TOKEN_<NAME>, read here and exported only as CLAUDE_CODE_OAUTH_TOKEN, with CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 so the Bash tool, hooks and MCP servers do not inherit it.
-# Never in argv, a log or OTEL_*; no fallback to another account. A name the project does not list is refused.
+# is a long-lived token (claude setup-token) in the Keychain service CLAUDE_OAUTH_TOKEN_<NAME>, read here and exported only as CLAUDE_CODE_OAUTH_TOKEN (Claude itself withholds it from the hooks it starts, measured on 2.1.331: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 is NOT set, it would also drop SSH_AUTH_SOCK, GIT_ASKPASS and the cloud credentials a worker pushes with).
+# Never in argv, a log or OTEL_*; no fallback to another account. A name the project does not list is refused. Inherited ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, which outrank every login, are unset so the chosen account is the one used.
 # To use Orca's Chat UI, put --settings ai-toolkit in Orca's Claude arguments: the launcher swaps it for the project's guard file (Orca's own --settings would switch every hook off).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -64,24 +64,24 @@ if [ -n "$synced" ] && { [ -n "${CLAUDE_ACCOUNTS:-}" ] || [ -n "$named" ]; }; th
   valid_account "$account" || die "'$account' is not an account name (letters, digits, _ and - only)"
   account_listed "$account" || die "account '$account' is not listed in CLAUDE_ACCOUNTS (${CLAUDE_ACCOUNTS:-empty}): this project may not use it"
   # the choice of the auth env, once, here: the stored login exports nothing; a directory ~/.claude-<name> is its own full login; anything else is a Keychain token
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
   cfg="$HOME/.claude-$account"
   if [ "$account" = "${CLAUDE_STORED_ACCOUNT:-max}" ]; then cfg=""
   elif [ -d "$cfg" ]; then
     jq -e '.oauthAccount | type == "object"' "$cfg/.claude.json" > /dev/null 2>&1 || die "no login in $cfg: run CLAUDE_CONFIG_DIR=$cfg claude auth login"
     for n in settings.json CLAUDE.md skills agents commands hooks plugins projects; do   # what the account shares with ~/.claude, by link, only where the directory has nothing of its own
       [ -e "$HOME/.claude/$n" ] && [ ! -L "$cfg/$n" ] || continue
-      if [ -e "$cfg/$n" ]; then warn "$cfg/$n is not a link to ~/.claude/$n: kept, so account $account does not share it"; else ln -s "$HOME/.claude/$n" "$cfg/$n"; fi
+      if [ -e "$cfg/$n" ]; then warn "$cfg/$n is not a link to ~/.claude/$n: kept, so account $account does not share it"; else ln -s "$HOME/.claude/$n" "$cfg/$n" 2> /dev/null || [ -L "$cfg/$n" ] || die "cannot link $cfg/$n"; fi   # two launches may start together: the loser finds the link made
     done
     export CLAUDE_CONFIG_DIR="$cfg"
   else
     svc="CLAUDE_OAUTH_TOKEN_$(printf %s "$account" | LC_ALL=C tr 'a-z-' 'A-Z_')"; cfg=""
     tok="$(security find-generic-password -s "$svc" -w 2> /dev/null)" && [ -n "$tok" ] || die "no Keychain item $svc for account $account (claude setup-token, then security add-generic-password -s $svc): no other account is used instead"
-    export CLAUDE_CODE_OAUTH_TOKEN="$tok" CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1; unset tok
+    export CLAUDE_CODE_OAUTH_TOKEN="$tok"; unset tok
   fi
   if multi_account; then tag=",account=$account"; fi
   if [ -n "$cfg" ] && [ ! -s "$top/.ai-toolkit/spoke-run-id" ] && [ -f "$HOME/.claude.json" ]; then   # the user-scope MCP servers live in ~/.claude.json, which a config directory does not read: a session of the human gets them from here (a worker has only the toolkit's list)
-    (umask 077; jq -c '{mcpServers: (.mcpServers // {})}' "$HOME/.claude.json" > "$cfg/aitk-user-mcp.json.tmp" && mv "$cfg/aitk-user-mcp.json.tmp" "$cfg/aitk-user-mcp.json") || die "cannot write $cfg/aitk-user-mcp.json"
+    (umask 077; t="$(mktemp "$cfg/aitk-user-mcp.XXXXXX")" && jq -c '{mcpServers: (.mcpServers // {})}' "$HOME/.claude.json" > "$t" && mv "$t" "$cfg/aitk-user-mcp.json") || die "cannot write $cfg/aitk-user-mcp.json"
     set -- --mcp-config "$cfg/aitk-user-mcp.json" "$@"
   fi
 elif [ -n "$named" ]; then die "account '$account' is not listed in CLAUDE_ACCOUNTS: this project is not synced, so no account is used"; fi
