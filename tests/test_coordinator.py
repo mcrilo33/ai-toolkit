@@ -64,7 +64,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": "failed", "agentTerminalHandle": None, "resource": None, "lastFailure": "Agent startup blocked: agent-trust-workspace",
                 "projection": {"liveness": {"verdict": "exited"}, "stage": {"detail": "agent_readiness"}, "resource": {"state": "absent", "reason": "not_materialized"}}}
 
-    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None, tool=None, ended=False):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim; tool = a tool call (the newest transcript message, read by worker-read) has run for that many minutes (ended: that call already returned its result, the turn is over)
+    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None, tool=None, ended=False, bg=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim; tool = a tool call (the newest transcript message, read by worker-read) has run for that many minutes (ended: that call already returned its result, the turn is over); bg = the worker's turn ended that many minutes ago and Orca's background-wait escalation (20 minutes after the turn end) was recorded (#555)
         def ago(m):
             return time.time() - m * 60
 
@@ -78,6 +78,9 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         if noterm:
             reply["terminal"] = None
         stubs.reply("orca.orchestration_worker_show", raw if raw is not None else json.dumps({"result": reply}))
+        if bg is not None:
+            (tmp_path / "state/run_t/bgwait").mkdir(parents=True, exist_ok=True)
+            (tmp_path / "state/run_t/bgwait/ctx_1").write_text(f"{int(time.time() - max(bg - 20, 0) * 60)}\n")
         if tool is not None:
             call = {"role": "tool", "blocks": [{"type": "tool-result"}], "timestamp": ago(tool) * 1000} if ended else {"role": "assistant", "blocks": [{"type": "tool-call", "name": "Bash"}], "timestamp": ago(tool) * 1000}
             stubs.reply("orca.orchestration_worker_read", json.dumps({"result": {"source": "transcript", "sourceExact": True, "transcript": {"messages": [call]}}}))
@@ -444,11 +447,23 @@ def test_a_needs_input_escalation_batched_with_its_permission_request_neither_bl
         assert "msg_p" in (tmp_path / "state/run_t/held").read_text().split()   # queued for --status and the human, not orphaned
 
 
-@pytest.mark.parametrize("reason, line", [("needs-input", "worker ctx_1 is at a prompt (needs-input)"), ("finished", "worker ctx_1 ended a turn without worker_done (finished)")])   # a finished turn is a worker idle between turns: the sweep owns it (#553)
-def test_a_needs_input_or_finished_escalation_alone_is_logged_and_blocks_nothing_at_once(C, reason, line):
+@pytest.mark.parametrize("reason, line", [("needs-input", "worker ctx_1 is at a prompt (needs-input)"), ("finished", "worker ctx_1 ended a turn without worker_done (finished)"),
+                                         ("background-wait", "worker ctx_1 waits on its background task")])   # a finished turn is a worker idle between turns: the sweep owns it (#553); so is one waiting on its own background task (#555)
+def test_a_needs_input_finished_or_background_wait_escalation_alone_is_logged_and_blocks_nothing_at_once(C, reason, line, tmp_path):
     C.mail([msg("escalation", "msg_stop", stopReason=reason)])
     r = C.go()
     assert r.returncode == 0 and left_alive(C) and f"#1: {line}" in r.stdout and not C.calls("gh issue comment")
+    assert (tmp_path / "state/run_t/bgwait/ctx_1").exists() == (reason == "background-wait")   # recorded for the sweep, which bounds the wait
+
+
+@pytest.mark.parametrize("orca_up", [True, False])   # Orca not answering the worker list: no record is pruned, so a hiccup never clears a shield
+def test_a_background_wait_record_of_a_dispatch_that_ended_is_removed_by_the_sweep_only_when_orca_listed_the_live_workers(C, tmp_path, orca_up):
+    C.workers(C.row()); C.show(silent=1, bg=21)
+    (tmp_path / "state/run_t/bgwait/ctx_9").write_text(f"{int(time.time())}\n")
+    if not orca_up:
+        C.stubs.reply("orca.orchestration_worker_list", "boom", rc=1)
+    C.go("--cap", "0", **SWEEP)
+    assert (tmp_path / "state/run_t/bgwait/ctx_9").exists() != orca_up and (tmp_path / "state/run_t/bgwait/ctx_1").exists() == (orca_up or True)
 
 
 @pytest.mark.parametrize("held", [True, False])   # the loop handed the plan over (exit 3), or answer.sh approved it: the #488 sequence
@@ -622,11 +637,13 @@ def relaunches(C):
     (True, {"born": 25, "frac": True}),   # ... or dispatchedAt
     (True, {"tool": 25, "ended": True}),   # the newest transcript message is a tool result, not a call in flight: silence alone decides
     (True, {"tool": 200}),   # a tool call running past the 90-minute bound shields nothing: no unbounded shield
+    (True, {"silent": 95, "bg": 95}),   # a background wait past the 90-minute bound shields nothing either (#555)
+    (True, {"bg": 60}),   # the worker showed life 25 minutes ago, after its turn ended 60 minutes ago: the record is stale, silence alone decides
 ])
 def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C, idle, shown):
     assert re.search(r"COORD_SWEEP_EVERY:-2\}", (V2 / "scripts/coordinator.sh").read_text())   # the defaults, read rather than waited for: a sweep every 2nd empty wait (~10 min), the idle bound 15 minutes
     assert "COORD_IDLE_MIN:-15}" in (V2 / "scripts/coordinator.sh").read_text()
-    C.workers(C.row(lv="live" if idle else "exited"), C.unstarted()); C.show(silent=25, **shown)   # a failed-start row with no resource is in the Run: rounds() skips it, it is neither fatal nor a spent round
+    C.workers(C.row(lv="live" if idle else "exited"), C.unstarted()); C.show(**{"silent": 25, **shown})   # a failed-start row with no resource is in the Run: rounds() skips it, it is neither fatal nor a spent round
     C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
     assert not C.stubs.calls("dispatch.sh")
     first_run = len(C.kinds())   # its exit closed the loop's own pane
@@ -634,10 +651,10 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     if not idle:
         assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]]
         return
-    assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and C.stubs.calls("dispatch.sh")[0][-1] == "1" and "continue from the pushed branch" in C.stubs.calls("dispatch.sh")[0][1].replace("Continue", "continue") and "after an error" not in C.stubs.calls("dispatch.sh")[0][1] and "silent for 2" in C.stubs.calls("dispatch.sh")[0][1]
+    assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and C.stubs.calls("dispatch.sh")[0][-1] == "1" and "continue from the pushed branch" in C.stubs.calls("dispatch.sh")[0][1].replace("Continue", "continue") and "after an error" not in C.stubs.calls("dispatch.sh")[0][1] and "silent for " in C.stubs.calls("dispatch.sh")[0][1]
     in_order(C.kinds()[first_run:], "orca orchestration worker-release", "dispatch.sh", "orca terminal close")   # the live dispatch is stopped before its replacement starts
     assert [arg(a, "--terminal") for a in C.calls("orca terminal close")] == ["term_c", "term_w", "term_c"]   # the first run's pane, the old worker's terminal, this run's pane
-    assert re.search(r"silent for 2[45]m, relaunching", r.stdout) and "round 1" in C.calls("gh issue comment")[0][-1]
+    assert re.search(r"silent for (2[45]|95)m, relaunching", r.stdout) and "round 1" in C.calls("gh issue comment")[0][-1]
 
 
 @pytest.mark.parametrize("rows, shown, gate", [
@@ -649,6 +666,7 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     ([{}], {"silent": 40, "born": 1}, False),   # just (re)dispatched: the old terminal output is not the new worker's silence
     ([{}], {"silent": 25, "tool": 25}, False),   # silent for 25 minutes inside one tool call (a long build): active, not idle
     ([{}], {"silent": 40, "tool": 80}, False),   # ... still under the tool-call bound
+    ([{}], {"silent": 40, "bg": 40}, False),   # turn ended, its own background task runs (an eval round's judge passes): under the same bound, activity (#555)
     ([{}], {"silent": 14}, False),   # silent, but under the bound
     ([{}], {"silent": 14, "wait": True}, False),   # ... also with a proved human-only prompt
     ([{}], {"silent": 40}, True),   # waiting on an open gate or permission question
