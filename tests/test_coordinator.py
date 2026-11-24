@@ -463,6 +463,15 @@ def test_a_repeated_background_wait_escalation_keeps_the_first_record_so_the_shi
     assert C.go().returncode == 0 and (tmp_path / "state/run_t/bgwait/ctx_1").read_text() == "1000\n"
 
 
+def test_a_background_wait_escalation_after_the_worker_showed_life_replaces_the_stale_record(C, tmp_path):   # a second background task in the same dispatch: its wait is its own
+    rec = tmp_path / "state/run_t/bgwait/ctx_1"
+    rec.parent.mkdir(parents=True)
+    rec.write_text(f"{int(time.time()) - 40 * 60}\n")   # an escalation 40 minutes ago: the wait is 60 minutes old
+    C.workers(C.row()); C.show(silent=22)   # the worker's last output is newer than that wait's turn end
+    C.mail([msg("escalation", "msg_stop", stopReason="background-wait")])
+    assert C.go().returncode == 0 and abs(int(rec.read_text()) - time.time()) < 60 and left_alive(C)
+
+
 @pytest.mark.parametrize("orca_up", [True, False])   # Orca not answering the worker list: no record is pruned, so a hiccup never clears a shield
 def test_a_background_wait_record_of_a_dispatch_that_ended_is_removed_by_the_sweep_only_when_orca_listed_the_live_workers(C, tmp_path, orca_up):
     C.workers(C.row()); C.show(silent=1, bg=21)
