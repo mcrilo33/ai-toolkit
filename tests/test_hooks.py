@@ -795,6 +795,26 @@ def test_quality_check_reads_the_knobs_from_the_local_env_file(qc, tmp_path):
     assert r.returncode == 2
 
 
+@pytest.mark.parametrize("git,venv,cwd_in_project", [(True, True, False), (False, True, True), (True, False, False)], ids=["git-subdir", "no-git-pwd-fallback", "no-venv"])
+def test_quality_check_puts_the_project_venv_first_on_path_only_when_it_has_one(tmp_path, link_script, shared, git, venv, cwd_in_project):
+    proj = tmp_path / "proj"
+    (proj / "pkg").mkdir(parents=True)
+    if git:
+        subprocess.run(["git", "init", "-q", str(proj)], check=True)
+    if venv:
+        (proj / ".venv/bin").mkdir(parents=True)
+        (proj / ".venv/bin/python").write_text("#!/bin/sh\n")
+        (proj / ".venv/bin/python").chmod(0o755)
+    f = proj / "pkg/a.py"
+    f.write_text("x = 1\n")
+    log = tmp_path / "path.log"
+    stub = link_script(tmp_path / "types", '#!/bin/bash\necho "$PATH" > "$STUB_LOG"\n')
+    env = {"STUB_LOG": str(log), "LINT_CMD": "", "SHELLCHECK_CMD": "", "TYPECHECK_CMD": str(stub)}
+    r = call("quality-check.sh", proj if cwd_in_project else shared["wt"], "Write", env=env, file_path=str(f), content="x")
+    assert r.returncode == 0
+    assert log.read_text().strip() == (f"{proj.resolve()}/.venv/bin:" if venv else "") + os.environ["PATH"]
+
+
 def test_the_shipped_knobs_are_ruff_check_pyright_and_shellcheck():
     env = (V2 / "settings/ai-toolkit.env").read_text().splitlines()
     assert 'LINT_CMD="ruff check --quiet"' in env and "TYPECHECK_CMD=pyright" in env and "SHELLCHECK_CMD=shellcheck" in env

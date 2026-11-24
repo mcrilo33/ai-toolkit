@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # quality-check: PostToolUse(Write|Edit|MultiEdit). Runs on the edited file only: LINT_CMD then TYPECHECK_CMD for *.py, SHELLCHECK_CMD for *.sh or an extension-less sh/bash/dash/ksh shebang
-# (never zsh). A failure exits 2 with the tool output on stderr, back to the model. An empty knob is off, a missing binary is skipped. Fail-open: the edit is made, a crash is no finding.
+# (never zsh). A failure exits 2 with the tool output on stderr, back to the model. An empty knob is off, a missing binary is skipped. A project-root .venv/bin is put first on PATH for the knobs (pyright ignores VIRTUAL_ENV). Fail-open: the edit is made, a crash is no finding.
 set -Euo pipefail
 # shellcheck source=../../scripts/lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../scripts" && pwd)/lib.sh"
@@ -11,8 +11,8 @@ case "$f" in
   *.sh) knobs=(SHELLCHECK_CMD) ;;
   *) IFS= read -r first < "$f"; [[ "${f##*/}" != *.* && "$first" =~ ^'#!'([^\ ]*/)?(env[[:space:]]+(-S[[:space:]]+)?)?(sh|bash|dash|ksh)([[:space:]]|$) ]] && knobs=(SHELLCHECK_CMD) || exit 0 ;;
 esac
-load_env
-rc=0
+load_env; rc=0
+root="$(git -C "$(dirname "$f")" rev-parse --show-toplevel 2>/dev/null || pwd)"; [ -x "$root/.venv/bin/python" ] && PATH="$root/.venv/bin:$PATH"
 for name in "${knobs[@]}"; do
   knob="${!name:-}"
   read -ra cmd <<<"$knob"
