@@ -6,7 +6,7 @@
 # --review inline (lands are serialized by construction); a rejected review, red CI or a conflict goes back to the SAME worker for a
 # bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked (a needs-input, finished or background-wait stop is not one: a worker idle between turns, at a prompt, at a gate or waiting on its own background task is left to the permission relay and the sweep). Every 2nd empty wait (COORD_SWEEP_EVERY,
 # ~10 min): a sweep of the workers that died or went idle without worker_done: one relaunch, then blocked. Idle = silent (no terminal output, heartbeat or
-# liveness change, and no tool call in flight, nor a turn ended on its own background task, for under COORD_TOOL_MAX minutes (90): a long build is activity) for COORD_IDLE_MIN minutes (15) with no open question: worst-case detection = that bound + the sweep period (~25 min). A silent worker Orca shows parked on a human-only prompt, or cannot prove (absent agentWait, null terminal), is blocked at once, never relaunched: the loop cannot answer it, and its slot and Scope must not be held without bound, in either --answer mode (the block comment is the notice). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
+# liveness change, and no tool call in flight, nor a turn ended on its own background task, for under COORD_TOOL_MAX minutes (90): a long build is activity) for COORD_IDLE_MIN minutes (21: Orca's 20-min background-wait escalation + 1, so the shield exists before a sweep may judge idle) with no open question: worst-case detection = that bound + the sweep period (~31 min). A silent worker Orca shows parked on a human-only prompt, or cannot prove (absent agentWait, null terminal), is blocked at once, never relaunched: the loop cannot answer it, and its slot and Scope must not be held without bound, in either --answer mode (the block comment is the notice). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
 # back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD OTEL_CMD.
 # --answer attended (the /coordinate attended loop, #450): the routine work out of sight, the human only for a decision. A routine plan is approved by answer.sh; a plan it hands over (exit 3, a reason) and every permission
@@ -54,6 +54,8 @@ if [ "$dreq" = 1 ]; then   # a dispatch request: <issue> = its one-line message 
   printf '%s\n' "$(printf '%s' "$dreq_text" | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c1-1000)" > "$d/.$dreq_n.tmp" && mv "$d/.$dreq_n.tmp" "$d/$dreq_n"
   echo "dispatch request for #$dreq_n queued: the loop starts it at its next wake, or --status says why not"; exit 0
 fi
+BGWAIT_DELAY_MIN=20   # Orca sends its background-wait escalation this long after a turn ended (#555)
+COORD_IDLE_MIN="${COORD_IDLE_MIN:-$((BGWAIT_DELAY_MIN + 1))}"   # #561: no sooner than the escalation, so the bgwait record exists before a sweep may judge a worker idle
 DISPATCH_CMD="${DISPATCH_CMD:-$here/dispatch.sh}"; LAND_CMD="${LAND_CMD:-$here/land.sh}"; ANSWER_CMD="${ANSWER_CMD:-$here/answer.sh}"
 telemetry() {   # #538: otel.sh status once (OTEL_CMD, else the toolkit's own, else TOOLKIT_DIR's: hosts have no copy). Prints the state and fails when the collector is down or degraded; silent and 0 when up, opted out (AI_TOOLKIT_OTEL=0) or no otel.sh. Never starts, stops or retries anything
   local c="${OTEL_CMD:-}" o rc=0; [ "${AI_TOOLKIT_OTEL:-1}" != 0 ] || return 0
@@ -108,8 +110,8 @@ silent() {   # $1 dispatch: "<minutes> <run|wait>": minutes since the newest sig
 tool_running() {   # $1 dispatch: the minutes its newest tool call has run, from Orca's exact transcript (the last message is an assistant tool-call with no result yet); empty = none, or Orca could not say (then the worker is judged by its silence alone)
   orca_json orchestration worker-read --dispatch "$1" --source transcript --limit 1 --full < /dev/null 2> /dev/null | jq -r --argjson now "$(date +%s)" '(.result.transcript.messages // []) | last // empty | select(.role == "assistant" and any(.blocks[]?; .type == "tool-call")) | [(($now - .timestamp / 1000) / 60) | floor, 0] | max' 2> /dev/null || true
 }
-bgwaited() {   # $1 dispatch: the minutes its worker has waited on its background task (#555), from the recorded escalation, which Orca sends 20 min after the turn end; empty = no record. An unreadable record counts as an old one: the existing relaunch path
-  local rec; [ -f "$sd/bgwait/$1" ] || return 0; read -r rec < "$sd/bgwait/$1" || true; [[ "${rec:-}" =~ ^[0-9]+$ ]] || rec=0; echo $((20 + ($(date +%s) - rec) / 60))
+bgwaited() {   # $1 dispatch: the minutes its worker has waited on its background task (#555), from the recorded escalation, which Orca sends BGWAIT_DELAY_MIN (20) min after the turn end; empty = no record. An unreadable record counts as an old one: the existing relaunch path
+  local rec; [ -f "$sd/bgwait/$1" ] || return 0; read -r rec < "$sd/bgwait/$1" || true; [[ "${rec:-}" =~ ^[0-9]+$ ]] || rec=0; echo $((BGWAIT_DELAY_MIN + ($(date +%s) - rec) / 60))
 }
 holder() { okread orchestration run-show --id "$run" --full | jq -r '.result.run.coordinator_handle // empty' || true; }   # the terminal that holds the Run
 live_hold() {   # $1 eq|ne, $2 a handle: if a live coordinator.sh (holder.<pid> = "<handle> <mode>", the pid's command must still be coordinator.sh) is bound as
@@ -164,7 +166,7 @@ if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live
   if ! t="$(telemetry)"; then echo "telemetry: $t"; fi
   echo "live workers:"   # verdict, the agent's activity and the silence: `unverifiable` for a long run tells a stuck worker from a working one
   wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched") | "\(.dispatchId) \(.resource.worktreeId | sub("^.*::"; "")) \(.projection.liveness.verdict) \(.projection.stage.activity // "-")"' | while read -r d w v a; do
-    read -r age how <<< "$(silent "$d")" || true; tcall=""; [ "${age:-0}" -lt "${COORD_IDLE_MIN:-15}" ] || tcall="$(tool_running "$d")"
+    read -r age how <<< "$(silent "$d")" || true; tcall=""; [ "${age:-0}" -lt "$COORD_IDLE_MIN" ] || tcall="$(tool_running "$d")"
     echo "  $d $w $v $a, silent ${age:-?}m${tcall:+, tool call running ${tcall}m}$([ "${how:-}" != wait ] || echo ", waits on a prompt only a human can answer")"; done || echo "  (Orca did not answer)"
   { [ -z "$lm" ] || ! read -r li _ lt 2> /dev/null < "$(spool_dir "$run")/landing"; } || echo "landing #$li since $lt"   # only a live loop can be landing: a file left by a killed one is not shown
   echo "queue (the order to present it):"
@@ -547,7 +549,7 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
   fi
   for d in $(wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited") | .dispatchId'); do
     ! jq -e --arg d "$d" 'index($d)' <<< "$open" > /dev/null || continue
-    how="$(silent "$d")" || true; [ -n "$how" ] || { warn "worker $d: cannot tell how long it has been silent (worker-show or its jq failed), left alone"; continue; }; read -r age how <<< "$how"; [ "$age" -ge "${COORD_IDLE_MIN:-15}" ] || continue   # never an age of 0: an unknown age is not an idle check that passed
+    how="$(silent "$d")" || true; [ -n "$how" ] || { warn "worker $d: cannot tell how long it has been silent (worker-show or its jq failed), left alone"; continue; }; read -r age how <<< "$how"; [ "$age" -ge "$COORD_IDLE_MIN" ] || continue   # never an age of 0: an unknown age is not an idle check that passed
     ctx "$d" || continue
     if [ "$how" = wait ]; then block "worker $d is silent for ${age}m and waits on a prompt only a human can answer, or Orca cannot prove it works: slot freed, worktree kept, check its terminal"; continue; fi   # never a relaunch: it may be healthy
     tcall="$(tool_running "$d")"; if [ -n "$tcall" ] && [ "$tcall" -lt "${COORD_TOOL_MAX:-90}" ]; then log "#$issue: worker $d silent for ${age}m inside a tool call running ${tcall}m, left alone"; continue; fi   # a long build or test run is activity, up to COORD_TOOL_MAX minutes
