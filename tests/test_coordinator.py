@@ -463,13 +463,15 @@ def test_a_repeated_background_wait_escalation_keeps_the_first_record_so_the_shi
     assert C.go().returncode == 0 and (tmp_path / "state/run_t/bgwait/ctx_1").read_text() == "1000\n"
 
 
-def test_a_background_wait_escalation_after_the_worker_showed_life_replaces_the_stale_record(C, tmp_path):   # a second background task in the same dispatch: its wait is its own
+@pytest.mark.parametrize("silent, replaced", [(22, True), (60, False)])   # output newer than the recorded wait's turn end: a second background task in the same dispatch, its wait is its own; silent since then: a repeat of the same wait, the bound stays
+def test_a_background_wait_escalation_replaces_the_record_only_when_the_worker_showed_life_since(C, tmp_path, silent, replaced):
     rec = tmp_path / "state/run_t/bgwait/ctx_1"
     rec.parent.mkdir(parents=True)
-    rec.write_text(f"{int(time.time()) - 40 * 60}\n")   # an escalation 40 minutes ago: the wait is 60 minutes old
-    C.workers(C.row()); C.show(silent=22)   # the worker's last output is newer than that wait's turn end
+    old = int(time.time()) - 40 * 60
+    rec.write_text(f"{old}\n")   # an escalation 40 minutes ago: the wait is 60 minutes old
+    C.workers(C.row()); C.show(silent=silent)
     C.mail([msg("escalation", "msg_stop", stopReason="background-wait")])
-    assert C.go().returncode == 0 and abs(int(rec.read_text()) - time.time()) < 60 and left_alive(C)
+    assert C.go().returncode == 0 and left_alive(C) and (abs(int(rec.read_text()) - time.time()) < 60) == replaced and (int(rec.read_text()) == old) == (not replaced)
 
 
 @pytest.mark.parametrize("orca_up", [True, False])   # Orca not answering the worker list: no record is pruned, so a hiccup never clears a shield
