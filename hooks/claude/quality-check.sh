@@ -11,10 +11,8 @@ case "$f" in
   *.sh) knobs=(SHELLCHECK_CMD) ;;
   *) IFS= read -r first < "$f"; [[ "${f##*/}" != *.* && "$first" =~ ^'#!'([^\ ]*/)?(env[[:space:]]+(-S[[:space:]]+)?)?(sh|bash|dash|ksh)([[:space:]]|$) ]] && knobs=(SHELLCHECK_CMD) || exit 0 ;;
 esac
-load_env
-root="$(git -C "$(dirname "$f")" rev-parse --show-toplevel 2>/dev/null)" || root="$PWD"
-[ -x "$root/.venv/bin/python" ] && PATH="$root/.venv/bin:$PATH"
-rc=0
+load_env; rc=0
+root="$(git -C "$(dirname "$f")" rev-parse --show-toplevel 2>/dev/null || pwd)"; [ -x "$root/.venv/bin/python" ] && PATH="$root/.venv/bin:$PATH"
 for name in "${knobs[@]}"; do
   knob="${!name:-}"
   read -ra cmd <<<"$knob"
