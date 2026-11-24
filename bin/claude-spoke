@@ -4,7 +4,11 @@
 # a worker with a spoke_run_id resource attribute, any other session (the coordinator or hub session on the main checkout) with role=coordinator and no run id or issue; a headless claude -p it spawns inherits the tag.
 # Privacy: with the OTEL_LOG_* opt-ins below, the raw JSONL the collector keeps (AITK_OTEL_RAW_DIR, 1.1 GB / 30 days) holds prompts and tool output in plaintext,
 # a coordinator's too, which include the human's own messages. Remote Control is split the same way as the notifications: off for a worker, on for the coordinator. In an unsynced project it is a plain claude, so it is safe to point Orca's agentCmdOverrides.claude at it.
-# AI_TOOLKIT_OTEL=0 opts out of the OTel. No auth header here.
+# AI_TOOLKIT_OTEL=0 opts out of the OTel. No auth header on the OTel exporter.
+# Claude account (#556): the project's CLAUDE_ACCOUNTS (per machine, ai-toolkit.local.env) lists the accounts it may use, the first being the default; --account <name> picks another listed one (the loop names it on a worker's launch line).
+# The stored login of ~/.claude (CLAUDE_STORED_ACCOUNT, default max) exports nothing. A name with a directory ~/.claude-<name> runs on that full login (CLAUDE_CONFIG_DIR, sharing the user's settings, skills and memory by symlink). Any other name
+# is a long-lived token (claude setup-token) in the Keychain service CLAUDE_OAUTH_TOKEN_<NAME>, read here and exported only as CLAUDE_CODE_OAUTH_TOKEN, with CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 so the Bash tool, hooks and MCP servers do not inherit it.
+# Never in argv, a log or OTEL_*; no fallback to another account. A name the project does not list is refused.
 # To use Orca's Chat UI, put --settings ai-toolkit in Orca's Claude arguments: the launcher swaps it for the project's guard file (Orca's own --settings would switch every hook off).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -20,9 +24,12 @@ top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 # passed with --settings, so the project's own settings cannot replace or switch them off. Orca's Claude command is one path for every project: an unsynced project
 # gets plain claude; a worker with no file is refused, never started without guards. A second --settings would silently drop the first (the last wins): refused too.
 tk="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2> /dev/null || echo "$top/.git")")/.ai-toolkit"
-kept=()   # drop the sentinel (the saved Claude arguments are global, the guard file is per project): the checks below see only what is left
+kept=(); account=""; named=""   # drop the sentinel (the saved Claude arguments are global, the guard file is per project) and --account (the launcher's own): the checks below see only what is left
 while [ $# -gt 0 ]; do
-  if [ "$1" = --settings=ai-toolkit ]; then shift; elif [ "$1" = --settings ] && [ "${2:-}" = ai-toolkit ]; then shift 2; else kept+=("$1"); shift; fi
+  if [ "$1" = --settings=ai-toolkit ]; then shift; elif [ "$1" = --settings ] && [ "${2:-}" = ai-toolkit ]; then shift 2
+  elif [ "$1" = --account ]; then [ $# -ge 2 ] || die "--account needs a name"; account="$2"; named=1; shift 2
+  elif [[ $1 == --account=* ]]; then account="${1#--account=}"; named=1; shift
+  else kept+=("$1"); shift; fi
 done
 set -- ${kept[@]+"${kept[@]}"}
 if [ -f "$tk/claude-settings.json" ]; then
@@ -50,8 +57,35 @@ if [ -s "$top/.ai-toolkit/spoke-run-id" ]; then   # a worker has only the server
   done
   set -- --strict-mcp-config "${mcp[@]}" --no-chrome "$@"
 fi
-if [ "${AI_TOOLKIT_OTEL:-1}" = 1 ] && { [ -s "$top/.ai-toolkit/spoke-run-id" ] || [ -f "$tk/claude-settings.json" ]; }; then   # a worker, or a session in a synced project that is not one: a coordinator or hub session by construction
-  load_env
+synced=""; if [ -s "$top/.ai-toolkit/spoke-run-id" ] || [ -f "$tk/claude-settings.json" ]; then synced=1; load_env; fi   # a worker, or a session in a synced project that is not one: a coordinator or hub session by construction
+tag=""; cfg=""
+if [ -n "$synced" ] && { [ -n "${CLAUDE_ACCOUNTS:-}" ] || [ -n "$named" ]; }; then
+  [ -n "$named" ] || account="$(first_account)"
+  valid_account "$account" || die "'$account' is not an account name (letters, digits, _ and - only)"
+  account_listed "$account" || die "account '$account' is not listed in CLAUDE_ACCOUNTS (${CLAUDE_ACCOUNTS:-empty}): this project may not use it"
+  # the choice of the auth env, once, here: the stored login exports nothing; a directory ~/.claude-<name> is its own full login; anything else is a Keychain token
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR
+  cfg="$HOME/.claude-$account"
+  if [ "$account" = "${CLAUDE_STORED_ACCOUNT:-max}" ]; then cfg=""
+  elif [ -d "$cfg" ]; then
+    jq -e '.oauthAccount | type == "object"' "$cfg/.claude.json" > /dev/null 2>&1 || die "no login in $cfg: run CLAUDE_CONFIG_DIR=$cfg claude auth login"
+    for n in settings.json CLAUDE.md skills agents commands hooks plugins projects; do   # what the account shares with ~/.claude, by link, only where the directory has nothing of its own
+      [ -e "$HOME/.claude/$n" ] && [ ! -L "$cfg/$n" ] || continue
+      if [ -e "$cfg/$n" ]; then warn "$cfg/$n is not a link to ~/.claude/$n: kept, so account $account does not share it"; else ln -s "$HOME/.claude/$n" "$cfg/$n"; fi
+    done
+    export CLAUDE_CONFIG_DIR="$cfg"
+  else
+    svc="CLAUDE_OAUTH_TOKEN_$(printf %s "$account" | LC_ALL=C tr 'a-z-' 'A-Z_')"; cfg=""
+    tok="$(security find-generic-password -s "$svc" -w 2> /dev/null)" && [ -n "$tok" ] || die "no Keychain item $svc for account $account (claude setup-token, then security add-generic-password -s $svc): no other account is used instead"
+    export CLAUDE_CODE_OAUTH_TOKEN="$tok" CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1; unset tok
+  fi
+  if multi_account; then tag=",account=$account"; fi
+  if [ -n "$cfg" ] && [ ! -s "$top/.ai-toolkit/spoke-run-id" ] && [ -f "$HOME/.claude.json" ]; then   # the user-scope MCP servers live in ~/.claude.json, which a config directory does not read: a session of the human gets them from here (a worker has only the toolkit's list)
+    (umask 077; jq -c '{mcpServers: (.mcpServers // {})}' "$HOME/.claude.json" > "$cfg/aitk-user-mcp.json.tmp" && mv "$cfg/aitk-user-mcp.json.tmp" "$cfg/aitk-user-mcp.json") || die "cannot write $cfg/aitk-user-mcp.json"
+    set -- --mcp-config "$cfg/aitk-user-mcp.json" "$@"
+  fi
+elif [ -n "$named" ]; then die "account '$account' is not listed in CLAUDE_ACCOUNTS: this project is not synced, so no account is used"; fi
+if [ "${AI_TOOLKIT_OTEL:-1}" = 1 ] && [ -n "$synced" ]; then
   repo="$(git remote get-url origin 2>/dev/null | sed -E 's#.*[/:]##; s#\.git$##' || true)"
   if [ -s "$top/.ai-toolkit/spoke-run-id" ]; then
     who="spoke_run_id=$(cat "$top/.ai-toolkit/spoke-run-id")"
@@ -64,6 +98,6 @@ if [ "${AI_TOOLKIT_OTEL:-1}" = 1 ] && { [ -s "$top/.ai-toolkit/spoke-run-id" ] |
   export OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false
   export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_ENDPOINT:-http://localhost:4317}"
   export BETA_TRACING_ENDPOINT="${OTEL_BETA_ENDPOINT:-http://localhost:4418}"
-  export OTEL_RESOURCE_ATTRIBUTES="$who${repo:+,repo=$repo}${issue:+,issue=$issue}${tv:+,toolkit_version=$tv}"
+  export OTEL_RESOURCE_ATTRIBUTES="$who${repo:+,repo=$repo}${issue:+,issue=$issue}${tv:+,toolkit_version=$tv}$tag"
 fi
 exec "$real" "$@"
