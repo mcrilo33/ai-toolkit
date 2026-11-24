@@ -6,8 +6,10 @@ import stat
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from conftest import STUB, STUB_TEE, V2, git
@@ -1807,3 +1809,82 @@ def test_a_relaunch_inside_a_human_round_shares_its_task_so_the_second_idle_bloc
     C.show(silent=40)
     C.go("--cap", "0", **SWEEP)
     assert not [a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"] and ["--add-label", "blocked"] in [a[3:] for a in C.calls("gh issue edit")]
+
+
+USAGE = "Error: Claude hit its usage limit. Details from the agent: You've hit your Fable limit · resets 6pm (Europe/Paris)"   # Orca's escalation body for a usage-limit stop (#556)
+ACCOUNTS = {"CLAUDE_ACCOUNTS": "max client"}
+
+
+def limit_msg(**payload):
+    return {**msg("escalation", "msg_lim", **payload), "body": USAGE}
+
+
+def spooled_account(tmp_path, kind, name, text="4102444800\n"):   # the loop's own records, in the Run's spool: exhausted/<account> = reset epoch, account/<dispatch>, failover/<dispatch>
+    f = tmp_path / "state/run_t" / kind / name
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(text)
+    return f
+
+
+@pytest.mark.parametrize("ran_on, to", [(None, "client"), ("client", "max")])
+def test_a_usage_limit_escalation_releases_the_worker_and_relaunches_it_on_the_next_allowed_account(C, tmp_path, ran_on, to):
+    if ran_on:
+        spooled_account(tmp_path, "account", "ctx_1", ran_on + "\n")   # a dispatch with no record ran on the first listed account
+    C.mail([limit_msg()])
+    r = C.go(**ACCOUNTS)
+    assert r.returncode == 0, r.stderr
+    assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "--account", to, "1"]]   # the same task, as a sweep relaunch, on the other account
+    in_order(C.kinds(), "orca orchestration worker-release", "dispatch.sh")
+    assert "term_w" in [arg(a, "--terminal") for a in C.calls("orca terminal close")]   # the dead agent's terminal
+    assert f"usage limit on account {ran_on or 'max'}: relaunched on {to}" in C.calls("gh issue comment")[0][-1] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
+    reset = int((tmp_path / "state/run_t/exhausted" / (ran_on or "max")).read_text())
+    when = datetime.fromtimestamp(reset, ZoneInfo("Europe/Paris"))
+    assert time.time() < reset <= time.time() + 86400 and (when.hour, when.minute) == (18, 0)   # the next 6pm Paris, from the message
+    assert not (tmp_path / "state/run_t/exhausted" / to).exists()
+
+
+@pytest.mark.parametrize("env, other_exhausted, dispatch_rc, why, tried, recorded", [
+    ({}, False, 0, "", False, False), ({"CLAUDE_ACCOUNTS": "max"}, False, 0, "", False, False),   # a project that lists no or one account never fails over, and writes no record
+    (ACCOUNTS, True, 0, "", False, True),   # the other account is at its limit too
+    (ACCOUNTS, False, 1, "failover relaunch failed", True, True),
+])
+def test_a_usage_limit_with_no_account_to_move_to_blocks_with_the_reset_time(C, tmp_path, env, other_exhausted, dispatch_rc, why, tried, recorded):
+    if other_exhausted:
+        spooled_account(tmp_path, "exhausted", "client")
+    C.stubs.reply("dispatch.sh", "boom", rc=dispatch_rc)
+    C.mail([limit_msg()])
+    C.go(**env)
+    comment = C.calls("gh issue comment")[0][-1]
+    assert C.blocked() and "usage limit" in comment and "resets 6pm (Europe/Paris)" in comment and why in comment
+    assert bool(relaunches(C)) == tried and (tmp_path / "state/run_t/exhausted/max").exists() == recorded
+
+
+@pytest.mark.parametrize("body, extra, blocks", [("the body", {}, True), (USAGE, {"stopReason": "needs-input"}, False)])
+def test_an_ordinary_escalation_and_needs_input_behave_as_before_on_a_project_with_two_accounts(C, tmp_path, body, extra, blocks):
+    C.mail([{**msg("escalation", "msg_e", **extra), "body": body}])
+    C.go(**ACCOUNTS)
+    assert (C.blocked() if blocks else left_alive(C)) and not relaunches(C) and not (tmp_path / "state/run_t/exhausted").exists()
+
+
+def test_an_idle_worker_after_a_failover_still_gets_its_one_relaunch(C, tmp_path):
+    spooled_account(tmp_path, "failover", "ctx_2", "")   # ctx_2 only moved ctx_1's task to the other account: it is not a spent relaunch
+    C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2")); C.show(silent=22)
+    C.go("--cap", "1", **SWEEP)
+    assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
+
+
+def test_a_ci_refusal_after_a_failover_still_gets_its_round(C, tmp_path):
+    spooled_account(tmp_path, "failover", "ctx_2", "")
+    C.stubs.reply("land.sh", "land.sh: CI is red for abc\n", rc=4)
+    C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2"))
+    C.mail([msg("worker_done", dispatchId="ctx_2", outcome="succeeded")])
+    C.go()
+    assert [a[0] for a in C.stubs.calls("dispatch.sh") if a != ["--next", "--dry-run"]] == ["--address"] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
+
+
+def test_no_issue_is_dispatched_while_every_allowed_account_is_exhausted(C, tmp_path):
+    for a in ("max", "client"):
+        spooled_account(tmp_path, "exhausted", a)
+    C.stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "5\n")
+    r = C.go("--cap", "2", **ACCOUNTS)
+    assert [a for a in C.stubs.calls("dispatch.sh") if a != ["--next", "--dry-run"]] == [] and "exhausted" in r.stdout
