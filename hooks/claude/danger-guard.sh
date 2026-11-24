@@ -4,7 +4,7 @@
 # The rule: everything is authorized except sensitive operations, which ASK the user when someone can answer and are DENIED when no one can.
 # Asks (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode), one per call whose reason names every sensitive segment: writes
 # to orca.yaml, ~/.claude/settings.json, .github/workflows/ and, in a worker, the project .claude/{settings*.json,hooks/}, .ai-toolkit/spoke-run-id and anything under the launcher's $AI_TOOLKIT_DIR (the main checkout's .ai-toolkit: the guards, the launcher, the scripts, the env files), in every spelling (an absolute literal path outside the worktree and that .ai-toolkit only mentions it);
-# rm -r outside the worktree, of its root or home, of another git checkout, or with an unexpanded variable; git reset --hard in the main checkout (or
+# in a worker a Keychain read of a Claude account token (CLAUDE_OAUTH_TOKEN_*) or a Keychain dump; rm -r outside the worktree, of its root or home, of another git checkout, or with an unexpanded variable; git reset --hard in the main checkout (or
 # with --git-dir/--work-tree); git clean -x and git stash -a. Someone can answer when there is no worker marker (the human's own prompt) or when a worker
 # has the permission-relay hook installed and registered in the launcher's settings file (it puts the question to the Run: the user answers an attended one, the auto loop denies it);
 # else the ask is denied like a hard deny, since a local ask nobody sees would hang. Before either, a Bash hit goes to judge.sh (a ~4 s model call, so the regex stays the fast
@@ -72,6 +72,8 @@ done < <(printf '%s\n' "$c" | grep -oE "/$wl*\.ai-toolkit/$wl*" || :)
 bw=""; if [[ $c =~ ($va)($p) ]] || { [ -n "$spoke" ] && { [[ $cw =~ ($va)($ft) ]] || [[ $c =~ $sy ]] || [[ $c =~ AI_TOOLKIT_ALLOW_BASE_COMMIT ]] || { [[ $c =~ AI_TOOLKIT_DIR ]] && [[ $c =~ $w ]]; }; }; }; then bw="a protected path, sync.sh or the base-commit switch (orca.yaml, claude settings/hooks, the toolkit's guards)"; fi
 if [[ $c =~ ($va)($pre\.github/workflows) ]]; then bw="${bw:+$bw and }.github/workflows"; fi
 [ -z "$bw" ] || sens "write to $bw: ${cmd:0:200}"
+ks='(^|[^[:alnum:]_.-])security[[:space:]]+' # a Claude account token (#556): the launcher reads it from the Keychain for the session, a worker's own Bash must not (it would land in its transcript and the OTel logs)
+if [ -n "$spoke" ] && { [[ $c =~ ${ks}dump-keychain ]] || { [[ $c =~ ${ks}(find|delete)-(generic|internet)-password ]] && [[ $c =~ CLAUDE_OAUTH_TOKEN ]]; }; }; then sens "read of a Claude account token from the Keychain (security): ${cmd:0:200}"; fi
 
 target() { # one `rm -r` target: inside the worktree, or strictly below a temp root
   local p="$1" v; for v in HOME TMPDIR; do p="${p/#\$$v/${!v:-}}"; p="${p/#\$\{$v\}/${!v:-}}"; done
