@@ -19,7 +19,7 @@ git, and GitHub labels. The only files ai-toolkit keeps are the human-reply spoo
 
 ```text
 scripts/   lib.sh dispatch.sh land.sh review.sh answer.sh coordinator.sh reply.sh setup.sh archive.sh sync.sh install.sh otel.sh cutover.sh
-bin/claude-spoke           launcher: the project's guards (--settings .ai-toolkit/claude-settings.json), OTel env (spoke_run_id in a spoke, role=coordinator in any other synced session), then exec claude (plain claude in an unsynced project)
+bin/claude-spoke           launcher: the project's guards (--settings .ai-toolkit/claude-settings.json), OTel env (spoke_run_id in a spoke, role=coordinator in any other synced session), a Claude account (`--account`, below), then exec claude (plain claude in an unsynced project)
 hooks/claude/              push-guard.sh danger-guard.sh judge.sh secrets-scan.sh permission-relay.sh (synced to .ai-toolkit/hooks/claude/, registered by settings/claude/settings.json; judge.sh is danger-guard's second stage)
 hooks/git/                 commit-msg (conventional type + #N anchor; only a test: commit may change a test file, rechecked by land.sh), pre-commit (no commit on the base branch in the main checkout)
 langfuse/                  otelcol.yaml compose.yaml (collector only; dashboards and scores are a later batch)
@@ -60,6 +60,13 @@ A script that still reads a worker-controlled source, or a worker that can still
 9. **Rounds.** A rejected review (max 2 rounds), red CI or a merge conflict (1 round) goes back to the worker as a fresh dispatch whose spec starts with
    `address:`. Still failing, a timeout, a `failed` completion or an escalation: label `blocked` + comment + the Orca surface (worktree comment), the worker is released,
    the **worktree is kept** for the human.
+   **Account failover (#556).** A project lists the Claude accounts it may use, in order, in `CLAUDE_ACCOUNTS` (`.ai-toolkit/ai-toolkit.local.env`, per machine); the first is the default. `bin/claude-spoke` is the one place that picks:
+   `--account <name>` (the loop names it on a worker's launch line, never the token), else the first entry. The stored login (`CLAUDE_STORED_ACCOUNT`, default `max`) exports nothing; a name with a directory `~/.claude-<name>` runs on that full login
+   (`CLAUDE_CONFIG_DIR`, with the claude.ai connectors; it shares `settings.json`, `CLAUDE.md`, skills, agents, commands, hooks, plugins and projects with `~/.claude` by link, keeps its own login, organisation policy files and trust state, and gets the user-scope MCP servers of `~/.claude.json` through a mode-0600 `aitk-user-mcp.json` in non-worker sessions);
+   any other name is a `claude setup-token` token in the Keychain service `CLAUDE_OAUTH_TOKEN_<NAME>`, exported only as `CLAUDE_CODE_OAUTH_TOKEN` (no connectors; enough for a worker). An unlisted account or a missing item is refused, never replaced by another account: a client's account serves only the projects that list it.
+   A worker that stops on Orca's usage-limit escalation (`usage_limit_reset` in `lib.sh` matches the body, shared with the model fallback) is not blocked when the project lists another free account: the loop records the account exhausted until the reset time of the message in the Run's spool (`exhausted/<account>`),
+   releases the dispatch and runs `dispatch.sh --retry-of D --task T --account B`, which records `account/<dispatch>` and `failover/<dispatch>`. `rounds()` leaves the `failover/` dispatches out, so a failover spends no relaunch or review round. Later dispatches use the first account that is not exhausted (a record past its reset is dropped);
+   `fill` starts nothing while all are. With no account left, or one listed account, the issue is blocked with the reset time. Residual: the loop's own headless calls (`answer.sh`, `review.sh`, triage) and `judge.sh` run on the stored login; an interactive chat is never switched mid-session.
    `dispatch.sh --address` / `--retry-of` refresh the kept worktree's installed copies first (`setup.sh --refresh`, output to stderr): the synced `.claude/` set listed in main's `sync-manifest`
    is copied, what main's sync has dropped since is removed, and files outside that set (`settings.local.json`, locks, anything the worker made) are left alone.
 
