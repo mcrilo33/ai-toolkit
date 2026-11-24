@@ -656,7 +656,8 @@ def relaunches(C):
 
 @pytest.mark.parametrize("idle, shown", [
     (False, {}),   # the process exited
-    (True, {}),   # the agent is alive but silent past the 15-minute bound after a failed turn
+    (True, {}),   # the agent is alive but silent past the 21-minute bound after a failed turn
+    (True, {"silent": 21}),   # silent exactly at the bound, no bgwait record, no tool call: the first minute a sweep may judge it idle
     (True, {"beat": 25, "frac": True}),   # the same, the heartbeat carrying fractional seconds
     (True, {"born": 25, "frac": True}),   # ... or dispatchedAt
     (True, {"tool": 25, "ended": True}),   # the newest transcript message is a tool result, not a call in flight: silence alone decides
@@ -665,8 +666,8 @@ def relaunches(C):
     (True, {"bg": 60}),   # the worker showed life 25 minutes ago, after its turn ended 60 minutes ago: the record is stale, silence alone decides
 ])
 def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C, idle, shown):
-    assert re.search(r"COORD_SWEEP_EVERY:-2\}", (V2 / "scripts/coordinator.sh").read_text())   # the defaults, read rather than waited for: a sweep every 2nd empty wait (~10 min), the idle bound 15 minutes
-    assert "COORD_IDLE_MIN:-15}" in (V2 / "scripts/coordinator.sh").read_text()
+    assert re.search(r"COORD_SWEEP_EVERY:-2\}", (V2 / "scripts/coordinator.sh").read_text())   # the defaults, read rather than waited for: a sweep every 2nd empty wait (~10 min), the idle bound 21 minutes
+    assert re.search(r"BGWAIT_DELAY_MIN=20\b", (V2 / "scripts/coordinator.sh").read_text()) and "COORD_IDLE_MIN:-$((BGWAIT_DELAY_MIN + 1))}" in (V2 / "scripts/coordinator.sh").read_text()   # the idle bound is Orca's escalation delay + 1: the bgwait record exists before a sweep may judge a worker idle (#561)
     C.workers(C.row(lv="live" if idle else "exited"), C.unstarted()); C.show(**{"silent": 25, **shown})   # a failed-start row with no resource is in the Run: rounds() skips it, it is neither fatal nor a spent round
     C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
     assert not C.stubs.calls("dispatch.sh")
@@ -692,6 +693,8 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     ([{}], {"silent": 40, "tool": 80}, False),   # ... still under the tool-call bound
     ([{}], {"silent": 40, "bg": 40}, False),   # turn ended, its own background task runs (an eval round's judge passes): under the same bound, activity (#555)
     ([{}], {"silent": 14}, False),   # silent, but under the bound
+    ([{}], {"silent": 16}, False),   # a turn ended on a background task 16 minutes ago: no bgwait record yet (Orca escalates at 20), no tool call in flight; a sweep must not relaunch it (#561)
+    ([{}], {"silent": 20}, False),   # ... still before the escalation can have been recorded
     ([{}], {"silent": 14, "wait": True}, False),   # ... also with a proved human-only prompt
     ([{}], {"silent": 40}, True),   # waiting on an open gate or permission question
     ([{}], {"silent": 40, "raw": "not json"}, False),   # worker-show unreadable: the age is unknown, so the worker is neither relaunched nor blocked idle
@@ -707,7 +710,7 @@ def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worke
 
 
 @pytest.mark.parametrize("shown", [
-    {"silent": 16, "wait": True},   # a proved human-only prompt, just past the bound: nobody answers it in an unattended run, so it blocks like any silent worker
+    {"silent": 22, "wait": True},   # a proved human-only prompt, just past the bound: nobody answers it in an unattended run, so it blocks like any silent worker
     {"silent": 40, "wait": True},   # ... however late the loop first sees it
     {"silent": 40, "obs": "missing"},   # no agentWait key: Orca never looked, the incident's `unverifiable` shape
     {"silent": 40, "obs": "null"},   # no observation at all
@@ -722,7 +725,7 @@ def test_a_silent_worker_with_no_open_question_is_blocked_at_the_first_sweep_pas
 
 @pytest.mark.parametrize("rows, shown", [
     ([("ctx_1", "failed", "exited"), ("ctx_2", "dispatched", "exited")], {}),   # died again
-    ([("ctx_1", "failed", "exited"), ("ctx_2", "dispatched", "live")], {"silent": 20}),   # idle again after a relaunch
+    ([("ctx_1", "failed", "exited"), ("ctx_2", "dispatched", "live")], {"silent": 22}),   # idle again after a relaunch
 ])
 def test_a_worker_that_died_or_went_idle_again_after_its_relaunch_blocks_the_issue(C, rows, shown):
     C.workers(*[C.row(d, st=st, lv=lv) for d, st, lv in rows]); C.show(**shown)
