@@ -179,6 +179,7 @@ WRITE_DENY = [
     "rm -rf .ai-toolkit", "rm -r .ai-toolkit/", "rm .ai-toolkit/spoke-run-id", "rm -rf .claude/hooks", "rm -rf .claude/hooks/",
     "mv .claude/hooks h", "rm -rf .claude; ls",
     "python3 -c \"open('orca.yaml','w')\"", "rm .github/workflows/ci.yml", 'bash -c "echo > orca.yaml"',
+    "echo x > ~/.claude-cma/settings.json", 'cat y > "$HOME/.claude-client/settings.json"', "cp x $CLAUDE_CONFIG_DIR/settings.json", "tee ${CLAUDE_CONFIG_DIR}/settings.json",   # a config-directory account's user settings (#556): hooks and env for every later session of that account
     "echo x > .claude/settings.json", "tee .claude/settings.local.json", "rm .claude/hooks/push-guard.sh",
     "chmod -x .claude/hooks/push-guard.sh", "echo > {spoke}/.claude/hooks/x.sh", "cd x && echo y > orca.yaml",
     "cd .github/workflows && echo x > ci.yml", "python3 - <<EOF\nopen('orca.yaml','w')\nEOF", "cat y > .GITHUB/Workflows/ci.yml",
@@ -268,7 +269,7 @@ def test_danger_guard_reset_hard_asks_only_in_the_main_checkout(shared, where, c
     ("Write", "file_path", ".github/workflows/ci.yml"), ("Edit", "file_path", "{spoke}/.github/workflows/new.yml"),
     ("MultiEdit", "file_path", "sub/../.github/workflows/ci.yml"), ("Write", "file_path", "orca.yaml"),
     ("Edit", "file_path", "{spoke}/orca.yaml"), ("Write", "file_path", "{home}/.claude/settings.json"),
-    ("Write", "file_path", "~/.claude/settings.json"), ("NotebookEdit", "notebook_path", ".github/workflows/n.ipynb"),
+    ("Write", "file_path", "~/.claude/settings.json"), ("Write", "file_path", "{home}/.claude-cma/settings.json"), ("NotebookEdit", "notebook_path", ".github/workflows/n.ipynb"),
     ("Write", "file_path", ".claude/settings.json"), ("Edit", "file_path", ".claude/settings.local.json"),
     ("Write", "file_path", ".claude/hooks/push-guard.sh"), ("Write", "file_path", ".claude/hooks"),
     ("Write", "file_path", ".ai-toolkit/spoke-run-id"), ("Write", "file_path", "./orca.yaml"),

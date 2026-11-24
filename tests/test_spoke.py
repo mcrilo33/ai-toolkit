@@ -188,8 +188,12 @@ def test_install_checks_prerequisites_then_prints_the_orca_override_without_a_pa
     assert f"{V2}/bin/claude-spoke" in r.stdout and not any((tmp_path / "home").rglob("claude"))
 
 
-PICK_THE_ACCOUNT = ["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "ANTHROPIC_PROFILE", "ANTHROPIC_CONFIG_DIR", "ANTHROPIC_BASE_URL",
-                    "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]   # inherited variables that decide whose login Claude uses
+IDENTITY = ["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "ANTHROPIC_PROFILE", "ANTHROPIC_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_GATEWAY",
+            "CLAUDE_CODE_GATEWAY_TOKEN", "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_USE_ANTHROPIC_AWS", "ANTHROPIC_AWS_API_KEY", "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_USE_MANTLE",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "ANTHROPIC_IDENTITY_TOKEN", "ANTHROPIC_IDENTITY_TOKEN_FILE", "CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_CODE_SESSIONS_OAUTH_TOKEN", "CLAUDE_CODE_HOST_AUTH_ENV_VAR"]   # inherited variables that say WHOSE login Claude uses
+ROUTING = ["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_API_BASE_URL", "ANTHROPIC_API_HOST", "ANTHROPIC_UNIX_SOCKET", "CLAUDE_CODE_CUSTOM_OAUTH_URL"]   # ... and WHERE it goes: a gateway a user set may stay when the project lists one stored account
+PICK_THE_ACCOUNT = IDENTITY + ROUTING
 
 
 def accounts(tmp_path, listing, logins=("client",)):
@@ -216,6 +220,13 @@ def test_an_unset_or_one_entry_account_list_leaves_the_claude_env_and_argv_uncha
     assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=abc-123,repo=origin\n" in claude_env + "\n"
     assert "ANTHROPIC_BASE_URL=https://gateway.test\n" in claude_env   # a user who routes Claude through a gateway keeps it when the project lists one account or none
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in claude_env and "CLAUDE_CONFIG_DIR" not in claude_env
+
+
+def test_a_one_entry_stored_list_drops_an_inherited_identity_but_keeps_a_gateway(run, stubs, repo, tmp_path):
+    synced(repo)   # a max-only project must not run on whatever login the caller's environment names (Orca's account switcher, a parent session on the client account)
+    r = run([SPOKE], cwd=in_spoke(repo), **dict.fromkeys(IDENTITY, "zz-probe-9"), **dict.fromkeys(ROUTING, "zz-gateway-9"), **accounts(tmp_path, "max"))
+    claude_env = stubs.env("claude")
+    assert r.returncode == 0 and "zz-probe-9" not in claude_env and all(f"{v}=zz-gateway-9\n" in claude_env for v in ROUTING), r.stderr
 
 
 @pytest.mark.parametrize("account", ["max", "client"])

@@ -1845,16 +1845,15 @@ def test_a_usage_limit_escalation_releases_the_worker_and_relaunches_it_on_the_n
 
 
 @pytest.mark.parametrize("env, other_exhausted, dispatch_rc, why, tried, recorded", [
-    (ACCOUNTS, "budget", 0, "failover budget", False, True),   # as many failovers as the project has accounts have run for this issue: a faked or looping stop is not followed again
+    (ACCOUNTS, "budget", 0, "failover budget", False, False),   # this issue was already failed over once: a second stop (a faked or looping one) blocks the issue and holds no second account
     ({}, False, 0, "", False, False), ({"CLAUDE_ACCOUNTS": "max"}, False, 0, "", False, False),   # a project that lists no or one account never fails over, and writes no record
     (ACCOUNTS, True, 0, "", False, True),   # the other account is at its limit too
     (ACCOUNTS, False, 1, "failover relaunch failed", True, True),
 ])
 def test_a_usage_limit_with_no_account_to_move_to_blocks_with_the_reset_time(C, tmp_path, env, other_exhausted, dispatch_rc, why, tried, recorded):
     if other_exhausted == "budget":
-        for i in (7, 8):
-            spooled_account(tmp_path, "failover", f"ctx_{i}", "")
-            spooled_account(tmp_path, "dispatch", f"ctx_{i}", "1\n")
+        spooled_account(tmp_path, "failover", "ctx_7", "")
+        spooled_account(tmp_path, "dispatch", "ctx_7", "1\n")
     elif other_exhausted:
         spooled_account(tmp_path, "exhausted", "client")
     C.stubs.reply("dispatch.sh", "boom", rc=dispatch_rc)
