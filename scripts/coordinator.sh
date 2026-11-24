@@ -4,7 +4,7 @@
 # (--run re-binds it with run-use; none creates one). Loop: fill slots to --cap (dispatch.sh) -> check --wait -> route each message
 # -> ack the delivery. question: answer.sh (auto) or the human, who types the answer on this terminal; worker_done succeeded: land.sh
 # --review inline (lands are serialized by construction); a rejected review, red CI or a conflict goes back to the SAME worker for a
-# bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked (a needs-input stop is not one: it is left to the permission relay and the sweep). Every 2nd empty wait (COORD_SWEEP_EVERY,
+# bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked (a needs-input or finished stop is not one: a worker idle between turns, at a prompt or at a gate, is left to the permission relay and the sweep). Every 2nd empty wait (COORD_SWEEP_EVERY,
 # ~10 min): a sweep of the workers that died or went idle without worker_done: one relaunch, then blocked. Idle = silent (no terminal output, heartbeat or
 # liveness change, and no tool call in flight for under COORD_TOOL_MAX minutes (90): a long build is activity) for COORD_IDLE_MIN minutes (15) with no open question: worst-case detection = that bound + the sweep period (~25 min). A silent worker Orca shows parked on a human-only prompt, or cannot prove (absent agentWait, null terminal), is blocked at once, never relaunched: the loop cannot answer it, and its slot and Scope must not be held without bound, in either --answer mode (the block comment is the notice). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
@@ -373,6 +373,7 @@ on_question() {
   else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
     yield   # ...unless the reply failed because the Run was taken back meanwhile
     hold "$id"
+    orca_mutate orchestration send --run "$run" --from "$H" --to "dispatch:$disp" --type status --subject "Your plan is queued for the human" --body "Your question $id is queued for the human, who answers it. Do not decide it yourself, whatever an earlier notice said: end your turn and wait for the reply." > /dev/null || warn "#$issue: could not tell worker $disp that its question is queued for the human"   # Orca tells a worker whose coordinator is busy to decide for itself (#553)
     case "${ans:-}" in human:*) why="$(head -n 1 <<< "$ans")" ;; esac   # attended: the answerer's reason for handing the plan over
     comment "$issue" "A gate question needs a human (message $id)${why:+, $why}; read it whole with: bash $here/coordinator.sh --run $run --show $id -- Reply from any terminal: $(replycmd "$id")   (or end it with: approve with: <change> to approve with a small change, or revise: <change> to amend the plan)"
     show_q "$q"; log "#$issue: gate question waiting${why:+ ($why)}: $(replycmd "$id")"; gate_flag "$wtp" "$id" "$q"
@@ -461,8 +462,12 @@ handle() {
   case "$(jq -r .type <<< "$1")" in
     question) on_question "$1" ;;
     worker_done) on_done "$1" ;;
-    escalation) ctx "$(pj "$1" dispatchId)" || return   # needs-input: Orca saw the worker parked on a prompt (often the one the permission relay is posting): not a failure, on_permission queues it or the sweep blocks it after COORD_IDLE_MIN
-      if [ "$(pj "$1" stopReason)" = needs-input ]; then log "#$issue: worker $disp is at a prompt (needs-input), left to the permission relay and the sweep"; else block "escalation: $(jq -r '.body // ""' <<< "$1")"; fi ;;
+    escalation) ctx "$(pj "$1" dispatchId)" || return   # needs-input: Orca saw the worker parked on a prompt (often the one the permission relay is posting): not a failure, on_permission queues it or the sweep blocks it after COORD_IDLE_MIN. finished: a turn ended without worker_done, the normal state at a gate (#553): the sweep shields an open question and relaunches then blocks an idle worker
+      case "$(pj "$1" stopReason)" in
+        needs-input) log "#$issue: worker $disp is at a prompt (needs-input), left to the permission relay and the sweep" ;;
+        finished) log "#$issue: worker $disp ended a turn without worker_done (finished), left to the sweep" ;;
+        *) block "escalation: $(jq -r '.body // ""' <<< "$1")" ;;
+      esac ;;
   esac
 }
 
