@@ -222,11 +222,13 @@ def test_an_unset_or_one_entry_account_list_leaves_the_claude_env_and_argv_uncha
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in claude_env and "CLAUDE_CONFIG_DIR" not in claude_env
 
 
-def test_a_one_entry_stored_list_drops_an_inherited_identity_but_keeps_a_gateway(run, stubs, repo, tmp_path):
-    synced(repo)   # a max-only project must not run on whatever login the caller's environment names (Orca's account switcher, a parent session on the client account)
-    r = run([SPOKE], cwd=in_spoke(repo), **dict.fromkeys(IDENTITY, "zz-probe-9"), **dict.fromkeys(ROUTING, "zz-gateway-9"), **accounts(tmp_path, "max"))
+@pytest.mark.parametrize("listing, identity_inherited, gateway_kept", [("max", False, True), ("max", True, False), ("client", False, False)])
+def test_a_gateway_is_kept_only_for_one_stored_account_and_no_inherited_identity(run, stubs, repo, tmp_path, listing, identity_inherited, gateway_kept):
+    synced(repo)   # a max-only project must not run on whatever login the caller's environment names (Orca's account switcher, a parent session on the client account), and a gateway URL kept next to a dropped credential would take the stored login's own to that host
+    inherited = {**dict.fromkeys(ROUTING, "zz-gateway-9"), **(dict.fromkeys(IDENTITY, "zz-probe-9") if identity_inherited else {})}
+    r = run([SPOKE], cwd=in_spoke(repo), **inherited, **accounts(tmp_path, listing))
     claude_env = stubs.env("claude")
-    assert r.returncode == 0 and "zz-probe-9" not in claude_env and all(f"{v}=zz-gateway-9\n" in claude_env for v in ROUTING), r.stderr
+    assert r.returncode == 0 and "zz-probe-9" not in claude_env and all((f"{v}=zz-gateway-9\n" in claude_env) == gateway_kept for v in ROUTING), r.stderr
 
 
 @pytest.mark.parametrize("account", ["max", "client"])
