@@ -467,3 +467,59 @@ def test_a_round_requested_on_a_land_human_issue_repeats_the_round_report_remind
     ws = worker_start(d)
     spec = ws[ws.index("--spec") + 1]   # the fresh agent reads no seed: the guidance and the reminder are all it gets
     assert spec.startswith("address: try the second prompt") and "round report" in spec and "never marked DEFERRED" in spec and "absolute paths" in spec
+
+
+FUTURE, PAST = "4102444800", "1"   # an exhausted account's reset, as epoch seconds: far ahead, long gone
+
+
+def exhaust(d, account, until):
+    """The loop's own record, in the Run's spool: the account is known to be at its usage limit until the epoch."""
+    f = d.record.parent / "exhausted" / account
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(until + "\n")
+    return f
+
+
+def launch_line(d):
+    return next(c for c in d.orca() if c[:2] == ["terminal", "create"])[7]
+
+
+@pytest.mark.parametrize("exhausted,account", [({}, "max"), ({"max": FUTURE}, "client"), ({"max": PAST}, "max")])
+def test_a_fresh_dispatch_runs_on_the_first_listed_account_that_is_not_exhausted(d, exhausted, account):
+    files = [exhaust(d, a, until) for a, until in exhausted.items()]
+    r = d.go("7", CLAUDE_ACCOUNTS="max client")
+    assert r.returncode == 0, r.stderr
+    assert launch_line(d).endswith(f"--dangerously-skip-permissions --account {account}")
+    assert (d.record.parent / "account/ctx_1").read_text() == f"{account}\n" and not (d.record.parent / "failover").exists()   # which account it ran on: the loop's record, never the worker's
+    assert [f.exists() for f in files] == [until == FUTURE for until in exhausted.values()]   # a record whose reset has passed is dropped
+
+
+def test_a_dispatch_with_every_account_exhausted_starts_nothing(d):
+    exhaust(d, "max", FUTURE)
+    exhaust(d, "client", FUTURE)
+    r = d.go("7", CLAUDE_ACCOUNTS="max client")
+    assert r.returncode == 1 and "exhausted" in r.stderr and not any(c[:2] in (["worktree", "create"], ["terminal", "create"]) for c in d.orca())
+
+
+def test_a_retry_with_an_account_is_a_failover_and_carries_that_account(d):
+    stale_worktree(d)
+    d.stubs.reply("orca.orchestration_worker_start", '{"result":{"dispatchId":"ctx_2","state":"ready"}}')
+    exhaust(d, "max", FUTURE)
+    assert d.go("--retry-of", "ctx_old", "--task", "task_7", "--account", "client", "7", CLAUDE_ACCOUNTS="max client").returncode == 0
+    assert launch_line(d).endswith("--dangerously-skip-permissions --account client")
+    assert (d.record.parent / "account/ctx_2").read_text() == "client\n" and (d.record.parent / "failover/ctx_2").exists()   # the loop tells a failover from a relaunch by this record only
+    d.stubs.reply("orca.orchestration_worker_start", '{"result":{"dispatchId":"ctx_3","state":"ready"}}')
+    assert d.go("--retry-of", "ctx_2", "--task", "task_7", "7", CLAUDE_ACCOUNTS="max client").returncode == 0   # a relaunch names no account: the first one not exhausted
+    assert launch_line(d).endswith("--account client") and not (d.record.parent / "failover/ctx_3").exists()
+
+
+@pytest.mark.parametrize("args,env,why", [
+    (["--account", "a b"], {"CLAUDE_ACCOUNTS": "max client"}, "not an account name"),
+    (["--account", "other"], {"CLAUDE_ACCOUNTS": "max client"}, "not listed"),   # an account the project does not list is never launched
+    (["--account", "client"], {}, "not listed"),
+    ([], {"CLAUDE_ACCOUNTS": "max client", "DISPATCH_LAUNCH": "override"}, "override"),   # Orca's own agent launch cannot carry an account
+])
+def test_a_malformed_or_unlisted_account_and_an_override_launch_on_another_account_die(d, args, env, why):
+    exhaust(d, "max", FUTURE)
+    r = d.go("7", *args, **env)
+    assert r.returncode == 1 and why in r.stderr and not any(c[:2] in (["worktree", "create"], ["terminal", "create"], ["orchestration", "worker-start"]) for c in d.orca())
