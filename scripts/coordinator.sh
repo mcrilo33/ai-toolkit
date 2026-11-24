@@ -4,9 +4,9 @@
 # (--run re-binds it with run-use; none creates one). Loop: fill slots to --cap (dispatch.sh) -> check --wait -> route each message
 # -> ack the delivery. question: answer.sh (auto) or the human, who types the answer on this terminal; worker_done succeeded: land.sh
 # --review inline (lands are serialized by construction); a rejected review, red CI or a conflict goes back to the SAME worker for a
-# bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked (a needs-input or finished stop is not one: a worker idle between turns, at a prompt or at a gate, is left to the permission relay and the sweep). Every 2nd empty wait (COORD_SWEEP_EVERY,
+# bounded number of rounds, then the issue is labelled blocked; worker_done failed / escalation: blocked (a needs-input, finished or background-wait stop is not one: a worker idle between turns, at a prompt, at a gate or waiting on its own background task is left to the permission relay and the sweep). Every 2nd empty wait (COORD_SWEEP_EVERY,
 # ~10 min): a sweep of the workers that died or went idle without worker_done: one relaunch, then blocked. Idle = silent (no terminal output, heartbeat or
-# liveness change, and no tool call in flight for under COORD_TOOL_MAX minutes (90): a long build is activity) for COORD_IDLE_MIN minutes (15) with no open question: worst-case detection = that bound + the sweep period (~25 min). A silent worker Orca shows parked on a human-only prompt, or cannot prove (absent agentWait, null terminal), is blocked at once, never relaunched: the loop cannot answer it, and its slot and Scope must not be held without bound, in either --answer mode (the block comment is the notice). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
+# liveness change, and no tool call in flight, nor a turn ended on its own background task, for under COORD_TOOL_MAX minutes (90): a long build is activity) for COORD_IDLE_MIN minutes (15) with no open question: worst-case detection = that bound + the sweep period (~25 min). A silent worker Orca shows parked on a human-only prompt, or cannot prove (absent agentWait, null terminal), is blocked at once, never relaunched: the loop cannot answer it, and its slot and Scope must not be held without bound, in either --answer mode (the block comment is the notice). The relaunch shares rounds() with review rounds: a worktree already re-dispatched is blocked at its first idle.
 # Stops at --until, or with --drain when nothing is ready and no worker is live. No state files: rounds, workers and issues are read
 # back from Orca (worker-list, worktree list) and GitHub. Sub-commands are overridable for tests: DISPATCH_CMD LAND_CMD ANSWER_CMD OTEL_CMD.
 # --answer attended (the /coordinate attended loop, #450): the routine work out of sight, the human only for a decision. A routine plan is approved by answer.sh; a plan it hands over (exit 3, a reason) and every permission
@@ -466,6 +466,7 @@ handle() {
       case "$(pj "$1" stopReason)" in
         needs-input) log "#$issue: worker $disp is at a prompt (needs-input), left to the permission relay and the sweep" ;;
         finished) log "#$issue: worker $disp ended a turn without worker_done (finished), left to the sweep" ;;
+        background-wait) (umask 077; mkdir -p "$sd/bgwait"); date +%s > "$sd/bgwait/$disp"; log "#$issue: worker $disp waits on its background task, left to the sweep up to COORD_TOOL_MAX" ;;   # #555: Orca fires it 20 min after the turn ended; the sweep bounds the wait from that record
         *) block "escalation: $(jq -r '.body // ""' <<< "$1")" ;;
       esac ;;
   esac
@@ -522,7 +523,7 @@ fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --n
   done
 }
 sweep() {   # a worker without worker_done whose process exited (and was not relaunched), or that is alive but silent for COORD_IDLE_MIN minutes: one relaunch, then blocked
-  local d age how open r tcall
+  local d age how open r tcall live f rec waited
   for d in $(wl | jq -r '.result.workers as $w | $w[] | select(.dispatchStatus == "dispatched" and .projection.liveness.verdict == "exited")
       | .resource.worktreeId as $p | select([$w[] | select(.resource.worktreeId == $p and .dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited")] | length == 0) | .dispatchId'); do
     ctx "$d" || continue
@@ -533,12 +534,20 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
     else block "worker exited again without worker_done"; fi
   done
   open="$(open_q | jq -sc '[.[] | (.payload // "{}" | if type == "string" then fromjson else . end).dispatchId]')" || return 0   # a worker waiting on a gate or permission question the human can still answer is never idle (an expired one does not shield it)
+  if live="$(wl | jq -r '[.result.workers[] | select(.dispatchStatus == "dispatched") | .dispatchId] | join(" ")')"; then   # a record of an ended dispatch goes; Orca not answering prunes nothing, so a hiccup never clears a shield
+    for f in "$sd"/bgwait/*; do [[ " $live " == *" ${f##*/} "* ]] || rm -f "$f"; done
+  fi
   for d in $(wl | jq -r '.result.workers[] | select(.dispatchStatus == "dispatched" and .projection.liveness.verdict != "exited") | .dispatchId'); do
     ! jq -e --arg d "$d" 'index($d)' <<< "$open" > /dev/null || continue
     how="$(silent "$d")" || true; [ -n "$how" ] || { warn "worker $d: cannot tell how long it has been silent (worker-show or its jq failed), left alone"; continue; }; read -r age how <<< "$how"; [ "$age" -ge "${COORD_IDLE_MIN:-15}" ] || continue   # never an age of 0: an unknown age is not an idle check that passed
     ctx "$d" || continue
     if [ "$how" = wait ]; then block "worker $d is silent for ${age}m and waits on a prompt only a human can answer, or Orca cannot prove it works: slot freed, worktree kept, check its terminal"; continue; fi   # never a relaunch: it may be healthy
     tcall="$(tool_running "$d")"; if [ -n "$tcall" ] && [ "$tcall" -lt "${COORD_TOOL_MAX:-90}" ]; then log "#$issue: worker $d silent for ${age}m inside a tool call running ${tcall}m, left alone"; continue; fi   # a long build or test run is activity, up to COORD_TOOL_MAX minutes
+    if [ -f "$sd/bgwait/$d" ]; then   # #555: the turn ended and its own background task runs: activity for COORD_TOOL_MAX minutes from the turn end (20 min before Orca's escalation), unless the worker showed life since
+      read -r rec < "$sd/bgwait/$d" || true; [[ "${rec:-}" =~ ^[0-9]+$ ]] || rec=0; waited=$((20 + ($(date +%s) - rec) / 60))
+      if [ $((age + 1)) -lt "$waited" ]; then rm -f "$sd/bgwait/$d"
+      elif [ "$waited" -lt "${COORD_TOOL_MAX:-90}" ]; then log "#$issue: worker $d silent for ${age}m, its turn ended ${waited}m ago on a background task, left alone"; continue; fi
+    fi
     rounds > /dev/null || continue   # Orca did not answer: not released and not blocked on a guess, the next sweep looks again
     log "#$issue: worker $d silent for ${age}m, relaunching"; release "$d"   # its dispatch is still live: stop it first or the worktree counts twice
     redispatch 1 "address: your agent was silent for ${age}m without worker_done. Continue from the pushed branch (git log), push, then send worker_done." "worker idle again without worker_done"
