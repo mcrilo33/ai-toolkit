@@ -71,7 +71,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
 
     def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None, tool=None, ended=False, bg=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim; tool = a tool call (the newest transcript message, read by worker-read) has run for that many minutes (ended: that call already returned its result, the turn is over); bg = the worker's turn ended that many minutes ago and Orca's background-wait escalation (20 minutes after the turn end) was recorded (#555)
         def ago(m):
-            return time.time() - m * 60
+            return int(time.time()) - m * 60   # whole seconds, like the loop's `date +%s`: a fractional stamp reads a second younger, so an age exactly at a bound could floor one minute low
 
         fs = ".123" if frac else ""
         reply = {"terminal": {"lastOutputAt": ago(silent) * 1000}, "observation": {"agentWait": {"source": "hook"} if wait else None},
