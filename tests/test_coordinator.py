@@ -453,7 +453,7 @@ def test_a_needs_input_or_finished_escalation_alone_is_logged_and_blocks_nothing
 
 @pytest.mark.parametrize("held", [True, False])   # the loop handed the plan over (exit 3), or answer.sh approved it: the #488 sequence
 def test_a_finished_escalation_batched_with_a_plan_the_loop_held_or_approved_blocks_and_abandons_nothing(C, held):
-    C.inbox(["msg_q"]) if held else None
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question="PLAN: do X?"), "run_id": "run_t", "thread_id": "msg_q"}]}}))
     C.stubs.reply("answer.sh", WHY + "\n" if held else "approve\n", rc=3 if held else 0)
     C.mail([msg("question", "msg_q", question="PLAN: do X?"), msg("escalation", "msg_stop", stopReason="finished")])
     r = C.go("--answer", "attended")
