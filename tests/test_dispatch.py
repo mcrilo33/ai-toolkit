@@ -485,12 +485,12 @@ def launch_line(d):
     return next(c for c in d.orca() if c[:2] == ["terminal", "create"])[7]
 
 
-@pytest.mark.parametrize("exhausted,account", [({}, "max"), ({"max": FUTURE}, "client"), ({"max": PAST}, "max"), ({"max": FAR}, "max")])
+@pytest.mark.parametrize("exhausted,account", [({}, "max"), ({"max": FUTURE}, "client"), ({"max": PAST}, "max"), ({"max": FAR}, "max"), ({"max": "garbage"}, "max")])
 def test_a_fresh_dispatch_runs_on_the_first_listed_account_that_is_not_exhausted(d, exhausted, account):
     files = [exhaust(d, a, until) for a, until in exhausted.items()]
     r = d.go("7", CLAUDE_ACCOUNTS="max client")
     assert r.returncode == 0, r.stderr
-    assert launch_line(d).endswith(f"--dangerously-skip-permissions --account {account}")
+    assert launch_line(d).endswith(f"--dangerously-skip-permissions --account {account}") and "expression" not in r.stderr
     assert (d.record.parent / "account/ctx_1").read_text() == f"{account}\n" and not (d.record.parent / "failover").exists()   # which account it ran on: the loop's record, never the worker's
     assert [f.exists() for f in files] == [until == FUTURE for until in exhausted.values()]   # a record whose reset has passed is dropped
 

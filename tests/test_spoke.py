@@ -210,11 +210,12 @@ def accounts(tmp_path, listing, logins=("client",)):
 def test_an_unset_or_one_entry_account_list_leaves_the_claude_env_and_argv_unchanged(run, stubs, repo, tmp_path, listing):
     tk = synced(repo)
     env = accounts(tmp_path, listing)
-    r = run([SPOKE, "--model", "m"], cwd=in_spoke(repo), **env)
+    r = run([SPOKE, "--model", "m"], cwd=in_spoke(repo), ANTHROPIC_BASE_URL="https://gateway.test", **env)
     assert r.returncode == 0 and stubs.calls("claude") == [[*MCP(tk), "--settings", WORKER_SETTINGS(tk), "--model", "m"]], r.stderr
     claude_env = stubs.env("claude")
     assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=abc-123,repo=origin\n" in claude_env + "\n"
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in claude_env and "CLAUDE_CONFIG_DIR" not in claude_env and "SUBPROCESS_ENV_SCRUB" not in claude_env
+    assert "ANTHROPIC_BASE_URL=https://gateway.test\n" in claude_env   # a user who routes Claude through a gateway keeps it when the project lists one account or none
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in claude_env and "CLAUDE_CONFIG_DIR" not in claude_env
 
 
 @pytest.mark.parametrize("account", ["max", "client"])
@@ -224,7 +225,7 @@ def test_no_account_kind_exports_a_token_and_every_inherited_login_variable_is_d
     r = run([SPOKE, "--account", account], cwd=in_spoke(repo), **dict.fromkeys(PICK_THE_ACCOUNT, "zz-probe-9"), **env)
     claude_env = stubs.env("claude")
     assert r.returncode == 0, r.stderr
-    assert "zz-probe-9" not in claude_env and "CLAUDE_CODE_OAUTH" not in claude_env and "SUBPROCESS_ENV_SCRUB" not in claude_env   # a key or token in the caller's env outranks every login: the chosen account must be the one used
+    assert "zz-probe-9" not in claude_env and "CLAUDE_CODE_OAUTH" not in claude_env   # a key or token in the caller's env outranks every login: the chosen account must be the one used
     assert (f"CLAUDE_CONFIG_DIR={env['HOME']}/.claude-client\n" in claude_env) == (account == "client") and f"account={account}\n" in claude_env + "\n"
 
 

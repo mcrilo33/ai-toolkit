@@ -1893,5 +1893,8 @@ def test_no_issue_is_dispatched_while_every_allowed_account_is_exhausted(C, tmp_
     for a in ("max", "client"):
         spooled_account(tmp_path, "exhausted", a)
     C.stubs.reply(key("dispatch.sh", "--next", "--dry-run"), "5\n")
+    (tmp_path / "state/run_t/requests").mkdir(parents=True, mode=0o700)
+    (tmp_path / "state/run_t/requests/9").write_text("redo it\n")   # a human's queued request waits for the reset too: it is not run (dispatch.sh would die) and not lost
     r = C.go("--cap", "2", **ACCOUNTS)
     assert [a for a in C.stubs.calls("dispatch.sh") if a != ["--next", "--dry-run"]] == [] and "exhausted" in r.stdout
+    assert (tmp_path / "state/run_t/requests/9").read_text() == "redo it\n"
