@@ -63,3 +63,15 @@ def test_gh_binary_can_be_swapped_by_env_for_stubbed_runs(run, stubs, tmp_path, 
     assert lib(run, "gh issue view 4", AI_TOOLKIT_GH=alt).stdout.strip() == "alt issue view 4"
     lib(run, "gh issue view 4")
     assert stubs.calls("gh") == [["issue", "view", "4"]]
+
+
+@pytest.mark.parametrize("text, hms, seconds", [
+    ("6pm (Europe/Paris)", "12 00 00", 6 * 3600), ("6:30pm (Europe/Paris)", "12 00 00", 6 * 3600 + 1800),   # later today, in the zone's own clock
+    ("6pm (Europe/Paris)", "18 00 30", 300),   # the reset passed while the loop read the message: stale, a short hold, never tomorrow's 6pm
+    ("6pm (Europe/Paris)", "23 00 00", 19 * 3600), ("12am (Europe/Paris)", "23 00 00", 3600), ("12pm (Europe/Paris)", "11 00 00", 3600),   # long past or midnight: the next one
+    ("soon", "12 00 00", 3600), ("6pm (Nowhere/Land)", "12 00 00", 3600), ("13pm (Europe/Paris)", "12 00 00", 3600),   # unreadable: a one-hour hold, never unbounded
+])
+def test_reset_epoch_is_the_next_reset_in_the_zone_and_never_an_unbounded_hold(run, text, hms, seconds):
+    fake = 'date() { if [ "$1" = +%s ]; then echo 1000000; else echo "$HMS"; fi; }'   # now = 1000000, the zone's clock = $HMS
+    r = lib(run, f'{fake}; echo $(( $(reset_epoch "$T") - 1000000 ))', T=text, HMS=hms)
+    assert r.returncode == 0 and r.stdout.strip() == str(seconds), r.stderr

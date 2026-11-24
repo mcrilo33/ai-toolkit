@@ -1860,7 +1860,8 @@ def test_a_usage_limit_with_no_account_to_move_to_blocks_with_the_reset_time(C, 
     assert bool(relaunches(C)) == tried and (tmp_path / "state/run_t/exhausted/max").exists() == recorded
 
 
-@pytest.mark.parametrize("body, extra, blocks", [("the body", {}, True), (USAGE, {"stopReason": "needs-input"}, False)])
+@pytest.mark.parametrize("body, extra, blocks", [("the body", {}, True), (USAGE, {"stopReason": "needs-input"}, False),
+                                                 (f"Error: the worker said: {USAGE}", {}, True)])   # Orca's own prefix is what counts: the agent's text can quote the phrase
 def test_an_ordinary_escalation_and_needs_input_behave_as_before_on_a_project_with_two_accounts(C, tmp_path, body, extra, blocks):
     C.mail([{**msg("escalation", "msg_e", **extra), "body": body}])
     C.go(**ACCOUNTS)
