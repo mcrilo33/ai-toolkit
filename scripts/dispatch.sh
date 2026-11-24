@@ -6,6 +6,8 @@
 # and Orca does not accept a new task on an idle two-step terminal: agent_unconfigured). Both first refresh the worktree's installed
 # copies from the main checkout (setup.sh --refresh), keeping its spoke-run-id; a failed refresh starts no agent.
 # --round (with --address): the new task is titled "#<n> round", a round the human asked for (coordinator.sh counts the retry budget from the last one).
+# --account <name>: the Claude account the worker runs on, one the project lists (CLAUDE_ACCOUNTS, #556); with --retry-of it is a failover after a usage limit, which coordinator.sh's rounds() does not count. Without it a list of 2+ accounts uses the first one not exhausted;
+# the launch line carries the name (never a token) and the Run's spool records it (account/<dispatch>, failover/<dispatch>).
 # --next <issue>: the same pick restricted to that issue, so it starts only if it is ready (exit 3 and a message when it is not).
 # Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready, 4 Claude's folder-trust dialog blocks the start (still up after one answer, or a layout the keys are not known for): the repo root is not trusted, no issue is at fault.
 set -euo pipefail
@@ -13,7 +15,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; n=""; only=""; next=0; dry=0; retry_of=""; task=""; address=""; round=0; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
+run="${RUN:-}"; n=""; only=""; next=0; dry=0; retry_of=""; task=""; address=""; round=0; account=""; named=""; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;;
@@ -23,6 +25,7 @@ while [ $# -gt 0 ]; do
     --task) task="${2:-}"; shift ;;
     --address) address="${2:-}"; shift ;;
     --round) round=1 ;;
+    --account) account="${2:-}"; named=1; shift ;;
     [0-9]*) n="$1" ;;
     *) usage_exit "usage: dispatch.sh [--run R] <issue> | --next" ;;
   esac; shift
@@ -96,7 +99,7 @@ launch_twostep() {
   o="$(orca_json worktree create --repo "path:$main" --name "$name" --base-branch "$base" --issue "$n" --setup run)" || die "worktree create failed: $o"
   wt="$(printf '%s' "$o" | jq -r '.result.worktree.path // empty')"; [ -n "$wt" ] || die "worktree create returned no path: $o"
   wait_until "$tries" "$poll" test -f "$wt/.ai-toolkit/setup-done" || die "setup did not finish in $wt (see its Orca setup terminal)"
-  term="$(spawn_claude "$wt" "$name-agent" "$model" "$effort")"
+  term="$(spawn_claude "$wt" "$name-agent" "$model" "$effort" "$account")"
   start_worker --worktree "path:$wt" --terminal "$term"; sel="path:$wt"
 }
 launch_retry() {
@@ -106,10 +109,11 @@ launch_retry() {
   # A kept worktree still holds the copies it was created with: bring them up to date first, as a new worktree's setup does.
   # stderr, so a host's setup.local.sh output never precedes dispatch's one JSON line.
   ORCA_ROOT_PATH="$main" ORCA_WORKTREE_PATH="$wt" bash "$here/setup.sh" --refresh >&2 || die "refresh of $wt failed: no agent was started in it"
-  term="$(spawn_claude "$wt" "$name-agent" "$model" "$effort")"
+  term="$(spawn_claude "$wt" "$name-agent" "$model" "$effort" "$account")"
   start_worker --worktree "path:$wt" --terminal "$term"; sel="path:$wt"
 }
 launch_override() {
+  [ -z "$account" ] || [ "$account" = "$(first_account)" ] || die "the override launch cannot carry account '$account' (Orca's own agent launch): use the two-step launch"
   start_worker --worktree new-top-level --repo "path:$main" --name "$name" --base-branch "$base" --agent claude --model "$model" --effort "$effort"
   sel="name:$name"; term=""
   wt="$(orca_json worktree show --worktree "$sel" | jq -r '.result.worktree.path // empty')"
@@ -132,10 +136,13 @@ dispatch() {
   case "$tracker" in *[!A-Za-z0-9._/#-]*) die "issue $n: bad Tracker footer '$tracker'" ;; esac
   slug="$(printf '%s' "$title" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')"
   name="$n-${slug:-issue}"
+  if [ -n "$named" ]; then valid_account "$account" || die "'$account' is not an account name"; account_listed "$account" || die "account '$account' is not listed in CLAUDE_ACCOUNTS (${CLAUDE_ACCOUNTS:-empty})"
+  elif multi_account; then account="$(free_account "$run")" || die "every account of CLAUDE_ACCOUNTS (${CLAUDE_ACCOUNTS}) is exhausted: nothing is started until a reset"; fi
   if [ -n "$retry_of$address" ]; then launch_retry; else "launch_${DISPATCH_LAUNCH:-twostep}"; fi
   status_label add "$n"
   [ -z "$retry_of$address" ] || gh issue edit "$n" --remove-label "$AWAITING_LABEL" > /dev/null 2>&1 || true   # a reviewer asked for changes: the issue is worked again
   orca_json worktree set --worktree "$sel" --issue "$n" --workspace-status in-progress > /dev/null || die "worktree set failed for $sel"
+  [ -z "$account" ] || record_account "$run" "$disp" "$account" "$([ -z "$retry_of" ] || [ -z "$named" ] || echo 1)"   # a retry that names its account is a failover
   record_dispatch "$run" "$disp" "$n"   # what coordinator.sh's ctx() checks Orca's link against: the worker can relink its worktree, not rewrite this
   jq -nc --argjson issue "$n" --arg dispatch "$disp" --arg worktree "$wt" --arg terminal "$term" \
     '{issue: $issue, dispatch: $dispatch, worktree: $worktree, terminal: $terminal}'

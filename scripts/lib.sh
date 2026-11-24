@@ -156,6 +156,10 @@ record_dispatch() {   # <run> <dispatch> <issue>
   _dispatch_id_ok "$2" || die "bad dispatch id '$2'"
   local d; d="$(spool_dir "$1")/dispatch"; (umask 077; mkdir -p "$d"; printf '%s\n' "$3" > "$d/$2")
 }
+record_account() {   # <run> <dispatch> <account> [failover]: the account the loop launched a dispatch on (account/<d>); failover/<d> marks a relaunch that only moved to another account (coordinator.sh's rounds() leaves it out)
+  _dispatch_id_ok "$2" || die "bad dispatch id '$2'"
+  local d; d="$(spool_dir "$1")"; (umask 077; mkdir -p "$d/account"; printf '%s\n' "$3" > "$d/account/$2"; [ -z "${4:-}" ] || { mkdir -p "$d/failover"; : > "$d/failover/$2"; })
+}
 recorded_issue() { local n; _dispatch_id_ok "$2" && n="$(head -n 1 "$(spool_dir "$1")/dispatch/$2" 2> /dev/null)" && [[ $n =~ ^[0-9]+$ ]] && printf '%s' "$n"; }   # <run> <dispatch>: rc 1 = none
 
 # Claude accounts (#556). CLAUDE_ACCOUNTS is the project's ordered list of the accounts it may use (per machine, .ai-toolkit/ai-toolkit.local.env); the first is the default.
@@ -164,6 +168,17 @@ valid_account() { [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]; }   # the name goes into a typ
 account_listed() { case " ${CLAUDE_ACCOUNTS:-} " in *" $1 "*) return 0 ;; esac; return 1; }
 first_account() { local a; read -r a _ <<< "${CLAUDE_ACCOUNTS:-}"; printf '%s' "$a"; }
 multi_account() { local a b; read -r a b _ <<< "${CLAUDE_ACCOUNTS:-}"; [ -n "$b" ]; }   # 2+ entries: the only lists a failover can use
+# free_account <run>: the first listed account not known (the Run's spool, exhausted/<account> = the epoch of its reset) to be at its usage limit; a record whose reset has passed is dropped. rc 1 = every one is exhausted.
+free_account() {
+  local a f
+  for a in ${CLAUDE_ACCOUNTS:-}; do
+    valid_account "$a" || continue
+    f="$(spool_dir "$1")/exhausted/$a"
+    if [ -f "$f" ] && [ "$(head -n 1 "$f")" -gt "$(date +%s)" ] 2> /dev/null; then continue; fi
+    rm -f "$f"; printf '%s' "$a"; return 0
+  done
+  return 1
+}
 
 # usage_exit <msg>: caller misuse, exit 2 (die is exit 1: a failed operation).
 usage_exit() { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 2; }
@@ -175,7 +190,7 @@ wait_until() {
   return 1
 }
 
-# spawn_claude <worktree> <title> <model> <effort>: the two-step launch (docs/architecture.md): a terminal running bin/claude-spoke
+# spawn_claude <worktree> <title> <model> <effort> [account]: the two-step launch (docs/architecture.md): a terminal running bin/claude-spoke
 # (OTel env), waited on until claude is up; prints its handle. The first run in a repo root meets Claude's trust dialog
 # (default "No, exit"): Down+Enter. A shell startup prompt (oh-my-zsh's update question) can eat the typed launch line's first byte and leave
 # the shell failing to run the launcher: the line is re-typed once, never on a timeout alone (it would land in claude's TUI). dispatch.sh uses it for a new worker and for a retry, so a retried worker keeps the shim's env.
@@ -198,7 +213,7 @@ _agent_up() {
 spawn_claude() {
   local h bin line retyped=   # retyped: _agent_up's once-only flag (dynamic scope), fresh per spawn
   bin="$(cd "$AI_TOOLKIT_LIB_DIR/../bin" && pwd -P)/claude-spoke"
-  line="$(printf %q "$bin") --model $3 --effort $4 --dangerously-skip-permissions"
+  line="$(printf %q "$bin") --model $3 --effort $4 --dangerously-skip-permissions${5:+ --account $5}"   # the account name is the only thing about the account on the line, never the token
   h="$(orca_json terminal create --worktree "path:$1" --title "$2" --command "$line" | jq -r '.result.terminal.handle // empty')"
   [ -n "$h" ] || die "terminal create returned no handle"
   wait_until "${DISPATCH_TRIES:-60}" "${AI_TOOLKIT_POLL:-3}" _agent_up "$h" "$line" || die "claude did not start in terminal $h"
