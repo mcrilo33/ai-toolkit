@@ -206,11 +206,10 @@ WRITE_DENY = [
     # a foreign-looking tail of a concatenation: the head is the end of the worktree or of the launcher's parent
     "python3 - <<EOF\nimport os\nopen(os.getcwd() + '/.ai-toolkit/hooks/x', 'w')\nEOF", "node -e \"require('fs').writeFileSync(process.cwd() + '/.ai-toolkit/hooks/x', 'x')\"",
     "python3 - <<EOF\nopen(os.path.dirname(os.getcwd()) + '/1-x/.ai-toolkit/hooks/x', 'w')\nEOF", "echo x > {spoke}\\\n/.ai-toolkit/hooks/x",
-    # a Claude account token in the Keychain (#556): the launcher reads it for the worker, the worker's own Bash must not (it would land in its transcript and the OTel logs); every spelling of the service name, and a dump of the whole Keychain
-    "security find-generic-password -s CLAUDE_OAUTH_TOKEN_CLIENT -w", "t=$(security find-generic-password -a $USER -w -s \"CLAUDE_OAUTH_TOKEN_$N\")", "security delete-generic-password -s CLAUDE_OAUTH_TOKEN_CLIENT",
-    "/usr/bin/security find-generic-password -w -s CLAUDE_OAUTH_TOKEN_MAX", "security dump-keychain -d", "cd ~ && security dump-keychain",
-    "security -q find-generic-password -s CLAUDE_OAUTH_TOKEN_CLIENT -w", "security -q dump-keychain -d", "security -i <<< 'x'", "echo x | security -i", "security add-generic-password -U -s CLAUDE_OAUTH_TOKEN_CLIENT -w x",
-    "security find-generic-password -s 'Claude Code-credentials' -w",
+    # Claude's own login items in the Keychain (#556: the stored login and each config-directory login): a worker's own Bash must not read, change or dump them (a refresh token and the connectors' access); every spelling of the service name, and a dump of the whole Keychain
+    "security find-generic-password -s 'Claude Code-credentials' -w", "t=$(security find-generic-password -a $USER -w -s \"Claude Code-credentials-1a2b3c4d\")", "security delete-generic-password -s Claude\\ Code-credentials",
+    "/usr/bin/security find-generic-password -w -s 'Claude Code-credentials'", "security dump-keychain -d", "cd ~ && security dump-keychain", "security -q find-generic-password -s 'Claude Code-credentials' -w",
+    "security -q dump-keychain -d", "security -i <<< 'x'", "echo x | security -i", "security add-generic-password -U -s 'Claude Code-credentials' -w x",
 ]
 WRITE_ALLOW = [
     "touch sub/orca.yaml", "echo x > v2/orca.yaml", "cp a docs/.github/workflows/x.yml", "rm -rf .claude/cache", "ls .claude",
@@ -223,7 +222,7 @@ WRITE_ALLOW = [
     "python3 - <<'EOF'\np='tests/test_x.py'\ns=open(p).read()+'f = \"/w/.ai-toolkit/rules/bug-triage.md\"'\nopen(p,'w').write(s)\nEOF",
     "python - <<'EOF'\np='tests/test_e.py'\ns=make_obs('tool:Read', 1, 2, file_path='/w/.ai-toolkit/rules/bug-triage.md')\nopen(p,'w').write(s)\nEOF",
     'python -m pytest tests -k "/w/.ai-toolkit/rules"', 'cat > tests/fix.json <<EOF\n{"p": "/w/.ai-toolkit/hooks/x.sh"}\nEOF',
-    "security find-generic-password -s ai-toolkit-langfuse-KEY -w", "grep -n CLAUDE_OAUTH_TOKEN bin/claude-spoke", "security find-identity -v",   # another secret, a mention without the Keychain, and an unrelated security call
+    "security find-generic-password -s ai-toolkit-langfuse-KEY -w", "grep -n Code-credentials bin/claude-spoke", "security find-identity -v",   # another secret, a mention without the Keychain, and an unrelated security call
 ]
 
 
