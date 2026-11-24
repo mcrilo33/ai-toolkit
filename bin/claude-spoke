@@ -64,11 +64,15 @@ if [ -n "$synced" ] && { [ -n "${CLAUDE_ACCOUNTS:-}" ] || [ -n "$named" ]; }; th
   valid_account "$account" || die "'$account' is not an account name (lower case letters, digits and - only)"
   account_listed "$account" || die "account '$account' is not listed in CLAUDE_ACCOUNTS (${CLAUDE_ACCOUNTS:-empty}): this project may not use it"
   # the choice of the login, once, here: the stored login exports nothing; a directory ~/.claude-<name> is its own full login; anything else is refused
-  # whatever in the caller's env says WHOSE login Claude uses is dropped for every listed project (Orca's account switcher or a parent session on another account would otherwise win); where it goes (a gateway) too, unless the project lists one stored account
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_SECURESTORAGE_CONFIG_DIR ANTHROPIC_PROFILE ANTHROPIC_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR CLAUDE_CODE_OAUTH_REFRESH_TOKEN \
-    CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_GATEWAY CLAUDE_CODE_GATEWAY_TOKEN CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR CLAUDE_CODE_USE_ANTHROPIC_AWS ANTHROPIC_AWS_API_KEY \
-    CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR ANTHROPIC_IDENTITY_TOKEN ANTHROPIC_IDENTITY_TOKEN_FILE CLAUDE_CODE_SESSION_ACCESS_TOKEN CLAUDE_CODE_SESSIONS_OAUTH_TOKEN CLAUDE_CODE_HOST_AUTH_ENV_VAR
-  if multi_account || [ "$account" != "${CLAUDE_STORED_ACCOUNT:-max}" ]; then unset ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_API_BASE_URL ANTHROPIC_API_HOST ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_CUSTOM_OAUTH_URL; fi
+  # whatever in the caller's env says WHOSE login Claude uses is dropped for every listed project (Orca's account switcher or a parent session on another account would otherwise win). Where it goes (a gateway) is dropped too, unless the project lists one stored account
+  # and the caller set no login of its own: a gateway URL kept next to a dropped credential would take the chosen login's own to that host.
+  ident=(CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_SECURESTORAGE_CONFIG_DIR ANTHROPIC_PROFILE ANTHROPIC_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+    CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_GATEWAY CLAUDE_CODE_GATEWAY_TOKEN CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR CLAUDE_CODE_USE_ANTHROPIC_AWS ANTHROPIC_AWS_API_KEY
+    CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR ANTHROPIC_IDENTITY_TOKEN ANTHROPIC_IDENTITY_TOKEN_FILE CLAUDE_CODE_SESSION_ACCESS_TOKEN CLAUDE_CODE_SESSIONS_OAUTH_TOKEN CLAUDE_CODE_HOST_AUTH_ENV_VAR)
+  keep_gateway=1; if multi_account || [ "$account" != "${CLAUDE_STORED_ACCOUNT:-max}" ]; then keep_gateway=""; fi
+  for v in "${ident[@]}"; do [ -z "${!v+x}" ] || keep_gateway=""; done
+  unset "${ident[@]}"
+  [ -n "$keep_gateway" ] || unset ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_API_BASE_URL ANTHROPIC_API_HOST ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_CUSTOM_OAUTH_URL
   cfg="$HOME/.claude-$account"
   if [ "$account" = "${CLAUDE_STORED_ACCOUNT:-max}" ]; then cfg=""
   elif [ -d "$cfg" ]; then
