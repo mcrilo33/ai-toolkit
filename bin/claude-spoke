@@ -6,9 +6,9 @@
 # a coordinator's too, which include the human's own messages. Remote Control is split the same way as the notifications: off for a worker, on for the coordinator. In an unsynced project it is a plain claude, so it is safe to point Orca's agentCmdOverrides.claude at it.
 # AI_TOOLKIT_OTEL=0 opts out of the OTel. No auth header on the OTel exporter.
 # Claude account (#556): the project's CLAUDE_ACCOUNTS (per machine, ai-toolkit.local.env) lists the accounts it may use, the first being the default; --account <name> picks another listed one (the loop names it on a worker's launch line).
-# The stored login of ~/.claude (CLAUDE_STORED_ACCOUNT, default max) exports nothing. A name with a directory ~/.claude-<name> runs on that full login (CLAUDE_CONFIG_DIR, sharing the user's settings, skills and memory by symlink). Any other name
-# is a long-lived token (claude setup-token) in the Keychain service CLAUDE_OAUTH_TOKEN_<NAME>, read here and exported only as CLAUDE_CODE_OAUTH_TOKEN (Claude itself withholds it from the hooks it starts, measured on 2.1.331: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 is NOT set, it would also drop SSH_AUTH_SOCK, GIT_ASKPASS and the cloud credentials a worker pushes with).
-# Never in argv, a log or OTEL_*; no fallback to another account. A name the project does not list is refused. Inherited ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, which outrank every login, are unset so the chosen account is the one used.
+# An account is the stored login of ~/.claude (CLAUDE_STORED_ACCOUNT, default max: nothing is exported) or a config-directory account: a full login in ~/.claude-<name>, selected with CLAUDE_CONFIG_DIR and sharing the user's settings, skills and memory by symlink.
+# A listed name that is neither is refused, never replaced by another account. The launcher handles no token: an inherited CLAUDE_CODE_OAUTH_TOKEN (and every other variable that would decide whose login Claude uses) is unset, so the chosen account is the one used.
+# A name the project does not list is refused.
 # To use Orca's Chat UI, put --settings ai-toolkit in Orca's Claude arguments: the launcher swaps it for the project's guard file (Orca's own --settings would switch every hook off).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -61,9 +61,9 @@ synced=""; if [ -s "$top/.ai-toolkit/spoke-run-id" ] || [ -f "$tk/claude-setting
 tag=""; cfg=""
 if [ -n "$synced" ] && { [ -n "${CLAUDE_ACCOUNTS:-}" ] || [ -n "$named" ]; }; then
   [ -n "$named" ] || account="$(first_account)"
-  valid_account "$account" || die "'$account' is not an account name (letters, digits, _ and - only)"
+  valid_account "$account" || die "'$account' is not an account name (lower case letters, digits and - only)"
   account_listed "$account" || die "account '$account' is not listed in CLAUDE_ACCOUNTS (${CLAUDE_ACCOUNTS:-empty}): this project may not use it"
-  # the choice of the auth env, once, here: the stored login exports nothing; a directory ~/.claude-<name> is its own full login; anything else is a Keychain token
+  # the choice of the login, once, here: the stored login exports nothing; a directory ~/.claude-<name> is its own full login; anything else is refused
   unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_SECURESTORAGE_CONFIG_DIR ANTHROPIC_PROFILE ANTHROPIC_CONFIG_DIR ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS \
     CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR CLAUDE_CODE_OAUTH_REFRESH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY   # whatever in the caller's env would decide whose login Claude uses
   cfg="$HOME/.claude-$account"
@@ -76,10 +76,7 @@ if [ -n "$synced" ] && { [ -n "${CLAUDE_ACCOUNTS:-}" ] || [ -n "$named" ]; }; th
       if [ -e "$cfg/$n" ] || [ -L "$cfg/$n" ]; then warn "$cfg/$n is not a link to ~/.claude/$n: kept, so account $account does not share it"; else ln -sn "$HOME/.claude/$n" "$cfg/$n" 2> /dev/null || [ "$(readlink "$cfg/$n" 2> /dev/null)" = "$HOME/.claude/$n" ] || die "cannot link $cfg/$n"; fi   # -n: two launches may start together, and the loser must not link inside the winner's link (that would write into ~/.claude)
     done
     export CLAUDE_CONFIG_DIR="$cfg"
-  else
-    svc="CLAUDE_OAUTH_TOKEN_$(printf %s "$account" | LC_ALL=C tr 'a-z-' 'A-Z_')"; cfg=""
-    tok="$("${AITK_SECURITY:-/usr/bin/security}" find-generic-password -s "$svc" -w 2> /dev/null)" && [ -n "$tok" ] || die "no Keychain item $svc for account $account (claude setup-token, then security add-generic-password -s $svc): no other account is used instead"
-    export CLAUDE_CODE_OAUTH_TOKEN="$tok"; unset tok
+  else die "account '$account' is neither the stored login (CLAUDE_STORED_ACCOUNT=${CLAUDE_STORED_ACCOUNT:-max}) nor a config directory $cfg: claude auth login with CLAUDE_CONFIG_DIR=$cfg, no other account is used instead"
   fi
   if multi_account; then tag=",account=$account"; fi
   if [ -n "$cfg" ] && [ ! -s "$top/.ai-toolkit/spoke-run-id" ] && [ -f "$HOME/.claude.json" ]; then   # the user-scope MCP servers live in ~/.claude.json, which a config directory does not read: a session of the human gets them from here (a worker has only the toolkit's list).

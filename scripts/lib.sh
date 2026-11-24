@@ -185,7 +185,7 @@ recorded_issue() { local n; _dispatch_id_ok "$2" && n="$(head -n 1 "$(spool_dir 
 
 # Claude accounts (#556). CLAUDE_ACCOUNTS is the project's ordered list of the accounts it may use (per machine, .ai-toolkit/ai-toolkit.local.env); the first is the default.
 # An account is used for a project only if the project lists it: the launcher and dispatch.sh both check, and the loop only ever picks from the list.
-valid_account() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }   # the name goes into a typed command line, a path and a Keychain service: lower case, digits and - only, so one name is one service and one directory (macOS paths ignore case)
+valid_account() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }   # the name goes into a typed command line and a directory name: lower case, digits and - only, so one name is one directory (macOS paths ignore case)
 account_listed() { case " ${CLAUDE_ACCOUNTS:-} " in *" $1 "*) return 0 ;; esac; return 1; }
 first_account() { local a; read -r a _ <<< "${CLAUDE_ACCOUNTS:-}"; printf '%s' "$a"; }
 multi_account() { local a b; read -r a b _ <<< "${CLAUDE_ACCOUNTS:-}"; [ -n "$b" ]; }   # 2+ entries: the only lists a failover can use
@@ -234,7 +234,7 @@ _agent_up() {
 spawn_claude() {
   local h bin line retyped=   # retyped: _agent_up's once-only flag (dynamic scope), fresh per spawn
   bin="$(cd "$AI_TOOLKIT_LIB_DIR/../bin" && pwd -P)/claude-spoke"
-  line="$(printf %q "$bin") --model $3 --effort $4 --dangerously-skip-permissions${5:+ --account $5}"   # the account name is the only thing about the account on the line, never the token
+  line="$(printf %q "$bin") --model $3 --effort $4 --dangerously-skip-permissions${5:+ --account $5}"   # only the account name goes on the line: the launcher picks the login itself
   h="$(orca_json terminal create --worktree "path:$1" --title "$2" --command "$line" | jq -r '.result.terminal.handle // empty')"
   [ -n "$h" ] || die "terminal create returned no handle"
   wait_until "${DISPATCH_TRIES:-60}" "${AI_TOOLKIT_POLL:-3}" _agent_up "$h" "$line" || die "claude did not start in terminal $h"

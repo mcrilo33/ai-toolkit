@@ -7,7 +7,7 @@
 # copies from the main checkout (setup.sh --refresh), keeping its spoke-run-id; a failed refresh starts no agent.
 # --round (with --address): the new task is titled "#<n> round", a round the human asked for (coordinator.sh counts the retry budget from the last one).
 # --account <name>: the Claude account the worker runs on, one the project lists (CLAUDE_ACCOUNTS, #556); with --retry-of it is a failover after a usage limit, which coordinator.sh's rounds() does not count. Without it a list of 2+ accounts uses the first one not exhausted;
-# the launch line carries the name (never a token) and the Run's spool records it (account/<dispatch>, failover/<dispatch>).
+# the launch line carries the name and the Run's spool records it (account/<dispatch>, failover/<dispatch>).
 # --next <issue>: the same pick restricted to that issue, so it starts only if it is ready (exit 3 and a message when it is not).
 # Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready, 4 Claude's folder-trust dialog blocks the start (still up after one answer, or a layout the keys are not known for): the repo root is not trusted, no issue is at fault.
 set -euo pipefail
