@@ -473,7 +473,7 @@ handle() {
       case "$(pj "$1" stopReason)" in
         needs-input) log "#$issue: worker $disp is at a prompt (needs-input), left to the permission relay and the sweep" ;;
         finished) log "#$issue: worker $disp ended a turn without worker_done (finished), left to the sweep" ;;
-        background-wait) bgwait_record; log "#$issue: worker $disp waits on its background task, left to the sweep up to COORD_TOOL_MAX" ;;   # #555: Orca fires it 20 min after the turn ended; the sweep bounds the wait from the first record, a repeat never moves it
+        background-wait) bgwait_record; log "#$issue: worker $disp waits on its background task, left to the sweep up to COORD_TOOL_MAX" ;;   # #555: Orca fires it 20 min after the turn ended; bgwait_record keeps a still-silent repeat from moving the bound
         *) block "escalation: $(jq -r '.body // ""' <<< "$1")" ;;
       esac ;;
   esac
