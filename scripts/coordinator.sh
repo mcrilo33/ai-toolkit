@@ -473,11 +473,13 @@ bgwait_record() {   # the first escalation of a wait sets its record; a repeat d
 # usage_limit <reset text> <escalation body>: the worker's account is at its usage limit (#556). The loop records it exhausted until the reset (the Run's spool, never the worker's files) and, when the project lists another account that is free,
 # releases the dispatch and relaunches the same task on it; the relaunch is marked a failover (dispatch.sh), so rounds() does not count it. #551's model fallback is the next step here when no account is left.
 usage_limit() {
-  local from next why
+  local from next why n f listed
   from="$(head -n 1 "$sd/account/$disp" 2> /dev/null)"; from="${from:-$(first_account)}"   # a dispatch with no record ran on the first listed account
   why="usage limit${from:+ on account $from}${1:+, resets $1}"
   if multi_account && account_listed "$from"; then
     mark_exhausted "$run" "$from" "$(reset_epoch "$1")"
+    n=0; for f in "$sd"/failover/*; do if [ -f "$f" ] && [ "$(recorded_issue "$run" "${f##*/}")" = "$issue" ]; then n=$((n + 1)); fi; done   # the stop is read from the escalation's text, which a worker can also send: one pass over the accounts is the most this issue gets
+    read -ra listed <<< "$CLAUDE_ACCOUNTS"; [ "$n" -lt "${#listed[@]}" ] || { block "$why: failover budget spent ($n failovers, ${#listed[@]} accounts)"; return 0; }
     next="$(free_account "$run")" || { block "$why: every other allowed account is at its limit too"; return 0; }
     release "$disp"; [ -z "$term" ] || orca terminal close --terminal "$term" --json > /dev/null 2>&1 || true   # the dead agent's terminal
     if RUN="$run" "$DISPATCH_CMD" --retry-of "$disp" --task "$task" --account "$next" "$issue" > /dev/null; then

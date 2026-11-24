@@ -185,7 +185,7 @@ recorded_issue() { local n; _dispatch_id_ok "$2" && n="$(head -n 1 "$(spool_dir 
 
 # Claude accounts (#556). CLAUDE_ACCOUNTS is the project's ordered list of the accounts it may use (per machine, .ai-toolkit/ai-toolkit.local.env); the first is the default.
 # An account is used for a project only if the project lists it: the launcher and dispatch.sh both check, and the loop only ever picks from the list.
-valid_account() { [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]; }   # the name goes into a typed command line, a path and a Keychain service: id characters only
+valid_account() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }   # the name goes into a typed command line, a path and a Keychain service: lower case, digits and - only, so one name is one service and one directory (macOS paths ignore case)
 account_listed() { case " ${CLAUDE_ACCOUNTS:-} " in *" $1 "*) return 0 ;; esac; return 1; }
 first_account() { local a; read -r a _ <<< "${CLAUDE_ACCOUNTS:-}"; printf '%s' "$a"; }
 multi_account() { local a b; read -r a b _ <<< "${CLAUDE_ACCOUNTS:-}"; [ -n "$b" ]; }   # 2+ entries: the only lists a failover can use
@@ -195,7 +195,7 @@ free_account() {
   for a in ${CLAUDE_ACCOUNTS:-}; do
     valid_account "$a" || continue
     f="$(spool_dir "$1")/exhausted/$a"
-    if [ -f "$f" ] && [ "$(head -n 1 "$f")" -gt "$(date +%s)" ] 2> /dev/null; then continue; fi
+    if [ -f "$f" ] && [ "$(head -n 1 "$f")" -gt "$(date +%s)" ] && [ "$(head -n 1 "$f")" -le "$(($(date +%s) + 90000))" ] 2> /dev/null; then continue; fi   # a record more than 25 hours ahead is no reset of a session window: dropped
     rm -f "$f"; printf '%s' "$a"; return 0
   done
   return 1

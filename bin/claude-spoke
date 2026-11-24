@@ -64,19 +64,21 @@ if [ -n "$synced" ] && { [ -n "${CLAUDE_ACCOUNTS:-}" ] || [ -n "$named" ]; }; th
   valid_account "$account" || die "'$account' is not an account name (letters, digits, _ and - only)"
   account_listed "$account" || die "account '$account' is not listed in CLAUDE_ACCOUNTS (${CLAUDE_ACCOUNTS:-empty}): this project may not use it"
   # the choice of the auth env, once, here: the stored login exports nothing; a directory ~/.claude-<name> is its own full login; anything else is a Keychain token
-  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_SECURESTORAGE_CONFIG_DIR ANTHROPIC_PROFILE ANTHROPIC_CONFIG_DIR ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS \
+    CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR CLAUDE_CODE_OAUTH_REFRESH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY   # whatever in the caller's env would decide whose login Claude uses
   cfg="$HOME/.claude-$account"
   if [ "$account" = "${CLAUDE_STORED_ACCOUNT:-max}" ]; then cfg=""
   elif [ -d "$cfg" ]; then
     jq -e '.oauthAccount | type == "object"' "$cfg/.claude.json" > /dev/null 2>&1 || die "no login in $cfg: run CLAUDE_CONFIG_DIR=$cfg claude auth login"
     for n in settings.json CLAUDE.md skills agents commands hooks plugins projects; do   # what the account shares with ~/.claude, by link, only where the directory has nothing of its own
-      [ -e "$HOME/.claude/$n" ] && [ ! -L "$cfg/$n" ] || continue
-      if [ -e "$cfg/$n" ]; then warn "$cfg/$n is not a link to ~/.claude/$n: kept, so account $account does not share it"; else ln -s "$HOME/.claude/$n" "$cfg/$n" 2> /dev/null || [ -L "$cfg/$n" ] || die "cannot link $cfg/$n"; fi   # two launches may start together: the loser finds the link made
+      [ -e "$HOME/.claude/$n" ] || continue
+      [ "$(readlink "$cfg/$n" 2> /dev/null)" != "$HOME/.claude/$n" ] || continue
+      if [ -e "$cfg/$n" ] || [ -L "$cfg/$n" ]; then warn "$cfg/$n is not a link to ~/.claude/$n: kept, so account $account does not share it"; else ln -sn "$HOME/.claude/$n" "$cfg/$n" 2> /dev/null || [ "$(readlink "$cfg/$n" 2> /dev/null)" = "$HOME/.claude/$n" ] || die "cannot link $cfg/$n"; fi   # -n: two launches may start together, and the loser must not link inside the winner's link (that would write into ~/.claude)
     done
     export CLAUDE_CONFIG_DIR="$cfg"
   else
     svc="CLAUDE_OAUTH_TOKEN_$(printf %s "$account" | LC_ALL=C tr 'a-z-' 'A-Z_')"; cfg=""
-    tok="$(security find-generic-password -s "$svc" -w 2> /dev/null)" && [ -n "$tok" ] || die "no Keychain item $svc for account $account (claude setup-token, then security add-generic-password -s $svc): no other account is used instead"
+    tok="$("${AITK_SECURITY:-/usr/bin/security}" find-generic-password -s "$svc" -w 2> /dev/null)" && [ -n "$tok" ] || die "no Keychain item $svc for account $account (claude setup-token, then security add-generic-password -s $svc): no other account is used instead"
     export CLAUDE_CODE_OAUTH_TOKEN="$tok"; unset tok
   fi
   if multi_account; then tag=",account=$account"; fi
