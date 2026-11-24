@@ -541,9 +541,8 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
 }
 fill() {   # dispatch ready issues until $cap workers are live; ready=0 once --next finds nothing
   local live n rc i out; ready=1
-  named
   if multi_account && ! free_account "$run" > /dev/null; then [ -n "${acc_wait:-}" ] || log "every account of CLAUDE_ACCOUNTS (${CLAUDE_ACCOUNTS}) is exhausted (usage limit): nothing is dispatched until a reset"; acc_wait=1; return 0; fi
-  acc_wait=""
+  acc_wait=""; named
   live="$(wl | nlive)" || return 0   # Orca did not answer: nothing is dispatched on a guess, the next wake tries again
   for ((i = live; i < cap; i++)); do
     n="$(RUN="$run" "$DISPATCH_CMD" --next --dry-run)" && rc=0 || rc=$?

@@ -191,11 +191,12 @@ first_account() { local a; read -r a _ <<< "${CLAUDE_ACCOUNTS:-}"; printf '%s' "
 multi_account() { local a b; read -r a b _ <<< "${CLAUDE_ACCOUNTS:-}"; [ -n "$b" ]; }   # 2+ entries: the only lists a failover can use
 # free_account <run>: the first listed account not known (the Run's spool, exhausted/<account> = the epoch of its reset) to be at its usage limit; a record whose reset has passed is dropped. rc 1 = every one is exhausted.
 free_account() {
-  local a f
+  local a f e
   for a in ${CLAUDE_ACCOUNTS:-}; do
     valid_account "$a" || continue
     f="$(spool_dir "$1")/exhausted/$a"
-    if [ -f "$f" ] && [ "$(head -n 1 "$f")" -gt "$(date +%s)" ] && [ "$(head -n 1 "$f")" -le "$(($(date +%s) + 90000))" ] 2> /dev/null; then continue; fi   # a record more than 25 hours ahead is no reset of a session window: dropped
+    e="$(head -n 1 "$f" 2> /dev/null)"; [[ $e =~ ^[0-9]+$ ]] || e=0   # a record that is no epoch is no hold
+    if [ "$e" -gt "$(date +%s)" ] && [ "$e" -le "$(($(date +%s) + 90000))" ]; then continue; fi   # a record more than 25 hours ahead is no reset of a session window: dropped
     rm -f "$f"; printf '%s' "$a"; return 0
   done
   return 1
