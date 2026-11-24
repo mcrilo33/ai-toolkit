@@ -24,6 +24,11 @@ def msg(kind, mid="msg_1", **payload):
     return {"id": mid, "type": kind, "body": "the body", "payload": json.dumps({"taskId": "task_ctx_1", "dispatchId": "ctx_1", **payload})}
 
 
+def notice(i):   # Orca's reconciler notice threaded on question i (#558): free prose, the same type, sender and payload as a real reply
+    return {"id": f"n_{i}", "type": "status", "run_id": "run_t", "thread_id": i, "payload": None,
+            "body": "Your coordinator stopped without answering your question and has no worker running for it. Decide it yourself and say what you chose when you report."}
+
+
 def arg(a, flag):
     return a[a.index(flag) + 1]
 
@@ -100,9 +105,10 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
     stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": wt, "linkedIssue": 1, "branch": "refs/heads/1-x"}]}}))
     stubs.reply("orca.orchestration_run_create", '{"result":{"run":{"id":"run_new"}}}')
     stubs.reply("orca.orchestration_task_list", json.dumps({"result": {"tasks": []}}))   # the titles rounds() reads: no human-requested round
-    def inbox(open_ids=(), answered=(), replies_only=(), pad=0):   # the Run's inbox: unanswered questions wait for the human
+    def inbox(open_ids=(), answered=(), replies_only=(), pad=0, noticed=()):   # the Run's inbox: unanswered questions wait for the human
         rows = [{**msg("question", i), "run_id": "run_t", "thread_id": i} for i in [*open_ids, *answered]]
         rows += [{"id": f"r_{i}", "type": "status", "run_id": "run_t", "thread_id": i, "body": "approve", "payload": None} for i in [*answered, *replies_only]]
+        rows += [notice(i) for i in noticed]
         rows += [{"id": f"x{i}", "type": "status", "run_id": "run_other", "thread_id": None, "body": "", "payload": None} for i in range(pad)]   # other Runs' mail
         stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
 
@@ -324,7 +330,7 @@ def test_reply_refuses_a_bad_message_id_or_body_and_a_missing_run(C, tmp_path, a
 
 @pytest.mark.parametrize("body", ["revise: use tmp", "approve with: use tmp"])
 def test_a_queued_reply_is_sent_as_the_bound_consumer_deleted_and_commented_on_the_issue(C, body):
-    C.inbox(["msg_q"])
+    C.inbox(["msg_q"], noticed=["msg_q"])   # Orca's notice is no reply: the question is still open
     C.spool("msg_q", body)
     assert C.go().returncode == 0
     rep = C.calls("orca orchestration reply")[0]
@@ -333,7 +339,7 @@ def test_a_queued_reply_is_sent_as_the_bound_consumer_deleted_and_commented_on_t
 
 
 def test_a_reply_for_an_unknown_or_already_answered_question_is_dropped_and_a_failed_one_stays_queued(C):
-    C.inbox(["msg_open"], answered=["msg_done"])
+    C.inbox(["msg_open"], answered=["msg_done"], noticed=["msg_open", "msg_done"])   # the notice neither answers msg_open nor reopens msg_done
     C.stubs.reply("orca.orchestration_reply", json.dumps({"error": {"code": "bad_state"}}), rc=1)
     for mid in ("msg_done", "msg_nope", "msg_open"):
         C.spool(mid, "approve")
@@ -810,7 +816,7 @@ def test_a_loop_whose_run_was_taken_back_exits_and_closes_its_own_pane(C, tmp_pa
     (True, {"tool": 30}, r"silent (29|30)m, tool call running (29|30)m$"),   # a worker inside one long tool call is not the same line as a stuck one
 ])
 def test_status_prints_the_run_workers_and_unanswered_questions_with_their_reply_command_and_changes_nothing(C, given, shown, line):
-    C.inbox(["msg_q"], answered=["msg_a"]); C.show(silent=30, **shown)
+    C.inbox(["msg_q"], answered=["msg_a"], noticed=["msg_q", "msg_a"]); C.show(silent=30, **shown)
     C.stubs.reply("orca.orchestration_run_current", '{"result":{"run":{"id":"run_t"}}}')
     r = C.go("--status", run_id="run_t" if given else None, ORCA_TERMINAL_HANDLE="")   # read-only: no coordinator terminal needed
     assert r.returncode == 0 and "run_t" in r.stdout and "ctx_1" in r.stdout and REPLY in r.stdout and "msg_a" not in r.stdout
@@ -1274,6 +1280,7 @@ def test_the_triage_prompt_and_allowlist_carry_the_dispatch_label_when_one_is_se
 def watched(C, *polls, seen=None, fail=None, **env):   # --wait with no terminal handle: each poll is (open question ids, blocked issue numbers), read once per poll; "msg_p*" ids are permission requests
     for n, (ids, blocked, *rounds) in enumerate(polls, 1):
         rows = [{**msg("question", q, question=PQ if q.startswith("msg_p") else "PLAN?"), "run_id": "run_t", "thread_id": q, "sequence": ord(q[-1])} for q in ids]
+        rows += [notice(q) for q in ids]   # Orca's notice is no reply: the decision still wakes the watcher
         C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}), n=n)
         C.stubs.reply("gh.issue_list", json.dumps([{"number": b, "title": "t", "labels": [{"name": "blocked"}]} for b in blocked]), n=2 * n - 1)   # each read: the blocked list, then the open issues that may be finished rounds
         C.stubs.reply("gh.issue_list", json.dumps(rounds[0] if rounds else []), n=2 * n)
@@ -1362,7 +1369,7 @@ def test_wait_reads_the_blocked_list_less_often_than_the_questions(C):
 
 def test_status_shows_each_open_question_text_above_its_reply_command_and_show_prints_one_whole(C, tmp_path):
     plan = "PLAN: add hello.py first\n\x1b[2Jthen\n" + "\n".join(f"step {i}: do the thing" for i in range(300))
-    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question=plan), "run_id": "run_t", "thread_id": "msg_q"}]}}))
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question=plan), "run_id": "run_t", "thread_id": "msg_q"}, notice("msg_q")]}}))
     out = C.go("--status", ORCA_TERMINAL_HANDLE="").stdout
     assert "  | PLAN: add hello.py first" in lines_before(out, "--reply msg_q")
     assert "step 299" not in out and "[display truncated" in out   # the default view stays at 25 lines
