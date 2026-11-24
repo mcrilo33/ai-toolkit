@@ -80,7 +80,8 @@ if [ -n "$synced" ] && { [ -n "${CLAUDE_ACCOUNTS:-}" ] || [ -n "$named" ]; }; th
     export CLAUDE_CODE_OAUTH_TOKEN="$tok"; unset tok
   fi
   if multi_account; then tag=",account=$account"; fi
-  if [ -n "$cfg" ] && [ ! -s "$top/.ai-toolkit/spoke-run-id" ] && [ -f "$HOME/.claude.json" ]; then   # the user-scope MCP servers live in ~/.claude.json, which a config directory does not read: a session of the human gets them from here (a worker has only the toolkit's list)
+  if [ -n "$cfg" ] && [ ! -s "$top/.ai-toolkit/spoke-run-id" ] && [ -f "$HOME/.claude.json" ]; then   # the user-scope MCP servers live in ~/.claude.json, which a config directory does not read: a session of the human gets them from here (a worker has only the toolkit's list).
+    # A file, not a process substitution: the fd does not survive the `exec` below. It is a mode-0600 copy of what ~/.claude.json already holds, rewritten at each start (a revoked key stays in it until then).
     (umask 077; t="$(mktemp "$cfg/aitk-user-mcp.XXXXXX")" && jq -c '{mcpServers: (.mcpServers // {})}' "$HOME/.claude.json" > "$t" && mv "$t" "$cfg/aitk-user-mcp.json") || die "cannot write $cfg/aitk-user-mcp.json"
     set -- --mcp-config "$cfg/aitk-user-mcp.json" "$@"
   fi

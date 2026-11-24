@@ -160,7 +160,7 @@ record_dispatch() {   # <run> <dispatch> <issue>
 # The one detection of this stop: the account failover (#556) and the model fallback (#551) both use it, so a change in Orca's wording is fixed in one place (until then the stop blocks the issue as any escalation does).
 usage_limit_reset() {
   local re='resets ([0-9]{1,2}(:[0-9]{2})?[ap]m( \([A-Za-z0-9_/+-]+\))?)'
-  [[ $1 == *"Claude hit its usage limit"* ]] || return 1
+  [[ $1 == "Error: Claude hit its usage limit."* ]] || return 1   # Orca's own prefix: what follows ("Details from the agent: ...") is the agent's text, and a worker quoting the phrase must not move an account
   if [[ $1 =~ $re ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
   return 0
 }
@@ -172,7 +172,7 @@ reset_epoch() {
     h=$((10#${BASH_REMATCH[1]} % 12)); m=$((10#${BASH_REMATCH[3]:-0})); z="${BASH_REMATCH[5]}"; [ "${BASH_REMATCH[4]}" != pm ] || h=$((h + 12))
     read -r hh mm ss <<< "$(TZ="$z" date '+%H %M %S')"   # the zone's time of day now
     delta=$((h * 3600 + m * 60 - (10#$hh * 3600 + 10#$mm * 60 + 10#$ss)))
-    [ "$delta" -gt 0 ] || delta=$((delta + 86400))
+    if [ "$delta" -le -900 ]; then delta=$((delta + 86400)); elif [ "$delta" -le 0 ]; then delta=300; fi   # passed by under 15 minutes: the loop read the message late, the reset is now (a short hold), not tomorrow's
     printf '%s' $((now + delta))
   else printf '%s' $((now + 3600)); fi
 }
