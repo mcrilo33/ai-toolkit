@@ -71,9 +71,7 @@ cw="$c"; wl='[[:alnum:]_./+@%:-]'; ta='([^[:alnum:]_./+@%:$`*?[{~-]|$)' # cw: c 
 done < <(printf '%s\n' "$c" | grep -oE "/$wl*\.ai-toolkit/$wl*" || :)
 bw=""; if [[ $c =~ ($va)($p) ]] || { [ -n "$spoke" ] && { [[ $cw =~ ($va)($ft) ]] || [[ $c =~ $sy ]] || [[ $c =~ AI_TOOLKIT_ALLOW_BASE_COMMIT ]] || { [[ $c =~ AI_TOOLKIT_DIR ]] && [[ $c =~ $w ]]; }; }; }; then bw="a protected path, sync.sh or the base-commit switch (orca.yaml, claude settings/hooks, the toolkit's guards)"; fi
 if [[ $c =~ ($va)($pre\.github/workflows) ]]; then bw="${bw:+$bw and }.github/workflows"; fi
-[ -z "$bw" ] || sens "write to $bw: ${cmd:0:200}"
-ks='(^|[^[:alnum:]_.-])security[[:space:]]+' # a Claude account token (#556): the launcher reads it from the Keychain for the session, a worker's own Bash must not (it would land in its transcript and the OTel logs)
-if [ -n "$spoke" ] && { [[ $c =~ ${ks}dump-keychain ]] || { [[ $c =~ ${ks}(find|delete)-(generic|internet)-password ]] && [[ $c =~ CLAUDE_OAUTH_TOKEN ]]; }; }; then sens "read of a Claude account token from the Keychain (security): ${cmd:0:200}"; fi
+[ -z "$bw" ] || sens "write to $bw: ${cmd:0:200}"; ks='(^|[^[:alnum:]_.-])security[[:space:]]+'; if [ -n "$spoke" ] && { [[ $c =~ ${ks}dump-keychain ]] || { [[ $c =~ ${ks}(find|delete)-(generic|internet)-password ]] && [[ $c =~ CLAUDE_OAUTH_TOKEN ]]; }; }; then sens "read of a Claude account token from the Keychain (security): ${cmd:0:200}"; fi # the Keychain rule (#556): the launcher reads a Claude account token for the session, a worker's own Bash must not (it would land in its transcript and the OTel logs)
 
 target() { # one `rm -r` target: inside the worktree, or strictly below a temp root
   local p="$1" v; for v in HOME TMPDIR; do p="${p/#\$$v/${!v:-}}"; p="${p/#\$\{$v\}/${!v:-}}"; done
