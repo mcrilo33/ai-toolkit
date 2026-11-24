@@ -98,7 +98,7 @@ def isolated_env(monkeypatch, tmp_path):
 def stubs(monkeypatch, tmp_path, link_script):
     d = tmp_path / "stubs"
     (d / "bin").mkdir(parents=True)
-    for name in ("orca", "gh", "claude", "security"):
+    for name in ("orca", "gh", "claude"):
         link_script(d / "bin" / name, STUB)
     monkeypatch.setenv("STUB_DIR", str(d))
     monkeypatch.setenv("PATH", f"{d / 'bin'}:{os.environ['PATH']}")
