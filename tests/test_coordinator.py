@@ -1247,6 +1247,31 @@ def test_a_decision_whose_reply_is_queued_in_the_spool_is_never_handed_over(C, t
     assert r.returncode == 0 and C.spooled("msg_a") and bodies == []
 
 
+def test_attended_never_hands_over_a_blocked_issue_a_dispatch_request_re_dispatched_before_its_delay(C, tmp_path):   # #564: the label removed by the request must reach the list the hand-over reads, whatever else the loop is busy with
+    C.stubs.reply("gh.issue_list", BLOCKED, n=1)   # wake 1 lists #1 blocked; the request cannot run yet (the worktrees are unreadable), so it keeps its file
+    C.stubs.reply("gh.issue_list", "[]")
+    C.stubs.reply("gh.issue_view", issue_json(labels=["blocked"]), n=1)
+    C.stubs.reply("gh.issue_view", issue_json(labels=["blocked"]), n=2)   # wake 2: the request is read blocked, runs, and removes the label; later reads see no label
+    C.stubs.reply("gh.issue_view", issue_json())
+    C.stubs.reply("orca.worktree_list", "boom", rc=1, n=1)
+    C.workers()
+    (tmp_path / "state/run_t/requests").mkdir(parents=True)
+    (tmp_path / "state/run_t/requests/1").write_text("go on\n")
+    C.stubs.reply("orca.orchestration_check", EMPTY, rc=1, n=1)   # wake 1 fails: the loop sleeps AI_TOOLKIT_POLL, which is what makes the issue a second old
+    C.stubs.reply("orca.orchestration_check", EMPTY)
+    r, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=1, AI_TOOLKIT_POLL=1)
+    assert r.returncode == 0 and any("dispatched #1 on request" in ln for ln in (tmp_path / "state/run_t/loop.log").read_text().splitlines())   # the request did run
+    assert bodies == [] and not (tmp_path / "state/run_t/handed").read_text().split()
+
+
+def test_away_never_posts_a_blocked_issue_whose_label_was_removed_by_hand_since_it_was_listed(C, tmp_path):
+    C.stubs.reply("gh.issue_list", BLOCKED)   # the list is read only after a sweep or a block: it is stale until then
+    C.stubs.reply("gh.issue_view", issue_json())
+    r, bodies, _ = posted(C, tmp_path)
+    assert r.returncode == 0 and bodies == []
+    assert not [b for b in bodies if b["event"] == "blocked"] and C.calls("gh issue view")
+
+
 def test_a_decision_handed_over_is_left_out_of_the_queue_the_session_presents(C, tmp_path):
     aged(C, msg_a=700)
     C.stubs.reply("gh.issue_list", BLOCKED)
