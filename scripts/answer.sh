@@ -17,6 +17,7 @@ if [ -z "$rule" ]; then   # the one place of this install layout, never a path a
 fi
 [ -f "$rule" ] || die "answer rule (afk-answering.md) not found"
 case "${ANSWER_MODE:-auto}" in auto | attended) mode="${ANSWER_MODE:-auto}" ;; *) die "ANSWER_MODE takes auto or attended" ;; esac   # a typo must not turn into the mode that always answers
+spend="${SPEND_APPROVE_USD:-}"; [[ $spend =~ ^[0-9]+$ ]] || spend=0   # from load_env only; a non-number fails closed: no spend is auto-approved
 q="$(cat)"; t="${q#"${q%%[![:space:]]*}"}"   # a worker's permission prompt (permission-relay.sh) is never answered here: the loop denies it, only the user allows it
 [[ $t != "PERMISSION REQUEST"* ]] || die "a permission question is never auto-answered (the coordinator denies it; only the user can allow it)"
 # The answerer judges the issue as it is now, from GitHub, and puts its text in the prompt. The number comes from Orca's link only (the worker can rewrite
@@ -29,7 +30,8 @@ q="$q
 Issue #$n (the only contract, as fetched now; never a task.md in the worktree):
 $issue
 
-Mode: $mode"   # the answerer's own last line, written here and never from the worker: the rule keys on it (attended = the loop's routine test and a hand-over, auto = always answer)
+Mode: $mode
+Spend auto-approve: below $spend USD"   # the answerer's own last two lines, written here and never from the worker: the rule keys on them (attended = the loop's routine test and a hand-over, auto = always answer; spend = the priced total below which a spend raise is routine)
 out="$(cd "$wt" && printf '%s' "$q" | CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 claude -p --model "$ANSWER_MODEL" --append-system-prompt-file "$rule" --allowedTools Read,Grep,Glob \
   --setting-sources "" --strict-mcp-config --settings '{"autoMemoryEnabled":false}' --no-session-persistence)" || die "claude failed"
 last="$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 1)"
