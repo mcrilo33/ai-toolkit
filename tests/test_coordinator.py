@@ -1160,6 +1160,7 @@ def posted(C, tmp_path, *args, rcs=(), pos="away", **env):   # one loop run in a
 def test_away_posts_each_decision_the_loop_leaves_open_once_with_ids_only_and_types_nothing(C, tmp_path, kind):
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)   # a plan answer.sh hands over: its reason is the answerer's text, never sent
     C.stubs.reply("gh.issue_list", BLOCKED if kind == "blocked" else "[]")
+    C.stubs.reply("gh.issue_view", issue_json(labels=["blocked"]))   # announce() reads the label of a blocked issue before the POST
     mid = {"plan": "msg_a", "permission_request": "msg_pa"}.get(kind)
     if mid:
         ticks([], [mid])   # the plan text of ticks() is hostile (control bytes, a shell command)
@@ -1226,6 +1227,7 @@ HANDOVER = {   # one run per settings: (the open decisions and their age in seco
 def test_attended_hands_an_unanswered_decision_over_to_the_webhook_once_after_its_delay_and_not_before(C, tmp_path, open_, settings, posts):
     aged(C, **open_)
     C.stubs.reply("gh.issue_list", BLOCKED if settings.pop("BLOCKED", 0) else "[]")
+    C.stubs.reply("gh.issue_view", issue_json(labels=["blocked"]))
     r, bodies, seen = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=3, **settings)   # three wakes: handed over once, not at each
     by_id = lambda b: b.get("message_id", "")  # noqa: E731
     assert r.returncode == 0 and sorted(bodies, key=by_id) == sorted([handed(**p) for p in posts], key=by_id) and URL not in seen
@@ -1261,20 +1263,20 @@ def test_attended_never_hands_over_a_blocked_issue_a_dispatch_request_re_dispatc
     C.stubs.reply("orca.orchestration_check", EMPTY)
     r, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=1, AI_TOOLKIT_POLL=1)
     assert r.returncode == 0 and any("dispatched #1 on request" in ln for ln in (tmp_path / "state/run_t/loop.log").read_text().splitlines())   # the request did run
-    assert bodies == [] and not (tmp_path / "state/run_t/handed").read_text().split()
+    assert bodies == [] and not (tmp_path / "state/run_t/handed").exists()
 
 
 def test_away_never_posts_a_blocked_issue_whose_label_was_removed_by_hand_since_it_was_listed(C, tmp_path):
     C.stubs.reply("gh.issue_list", BLOCKED)   # the list is read only after a sweep or a block: it is stale until then
     C.stubs.reply("gh.issue_view", issue_json())
     r, bodies, _ = posted(C, tmp_path)
-    assert r.returncode == 0 and bodies == []
-    assert not [b for b in bodies if b["event"] == "blocked"] and C.calls("gh issue view")
+    assert r.returncode == 0 and bodies == [] and C.calls("gh issue view")   # the label was read before the POST
 
 
 def test_a_decision_handed_over_is_left_out_of_the_queue_the_session_presents(C, tmp_path):
     aged(C, msg_a=700)
     C.stubs.reply("gh.issue_list", BLOCKED)
+    C.stubs.reply("gh.issue_view", issue_json(labels=["blocked"]))
     _, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=0)   # the plan and the blocked issue are both handed over
     assert [b["event"] for b in bodies] == ["plan", "blocked"] and not C.calls("orca terminal send")   # and the session is told nothing about them
     assert (tmp_path / "state/run_t/handed").read_text().split() == ["q:msg_a", "b:1"]
