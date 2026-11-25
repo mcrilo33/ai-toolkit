@@ -201,7 +201,7 @@ watch_queue() {   # $1 poll number: one look at the queue (#473). Sets $found to
   local all="" i k f b first=1 now=""; lm="$(live_hold ne "")" || lm=""
   if [ "$bok" = 0 ] || [ $(($1 % ${COORD_WATCH_GH_EVERY:-12})) -eq 0 ]; then b="$(blocked_q | cut -f1 | sed 's/^/b:/')" || return 1; f="$(round_q | cut -f1 | sed 's/^/f:/')" || return 1; bids="$b"$'\n'"$f"; bok=1; fi   # gh is read every COORD_WATCH_GH_EVERY polls, not every poll
   all="$(queue_ids | tr '\n' ' ')" || return 1
-  for f in "$(spool_dir "$run")/requests"/*; do [ ! -f "$f" ] || [ -z "$(sed -n 2p "$f")" ] || all="$all r:${f##*/} "; done   # a dispatch request with a refusal reason
+  for f in "$(spool_dir "$run")/requests"/*; do [ ! -f "$f" ] || case "$(sed -n 2p "$f")" in "" | "waiting: "*) ;; *) all="$all r:${f##*/} " ;; esac; done   # a dispatch request refused for a reason the human must act on; one that only waits (named(): "waiting: ") starts on its own
   all=" $all"; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || all="${all/ [qp]:${f##*/} / }"; done   # a decision answered with --reply stays open in Orca until the loop's next wake: it is no longer waiting
   if [ -z "$started" ]; then started=1; seen="$all"; [ "$seen_given" = 0 ] || { seen=""; for i in $all; do case " $seen_arg " in *" ${i#?:} "*) seen="$seen$i " ;; esac; done; }; fi
   for i in $seen; do case "$i" in f:*) continue ;; esac; case " $all " in *" $i "*) first=0 ;; esac; done   # a round kept for later is parked, it must not silence the next wake
@@ -535,8 +535,8 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
       r="$(jq -r --arg p "::$path" '[.result.workers[] | select(.dispatchStatus == "dispatched" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty' <<< "$all")"; live="$(nlive <<< "$all")"
       if [ -n "$path" ] && [ -n "$r" ]; then
         [ -n "$spec" ] || { log "dispatch request for #$n dropped: already running (dispatch $r)"; rm -f "$f"; continue; }   # a plain request is met: the issue runs, whoever started it
-        why="a worker is still live on the worktree (dispatch $r): it starts once that worker ends"   # a message asks to replace it: kept, shown by --status, waked on by --wait
-      elif [ "$live" -ge "$cap" ]; then why="waiting for a free slot (cap $cap)"; fi
+        why="waiting: a worker is still live on the worktree (dispatch $r): it starts once that worker ends"   # a message asks to replace it: kept and shown by --status; a "waiting: " reason is no decision, --wait does not wake on it
+      elif [ "$live" -ge "$cap" ]; then why="waiting: for a free slot (cap $cap)"; fi
     fi
     [ -n "$why" ] || [ -n "$path" ] || [ -z "$spec" ] || why="no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"
     if [ -z "$why" ]; then   # a kept worktree is re-dispatched (--address, a default message when none was given); none yet: dispatch.sh --next <n> starts it only if it is ready (its rule: hold, blocked, in flight, Scope)
@@ -548,7 +548,7 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
         ! jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null || gh issue edit "$n" --remove-label blocked > /dev/null 2>&1 || warn "cannot remove the blocked label of #$n"
         log "dispatched #$n on request"; rm -f "$f"; continue
       fi
-      why="$(tail -n 1 <<< "$out")"; if [ "$rc" = 3 ]; then why="$why (dispatch.sh exit 3)"; else why="dispatch failed: $why"; fi   # a refusal is dispatch.sh's own words and is asked again at the next wake
+      why="$(tail -n 1 <<< "$out")"; if [ "$rc" = 3 ]; then why="waiting: $why (dispatch.sh exit 3)"; else why="dispatch failed: $why"; fi   # a refusal is dispatch.sh's own words and is asked again at the next wake
     fi
     printf '%s\n%s\n' "$spec" "$why" > "$f"
   done
