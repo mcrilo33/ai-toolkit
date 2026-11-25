@@ -66,6 +66,7 @@ def test_gh_binary_can_be_swapped_by_env_for_stubbed_runs(run, stubs, tmp_path, 
     assert stubs.calls("gh") == [["issue", "view", "4"]]
 
 
+HOLD = 3601   # the one-hour hold reads its own bare +%s, which the fake answers a second after the combined read
 NOV25 = "2026 11 25"   # the zone's calendar date in the faked clock below (the time-of-day cases never read it)
 
 
@@ -73,7 +74,7 @@ NOV25 = "2026 11 25"   # the zone's calendar date in the faked clock below (the 
     ("6pm (Europe/Paris)", "12 00 00", 6 * 3600, NOV25), ("6:30pm (Europe/Paris)", "12 00 00", 6 * 3600 + 1800, NOV25),   # later today, in the zone's own clock
     ("6pm (Europe/Paris)", "18 00 30", 300, NOV25),   # the reset passed while the loop read the message: stale, a short hold, never tomorrow's 6pm
     ("6pm (Europe/Paris)", "23 00 00", 19 * 3600, NOV25), ("12am (Europe/Paris)", "23 00 00", 3600, NOV25), ("12pm (Europe/Paris)", "11 00 00", 3600, NOV25),   # long past or midnight: the next one
-    ("soon", "12 00 00", 3600, NOV25), ("6pm (Nowhere/Land)", "12 00 00", 3600, NOV25), ("13pm (Europe/Paris)", "12 00 00", 3600, NOV25),   # unreadable: a one-hour hold, never unbounded
+    ("soon", "12 00 00", HOLD, NOV25), ("6pm (Nowhere/Land)", "12 00 00", HOLD, NOV25), ("13pm (Europe/Paris)", "12 00 00", HOLD, NOV25),   # unreadable: a one-hour hold, never unbounded
     ("Nov 28, 6pm (Europe/Paris)", "12 00 00", 3 * 86400 + 6 * 3600, NOV25),   # #565: a dated reset (a weekly limit): days ahead in the zone's own calendar
     ("Dec 1, 6:30pm (Europe/Paris)", "12 00 00", 2 * 86400 + 6 * 3600 + 1800, "2026 11 29"),   # across a month end
     ("Jan 2, 6pm (Europe/Paris)", "12 00 00", 3 * 86400 + 6 * 3600, "2026 12 30"),   # across the year end: next year's date
@@ -81,10 +82,10 @@ NOV25 = "2026 11 25"   # the zone's calendar date in the faked clock below (the 
     ("Nov 25, 6pm (Europe/Paris)", "12 00 00", 6 * 3600, NOV25),   # the same day, later
     ("Nov 25, 6pm (Europe/Paris)", "18 00 30", 300, NOV25), ("Nov 20, 6pm (Europe/Paris)", "12 00 00", 300, NOV25),   # a dated reset already passed: the short hold, never next year's
     ("Dec 31, 6pm (Europe/Paris)", "12 00 00", 300, "2027 01 01"),   # December's date read in January: passed, not next December
-    ("Foo 28, 6pm (Europe/Paris)", "12 00 00", 3600, NOV25), ("Nov 40, 6pm (Europe/Paris)", "12 00 00", 3600, NOV25),   # unreadable date: a one-hour hold
+    ("Foo 28, 6pm (Europe/Paris)", "12 00 00", HOLD, NOV25), ("Nov 40, 6pm (Europe/Paris)", "12 00 00", HOLD, NOV25),   # unreadable date: a one-hour hold
 ])
 def test_reset_epoch_is_the_next_reset_in_the_zone_and_never_an_unbounded_hold(run, text, hms, seconds, ymd):
-    fake = 'date() { case "$1" in +%s) echo 1000000;; "+%Y %m %d") echo "$YMD";; *) echo "$HMS";; esac; }'   # now = 1000000, the zone's clock = $HMS on $YMD
+    fake = 'date() { case "$1" in +%s) echo 1000001;; "+%s %H %M %S %Y %m %d") echo "1000000 $HMS $YMD";; *) return 1;; esac; }'   # one call answers the instant, the zone's clock = $HMS on $YMD; a bare +%s is a second later: only the fallbacks read it
     r = lib(run, f'{fake}; echo $(( $(reset_epoch "$T") - 1000000 ))', T=text, HMS=hms, YMD=ymd)
     assert r.returncode == 0 and r.stdout.strip() == str(seconds), r.stderr
 
