@@ -80,6 +80,7 @@ NOV25 = "2026 11 25"   # the zone's calendar date in the faked clock below (the 
     ("Mar 1, 6pm (Europe/Paris)", "12 00 00", 2 * 86400 + 6 * 3600, "2028 02 28"),   # a leap year has a 29 February
     ("Nov 25, 6pm (Europe/Paris)", "12 00 00", 6 * 3600, NOV25),   # the same day, later
     ("Nov 25, 6pm (Europe/Paris)", "18 00 30", 300, NOV25), ("Nov 20, 6pm (Europe/Paris)", "12 00 00", 300, NOV25),   # a dated reset already passed: the short hold, never next year's
+    ("Dec 31, 6pm (Europe/Paris)", "12 00 00", 300, "2027 01 01"),   # December's date read in January: passed, not next December
     ("Foo 28, 6pm (Europe/Paris)", "12 00 00", 3600, NOV25), ("Nov 40, 6pm (Europe/Paris)", "12 00 00", 3600, NOV25),   # unreadable date: a one-hour hold
 ])
 def test_reset_epoch_is_the_next_reset_in_the_zone_and_never_an_unbounded_hold(run, text, hms, seconds, ymd):
