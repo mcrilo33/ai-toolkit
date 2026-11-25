@@ -14,11 +14,11 @@ V2 = ROOT / "v2" if (ROOT / "v2").is_dir() else ROOT  # cutover.sh moves v2/* to
 # records argv (US-separated) + env; replays <name>.<arg1>_<arg2>.<call#> > <name>.<arg1>_<arg2> > <name>
 STUB = """#!/bin/bash
 n=${0##*/}; d=$STUB_DIR; [ -n "$STUB_NOENV" ] || env > "$d/$n.env"
-printf '%s' "$n" >> "$d/calls.log"; for a in "$@"; do printf '\\037%s' "$a" >> "$d/calls.log"; done; echo >> "$d/calls.log"
+{ printf '%s' "$n"; for a in "$@"; do printf '\\037%s' "$a"; done; echo; } >> "$d/calls.log"
 k="$1_$2"; k="$n.${k//[^A-Za-z0-9_]/_}"; c=0; [ -f "$d/$k.count" ] && read -r c < "$d/$k.count"; c=$((c + 1)); echo $c > "$d/$k.count"
 [[ "$n $1" != "orca orchestration" || " worker-list worker-show run-show run-current task-list check run-create " != *" $2 "* || " $* " == *" --full "* || " $* " == *" --ack "* ]] \\
   || { printf '{"error":{"code":"concise_view"}}\\n'; exit 1; }   # Orca >= 1.4.246 prints these reads, and run-create, in a concise view without the parsed fields unless --full (#515, #539)
-for f in "$d/$k.$c" "$d/$k" "$d/$n"; do   # builtins only: a stub call costs one process, since the suite is bound by spawning
+for f in "$d/$k.$c" "$d/$k" "$d/$n"; do   # builtins only: a stub call costs one process and one open of calls.log (the record is one redirection), since the suite is bound by spawning and each open goes through the endpoint-security agent
   [ -f "$f" ] || continue; IFS= read -r -d '' out < "$f"; printf '%s' "$out"; rc=0; [ -f "$f.rc" ] && read -r rc < "$f.rc"; exit "$rc"
 done; exit 0
 """
