@@ -325,9 +325,10 @@ block() {   # $1 = why. Label, comment, flag (log, worktree comment), free the s
   bdirty=1; comment "$issue" "blocked: $1"; log "#$issue blocked: $1"; flag "$wtp" "BLOCKED #$issue: ${1:0:80}"; release "$disp"
 }
 redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds are spent. A fresh terminal and a NEW Task (dispatch.sh --address):
-  local r out; r="$(rounds)" || { block "cannot count the rounds: Orca did not answer"; return 0; }   # worker-start refuses --task with --spec, and Orca refuses a new task on the idle two-step terminal
+  local r out m=() ran; r="$(rounds)" || { block "cannot count the rounds: Orca did not answer"; return 0; }   # worker-start refuses --task with --spec, and Orca refuses a new task on the idle two-step terminal
   [ "$r" -lt "$1" ] || { block "$3"; return 0; }
-  out="$(RUN="$run" "$DISPATCH_CMD" --address "$2" "$issue" 2>&1)" || { warn "re-dispatch: $out"; block "re-dispatch failed"; return 0; }
+  ran="$(head -n 1 "$sd/model/$disp" 2> /dev/null)"; [ -z "$ran" ] || [ "$ran" != "${FALLBACK_MODEL:-}" ] || m=(--model "$FALLBACK_MODEL")   # #566: an automatic round stays on the fallback the dispatch ran on (the footer model is at its limit); named() keeps the footer model
+  out="$(RUN="$run" "$DISPATCH_CMD" --address "$2" ${m[@]+"${m[@]}"} "$issue" 2>&1)" || { warn "re-dispatch: $out"; block "re-dispatch failed"; return 0; }
   [ -z "$term" ] || orca terminal close --terminal "$term" --json > /dev/null 2>&1 || true   # the old, idle terminal; an empty --terminal would close the caller's active one
   comment "$issue" "round $((r + 1)): $2"
 }
@@ -486,11 +487,11 @@ bgwait_record() {   # the first escalation of a wait sets its record; a repeat d
 }
 # model_fallback <why> <escalation body> [account]: #551. A usage-limit stop the account failover could not absorb relaunches the same task, once per issue, on FALLBACK_MODEL (the limit is per model: the same account still serves the other one,
 # so it is named again, also when it was just marked exhausted). The model the stopped dispatch ran with is the loop's own record (dispatch.sh, model/<dispatch>): none, or any dispatch of the issue already on FALLBACK_MODEL (one per issue, whichever dispatch it was), is today's block. The relaunch is a failover
-# in the spool (dispatch.sh), so rounds() does not count it. The same check for REVIEW_MODEL/ANSWER_MODEL (review.sh, answer.sh) is not done here.
+# in the spool (dispatch.sh), so rounds() does not count it. An automatic --address round (redispatch()) stays on the fallback, so a usage-limit stop there blocks; a human-requested round (named()) starts on the footer model. The same check for REVIEW_MODEL/ANSWER_MODEL (review.sh, answer.sh) is not done here.
 model_fallback() {
   local ran acct=() f used=0
   ran="$(head -n 1 "$sd/model/$disp" 2> /dev/null)"
-  for f in "$sd"/model/*; do if [ -f "$f" ] && [ "$(head -n 1 "$f")" = "${FALLBACK_MODEL:-}" ] && [ "$(recorded_issue "$run" "${f##*/}")" = "$issue" ]; then used=1; fi; done   # any dispatch of this issue, not only the stopped one: an --address round starts on the footer model again
+  for f in "$sd"/model/*; do if [ -f "$f" ] && [ "$(head -n 1 "$f")" = "${FALLBACK_MODEL:-}" ] && [ "$(recorded_issue "$run" "${f##*/}")" = "$issue" ]; then used=1; fi; done   # any dispatch of this issue, not only the stopped one: an automatic --address round keeps the fallback (redispatch()), so it counts as the one used
   if [ -z "${FALLBACK_MODEL:-}" ] || [ -z "$ran" ] || [ "$used" = 1 ]; then block "$1${2:+: $2}"; return 0; fi
   ! multi_account || ! account_listed "$3" || acct=(--account "$3")
   release "$disp"; [ -z "$term" ] || orca terminal close --terminal "$term" --json > /dev/null 2>&1 || true   # the dead agent's terminal

@@ -135,7 +135,7 @@ dispatch() {
   model="${model:-$SPOKE_MODEL}"; effort="${effort:-$SPOKE_EFFORT}"
   case "$model_opt" in *[!A-Za-z0-9._-]*) die "bad Model '--model $model_opt'" ;; esac
   if [ -n "$model_opt" ]; then model="$model_opt"
-  elif [ -n "$retry_of" ] && _dispatch_id_ok "$retry_of"; then local kept=""; read -r kept < "$(spool_dir "$run")/model/$retry_of" 2> /dev/null || true; model="${kept:-$model}"; fi   # the model recorded for the dispatch this one replaces: a plain relaunch after a fallback must not go back to the model at its limit (an --address round starts on the footer model: coordinator.sh's model_fallback counts the issue's dispatches)
+  elif [ -n "$retry_of" ] && _dispatch_id_ok "$retry_of"; then local kept=""; read -r kept < "$(spool_dir "$run")/model/$retry_of" 2> /dev/null || true; model="${kept:-$model}"; fi   # the model recorded for the dispatch this one replaces: a plain relaunch after a fallback must not go back to the model at its limit (an --address round starts on the footer model unless --model names one: coordinator.sh's redispatch() keeps the fallback for an automatic round, named() leaves a human-requested one on the footer)
   # The model/effort end up in a shell command typed into a terminal: allow nothing but id characters.
   case "$model$effort" in *[!A-Za-z0-9._-]*) die "issue $n: bad Model footer '$model $effort'" ;; esac
   land="$(issue_footer "$body" Land | LC_ALL=C tr -d '[:space:]' | LC_ALL=C tr '[:upper:]' '[:lower:]')"; land="${land:-auto}"
