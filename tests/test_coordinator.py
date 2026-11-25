@@ -1188,23 +1188,25 @@ def handed(**kw):
     return {"repo": "o/r", "issue": 1, "run": "run_t", "position": "attended", "handed_over": True, **kw}
 
 
-HANDOVER = {   # (the open decisions and their age in seconds, the settings, the one POST it is handed over with, or None)
-    "plan-past-its-delay": ({"msg_a": 700}, {}, {"event": "plan", "message_id": "msg_a"}), "plan-before-its-delay": ({"msg_a": 400}, {}, None),
-    "plan-delay-overridden": ({"msg_a": 400}, {"HANDOVER_PLAN_S": 300}, {"event": "plan", "message_id": "msg_a"}),
-    "permission-past-its-shorter-delay": ({"msg_pb": 400}, {}, {"event": "permission_request", "message_id": "msg_pb"}), "permission-before-its-delay": ({"msg_pb": 200}, {}, None),
-    "permission-delay-overridden": ({"msg_pb": 200}, {"HANDOVER_PERMISSION_S": 100}, {"event": "permission_request", "message_id": "msg_pb"}),
-    "blocked-issue-after-the-plan-delay": ({}, {"HANDOVER_PLAN_S": 0, "BLOCKED": 1}, {"event": "blocked"}), "blocked-issue-before-it": ({}, {"BLOCKED": 1}, None),
-    "no-webhook": ({"msg_a": 700}, {"NOTIFY_WEBHOOK_URL": ""}, None),
+HANDOVER = {   # one run per settings: (the open decisions and their age in seconds, the settings, the POSTs they are handed over with, once each)
+    "default-delays": ({"msg_a": 700, "msg_b": 400, "msg_pc": 400, "msg_pd": 200}, {"BLOCKED": 1},   # a plan past its delay, one before it; a permission request past its shorter delay, one before it; a blocked issue before the plan delay
+                       [{"event": "plan", "message_id": "msg_a"}, {"event": "permission_request", "message_id": "msg_pc"}]),
+    "delays-overridden": ({"msg_a": 400, "msg_pb": 200}, {"HANDOVER_PLAN_S": 300, "HANDOVER_PERMISSION_S": 100},
+                          [{"event": "plan", "message_id": "msg_a"}, {"event": "permission_request", "message_id": "msg_pb"}]),
+    "blocked-issue-after-the-plan-delay": ({}, {"HANDOVER_PLAN_S": 0, "BLOCKED": 1}, [{"event": "blocked"}]),
+    "no-webhook": ({"msg_a": 700}, {"NOTIFY_WEBHOOK_URL": ""}, []),
 }
 
 
-@pytest.mark.parametrize(("open_", "settings", "post"), HANDOVER.values(), ids=list(HANDOVER))
-def test_attended_hands_an_unanswered_decision_over_to_the_webhook_once_after_its_delay_and_not_before(C, tmp_path, open_, settings, post):
+@pytest.mark.parametrize(("open_", "settings", "posts"), HANDOVER.values(), ids=list(HANDOVER))
+def test_attended_hands_an_unanswered_decision_over_to_the_webhook_once_after_its_delay_and_not_before(C, tmp_path, open_, settings, posts):
     aged(C, **open_)
     C.stubs.reply("gh.issue_list", BLOCKED if settings.pop("BLOCKED", 0) else "[]")
     r, bodies, seen = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=3, **settings)   # three wakes: handed over once, not at each
-    assert r.returncode == 0 and bodies == ([handed(**post)] if post else []) and URL not in seen
-    assert (tmp_path / "state/run_t/handed").exists() == bool(post)
+    by_id = lambda b: b.get("message_id", "")  # noqa: E731
+    assert r.returncode == 0 and sorted(bodies, key=by_id) == sorted([handed(**p) for p in posts], key=by_id) and URL not in seen
+    handed_ids = (tmp_path / "state/run_t/handed").read_text().split() if posts else []
+    assert (tmp_path / "state/run_t/handed").exists() == bool(posts) and len(handed_ids) == len(posts)
 
 
 def test_a_decision_that_leaves_the_queue_is_no_longer_listed_as_handed_over(C, tmp_path):   # an issue number comes back: a stale entry would hide the next decision of that number
