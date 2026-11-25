@@ -25,6 +25,8 @@ approach, test strategy, open questions) and `--options approve,revise`. The tes
 extended, the tests new, and the net count (`pytest-conventions`, Test economy). It blocks until the coordinator
 (`answer.sh` or the human) replies.
 
+Paid spend (eval draws, model calls, a raised spend cap) is priced in the plan, and in the round report if it changed; below `SPEND_APPROVE_USD` (the main checkout's `.ai-toolkit/ai-toolkit.local.env`, else its `.ai-toolkit/ai-toolkit.env`, not the worktree's; unreadable or not a number = 0) it needs no separate `ask`: carry on. A spend at or above it that only shows up mid-work is an `ask`.
+
 | Reply | You |
 |-------|-----|
 | `approve` | start the cycle |
