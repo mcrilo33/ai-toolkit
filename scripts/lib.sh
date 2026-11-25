@@ -175,25 +175,23 @@ _civil_days() {
 reset_epoch() {
   local re='^(([A-Z][a-z]{2}) ([0-9]{1,2}), )?([0-9]{1,2})(:([0-9]{2}))?([ap]m) \(([A-Za-z0-9_/+-]+)\)$' now h m z hh mm ss delta mon md=0 i y cm dom today days
   local -a months=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
-  now="$(date +%s)"
   if [[ $1 =~ $re ]] && [ -e "/usr/share/zoneinfo/${BASH_REMATCH[8]}" ] && [ "$((10#${BASH_REMATCH[4]}))" -ge 1 ] && [ "$((10#${BASH_REMATCH[4]}))" -le 12 ]; then
     h=$((10#${BASH_REMATCH[4]} % 12)); m=$((10#${BASH_REMATCH[6]:-0})); z="${BASH_REMATCH[8]}"; [ "${BASH_REMATCH[7]}" != pm ] || h=$((h + 12))
     mon="${BASH_REMATCH[2]}"; dom=$((10#${BASH_REMATCH[3]:-0}))
     if [ -n "$mon" ]; then
       for i in "${!months[@]}"; do if [ "${months[i]}" = "$mon" ]; then md=$((i + 1)); fi; done
-      if [ "$md" -eq 0 ] || [ "$dom" -lt 1 ] || [ "$dom" -gt 31 ]; then printf '%s' $((now + 3600)); return; fi
+      if [ "$md" -eq 0 ] || [ "$dom" -lt 1 ] || [ "$dom" -gt 31 ]; then printf '%s' $(($(date +%s) + 3600)); return; fi
     fi
-    read -r hh mm ss <<< "$(TZ="$z" date '+%H %M %S')"   # the zone's time of day now
+    read -r now hh mm ss y cm today <<< "$(TZ="$z" date '+%s %H %M %S %Y %m %d')"   # one call: the instant and the zone's clock and date at it, so a second ticking between reads cannot skew the reset
     delta=$((h * 3600 + m * 60 - (10#$hh * 3600 + 10#$mm * 60 + 10#$ss)))
     if [ -n "$mon" ]; then
-      read -r y cm today <<< "$(TZ="$z" date '+%Y %m %d')"   # the zone's date now
       days=$(( $(_civil_days "$y" "$md" "$dom") - $(_civil_days "$y" "$cm" "$today") ))
       if [ "$days" -lt -180 ]; then days=$(( $(_civil_days "$((y + 1))" "$md" "$dom") - $(_civil_days "$y" "$cm" "$today") ))   # January named in December
       elif [ "$days" -gt 180 ]; then days=-1; fi   # December's date read in January: passed, not next December
       delta=$((days * 86400 + delta)); [ "$delta" -gt 0 ] || delta=300   # a date already passed: the reset is now (a short hold), the time of day's roll to tomorrow does not apply
     elif [ "$delta" -le -900 ]; then delta=$((delta + 86400)); elif [ "$delta" -le 0 ]; then delta=300; fi   # passed by under 15 minutes: the loop read the message late, the reset is now (a short hold), not tomorrow's
     printf '%s' $((now + delta))
-  else printf '%s' $((now + 3600)); fi
+  else printf '%s' $(($(date +%s) + 3600)); fi
 }
 mark_exhausted() { local d; d="$(spool_dir "$1")/exhausted"; (umask 077; mkdir -p "$d"; printf '%s\n' "$3" > "$d/$2"); }   # <run> <account> <epoch of its reset>
 record_account() {   # <run> <dispatch> <account> [failover]: the account the loop launched a dispatch on (account/<d>); failover/<d> marks a relaunch that only moved to another account (coordinator.sh's rounds() leaves it out)
