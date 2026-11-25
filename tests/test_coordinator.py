@@ -106,6 +106,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
 
     stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": wt, "linkedIssue": 1, "branch": "refs/heads/1-x"}]}}))
     stubs.reply("orca.orchestration_run_create", '{"result":{"run":{"id":"run_new"}}}')
+    stubs.reply("orca.orchestration_run_show", '{"result":{"run":{"coordinator_handle":"term_c"}}}')   # the loop's own terminal holds the Run: every yield takes its normal path (an unreadable holder: test_a_failed_orca_read_never_ends_the_loop...[run_show])
     stubs.reply("orca.orchestration_task_list", json.dumps({"result": {"tasks": []}}))   # the titles rounds() reads: no human-requested round
     def inbox(open_ids=(), answered=(), replies_only=(), pad=0, noticed=()):   # the Run's inbox: unanswered questions wait for the human
         rows = [{**msg("question", i), "run_id": "run_t", "thread_id": i} for i in [*open_ids, *answered]]

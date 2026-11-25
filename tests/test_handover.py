@@ -61,6 +61,7 @@ def test_a_fenced_wait_ends_the_coordinator_with_exit_0_naming_the_new_holder_an
 
 def test_a_fence_with_an_unreadable_holder_still_exits_0(C):
     C.stubs.reply("orca.orchestration_check", '{"error":{"code":"consumer_fenced"}}', rc=1)
+    C.stubs.reply("orca.orchestration_run_show", "boom", rc=1)
     r = C.go(COORD_MAX_TICKS=5)
     assert r.returncode == 0 and "taken back by another terminal" in r.stdout and len(C.calls("orca orchestration check")) == 1
 
