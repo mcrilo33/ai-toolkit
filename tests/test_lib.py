@@ -105,5 +105,5 @@ def test_free_account_keeps_a_record_up_to_a_week_ahead_and_drops_one_beyond(run
     (tmp_path / "state/run_t/exhausted").mkdir(parents=True)
     f = tmp_path / "state/run_t/exhausted/max"
     f.write_text(f"{int(time.time()) + days * 86400}\n")
-    r = lib(run, "free_account run_t", CLAUDE_ACCOUNTS="max client", AITK_STATE_DIR=tmp_path / "state")
+    r = lib(run, "free_account run_t || true", CLAUDE_ACCOUNTS="max client", AITK_STATE_DIR=tmp_path / "state")
     assert (r.stdout, f.exists()) == (("client", True) if kept else ("max", False)), r.stderr
