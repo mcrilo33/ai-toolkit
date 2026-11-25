@@ -297,7 +297,7 @@ rm_wt() {   # <n>: remove the half-made worktree a failed fresh dispatch may lea
 nlive() { jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length'; }   # the workers of one wl reply that are live
 rounds() {   # dispatches of the worktree since its last human-requested round (a task titled "#<n> round", see named()), else all of them - 1; a relaunch shares its task, so the base is that task's oldest dispatch
   local hr f fo=""; hr="$(okread orchestration task-list --run "$run" --brief --full | jq -c '[.result.tasks[] | select(.task_title | test("^#[0-9]+ round$")) | .id]')" || return 1
-  for f in "$sd"/failover/*; do [ ! -f "$f" ] || fo="$fo${f##*/}"$'\n'; done   # a failover (dispatch.sh --retry-of ... --account, #556) only moved the task to another account: it is no spent relaunch, and the loop knows it from its own spool alone
+  for f in "$sd"/failover/*; do [ ! -f "$f" ] || fo="$fo${f##*/}"$'\n'; done   # a failover (dispatch.sh --retry-of ... --account, #556, or --model, #551) only moved the task to another account or model: it is no spent relaunch, and the loop knows it from its own spool alone
   fo="$(printf %s "$fo" | jq -Rsc 'split("\n") | map(select(. != ""))')"
   wl | jq --arg p "::$wtp" --argjson h "$hr" --argjson fo "$fo" '[.result.workers[] | select((.resource.worktreeId // "") | endswith($p)) | select(.dispatchId as $d | $fo | index($d) | not)] as $w   # worker-list is newest first
     | ([$w[] | select(.taskId as $t | $h | index($t))][0].taskId) as $t
@@ -470,24 +470,37 @@ bgwait_record() {   # the first escalation of a wait sets its record; a repeat d
   local w age; w="$(bgwaited "$disp")"; read -r age _ <<< "$(silent "$disp" || true)"
   if [ -z "$w" ] || { [ -n "${age:-}" ] && [ $((age + 1)) -lt "$w" ]; }; then (umask 077; mkdir -p "$sd/bgwait"); date +%s > "$sd/bgwait/$disp"; fi
 }
+# model_fallback <why> <escalation body> [account]: #551. A usage-limit stop the account failover could not absorb relaunches the same task, once per issue, on FALLBACK_MODEL (the limit is per model: the same account still serves the other one,
+# so it is named again, also when it was just marked exhausted). The model the stopped dispatch ran with is the loop's own record (dispatch.sh, model/<dispatch>): none, or already FALLBACK_MODEL, is today's block. The relaunch is a failover
+# in the spool (dispatch.sh), so rounds() does not count it. The same check for REVIEW_MODEL/ANSWER_MODEL (review.sh, answer.sh) is not done here.
+model_fallback() {
+  local ran acct=()
+  ran="$(head -n 1 "$sd/model/$disp" 2> /dev/null)"
+  if [ -z "${FALLBACK_MODEL:-}" ] || [ -z "$ran" ] || [ "$ran" = "$FALLBACK_MODEL" ]; then block "$1: $2"; return 0; fi
+  ! multi_account || ! account_listed "$3" || acct=(--account "$3")
+  release "$disp"; [ -z "$term" ] || orca terminal close --terminal "$term" --json > /dev/null 2>&1 || true   # the dead agent's terminal
+  if RUN="$run" "$DISPATCH_CMD" --retry-of "$disp" --task "$task" --model "$FALLBACK_MODEL" ${acct[@]+"${acct[@]}"} "$issue" > /dev/null; then
+    comment "$issue" "usage limit on $ran: relaunched on $FALLBACK_MODEL"; log "#$issue: usage limit on $ran, relaunched on $FALLBACK_MODEL"
+  else block "$1: fallback relaunch on $FALLBACK_MODEL failed"; fi
+}
 # usage_limit <reset text> <escalation body>: the worker's account is at its usage limit (#556). The loop records it exhausted until the reset (the Run's spool, never the worker's files) and, when the project lists another account that is free,
-# releases the dispatch and relaunches the same task on it; the relaunch is marked a failover (dispatch.sh), so rounds() does not count it. #551's model fallback is the next step here when no account is left.
+# releases the dispatch and relaunches the same task on it; the relaunch is marked a failover (dispatch.sh), so rounds() does not count it. When no account is left (or none is listed) the model fallback follows (#551).
 usage_limit() {
   local from next why n f
   from="$(head -n 1 "$sd/account/$disp" 2> /dev/null)"; from="${from:-$(first_account)}"   # a dispatch with no record ran on the first listed account
   why="usage limit${from:+ on account $from}${1:+, resets $1}"
   if multi_account && account_listed "$from"; then
     n=0; for f in "$sd"/failover/*; do if [ -f "$f" ] && [ "$(recorded_issue "$run" "${f##*/}")" = "$issue" ]; then n=$((n + 1)); fi; done   # the stop is read from the escalation's text, which a worker can also send: an issue is failed over once, and a second stop blocks it instead of holding another account
-    [ "$n" -lt 1 ] || { block "$why: failover budget spent: this issue was already failed over once"; return 0; }
+    [ "$n" -lt 1 ] || { model_fallback "$why: failover budget spent: this issue was already failed over once" "$2" "$from"; return 0; }
     mark_exhausted "$run" "$from" "$(reset_epoch "$1")"
-    next="$(free_account "$run")" || { block "$why: every other allowed account is at its limit too"; return 0; }
+    next="$(free_account "$run")" || { model_fallback "$why: every other allowed account is at its limit too" "$2" "$from"; return 0; }
     release "$disp"; [ -z "$term" ] || orca terminal close --terminal "$term" --json > /dev/null 2>&1 || true   # the dead agent's terminal
     if RUN="$run" "$DISPATCH_CMD" --retry-of "$disp" --task "$task" --account "$next" "$issue" > /dev/null; then
       comment "$issue" "usage limit on account $from: relaunched on $next"; log "#$issue: usage limit on account $from (resets ${1:-unknown}), relaunched on $next"
     else block "$why: failover relaunch failed"; fi
     return 0
   fi
-  block "$why: $2"
+  model_fallback "$why" "$2" "$from"
 }
 handle() {
   case "$(jq -r .type <<< "$1")" in

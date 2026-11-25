@@ -8,6 +8,8 @@
 # --round (with --address): the new task is titled "#<n> round", a round the human asked for (coordinator.sh counts the retry budget from the last one).
 # --account <name>: the Claude account the worker runs on, one the project lists (CLAUDE_ACCOUNTS, #556); with --retry-of it is a failover after a usage limit, which coordinator.sh's rounds() does not count. Without it a list of 2+ accounts uses the first one not exhausted;
 # the launch line carries the name and the Run's spool records it (account/<dispatch>, failover/<dispatch>).
+# --model <id>: with --retry-of/--address, the model the worker runs on instead of the issue's Model: footer (#551: the fallback after a usage limit); a --retry-of without it keeps the model recorded for the dispatch it retries. The model of
+# every dispatch is recorded in the Run's spool (model/<dispatch>), and a --model retry is marked failover/<dispatch> like an account failover: it only moved the task, so coordinator.sh's rounds() does not count it.
 # --next <issue>: the same pick restricted to that issue, so it starts only if it is ready (exit 3 and a message when it is not).
 # Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready, 4 Claude's folder-trust dialog blocks the start (still up after one answer, or a layout the keys are not known for): the repo root is not trusted, no issue is at fault.
 set -euo pipefail
@@ -15,7 +17,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 load_env
-run="${RUN:-}"; n=""; only=""; next=0; dry=0; retry_of=""; task=""; address=""; round=0; account=""; named=""; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
+run="${RUN:-}"; n=""; only=""; next=0; dry=0; retry_of=""; task=""; address=""; round=0; account=""; named=""; model_opt=""; tries="${DISPATCH_TRIES:-60}"; poll="${AI_TOOLKIT_POLL:-3}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --run) run="${2:-}"; shift ;;
@@ -26,6 +28,7 @@ while [ $# -gt 0 ]; do
     --address) address="${2:-}"; shift ;;
     --round) round=1 ;;
     --account) account="${2:-}"; named=1; shift ;;
+    --model) model_opt="${2:-}"; shift ;;
     [0-9]*) n="$1" ;;
     *) usage_exit "usage: dispatch.sh [--run R] <issue> | --next" ;;
   esac; shift
@@ -33,6 +36,7 @@ done
 [ -n "$run" ] || usage_exit "no Run: pass --run or set RUN"
 [ "$next" = 1 ] || [ -n "$n" ] || usage_exit "usage: dispatch.sh [--run R] <issue> | --next | --retry-of D --task T <issue>"
 [ -z "$retry_of" ] || [ -n "$task" ] || usage_exit "--retry-of needs --task"
+[ -z "$model_opt" ] || [ -n "$retry_of$address" ] || usage_exit "--model needs --retry-of or --address"
 : "${ORCA_TERMINAL_HANDLE:?run me from the coordinator Orca terminal}"
 main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 base="origin/$BASE_BRANCH"
@@ -128,6 +132,9 @@ dispatch() {
   gate="$(issue_footer "$body" Gate | tr '[:upper:]' '[:lower:]')"; gate="${gate:-$GATE_DEFAULT}"
   read -r model effort _ <<< "$(issue_footer "$body" Model)"
   model="${model:-$SPOKE_MODEL}"; effort="${effort:-$SPOKE_EFFORT}"
+  case "$model_opt" in *[!A-Za-z0-9._-]*) die "bad Model '--model $model_opt'" ;; esac
+  if [ -n "$model_opt" ]; then model="$model_opt"
+  elif [ -n "$retry_of" ] && _dispatch_id_ok "$retry_of"; then local kept=""; read -r kept < "$(spool_dir "$run")/model/$retry_of" 2> /dev/null || true; model="${kept:-$model}"; fi   # the model recorded for the dispatch this one replaces: a sweep relaunch after a fallback must not go back to the model at its limit
   # The model/effort end up in a shell command typed into a terminal: allow nothing but id characters.
   case "$model$effort" in *[!A-Za-z0-9._-]*) die "issue $n: bad Model footer '$model $effort'" ;; esac
   land="$(issue_footer "$body" Land | LC_ALL=C tr -d '[:space:]' | LC_ALL=C tr '[:upper:]' '[:lower:]')"; land="${land:-auto}"
@@ -144,6 +151,8 @@ dispatch() {
   orca_json worktree set --worktree "$sel" --issue "$n" --workspace-status in-progress > /dev/null || die "worktree set failed for $sel"
   [ -z "$account" ] || record_account "$run" "$disp" "$account" "$([ -z "$retry_of" ] || [ -z "$named" ] || echo 1)"   # a retry that names its account is a failover
   record_dispatch "$run" "$disp" "$n"   # what coordinator.sh's ctx() checks Orca's link against: the worker can relink its worktree, not rewrite this
+  (umask 077; d="$(spool_dir "$run")"; mkdir -p "$d/model"; printf '%s\n' "$model" > "$d/model/$disp"   # the id passed record_dispatch's check just above
+    [ -z "$model_opt" ] || [ -z "$retry_of" ] || [ -n "$named" ] || { mkdir -p "$d/failover"; : > "$d/failover/$disp"; })   # a --model retry only moved the task (a named account already marked it)
   jq -nc --argjson issue "$n" --arg dispatch "$disp" --arg worktree "$wt" --arg terminal "$term" \
     '{issue: $issue, dispatch: $dispatch, worktree: $worktree, terminal: $terminal}'
 }
