@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1090,SC2154   # a sourced lib: lib.sh is found at run time, and key/site/email/token are set by the caller or jira_config
 # Plumbing shared by the jira skill's scripts, sourced by each of them: . "$(dirname "${BASH_SOURCE[0]}")/jira-lib.sh"
 # Sourcing reads the env files like land.sh and dispatch.sh do (caller env > ai-toolkit.local.env), so JIRA_* set there reach the script.
 # The caller sets $key (the ticket) before api / transition_to, then calls jira_config and jira_token before any request.
