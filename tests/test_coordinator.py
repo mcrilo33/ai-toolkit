@@ -1884,6 +1884,7 @@ def spooled_model(tmp_path, dispatch, model):   # the model a dispatch ran with:
     ({"FALLBACK_MODEL": ""}, "claude-fable-5-2", None, 0, "resets 6pm"),   # off: blocks as today
     (FALLBACK, "claude-opus-5-5", None, 0, "resets 6pm"),   # a second stop, or a stop on the fallback itself: one fallback per issue
     (FALLBACK, "claude-fable-5-2", "claude-opus-5-5", 0, "resets 6pm"),   # an earlier dispatch of this issue already ran on the fallback, this one (an --address round) is back on the footer model
+    (FALLBACK, "claude-fable-5-2", ("claude-opus-5-5", "2"), 0, ""),   # another issue's fallback in the same Run spends nothing of this one's
     (FALLBACK, None, None, 0, "resets 6pm"),   # no record of the model: never relaunched on a guess
     (FALLBACK, "claude-fable-5-2", None, 1, "fallback relaunch on claude-opus-5-5 failed"),
 ])
@@ -1891,8 +1892,9 @@ def test_a_usage_limit_relaunches_the_same_task_once_on_the_fallback_model(C, tm
     if ran:
         spooled_model(tmp_path, "ctx_1", ran)
     if prior:
+        prior, other = (prior, "1") if isinstance(prior, str) else prior
         spooled_model(tmp_path, "ctx_7", prior)
-        spooled_account(tmp_path, "dispatch", "ctx_7", "1\n")
+        spooled_account(tmp_path, "dispatch", "ctx_7", other + "\n")
     C.stubs.reply("dispatch.sh", "boom", rc=dispatch_rc)
     C.mail([limit_msg()])
     r = C.go(**env)
