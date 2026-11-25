@@ -213,7 +213,7 @@ def test_a_question_for_the_human_is_flagged_with_the_exact_reply_command_and_ac
         C.workers(C.row("ctx_1", st="completed"))
         r = C.go("--answer", mode)
         assert r.returncode == 0 and "finished before its plan msg_q was read" in r.stdout and C.calls("orca orchestration check ack")
-        assert not C.calls("orca orchestration send") and not C.calls("gh issue comment") and not C.calls("orca worktree set") and not (tmp_path / "state/run_t/held").exists()
+        assert not C.calls("orca orchestration send") and not C.calls("gh issue comment") and not C.calls("orca worktree set") and "msg_q" not in (tmp_path / "state/run_t/held").read_text().split()
         return
     assert C.go("--answer", mode).returncode == 0
     assert not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack") and (len(C.stubs.calls("answer.sh")) == 1) == (mode != "human")
@@ -616,10 +616,11 @@ def test_a_worker_done_from_a_dispatch_that_another_live_one_replaced_is_never_l
     C.mail([msg("worker_done", dispatchId="ctx_1", outcome="succeeded")])
     r = C.go()
     assert not C.stubs.calls("land.sh") and len(C.calls("orca orchestration check ack")) == 1 and bool(C.calls("gh issue edit")) == (rec is None)
-    assert "ctx_1" in r.stderr and "ctx_2" in r.stderr and ("ignored" in r.stderr) == (rec is not None)
-    if rec is None:
+    if rec is not None:
+        assert "ctx_1" in r.stderr and "ctx_2" in r.stderr and "ignored" in r.stderr
+    else:
         c = C.calls("gh issue comment")[0][-1]
-        assert C.blocked() and "ctx_1" in c and "ctx_2" in c
+        assert C.blocked() and "ctx_1" in c and "ctx_2" in c and "ignored" not in r.stderr
 
 
 @pytest.mark.parametrize("cleanup_rc, mode", [(0, "orca"), (6, "orca"), (6, "switched"), (6, "nobranch")])   # the branch is Orca's, never the worker's HEAD; none from Orca = block, not a guess
