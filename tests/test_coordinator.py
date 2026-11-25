@@ -685,16 +685,16 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     assert re.search(r"silent for (2[0-5]|9[45])m, relaunching", r.stdout) and "round 1" in C.calls("gh issue comment")[0][-1]
 
 
-HEALTHY = [   # (case, its workers' rows, its live worker's worker-show): one sweep over every case, case k on its own worktree /w<k> linked to issue k
+HEALTHY = [   # (case, its workers' rows, its live worker's worker-show; past = silent past COORD_IDLE_MIN with nothing else to show life, so the sweep reads its transcript): one sweep per half, case k on its own worktree /w<k> linked to issue k
     ("settled", [{"st": "completed", "lv": "exited"}], None),   # a settled worker's process is expected to be gone
     ("relaunch-alive", [{"st": "failed", "lv": "exited"}, {}], {}),   # the relaunched worker is alive: left alone
     ("old-heartbeat", [{}], {"silent": 0, "beat": 93}),   # an old heartbeat, the agent working: #415 and #418 at 09:39 UTC
     ("heartbeat", [{}], {"silent": 40, "beat": 1}),   # a worker that heartbeats
     ("heartbeat-frac", [{}], {"silent": 40, "beat": 1, "frac": True}),   # ... the heartbeat carrying fractional seconds: read, not dropped
     ("just-dispatched", [{}], {"silent": 40, "born": 1}),   # just (re)dispatched: the old terminal output is not the new worker's silence
-    ("tool-call", [{}], {"silent": 25, "tool": 25}),   # silent for 25 minutes inside one tool call (a long build): active, not idle
-    ("long-tool-call", [{}], {"silent": 40, "tool": 80}),   # ... still under the tool-call bound
-    ("background-task", [{}], {"silent": 40, "bg": 40}),   # turn ended, its own background task runs (an eval round's judge passes): under the same bound, activity (#555)
+    ("tool-call", [{}], {"silent": 25, "tool": 25, "past": True}),   # silent for 25 minutes inside one tool call (a long build): active, not idle
+    ("long-tool-call", [{}], {"silent": 40, "tool": 80, "past": True}),   # ... still under the tool-call bound
+    ("background-task", [{}], {"silent": 40, "bg": 40, "past": True}),   # turn ended, its own background task runs (an eval round's judge passes): under the same bound, activity (#555)
     ("under-bound", [{}], {"silent": 14}),   # silent, but under the bound
     ("before-escalation", [{}], {"silent": 16}),   # a turn ended on a background task 16 minutes ago: no bgwait record yet (Orca escalates at 20), no tool call in flight; a sweep must not relaunch it (#561)
     ("still-before-escalation", [{}], {"silent": 20}),   # ... still before the escalation can have been recorded
@@ -704,9 +704,10 @@ HEALTHY = [   # (case, its workers' rows, its live worker's worker-show): one sw
 ]
 
 
-def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worker_alone(C):
+@pytest.mark.parametrize("cases", [HEALTHY[:8], HEALTHY[8:]], ids=["first-half", "second-half"])   # two sweeps: one sweep over all fifteen nears the per-test time limit
+def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worker_alone(C, cases):
     rows, wts, gates, reads, tools = [], [], [], 0, 0   # the sweep reads each live worker not at a gate in list order (worker-show call n), and the transcript of each one past the bound (worker-read call rn)
-    for k, (_, rs, shown) in enumerate(HEALTHY, 1):
+    for k, (_, rs, shown) in enumerate(cases, 1):
         wts.append({"path": f"/w{k}", "linkedIssue": k, "branch": f"refs/heads/{k}-x"})
         rows += [{**C.row(f"ctx_{k}_{j}", rec=k, **r), "resource": {"worktreeId": f"r::/w{k}"}} for j, r in enumerate(rs)]
         if shown is None:
@@ -716,7 +717,7 @@ def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worke
             gates.append(d)
             continue
         reads += 1
-        past = sh.get("silent", 0) >= 21 and sh.get("beat") is None and sh.get("born") is None and not sh.get("wait") and "raw" not in sh
+        past = sh.pop("past", False)
         tools += past
         C.show(**sh, d=d, n=reads, rn=tools if past else None)
     C.workers(*rows)
@@ -725,9 +726,10 @@ def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worke
     r = C.go("--cap", "0", **SWEEP)
     assert not C.stubs.calls("dispatch.sh") and not C.calls("gh issue edit") and not C.calls("orca orchestration worker-release")
     assert not C.calls("orca worktree set") and not C.calls("gh issue comment")
-    assert len(C.calls("orca orchestration worker-show")) == reads and len(C.calls("orca orchestration worker-read")) == tools == 3   # every case was reached, the three past the bound up to their tool-call check
+    assert len(C.calls("orca orchestration worker-show")) == reads and len(C.calls("orca orchestration worker-read")) == tools   # every case was reached, the ones past the bound up to their tool-call check
     unknown = [ln for ln in r.stderr.splitlines() if "cannot tell how long" in ln]
-    assert "jq: error" not in r.stderr and len(unknown) == 1 and f"ctx_{len(HEALTHY)}_0" in unknown[0]   # an unknown age is warned about, naming the dispatch
+    raw = [f"ctx_{k}_0" for k, (_, _, sh) in enumerate(cases, 1) if sh and "raw" in sh]
+    assert "jq: error" not in r.stderr and len(unknown) == len(raw) and all(d in ln for d, ln in zip(raw, unknown, strict=True))   # an unknown age is warned about, naming the dispatch
 
 
 @pytest.mark.parametrize("shown", [
