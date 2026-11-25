@@ -28,7 +28,7 @@ while [ $# -gt 0 ]; do
     --address) address="${2:-}"; shift ;;
     --round) round=1 ;;
     --account) account="${2:-}"; named=1; shift ;;
-    --model) model_opt="${2:-}"; shift ;;
+    --model) model_opt="${2:-}"; [ -n "$model_opt" ] || usage_exit "--model needs an id"; shift ;;
     [0-9]*) n="$1" ;;
     *) usage_exit "usage: dispatch.sh [--run R] <issue> | --next" ;;
   esac; shift
@@ -134,7 +134,7 @@ dispatch() {
   model="${model:-$SPOKE_MODEL}"; effort="${effort:-$SPOKE_EFFORT}"
   case "$model_opt" in *[!A-Za-z0-9._-]*) die "bad Model '--model $model_opt'" ;; esac
   if [ -n "$model_opt" ]; then model="$model_opt"
-  elif [ -n "$retry_of" ] && _dispatch_id_ok "$retry_of"; then local kept=""; read -r kept < "$(spool_dir "$run")/model/$retry_of" 2> /dev/null || true; model="${kept:-$model}"; fi   # the model recorded for the dispatch this one replaces: a sweep relaunch after a fallback must not go back to the model at its limit
+  elif [ -n "$retry_of" ] && _dispatch_id_ok "$retry_of"; then local kept=""; read -r kept < "$(spool_dir "$run")/model/$retry_of" 2> /dev/null || true; model="${kept:-$model}"; fi   # the model recorded for the dispatch this one replaces: a plain relaunch after a fallback must not go back to the model at its limit (an --address round starts on the footer model: coordinator.sh's model_fallback counts the issue's dispatches)
   # The model/effort end up in a shell command typed into a terminal: allow nothing but id characters.
   case "$model$effort" in *[!A-Za-z0-9._-]*) die "issue $n: bad Model footer '$model $effort'" ;; esac
   land="$(issue_footer "$body" Land | LC_ALL=C tr -d '[:space:]' | LC_ALL=C tr '[:upper:]' '[:lower:]')"; land="${land:-auto}"
