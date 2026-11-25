@@ -67,15 +67,21 @@ cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
 log() { printf '%s coordinator: %s\n' "$(date +%H:%M:%S)" "$*"; }
 comment() { gh issue comment "$1" -b "$2" > /dev/null || warn "cannot comment on #$1"; }
-okread() {   # an Orca read whose reply has .result: prints it; any other reply (an error is 11 lines on stdout, exit 1, no .result) is ONE warning naming the call and its error code, status 1
-  local o c; o="$(orca_json "$@" 2> /dev/null)" && jq -e '.result' <<< "$o" > /dev/null 2>&1 && { printf '%s\n' "$o"; return 0; }
+okread() {   # <jq options and program> -- <Orca read>: the program's output on a reply with .result, the check and the caller's parse in ONE jq; any other reply (an error is 11 lines on stdout, exit 1, no .result) is ONE warning naming the call and its error code, status 1
+  local o c j=() p rc=0
+  while [ "$1" != -- ]; do j+=("$1"); shift; done; shift; p="${j[${#j[@]}-1]}"; unset "j[${#j[@]}-1]"
+  if o="$(orca_json "$@" 2> /dev/null)"; then
+    jq ${j[@]+"${j[@]}"} 'if .result then . else ("" | halt_error(9)) end |
+'"$p" <<< "$o" 2> /dev/null && return 0 || rc=$?
+    [ "$rc" = 9 ] || ! jq -e .result <<< "$o" > /dev/null 2>&1 || { jq ${j[@]+"${j[@]}"} "$p" <<< "$o" > /dev/null; return "$rc"; }   # a good reply the program failed on: its own jq error, no warning (only this failure costs the extra spawns)
+  fi
   c="$(jq -r '.error.code // empty' <<< "$o" 2> /dev/null || true)"; warn "orca $1 $2 failed: ${c:-no reply}"; return 1
 }
 wl() {   # every page of the Run's workers (newest first, 100 a page), in the shape of one reply; live = dispatchStatus "dispatched"
   local cur="" out all="[]"
   while :; do
-    out="$(okread orchestration worker-list --run "$run" --limit 100 ${cur:+--cursor "$cur"} --full)" || return 1
-    out="$(jq -rc --argjson a "$all" '(.result.page.nextCursor // ""), $a + .result.workers' <<< "$out")" || return 1   # one jq a page: the next cursor, then the workers so far
+    # shellcheck disable=SC2016  # okread's argument is a jq program
+    out="$(okread -rc --argjson a "$all" '(.result.page.nextCursor // ""), $a + .result.workers' -- orchestration worker-list --run "$run" --limit 100 ${cur:+--cursor "$cur"} --full)" || return 1   # one jq a page: the next cursor, then the workers so far
     cur="${out%%$'\n'*}"; all="${out#*$'\n'}"
     [ -n "$cur" ] || break
   done
@@ -98,15 +104,17 @@ mins() { echo $((10#${1%:*} * 60 + 10#${1#*:})); }
 now_min() { mins "${AI_TOOLKIT_NOW:-$(date +%H:%M)}"; }
 
 pending() {   # {open: questions nobody has replied to (waiting for the human), answered: ids with a reply, truncated: the page was full}
-  okread orchestration inbox --limit 200 --full | jq -c --arg r "$run" '.result.messages as $all | [$all[] | select(.run_id == $r)] as $m   # a reply is a threaded message in the reply grammar (#558): Orca'\''s own free-prose notice on a question (same type and sender) is not one
+  # shellcheck disable=SC2016  # okread's argument is a jq program
+  okread -c --arg r "$run" '.result.messages as $all | [$all[] | select(.run_id == $r)] as $m   # a reply is a threaded message in the reply grammar (#558): Orca'\''s own free-prose notice on a question (same type and sender) is not one
     | def reply: (.body // "") | test("\\A(approve|allow|deny)\\z|\\A(approve with: |revise:)");
     {open: [$m[] | select(.type == "question") | select(. as $q | $m | any(.id != $q.id and .thread_id == $q.id and reply) | not)],
-       answered: [$m[] | select(.thread_id != null and .thread_id != .id and reply) | .thread_id], truncated: ($all | length >= 200)}'
+       answered: [$m[] | select(.thread_id != null and .thread_id != .id and reply) | .thread_id], truncated: ($all | length >= 200)}' -- orchestration inbox --limit 200 --full
 }
 silent() {   # $1 dispatch: "<minutes> <run|wait>": minutes since the newest sign of life (terminal output, liveness observation, heartbeat, never before dispatchedAt);
-  okread orchestration worker-show --dispatch "$1" --full < /dev/null | jq -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer, or Orca could not prove the worker (never "not waiting")
+  # shellcheck disable=SC2016  # okread's argument is a jq program
+  okread -r --argjson now "$(date +%s)" '.result as $r   # wait = parked on a prompt only a human can answer, or Orca could not prove the worker (never "not waiting")
     | ([($r.terminal.lastOutputAt, $r.projection.liveness.observedAt | select(. != null) / 1000), ($r.dispatch.lastHeartbeatAt, $r.dispatch.dispatchedAt | select(. != null) | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)] | max) as $t
-    | "\(([(($now - $t) / 60) | floor, 0] | max)) \(if ($r.terminal == null or (($r.observation // {}) | has("agentWait") | not) or $r.observation.agentWait) then "wait" else "run" end)"'
+    | "\(([(($now - $t) / 60) | floor, 0] | max)) \(if ($r.terminal == null or (($r.observation // {}) | has("agentWait") | not) or $r.observation.agentWait) then "wait" else "run" end)"' -- orchestration worker-show --dispatch "$1" --full < /dev/null
 }
 tool_running() {   # $1 dispatch: the minutes its newest tool call has run, from Orca's exact transcript (the last message is an assistant tool-call with no result yet); empty = none, or Orca could not say (then the worker is judged by its silence alone)
   orca_json orchestration worker-read --dispatch "$1" --source transcript --limit 1 --full < /dev/null 2> /dev/null | jq -r --argjson now "$(date +%s)" '(.result.transcript.messages // []) | last // empty | select(.role == "assistant" and any(.blocks[]?; .type == "tool-call")) | [(($now - .timestamp / 1000) / 60) | floor, 0] | max' 2> /dev/null || true
@@ -114,7 +122,7 @@ tool_running() {   # $1 dispatch: the minutes its newest tool call has run, from
 bgwaited() {   # $1 dispatch: the minutes its worker has waited on its background task (#555), from the recorded escalation, which Orca sends BGWAIT_DELAY_MIN (20) min after the turn end; empty = no record. An unreadable record counts as an old one: the existing relaunch path
   local rec; [ -f "$sd/bgwait/$1" ] || return 0; read -r rec < "$sd/bgwait/$1" || true; [[ "${rec:-}" =~ ^[0-9]+$ ]] || rec=0; echo $((BGWAIT_DELAY_MIN + ($(date +%s) - rec) / 60))
 }
-holder() { okread orchestration run-show --id "$run" --full | jq -r '.result.run.coordinator_handle // empty' || true; }   # the terminal that holds the Run
+holder() { okread -r '.result.run.coordinator_handle // empty' -- orchestration run-show --id "$run" --full || true; }   # the terminal that holds the Run
 live_hold() {   # $1 eq|ne, $2 a handle: if a live coordinator.sh (holder.<pid> = "<handle> <mode>", the pid's command must still be coordinator.sh) is bound as
   local f h  # (eq) / as anything but (ne) that handle, print its mode and succeed
   for f in "$(spool_dir "$run")"/holder.*; do
@@ -155,9 +163,9 @@ hold() { held="$held $1 "; printf '%s\n' "$1" >> "$sd/held"; }   # $1 message id
 by_loop() { case "${lm%% *}" in attended | auto | away) ! is_perm "$2" && [ -f "$(spool_dir "$run")/held" ] && ! grep -qxF "$1" "$(spool_dir "$run")/held" ;; *) false ;; esac; }   # $1 message id, $2 its question, $lm the live loop's mode (none, human or no held file, e.g. an older loop: every open question is the human's)
 replycmd() { printf 'bash %s --run %s --reply %s %s' "$here/coordinator.sh" "$run" "$1" "${2:-approve}"; }
 if [ "$position" = 1 ]; then   # #543: the position of the loop holding this project's Run, one word and nothing else (attended, away, auto or none; human counts as attended), from Orca's holder and the live loop's own record. No Run id needed. An Orca that does not answer is exit 1 with nothing on stdout: unknown is not none
-  [ -n "$run" ] || run="$(okread orchestration run-current --full | jq -r '.result.run.id // empty')" || exit 1
+  [ -n "$run" ] || run="$(okread -r '.result.run.id // empty' -- orchestration run-current --full)" || exit 1
   [ -n "$run" ] || { echo none; exit 0; }
-  valid_run "$run" || exit 1; h="$(okread orchestration run-show --id "$run" --full | jq -r '.result.run.coordinator_handle // empty')" || exit 1
+  valid_run "$run" || exit 1; h="$(okread -r '.result.run.coordinator_handle // empty' -- orchestration run-show --id "$run" --full)" || exit 1
   m="$(live_hold eq "$h")" && m="${m%% *}" || m=none; [ "$m" != human ] || m=attended; echo "$m"; exit 0
 fi
 if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to; --show: one of them whole
@@ -277,9 +285,10 @@ ctx() {
   r="$(wl | jq -r --arg d "$1" '[.result.workers[] | select(.dispatchId == $d)][0] // empty | [.taskId // "", .agentTerminalHandle // "", ((.resource.worktreeId // "") | sub("^.*::"; ""))] | join("\u001f")')"
   [ -n "$r" ] || { warn "unknown dispatch '$1'"; return 1; }
   IFS=$'\037' read -r task term wtp <<< "$r"
-  r="$(okread worktree list --repo "path:$PWD")" || return 1   # scoped: another repo's worktree linked to the same number must not count (#531)
-  IFS=$'\037' read -r issue br nlinked <<< "$(jq -r --arg p "$wtp" '.result.worktrees as $w | ([$w[] | select(.path == $p)][0] // {}) as $r
-    | [($r.linkedIssue // "" | tostring), (($r.branch // "") | sub("^refs/heads/"; "")), ([$w[] | select(.repoId == $r.repoId and .linkedIssue == $r.linkedIssue)] | length | tostring)] | join("\u001f")' <<< "$r")"   # br: Orca's branch for the worktree, never the worker's own HEAD (it can switch or rename it)
+  # shellcheck disable=SC2016  # okread's argument is a jq program
+  r="$(okread -r --arg p "$wtp" '.result.worktrees as $w | ([$w[] | select(.path == $p)][0] // {}) as $r
+    | [($r.linkedIssue // "" | tostring), (($r.branch // "") | sub("^refs/heads/"; "")), ([$w[] | select(.repoId == $r.repoId and .linkedIssue == $r.linkedIssue)] | length | tostring)] | join("\u001f")' -- worktree list --repo "path:$PWD")" || return 1   # scoped: another repo's worktree linked to the same number must not count (#531)
+  IFS=$'\037' read -r issue br nlinked <<< "$r"   # br: Orca's branch for the worktree, never the worker's own HEAD (it can switch or rename it)
   [ -n "$issue" ] || { warn "no issue is linked to $wtp"; return 1; }
   # The link is the worker's to rewrite: it must match what dispatch.sh recorded, or nothing is answered or landed. No record fails closed (a dispatch from before this check:
   # the human answers it by hand), and blames no issue, since the link is the one thing not trusted.
@@ -294,7 +303,7 @@ rm_wt() {   # <n>: remove the half-made worktree a failed fresh dispatch may lea
 }
 nlive() { jq '[.result.workers[] | select(.dispatchStatus == "dispatched")] | length'; }   # the workers of one wl reply that are live
 rounds() {   # dispatches of the worktree since its last human-requested round (a task titled "#<n> round", see named()), else all of them - 1; a relaunch shares its task, so the base is that task's oldest dispatch
-  local hr f fo=""; hr="$(okread orchestration task-list --run "$run" --brief --full | jq -c '[.result.tasks[] | select(.task_title | test("^#[0-9]+ round$")) | .id]')" || return 1
+  local hr f fo=""; hr="$(okread -c '[.result.tasks[] | select(.task_title | test("^#[0-9]+ round$")) | .id]' -- orchestration task-list --run "$run" --brief --full)" || return 1
   for f in "$sd"/failover/*; do [ ! -f "$f" ] || fo="$fo${f##*/}"$'\n'; done   # a failover (dispatch.sh --retry-of ... --account, #556, or --model, #551) only moved the task to another account or model: it is no spent relaunch, and the loop knows it from its own spool alone
   fo="$(printf %s "$fo" | jq -Rsc 'split("\n") | map(select(. != ""))')"
   wl | jq --arg p "::$wtp" --argjson h "$hr" --argjson fo "$fo" '[.result.workers[] | select((.resource.worktreeId // "") | endswith($p)) | select(.dispatchId as $d | $fo | index($d) | not)] as $w   # worker-list is newest first
@@ -526,7 +535,7 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
     if jq -e '.labels | map(.name) | index("hold")' <<< "$v" > /dev/null; then why="on hold: remove the hold label to start it"
     elif [ -n "${DISPATCH_LABEL:-}" ] && ! jq -e --arg l "$DISPATCH_LABEL" '.labels | map(.name) | index($l)' <<< "$v" > /dev/null; then why="not a toolkit issue: it lacks the $DISPATCH_LABEL label"
     elif [ -z "$spec" ] && jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null; then why="blocked: remove the label, or give a message to re-dispatch it"
-    elif ! wts="$(okread worktree list --repo "path:$PWD" | jq -c '.result.worktrees')"; then why="cannot read the worktrees"
+    elif ! wts="$(okread -c '.result.worktrees' -- worktree list --repo "path:$PWD")"; then why="cannot read the worktrees"
     elif ! all="$(wl)"; then why="cannot read the workers"
     else
       path="$(jq -r --argjson n "$n" '[.[] | select(.linkedIssue == $n)][0].path // empty' <<< "$wts")"
@@ -602,7 +611,7 @@ sweep() {   # a worker without worker_done whose process exited (and was not rel
 closed_sweep() {   # prune the registrations of worktree folders that are gone; then each worktree linked to a CLOSED issue (one query, not awaiting main: pr_sweep owns those) is cleaned or flagged by closed_cleanup
   local rows closed list fl
   git worktree prune || warn "git worktree prune failed"
-  rows="$(okread worktree list --repo "path:$PWD" | jq -c '.result.worktrees')" || return 0
+  rows="$(okread -c '.result.worktrees' -- worktree list --repo "path:$PWD")" || return 0
   closed="$(gh issue list --state closed --search "sort:updated-desc" --limit 200 --json number,state,labels 2> /dev/null | jq -c --arg l "$AWAITING_LABEL" '[.[] | select(.state == "CLOSED" and (.labels | map(.name) | index($l) | not)) | .number]')" || return 0
   [ -n "$closed" ] || return 0
   list="$(jq -r --argjson c "$closed" '. as $all | .[] | .linkedIssue as $i | select($i != null and ($c | index($i)) != null and ([$all[] | select(.linkedIssue == $i)] | length) == 1)
