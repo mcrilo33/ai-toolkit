@@ -327,7 +327,7 @@ block() {   # $1 = why. Label, comment, flag (log, worktree comment), free the s
 redispatch() {   # $1 = max rounds, $2 = spec, $3 = why blocked once the rounds are spent. A fresh terminal and a NEW Task (dispatch.sh --address):
   local r out m=() ran; r="$(rounds)" || { block "cannot count the rounds: Orca did not answer"; return 0; }   # worker-start refuses --task with --spec, and Orca refuses a new task on the idle two-step terminal
   [ "$r" -lt "$1" ] || { block "$3"; return 0; }
-  ran="$(head -n 1 "$sd/model/$disp" 2> /dev/null)"; [ -z "$ran" ] || [ "$ran" != "${FALLBACK_MODEL:-}" ] || m=(--model "$FALLBACK_MODEL")   # #566: an automatic round stays on the fallback the dispatch ran on (the footer model is at its limit); named() keeps the footer model
+  ran="$(head -n 1 "$sd/model/$disp" 2> /dev/null)" || ran=""; [ -z "$ran" ] || [ "$ran" != "${FALLBACK_MODEL:-}" ] || m=(--model "$FALLBACK_MODEL")   # #566: an automatic round stays on the fallback the dispatch ran on (the footer model is at its limit); named() keeps the footer model
   out="$(RUN="$run" "$DISPATCH_CMD" --address "$2" ${m[@]+"${m[@]}"} "$issue" 2>&1)" || { warn "re-dispatch: $out"; block "re-dispatch failed"; return 0; }
   [ -z "$term" ] || orca terminal close --terminal "$term" --json > /dev/null 2>&1 || true   # the old, idle terminal; an empty --terminal would close the caller's active one
   comment "$issue" "round $((r + 1)): $2"
