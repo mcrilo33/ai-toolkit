@@ -174,13 +174,13 @@ _civil_days() {
 # reset_epoch <"6pm (Europe/Paris)" | "Nov 28, 6pm (Europe/Paris)">: the epoch of the next such time of day in that zone, or of that date and time (the zone's own calendar: its days from today, next year's date when this year's is long past, as January named in December; a date more than half a year ahead is a December read in January, passed); a dated reset already passed is a short hold, a text it cannot read (or an unknown zone) a one-hour hold, never an unbounded one. Arithmetic on the zone's own clock, no `date -j`/`-d`.
 reset_epoch() {
   local re='^(([A-Z][a-z]{2}) ([0-9]{1,2}), )?([0-9]{1,2})(:([0-9]{2}))?([ap]m) \(([A-Za-z0-9_/+-]+)\)$' now h m z hh mm ss delta mon md=0 i y cm dom today days
-  local -a names=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
+  local -a months=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
   now="$(date +%s)"
   if [[ $1 =~ $re ]] && [ -e "/usr/share/zoneinfo/${BASH_REMATCH[8]}" ] && [ "$((10#${BASH_REMATCH[4]}))" -ge 1 ] && [ "$((10#${BASH_REMATCH[4]}))" -le 12 ]; then
     h=$((10#${BASH_REMATCH[4]} % 12)); m=$((10#${BASH_REMATCH[6]:-0})); z="${BASH_REMATCH[8]}"; [ "${BASH_REMATCH[7]}" != pm ] || h=$((h + 12))
     mon="${BASH_REMATCH[2]}"; dom=$((10#${BASH_REMATCH[3]:-0}))
     if [ -n "$mon" ]; then
-      for i in "${!names[@]}"; do if [ "${names[i]}" = "$mon" ]; then md=$((i + 1)); fi; done
+      for i in "${!months[@]}"; do if [ "${months[i]}" = "$mon" ]; then md=$((i + 1)); fi; done
       if [ "$md" -eq 0 ] || [ "$dom" -lt 1 ] || [ "$dom" -gt 31 ]; then printf '%s' $((now + 3600)); return; fi
     fi
     read -r hh mm ss <<< "$(TZ="$z" date '+%H %M %S')"   # the zone's time of day now
