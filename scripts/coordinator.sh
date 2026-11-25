@@ -75,10 +75,11 @@ wl() {   # every page of the Run's workers (newest first, 100 a page), in the sh
   local cur="" out all="[]"
   while :; do
     out="$(okread orchestration worker-list --run "$run" --limit 100 ${cur:+--cursor "$cur"} --full)" || return 1
-    all="$(jq -c --argjson o "$out" '. + $o.result.workers' <<< "$all")"; cur="$(jq -r '.result.page.nextCursor // empty' <<< "$out")"
+    out="$(jq -rc --argjson a "$all" '(.result.page.nextCursor // ""), $a + .result.workers' <<< "$out")" || return 1   # one jq a page: the next cursor, then the workers so far
+    cur="${out%%$'\n'*}"; all="${out#*$'\n'}"
     [ -n "$cur" ] || break
   done
-  jq -nc --argjson w "$all" '{result: {workers: $w}}'
+  printf '{"result":{"workers":%s}}\n' "$all"
 }
 pj() { jq -r --arg k "$2" '(.payload // "{}" | if type == "string" then fromjson else . end)[$k] // empty' <<< "$1"; }   # payload field of a message
 question_of() { local q; q="$(pj "$1" question)"; [ -n "$q" ] || q="$(jq -r '.body // ""' <<< "$1")"; printf '%s' "$q"; }
@@ -272,23 +273,20 @@ tel="$(telemetry)" || warn "telemetry $tel"   # #538: once per start, a heads-up
 
 # ctx <dispatch>: sets disp task term wtp issue br (its Orca branch) from the worker's Orca row and the issue linked to its worktree.
 ctx() {
-  local r rec rows; disp="$1"
-  r="$(wl | jq -c --arg d "$1" '[.result.workers[] | select(.dispatchId == $d)][0] // empty')"
+  local r rec nlinked; disp="$1"   # one jq for the row's fields and one for its worktree's: the fields joined by \037, which read keeps when empty (unlike a tab)
+  r="$(wl | jq -r --arg d "$1" '[.result.workers[] | select(.dispatchId == $d)][0] // empty | [.taskId // "", .agentTerminalHandle // "", ((.resource.worktreeId // "") | sub("^.*::"; ""))] | join("\u001f")')"
   [ -n "$r" ] || { warn "unknown dispatch '$1'"; return 1; }
-  task="$(jq -r '.taskId // empty' <<< "$r")"; term="$(jq -r '.agentTerminalHandle // empty' <<< "$r")"
-  wtp="$(jq -r '.resource.worktreeId | sub("^.*::"; "")' <<< "$r")"
+  IFS=$'\037' read -r task term wtp <<< "$r"
   r="$(okread worktree list --repo "path:$PWD")" || return 1   # scoped: another repo's worktree linked to the same number must not count (#531)
-  rows="$(jq -c '.result.worktrees' <<< "$r")"; r="$(jq -c --arg p "$wtp" '[.result.worktrees[] | select(.path == $p)][0] // {}' <<< "$r")"
-  issue="$(jq -r '.linkedIssue // empty' <<< "$r")"
-  br="$(jq -r '(.branch // "") | sub("^refs/heads/"; "")' <<< "$r")"   # Orca's branch for the worktree, never the worker's own HEAD (it can switch or rename it)
+  IFS=$'\037' read -r issue br nlinked <<< "$(jq -r --arg p "$wtp" '.result.worktrees as $w | ([$w[] | select(.path == $p)][0] // {}) as $r
+    | [($r.linkedIssue // "" | tostring), (($r.branch // "") | sub("^refs/heads/"; "")), ([$w[] | select(.repoId == $r.repoId and .linkedIssue == $r.linkedIssue)] | length | tostring)] | join("\u001f")' <<< "$r")"   # br: Orca's branch for the worktree, never the worker's own HEAD (it can switch or rename it)
   [ -n "$issue" ] || { warn "no issue is linked to $wtp"; return 1; }
   # The link is the worker's to rewrite: it must match what dispatch.sh recorded, or nothing is answered or landed. No record fails closed (a dispatch from before this check:
   # the human answers it by hand), and blames no issue, since the link is the one thing not trusted.
   rec="$(recorded_issue "$run" "$1")" || { warn "no dispatch record for $1: not trusting the link to #$issue of $wtp"; return 1; }
   [ "$rec" = "$issue" ] || { local linked="$issue"; issue="$rec"; block "Orca now links $wtp to #$linked but it was dispatched for #$rec: nothing is answered or landed until a human checks"; return 2; }
   # review.sh and land.sh resolve the worktree for #n within this repo (worktree_of): a second worktree of this repo linked to it could be landed in this one's place.
-  [ "$(jq --argjson i "$issue" --arg p "$wtp" '([.[] | select(.path == $p)][0].repoId) as $r | [.[] | select(.repoId == $r and .linkedIssue == $i)] | length' <<< "$rows")" = 1 ] \
-    || { block "more than one worktree is linked to #$issue in Orca: nothing is answered or landed until a human checks"; return 2; }
+  [ "$nlinked" = 1 ] || { block "more than one worktree is linked to #$issue in Orca: nothing is answered or landed until a human checks"; return 2; }
 }
 rm_wt() {   # <n>: remove the half-made worktree a failed fresh dispatch may leave. Only this repo's worktree for #n is ever removed; none resolved: nothing is (#531).
   local s
