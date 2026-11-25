@@ -203,5 +203,6 @@ def test_the_land_human_footer_is_taught_where_issues_are_filed_worked_and_docum
 
 @pytest.mark.parametrize("path", ["skills/solo-cycle/SKILL.md", "agents/bug-scoper.md", "agents/followup-scoper.md"])
 def test_no_worker_text_tells_the_reader_to_open_the_whole_local_env_file(path):
-    text = (SHARED / path).read_text().replace("never `Read` or `cat`", "")
-    assert not re.search(r"`Read`|`cat`|\bcat \S*\.env", text)
+    text = (SHARED / path).read_text()
+    mentions = [m.start() for m in re.finditer(r"ai-toolkit\.local\.env", text)]
+    assert mentions and all("grep -m1" in text[max(0, i - 250):i + 250] for i in mentions)
