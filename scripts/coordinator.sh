@@ -560,7 +560,7 @@ named() {   # the queued dispatch requests (coordinator.sh --dispatch), ahead of
       else out="$(RUN="$run" "$DISPATCH_CMD" --next "$n" 2>&1)" && rc=0 || rc=$?; [ "$rc" = 0 ] || [ "$rc" = 3 ] || rm_wt "$n"; fi   # a failed fresh dispatch may leave a half-made worktree (as fill() does)
       if [ "$rc" = 0 ]; then
         ! jq -e '.labels | map(.name) | index("blocked")' <<< "$v" > /dev/null || gh issue edit "$n" --remove-label blocked > /dev/null 2>&1 || warn "cannot remove the blocked label of #$n"
-        log "dispatched #$n on request"; rm -f "$f"; continue
+        bdirty=1; log "dispatched #$n on request"; rm -f "$f"; continue
       fi
       why="$(tail -n 1 <<< "$out")"; if [ "$rc" = 3 ]; then why="waiting: $why (dispatch.sh exit 3)"; else why="dispatch failed: $why"; fi   # a refusal is dispatch.sh's own words and is asked again at the next wake
     fi
@@ -661,7 +661,7 @@ post() {   # $1 event, $2 issue, $3 message id (none for blocked): ONE POST of i
 }
 kindc() { case "$1" in plan) echo q ;; permission_request) echo p ;; *) echo b ;; esac; }   # the queue id letter of an announce event
 announce() {   # away: POST each decision the loop left open ($held) and each blocked issue ($bids) once; attended with a webhook (#546, $handover): the same, for each one still unanswered after its delay (a permission request HANDOVER_PERMISSION_S, a plan or a blocked issue HANDOVER_PLAN_S), then listed in $sd/handed so the session no longer presents it. $sent holds the delivered ones (no file: a restart sends again, the receiver dedupes). A failed POST stops this wake's sends (a dead webhook costs 5 s, not 5 s each) and is retried at the next; an id no longer in the queue is dropped from $sent
-  local items ev id d n mid age lim t fail=0 now="" keep="" i nb=" " tnow; tnow="$(date +%s)"
+  local items ev id d n mid age lim t lb fail=0 now="" keep="" i nb=" " tnow; tnow="$(date +%s)"
   items="$(open_q | jq -r --argjson now "$tnow" '(.payload // "{}" | if type == "string" then fromjson else . end) as $p | [(if ($p.question // .body // "") | test("^\\s*PERMISSION REQUEST") then "permission_request" else "plan" end), .id, ($p.dispatchId // "-"), ((try ((.created_at | sub(" "; "T") | sub("\\.[0-9]+"; "") | sub("Z?$"; "Z") | fromdateiso8601)) catch $now) | $now - .)] | @tsv')" || return 0   # @tsv: a field a worker wrote cannot start a line of its own; the age is in seconds, 0 when Orca gave no usable time
   for i in $bids; do   # a blocked issue has no time of its own: its age is the time since this loop first listed it (a restart starts it again, which only delays)
     case "$bseen" in *" $i="*) t="${bseen#* "$i"=}"; t="${t%% *}" ;; *) t="$tnow" ;; esac; nb="$nb$i=$t "; items="$items"$'\n'"blocked ${i#b:} - $((tnow - t))"
@@ -671,6 +671,10 @@ announce() {   # away: POST each decision the loop left open ($held) and each bl
     if [ "$ev" != blocked ]; then case " $held " in *" $id "*) ;; *) continue ;; esac; mid="$id"; n="$(recorded_issue "$run" "$d")" || n=""; fi
     now="$now$ev:$id "; case " $sent " in *" $ev:$id "*) continue ;; esac; [ "$fail" = 0 ] || continue
     if [ "$answer" = attended ]; then [ -z "$mid" ] || [ ! -e "$sd/replies/$id" ] || continue; lim="$HANDOVER_PLAN_S"; [ "$ev" != permission_request ] || lim="$HANDOVER_PERMISSION_S"; [ "$age" -ge "$lim" ] || continue; fi
+    if [ "$ev" = blocked ]; then   # #564: only an issue that still carries the label is handed over (the list may predate its answer); an unreadable label is asked again at the next wake
+      lb="$(gh issue view "$n" --json labels 2> /dev/null | jq -r '.labels | map(.name) | index("blocked") != null')" || continue
+      [ "$lb" = true ] || { [ "$lb" != false ] || now="${now%"$ev:$id "}"; continue; }
+    fi
     if ! [[ $id =~ ^[A-Za-z0-9_-]+$ && $n =~ ^[0-9]+$ ]]; then warn "webhook: no issue is recorded for $ev $id, so it cannot be announced: reply by hand, see --status"; sent="$sent$ev:$id "
     elif post "$ev" "$n" "$mid"; then sent="$sent$ev:$id "; [ "$answer" != attended ] || printf '%s:%s\n' "$(kindc "$ev")" "$id" >> "$sd/handed"; else [ $? = 22 ] || fail=1; fi   # curl 22 = the receiver answered with an HTTP error: the next decision is still sent; any other failure (down, timeout) stops this wake
   done 3<<< "$items"
