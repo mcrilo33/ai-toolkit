@@ -386,6 +386,9 @@ on_question() {
     log "#$issue gate answered: $body"; warns="$(sed -n '/^WARN:/p' <<< "$ans")"
     [ -z "$warns" ] || { comment "$issue" "Gate answered \"$body\" by answer.sh; please double-check: $warns"; log "#$issue: $warns"; flag "$wtp" "#$issue ${warns:0:80}"; }
   else   # human mode, no usable answer, or the reply failed: never a blind approve, never waiting: the human queues a reply with --reply
+    if wl 2> /dev/null | jq -e --arg d "$disp" '[.result.workers[] | select(.dispatchId == $d and .dispatchStatus == "dispatched")] | length == 0' > /dev/null; then   # Orca silent: live, as before
+      log "#$issue: worker $disp finished before its plan $id was read: nothing held or sent, its worker_done decides"; return 0   # a message to a completed dispatch makes Orca open an unrecorded follow-up dispatch (#571)
+    fi
     yield   # ...unless the reply failed because the Run was taken back meanwhile
     hold "$id"
     orca_mutate orchestration send --run "$run" --from "$H" --to "dispatch:$disp" --type status --subject "Your plan is queued for the human" --body "Your question $id is queued for the human, who answers it. Do not decide it yourself, whatever an earlier notice said: end your turn and wait for the reply." > /dev/null || warn "#$issue: could not tell worker $disp that its question is queued for the human"   # Orca tells a worker whose coordinator is busy to decide for itself (#553)
@@ -434,7 +437,11 @@ on_done() {
   local out rc=0 bl last v t=0 land rep
   ctx "$(pj "$1" dispatchId)" || return 1
   out="$(wl | jq -r --arg p "::$wtp" --arg d "$disp" '[.result.workers[] | select(.dispatchStatus == "dispatched" and .dispatchId != $d and .projection.liveness.verdict != "exited" and (.resource.worktreeId | endswith($p)))][0].dispatchId // empty')" || return 1
-  [ -z "$out" ] || { warn "#$issue: worker_done from $disp ignored: dispatch $out is live on $wtp"; return 0; }   # a stale or duplicate dispatch never lands the worktree its live worker is editing
+  if [ -n "$out" ]; then   # a stale or duplicate dispatch never lands the worktree its live worker is editing
+    if recorded_issue "$run" "$out" > /dev/null; then warn "#$issue: worker_done from $disp ignored: dispatch $out is live on $wtp"
+    else block "worker_done from $disp not landed: dispatch $out is live on $wtp but has no dispatch record (dispatch.sh did not make it): a human must sort it out"; fi   # Orca opened it itself (#571): nothing else reaches the human
+    return 0
+  fi
   [ "$(pj "$1" outcome)" = succeeded ] || { block "worker_done failed: $(jq -r '.body // ""' <<< "$1")"; return 0; }
   until v="$(gh issue view "$issue" --json state,labels,body 2> /dev/null)"; do   # a few tries, then blocked: the hold label is unknown, never landed on a guess
     ((++t < 3)) || { block "cannot read the issue (GitHub did not answer), so its hold label is unknown: not landed on a guess"; return 0; }; sleep "${AI_TOOLKIT_POLL:-3}"
