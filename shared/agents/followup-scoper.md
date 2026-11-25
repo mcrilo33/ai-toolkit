@@ -126,7 +126,7 @@ upstream: a host project's ticket key must not leak into the toolkit's tracker.
 
 ## Phase 6: Labels
 
-Always `enhancement`. No `hold` unless the bar in the `bug-triage` rule is met (create the label if the repo lacks it): then write the reason in the body as `Hold: <reason>`. Say in your report which case applied: no hold, or held with the reason. When `DISPATCH_LABEL` is set (`bug-triage` rule), add it too on an
+Always `enhancement`. No `hold` unless the bar in the `bug-triage` rule is met (create the label if the repo lacks it): then write the reason in the body as `Hold: <reason>`. Say in your report which case applied: no hold, or held with the reason. When `DISPATCH_LABEL` is set (`bug-triage` rule; read it the same single-key way, `grep -m1 '^DISPATCH_LABEL='`), add it too on an
 issue filed to this repo. An issue filed upstream always carries `ai-toolkit`, also when `DISPATCH_LABEL` is empty.
 
 ## Phase 7: File or draft
@@ -142,8 +142,8 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
 - **Target repo — set `owner`/`repo` EXPLICITLY, never rely on the ambient default.** A follow-up on the
   **ai-toolkit tooling** (a synced rule, skill, agent, hook, script, or `orca.yaml`: anything
   under `.claude/` or `.ai-toolkit/`, or `shared/` in the toolkit repo itself) is filed to `UPSTREAM_REPO`
-  (`owner/repo`, from the main checkout's `.ai-toolkit/ai-toolkit.local.env` (`$ORCA_ROOT_PATH`), else
-  `.ai-toolkit/ai-toolkit.env`); empty or unset means the toolkit's own repo only when this checkout has
+  (`owner/repo`, read with `grep -m1 '^UPSTREAM_REPO='` on the main checkout's `.ai-toolkit/ai-toolkit.local.env` (`$ORCA_ROOT_PATH`), else
+  on `.ai-toolkit/ai-toolkit.env`; that local file holds per-machine secrets (`NOTIFY_WEBHOOK_URL`): read a key with a single-key `grep`, never `Read` or `cat` the file); empty or unset means the toolkit's own repo only when this checkout has
   `shared/`, `hooks/claude/` and `scripts/sync.sh` at its root. Otherwise it is a host project with no upstream:
   **never file to the host repo**, return the draft and say plainly that no upstream is configured and
   how to set it (see `bug-triage.md`, which also says synced copies are never edited in a host project).
