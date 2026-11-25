@@ -71,7 +71,7 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
         return {"dispatchId": d, "taskId": f"task_{d}", "dispatchStatus": "failed", "agentTerminalHandle": None, "resource": None, "lastFailure": "Agent startup blocked: agent-trust-workspace",
                 "projection": {"liveness": {"verdict": "exited"}, "stage": {"detail": "agent_readiness"}, "resource": {"state": "absent", "reason": "not_materialized"}}}
 
-    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None, tool=None, ended=False, bg=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim; tool = a tool call (the newest transcript message, read by worker-read) has run for that many minutes (ended: that call already returned its result, the turn is over); bg = the worker's turn ended that many minutes ago and Orca's background-wait escalation (20 minutes after the turn end) was recorded (#555)
+    def show(silent=0, wait=False, beat=None, born=None, frac=False, obs=None, noterm=False, raw=None, tool=None, ended=False, bg=None, d="ctx_1", n=None, rn=None):   # worker-show: the newest terminal output `silent` minutes old, an optional heartbeat `beat` minutes old, agentWait set when the agent waits on a human-only prompt; frac = fractional seconds in the timestamps, obs "null"/"missing" = no observation, noterm = no terminal, raw = the reply verbatim; tool = a tool call (the newest transcript message, read by worker-read) has run for that many minutes (ended: that call already returned its result, the turn is over); bg = the worker's turn ended that many minutes ago and Orca's background-wait escalation (20 minutes after the turn end) was recorded (#555); d = the dispatch, n / rn = the worker-show / worker-read call this reply answers (None: every call), for a sweep over several workers
         def ago(m):
             return int(time.time()) - m * 60   # whole seconds, like the loop's `date +%s`: a fractional stamp reads a second younger, so an age exactly at a bound could floor one minute low
 
@@ -84,13 +84,13 @@ def C(stubs, repo, run, tmp_path, monkeypatch, link_script):
             reply["observation"] = None
         if noterm:
             reply["terminal"] = None
-        stubs.reply("orca.orchestration_worker_show", raw if raw is not None else json.dumps({"result": reply}))
+        stubs.reply("orca.orchestration_worker_show", raw if raw is not None else json.dumps({"result": reply}), n=n)
         if bg is not None:
             (tmp_path / "state/run_t/bgwait").mkdir(parents=True, exist_ok=True)
-            (tmp_path / "state/run_t/bgwait/ctx_1").write_text(f"{int(time.time() - max(bg - 20, 0) * 60)}\n")
+            (tmp_path / "state/run_t/bgwait" / d).write_text(f"{int(time.time() - max(bg - 20, 0) * 60)}\n")
         if tool is not None:
             call = {"role": "tool", "blocks": [{"type": "tool-result"}], "timestamp": ago(tool) * 1000} if ended else {"role": "assistant", "blocks": [{"type": "tool-call", "name": "Bash"}], "timestamp": ago(tool) * 1000}
-            stubs.reply("orca.orchestration_worker_read", json.dumps({"result": {"source": "transcript", "sourceExact": True, "transcript": {"messages": [call]}}}))
+            stubs.reply("orca.orchestration_worker_read", json.dumps({"result": {"source": "transcript", "sourceExact": True, "transcript": {"messages": [call]}}}), n=rn)
 
     def workers(*rows):
         stubs.reply("orca.orchestration_worker_list", json.dumps({"result": {"workers": list(rows)}}))
@@ -685,31 +685,49 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     assert re.search(r"silent for (2[0-5]|9[45])m, relaunching", r.stdout) and "round 1" in C.calls("gh issue comment")[0][-1]
 
 
-@pytest.mark.parametrize("rows, shown, gate", [
-    ([{"st": "completed", "lv": "exited"}], {}, False),   # a settled worker's process is expected to be gone
-    ([{"d": "ctx_1", "st": "failed", "lv": "exited"}, {"d": "ctx_2", "lv": "live"}], {}, False),   # the relaunched worker is alive: left alone
-    ([{}], {"silent": 0, "beat": 93}, False),   # an old heartbeat, the agent working: #415 and #418 at 09:39 UTC
-    ([{}], {"silent": 40, "beat": 1}, False),   # a worker that heartbeats
-    ([{}], {"silent": 40, "beat": 1, "frac": True}, False),   # ... the heartbeat carrying fractional seconds: read, not dropped
-    ([{}], {"silent": 40, "born": 1}, False),   # just (re)dispatched: the old terminal output is not the new worker's silence
-    ([{}], {"silent": 25, "tool": 25}, False),   # silent for 25 minutes inside one tool call (a long build): active, not idle
-    ([{}], {"silent": 40, "tool": 80}, False),   # ... still under the tool-call bound
-    ([{}], {"silent": 40, "bg": 40}, False),   # turn ended, its own background task runs (an eval round's judge passes): under the same bound, activity (#555)
-    ([{}], {"silent": 14}, False),   # silent, but under the bound
-    ([{}], {"silent": 16}, False),   # a turn ended on a background task 16 minutes ago: no bgwait record yet (Orca escalates at 20), no tool call in flight; a sweep must not relaunch it (#561)
-    ([{}], {"silent": 20}, False),   # ... still before the escalation can have been recorded
-    ([{}], {"silent": 14, "wait": True}, False),   # ... also with a proved human-only prompt
-    ([{}], {"silent": 40}, True),   # waiting on an open gate or permission question
-    ([{}], {"silent": 40, "raw": "not json"}, False),   # worker-show unreadable: the age is unknown, so the worker is neither relaunched nor blocked idle
-])
-def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worker_alone(C, rows, shown, gate):
-    C.workers(*[C.row(**r) for r in rows]); C.show(**shown)
-    if gate:
-        C.inbox(["msg_q"])
+HEALTHY = [   # (case, its workers' rows, its live worker's worker-show): one sweep over every case, case k on its own worktree /w<k> linked to issue k
+    ("settled", [{"st": "completed", "lv": "exited"}], None),   # a settled worker's process is expected to be gone
+    ("relaunch-alive", [{"st": "failed", "lv": "exited"}, {}], {}),   # the relaunched worker is alive: left alone
+    ("old-heartbeat", [{}], {"silent": 0, "beat": 93}),   # an old heartbeat, the agent working: #415 and #418 at 09:39 UTC
+    ("heartbeat", [{}], {"silent": 40, "beat": 1}),   # a worker that heartbeats
+    ("heartbeat-frac", [{}], {"silent": 40, "beat": 1, "frac": True}),   # ... the heartbeat carrying fractional seconds: read, not dropped
+    ("just-dispatched", [{}], {"silent": 40, "born": 1}),   # just (re)dispatched: the old terminal output is not the new worker's silence
+    ("tool-call", [{}], {"silent": 25, "tool": 25}),   # silent for 25 minutes inside one tool call (a long build): active, not idle
+    ("long-tool-call", [{}], {"silent": 40, "tool": 80}),   # ... still under the tool-call bound
+    ("background-task", [{}], {"silent": 40, "bg": 40}),   # turn ended, its own background task runs (an eval round's judge passes): under the same bound, activity (#555)
+    ("under-bound", [{}], {"silent": 14}),   # silent, but under the bound
+    ("before-escalation", [{}], {"silent": 16}),   # a turn ended on a background task 16 minutes ago: no bgwait record yet (Orca escalates at 20), no tool call in flight; a sweep must not relaunch it (#561)
+    ("still-before-escalation", [{}], {"silent": 20}),   # ... still before the escalation can have been recorded
+    ("under-bound-prompt", [{}], {"silent": 14, "wait": True}),   # ... also with a proved human-only prompt
+    ("gate", [{}], {"silent": 40, "gate": True}),   # waiting on an open gate or permission question
+    ("unreadable", [{}], {"silent": 40, "raw": "not json"}),   # worker-show unreadable: the age is unknown, so the worker is neither relaunched nor blocked idle
+]
+
+
+def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worker_alone(C):
+    rows, wts, gates, reads, tools = [], [], [], 0, 0   # the sweep reads each live worker not at a gate in list order (worker-show call n), and the transcript of each one past the bound (worker-read call rn)
+    for k, (_, rs, shown) in enumerate(HEALTHY, 1):
+        wts.append({"path": f"/w{k}", "linkedIssue": k, "branch": f"refs/heads/{k}-x"})
+        rows += [{**C.row(f"ctx_{k}_{j}", rec=k, **r), "resource": {"worktreeId": f"r::/w{k}"}} for j, r in enumerate(rs)]
+        if shown is None:
+            continue
+        sh, d = dict(shown), f"ctx_{k}_{len(rs) - 1}"
+        if sh.pop("gate", False):
+            gates.append(d)
+            continue
+        reads += 1
+        past = sh.get("silent", 0) >= 21 and sh.get("beat") is None and sh.get("born") is None and not sh.get("wait") and "raw" not in sh
+        tools += past
+        C.show(**sh, d=d, n=reads, rn=tools if past else None)
+    C.workers(*rows)
+    C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": wts}}))
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", f"q_{d}", dispatchId=d), "run_id": "run_t", "thread_id": f"q_{d}"} for d in gates]}}))
     r = C.go("--cap", "0", **SWEEP)
     assert not C.stubs.calls("dispatch.sh") and not C.calls("gh issue edit") and not C.calls("orca orchestration worker-release")
     assert not C.calls("orca worktree set") and not C.calls("gh issue comment")
-    assert "jq: error" not in r.stderr and ("ctx_1" in r.stderr and "silent" in r.stderr) == ("raw" in shown)   # an unknown age is warned about, naming the dispatch
+    assert len(C.calls("orca orchestration worker-show")) == reads and len(C.calls("orca orchestration worker-read")) == tools == 3   # every case was reached, the three past the bound up to their tool-call check
+    unknown = [ln for ln in r.stderr.splitlines() if "cannot tell how long" in ln]
+    assert "jq: error" not in r.stderr and len(unknown) == 1 and f"ctx_{len(HEALTHY)}_0" in unknown[0]   # an unknown age is warned about, naming the dispatch
 
 
 @pytest.mark.parametrize("shown", [
