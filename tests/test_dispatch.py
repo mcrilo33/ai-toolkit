@@ -183,6 +183,7 @@ def test_a_model_footer_cannot_inject_into_the_terminal_command(d):
     assert r.returncode == 1 and "bad Model" in r.stderr
     assert not any(c[:2] in (["terminal", "create"], ["orchestration", "worker-start"]) for c in d.orca())
     assert d.go("--model", "claude-opus-5-5", "7").returncode == 2   # an override only makes sense for a relaunch
+    assert d.go("--retry-of", "ctx_1", "--task", "task_7", "--model", "", "7").returncode == 2   # an empty one is no override: not silently ignored
 
 
 def test_trust_dialog_is_dismissed_with_down_then_enter(d):
