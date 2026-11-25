@@ -672,16 +672,16 @@ def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_onc
     assert re.search(r"COORD_SWEEP_EVERY:-2\}", (V2 / "scripts/coordinator.sh").read_text())   # the defaults, read rather than waited for: a sweep every 2nd empty wait (~10 min), the idle bound 21 minutes
     assert re.search(r"BGWAIT_DELAY_MIN=20\b", (V2 / "scripts/coordinator.sh").read_text()) and "COORD_IDLE_MIN:-$((BGWAIT_DELAY_MIN + 1))}" in (V2 / "scripts/coordinator.sh").read_text()   # the idle bound is Orca's escalation delay + 1: the bgwait record exists before a sweep may judge a worker idle (#561)
     C.workers(C.row(lv="live" if idle else "exited"), C.unstarted()); C.show(**{"silent": 25, **shown})   # a failed-start row with no resource is in the Run: rounds() skips it, it is neither fatal nor a spent round
-    C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
-    assert not C.stubs.calls("dispatch.sh")
-    first_run = len(C.kinds())   # its exit closed the loop's own pane
-    r = C.go("--cap", "1", **SWEEP)
-    if not idle:
+    if not idle:   # no sweep at the first empty wait: a property of the loop, not of the worker, proved once here
+        C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
+        assert not C.stubs.calls("dispatch.sh")
+        C.go("--cap", "1", **SWEEP)
         assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]]
         return
+    r = C.go("--cap", "1", **SWEEP)
     assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and C.stubs.calls("dispatch.sh")[0][-1] == "1" and "continue from the pushed branch" in C.stubs.calls("dispatch.sh")[0][1].replace("Continue", "continue") and "after an error" not in C.stubs.calls("dispatch.sh")[0][1] and re.search(r"silent for (2[0-5]|9[45])m", C.stubs.calls("dispatch.sh")[0][1])
-    in_order(C.kinds()[first_run:], "orca orchestration worker-release", "dispatch.sh", "orca terminal close")   # the live dispatch is stopped before its replacement starts
-    assert [arg(a, "--terminal") for a in C.calls("orca terminal close")] == ["term_c", "term_w", "term_c"]   # the first run's pane, the old worker's terminal, this run's pane
+    in_order(C.kinds(), "orca orchestration worker-release", "dispatch.sh", "orca terminal close")   # the live dispatch is stopped before its replacement starts
+    assert [arg(a, "--terminal") for a in C.calls("orca terminal close")] == ["term_w", "term_c"]   # the old worker's terminal, then the loop's own pane
     assert re.search(r"silent for (2[0-5]|9[45])m, relaunching", r.stdout) and "round 1" in C.calls("gh issue comment")[0][-1]
 
 
@@ -732,18 +732,28 @@ def test_a_sweep_leaves_a_settled_worker_a_live_relaunch_and_every_healthy_worke
     assert "jq: error" not in r.stderr and len(unknown) == len(raw) and all(d in ln for d, ln in zip(raw, unknown, strict=True))   # an unknown age is warned about, naming the dispatch
 
 
-@pytest.mark.parametrize("shown", [
+SILENT = [   # one sweep: worker ctx_<k> on its own worktree /w<k> linked to issue k, silent past the bound with no open question
     {"silent": 22, "wait": True},   # a proved human-only prompt, just past the bound: nobody answers it in an unattended run, so it blocks like any silent worker
     {"silent": 40, "wait": True},   # ... however late the loop first sees it
     {"silent": 40, "obs": "missing"},   # no agentWait key: Orca never looked, the incident's `unverifiable` shape
     {"silent": 40, "obs": "null"},   # no observation at all
     {"silent": 40, "noterm": True},   # a null terminal
-])
-def test_a_silent_worker_with_no_open_question_is_blocked_at_the_first_sweep_past_the_bound_whether_or_not_its_prompt_is_proved(C, shown):
-    C.workers(C.row()); C.show(**shown)
+]
+
+
+def test_a_silent_worker_with_no_open_question_is_blocked_at_the_first_sweep_past_the_bound_whether_or_not_its_prompt_is_proved(C):
+    C.workers(*[{**C.row(f"ctx_{k}", rec=k), "resource": {"worktreeId": f"r::/w{k}"}} for k in range(1, len(SILENT) + 1)])
+    C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": f"/w{k}", "linkedIssue": k, "branch": f"refs/heads/{k}-x"} for k in range(1, len(SILENT) + 1)]}}))
+    for k, shown in enumerate(SILENT, 1):
+        C.show(**shown, n=k)   # the sweep reads the workers in list order
     C.go("--cap", "0", **SWEEP)
-    assert C.blocked() and not C.stubs.calls("dispatch.sh")   # label, comment, flag, slot released; never a relaunch
-    assert re.search(r"silent for [0-9]+m", C.calls("gh issue comment")[0][-1])   # the block comment is the notice: it names the silence
+    assert not C.stubs.calls("dispatch.sh") and not C.calls("orca worktree rm")   # never a relaunch, the worktree stays
+    assert sorted(arg(a, "--dispatch") for a in C.calls("orca orchestration worker-release")) == [f"ctx_{k}" for k in range(1, len(SILENT) + 1)]   # each slot released
+    for k in range(1, len(SILENT) + 1):   # label, comment, flag for each case
+        edits, comments = [a[3:] for a in C.calls("gh issue edit") if a[2] == str(k)], [a[-1] for a in C.calls("gh issue comment") if a[2] == str(k)]
+        assert edits.index(["--add-label", "blocked"]) < edits.index(["--remove-label", "status:in-progress"]), SILENT[k - 1]   # one in-progress or blocked label, never both
+        assert len(comments) == 1 and re.search(r"silent for [0-9]+m", comments[0]), SILENT[k - 1]   # the block comment is the notice: it names the silence
+        assert any(arg(a, "--worktree") == f"path:/w{k}" and arg(a, "--comment").startswith(f"BLOCKED #{k}") for a in C.calls("orca worktree set")), SILENT[k - 1]
 
 
 @pytest.mark.parametrize("rows, shown", [
