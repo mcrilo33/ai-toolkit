@@ -1993,7 +1993,7 @@ def spooled_model(tmp_path, dispatch, model):   # the model a dispatch ran with:
     (FALLBACK, "claude-fable-5-2", None, 0, ""),   # relaunched on the fallback
     ({"FALLBACK_MODEL": ""}, "claude-fable-5-2", None, 0, "resets 6pm"),   # off: blocks as today
     (FALLBACK, "claude-opus-5-5", None, 0, "resets 6pm"),   # a second stop, or a stop on the fallback itself: one fallback per issue
-    (FALLBACK, "claude-fable-5-2", "claude-opus-5-5", 0, "resets 6pm"),   # an earlier dispatch of this issue already ran on the fallback, this one (an --address round) is back on the footer model
+    (FALLBACK, "claude-fable-5-2", "claude-opus-5-5", 0, "resets 6pm"),   # an earlier dispatch of this issue already ran on the fallback, this one (a human-requested round, named()) is back on the footer model
     (FALLBACK, "claude-fable-5-2", ("claude-opus-5-5", "2"), 0, ""),   # another issue's fallback in the same Run spends nothing of this one's
     (FALLBACK, None, None, 0, "resets 6pm"),   # no record of the model: never relaunched on a guess
     (FALLBACK, "claude-fable-5-2", None, 1, "fallback relaunch on claude-opus-5-5 failed"),
