@@ -313,12 +313,16 @@ def test_reply_queues_a_one_line_request_in_a_private_spool_outside_any_worktree
     d = tmp_path / "home/.ai-toolkit/coordinator/run_t/replies"
     assert r.returncode == 0 and (d / "msg_q").read_text() == f"{queued}\n" and stat.S_IMODE(d.stat().st_mode) == 0o700
     assert not C.stubs.calls("orca") and not list(d.glob(".*"))
+
+
+def test_dispatch_queues_a_one_line_request_in_the_same_spool_and_reply_and_dispatch_need_a_run(C, tmp_path):   # the reply's own case-independent checks too: run once, not per reply body
     assert C.go("--reply", "msg_q", "approve", ORCA_TERMINAL_HANDLE="").returncode == 0 and C.spooled("msg_q")   # AITK_STATE_DIR is a base: <dir>/<run-id>/replies
-    q = d.parent / "requests"   # the same spool, the same shape: a dispatch request is <issue> = its one-line message (empty = a plain dispatch), queued for the loop
+    q = tmp_path / "home/.ai-toolkit/coordinator/run_t/requests"   # the same spool, the same shape: a dispatch request is <issue> = its one-line message (empty = a plain dispatch), queued for the loop
     assert C.go("--dispatch", "7", "start again, but\x1b[2K test first\nsecond line", ORCA_TERMINAL_HANDLE="", AITK_STATE_DIR="").returncode == 0
     assert (q / "7").read_text() == "start again, but[2K test first\n" and stat.S_IMODE(q.stat().st_mode) == 0o700 and C.go("--dispatch", "8", ORCA_TERMINAL_HANDLE="", AITK_STATE_DIR="").returncode == 0 and (q / "8").read_text() == "\n"
     assert not C.stubs.calls("orca") and not list(q.glob(".*"))
     assert C.go("--dispatch", "7", "--cancel", ORCA_TERMINAL_HANDLE="", AITK_STATE_DIR="").returncode == 0 and not (q / "7").exists() and (q / "8").exists()   # a request that can never run is withdrawn, not left in --status
+    assert C.go("--reply", "msg_q", "approve", run_id=None).returncode == 2 and C.go("--dispatch", "7", run_id=None).returncode == 2   # no --run: refused
 
 
 @pytest.mark.parametrize("args", [["--reply", "msg_q", "maybe"], ["--reply", "msg_q", "revise:"], ["--reply", "../x", "approve"], ["--reply", "msg_q"],
@@ -328,7 +332,6 @@ def test_reply_queues_a_one_line_request_in_a_private_spool_outside_any_worktree
                                   ["--dispatch", "x"], ["--dispatch", "7;x"], ["--dispatch", "../7"], ["--dispatch"]])
 def test_reply_refuses_a_bad_message_id_or_body_and_a_missing_run(C, tmp_path, args):
     assert C.go(*args).returncode == 2 and not C.spooled("msg_q") and not C.spooled("../x") and not (tmp_path / "state/run_t/requests").exists()
-    assert C.go("--reply", "msg_q", "approve", run_id=None).returncode == 2 and C.go("--dispatch", "7", run_id=None).returncode == 2
 
 
 @pytest.mark.parametrize("body", ["revise: use tmp", "approve with: use tmp"])
