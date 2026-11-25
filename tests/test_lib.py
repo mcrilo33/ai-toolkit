@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 from conftest import V2
@@ -65,13 +66,45 @@ def test_gh_binary_can_be_swapped_by_env_for_stubbed_runs(run, stubs, tmp_path, 
     assert stubs.calls("gh") == [["issue", "view", "4"]]
 
 
-@pytest.mark.parametrize("text, hms, seconds", [
-    ("6pm (Europe/Paris)", "12 00 00", 6 * 3600), ("6:30pm (Europe/Paris)", "12 00 00", 6 * 3600 + 1800),   # later today, in the zone's own clock
-    ("6pm (Europe/Paris)", "18 00 30", 300),   # the reset passed while the loop read the message: stale, a short hold, never tomorrow's 6pm
-    ("6pm (Europe/Paris)", "23 00 00", 19 * 3600), ("12am (Europe/Paris)", "23 00 00", 3600), ("12pm (Europe/Paris)", "11 00 00", 3600),   # long past or midnight: the next one
-    ("soon", "12 00 00", 3600), ("6pm (Nowhere/Land)", "12 00 00", 3600), ("13pm (Europe/Paris)", "12 00 00", 3600),   # unreadable: a one-hour hold, never unbounded
+NOV25 = "2026 11 25"   # the zone's calendar date in the faked clock below (the time-of-day cases never read it)
+
+
+@pytest.mark.parametrize("text, hms, seconds, ymd", [
+    ("6pm (Europe/Paris)", "12 00 00", 6 * 3600, NOV25), ("6:30pm (Europe/Paris)", "12 00 00", 6 * 3600 + 1800, NOV25),   # later today, in the zone's own clock
+    ("6pm (Europe/Paris)", "18 00 30", 300, NOV25),   # the reset passed while the loop read the message: stale, a short hold, never tomorrow's 6pm
+    ("6pm (Europe/Paris)", "23 00 00", 19 * 3600, NOV25), ("12am (Europe/Paris)", "23 00 00", 3600, NOV25), ("12pm (Europe/Paris)", "11 00 00", 3600, NOV25),   # long past or midnight: the next one
+    ("soon", "12 00 00", 3600, NOV25), ("6pm (Nowhere/Land)", "12 00 00", 3600, NOV25), ("13pm (Europe/Paris)", "12 00 00", 3600, NOV25),   # unreadable: a one-hour hold, never unbounded
+    ("Nov 28, 6pm (Europe/Paris)", "12 00 00", 3 * 86400 + 6 * 3600, NOV25),   # #565: a dated reset (a weekly limit): days ahead in the zone's own calendar
+    ("Dec 1, 6:30pm (Europe/Paris)", "12 00 00", 2 * 86400 + 6 * 3600 + 1800, "2026 11 29"),   # across a month end
+    ("Jan 2, 6pm (Europe/Paris)", "12 00 00", 3 * 86400 + 6 * 3600, "2026 12 30"),   # across the year end: next year's date
+    ("Mar 1, 6pm (Europe/Paris)", "12 00 00", 2 * 86400 + 6 * 3600, "2028 02 28"),   # a leap year has a 29 February
+    ("Nov 25, 6pm (Europe/Paris)", "12 00 00", 6 * 3600, NOV25),   # the same day, later
+    ("Nov 25, 6pm (Europe/Paris)", "18 00 30", 300, NOV25), ("Nov 20, 6pm (Europe/Paris)", "12 00 00", 300, NOV25),   # a dated reset already passed: the short hold, never next year's
+    ("Dec 31, 6pm (Europe/Paris)", "12 00 00", 300, "2027 01 01"),   # December's date read in January: passed, not next December
+    ("Foo 28, 6pm (Europe/Paris)", "12 00 00", 3600, NOV25), ("Nov 40, 6pm (Europe/Paris)", "12 00 00", 3600, NOV25),   # unreadable date: a one-hour hold
 ])
-def test_reset_epoch_is_the_next_reset_in_the_zone_and_never_an_unbounded_hold(run, text, hms, seconds):
-    fake = 'date() { if [ "$1" = +%s ]; then echo 1000000; else echo "$HMS"; fi; }'   # now = 1000000, the zone's clock = $HMS
-    r = lib(run, f'{fake}; echo $(( $(reset_epoch "$T") - 1000000 ))', T=text, HMS=hms)
+def test_reset_epoch_is_the_next_reset_in_the_zone_and_never_an_unbounded_hold(run, text, hms, seconds, ymd):
+    fake = 'date() { case "$1" in +%s) echo 1000000;; "+%Y %m %d") echo "$YMD";; *) echo "$HMS";; esac; }'   # now = 1000000, the zone's clock = $HMS on $YMD
+    r = lib(run, f'{fake}; echo $(( $(reset_epoch "$T") - 1000000 ))', T=text, HMS=hms, YMD=ymd)
     assert r.returncode == 0 and r.stdout.strip() == str(seconds), r.stderr
+
+
+@pytest.mark.parametrize("body, rc, want", [
+    ("Error: Claude hit its usage limit. You've hit your weekly limit · resets Nov 28, 6pm (Europe/Paris)", 0, "Nov 28, 6pm (Europe/Paris)"),
+    ("Error: Claude hit its usage limit. You've hit your weekly limit · resets Dec 3, 6:30pm (Europe/Paris)", 0, "Dec 3, 6:30pm (Europe/Paris)"),
+    ("Error: Claude hit its usage limit. You've hit your limit · resets 6pm (Europe/Paris)", 0, "6pm (Europe/Paris)"),
+    ("Error: Claude hit its usage limit. Try again later.", 0, ""),
+    ("A worker says: Claude hit its usage limit, resets Nov 28, 6pm (Europe/Paris)", 1, ""),
+], ids=["dated", "dated-minutes", "time-of-day", "no-reset", "not-orcas-text"])   # #565: a weekly limit's reset starts with a date
+def test_usage_limit_reset_prints_the_reset_text_with_its_date_when_it_has_one(run, body, rc, want):
+    r = lib(run, 'rc=0; usage_limit_reset "$B" || rc=$?; echo "|$rc"', B=body)
+    assert r.stdout == f"{want}|{rc}\n", r.stderr
+
+
+@pytest.mark.parametrize("days, kept", [(3, True), (7, True), (30, False)], ids=["3-days", "7-days", "30-days"])   # a weekly reset is kept, a record far beyond the cap is dropped
+def test_free_account_keeps_a_record_up_to_a_week_ahead_and_drops_one_beyond(run, tmp_path, days, kept):
+    (tmp_path / "state/run_t/exhausted").mkdir(parents=True)
+    f = tmp_path / "state/run_t/exhausted/max"
+    f.write_text(f"{int(time.time()) + days * 86400}\n")
+    r = lib(run, "free_account run_t || true", CLAUDE_ACCOUNTS="max client", AITK_STATE_DIR=tmp_path / "state")
+    assert (r.stdout, f.exists()) == (("client", True) if kept else ("max", False)), r.stderr
