@@ -673,7 +673,7 @@ announce() {   # away: POST each decision the loop left open ($held) and each bl
     if [ "$answer" = attended ]; then [ -z "$mid" ] || [ ! -e "$sd/replies/$id" ] || continue; lim="$HANDOVER_PLAN_S"; [ "$ev" != permission_request ] || lim="$HANDOVER_PERMISSION_S"; [ "$age" -ge "$lim" ] || continue; fi
     if [ "$ev" = blocked ]; then   # #564: only an issue that still carries the label is handed over (the list may predate its answer); an unreadable label is asked again at the next wake
       lb="$(gh issue view "$n" --json labels 2> /dev/null | jq -r '.labels | map(.name) | index("blocked") != null')" || continue
-      [ "$lb" = true ] || { [ "$lb" != false ] || now="${now%"$ev:$id "}"; continue; }
+      [ "$lb" = true ] || { [ "$lb" != false ] || { now="${now%"$ev:$id "}"; bdirty=1; }; continue; }   # a dropped entry makes the next wake read the list again, once
     fi
     if ! [[ $id =~ ^[A-Za-z0-9_-]+$ && $n =~ ^[0-9]+$ ]]; then warn "webhook: no issue is recorded for $ev $id, so it cannot be announced: reply by hand, see --status"; sent="$sent$ev:$id "
     elif post "$ev" "$n" "$mid"; then sent="$sent$ev:$id "; [ "$answer" != attended ] || printf '%s:%s\n' "$(kindc "$ev")" "$id" >> "$sd/handed"; else [ $? = 22 ] || fail=1; fi   # curl 22 = the receiver answered with an HTTP error: the next decision is still sent; any other failure (down, timeout) stops this wake
