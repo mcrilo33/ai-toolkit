@@ -1872,6 +1872,57 @@ def test_an_ordinary_escalation_and_needs_input_behave_as_before_on_a_project_wi
     assert (C.blocked() if blocks else left_alive(C)) and not relaunches(C) and not (tmp_path / "state/run_t/exhausted").exists()
 
 
+FALLBACK = {"FALLBACK_MODEL": "claude-opus-5-5"}
+
+
+def spooled_model(tmp_path, dispatch, model):   # the model a dispatch ran with: the loop's own record (dispatch.sh), never the worker's files
+    spooled_account(tmp_path, "model", dispatch, model + "\n")
+
+
+@pytest.mark.parametrize("env, ran, dispatch_rc, why", [
+    (FALLBACK, "claude-fable-5-2", 0, ""),   # relaunched on the fallback
+    ({"FALLBACK_MODEL": ""}, "claude-fable-5-2", 0, "resets 6pm"),   # off: blocks as today
+    (FALLBACK, "claude-opus-5-5", 0, "resets 6pm"),   # a second stop, or a stop on the fallback itself: one fallback per issue
+    (FALLBACK, None, 0, "resets 6pm"),   # no record of the model: never relaunched on a guess
+    (FALLBACK, "claude-fable-5-2", 1, "fallback relaunch on claude-opus-5-5 failed"),
+])
+def test_a_usage_limit_relaunches_the_same_task_once_on_the_fallback_model(C, tmp_path, env, ran, dispatch_rc, why):
+    if ran:
+        spooled_model(tmp_path, "ctx_1", ran)
+    C.stubs.reply("dispatch.sh", "boom", rc=dispatch_rc)
+    C.mail([limit_msg()])
+    r = C.go(**env)
+    assert r.returncode == 0, r.stderr
+    if why:
+        assert C.blocked() and why in C.calls("gh issue comment")[0][-1]
+        assert bool(relaunches(C)) == (dispatch_rc == 1)
+        return
+    assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "--model", "claude-opus-5-5", "1"]]
+    kinds = C.kinds()
+    assert kinds.index("orca orchestration worker-release") < max(i for i, k in enumerate(kinds) if k == "dispatch.sh")   # stopped before its replacement starts
+    assert "term_w" in [arg(a, "--terminal") for a in C.calls("orca terminal close")]
+    assert "usage limit on claude-fable-5-2: relaunched on claude-opus-5-5" in C.calls("gh issue comment")[0][-1]
+    assert ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
+
+
+@pytest.mark.parametrize("spool, ran_on, relaunch", [
+    ({}, None, ["--retry-of", "ctx_1", "--task", "task_ctx_1", "--account", "client", "1"]),   # the accounts first: the same model on the other one
+    ({"failover": "ctx_7"}, "client", ["--retry-of", "ctx_1", "--task", "task_ctx_1", "--model", "claude-opus-5-5", "--account", "client", "1"]),   # budget spent: the fallback keeps the account
+    ({"exhausted": "client"}, None, ["--retry-of", "ctx_1", "--task", "task_ctx_1", "--model", "claude-opus-5-5", "--account", "max", "1"]),   # no account free: still the account the worker ran on, just marked exhausted
+])
+def test_the_account_failover_comes_first_and_the_model_fallback_keeps_the_account(C, tmp_path, spool, ran_on, relaunch):
+    spooled_model(tmp_path, "ctx_1", "claude-fable-5-2")
+    if ran_on:
+        spooled_account(tmp_path, "account", "ctx_1", ran_on + "\n")
+    for kind, name in spool.items():
+        spooled_account(tmp_path, kind, name, "" if kind == "failover" else None)
+        if kind == "failover":
+            spooled_account(tmp_path, "dispatch", name, "1\n")
+    C.mail([limit_msg()])
+    assert C.go(**ACCOUNTS, **FALLBACK).returncode == 0
+    assert relaunches(C) == [relaunch] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
+
+
 def test_an_idle_worker_after_a_failover_still_gets_its_one_relaunch(C, tmp_path):
     spooled_account(tmp_path, "failover", "ctx_2", "")   # ctx_2 only moved ctx_1's task to the other account: it is not a spent relaunch
     C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2")); C.show(silent=22)

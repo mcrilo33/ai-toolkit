@@ -89,6 +89,7 @@ def test_gate_none_and_model_footer_override_the_defaults(d):
     d.go("7")
     term = next(c for c in d.orca() if c[:2] == ["terminal", "create"])
     assert term[7].endswith("--model claude-opus-5-5 --effort medium --dangerously-skip-permissions")
+    assert (d.record.parent / "model/ctx_1").read_text() == "claude-opus-5-5\n"   # the model a dispatch ran with, in the loop's own spool (#551)
     ws = worker_start(d)
     seed = ws[ws.index("--spec") + 1]
     assert "approve,revise" not in seed and "approve with" not in seed and "code-review" not in seed  # light lane: no PLAN gate, no in-worker review
@@ -177,6 +178,11 @@ def test_a_model_footer_cannot_inject_into_the_terminal_command(d):
     r = d.go("7")
     assert r.returncode == 1 and "bad Model footer" in r.stderr
     assert not any(c[:2] in (["terminal", "create"], ["orchestration", "worker-start"]) for c in d.orca())
+    d.stubs.reply("gh.issue_view", json.dumps(ISSUE))
+    r = d.go("--retry-of", "ctx_1", "--task", "task_7", "--model", "x; touch /tmp/pwned", "7")   # the --model override passes the same check
+    assert r.returncode == 1 and "bad Model" in r.stderr
+    assert not any(c[:2] in (["terminal", "create"], ["orchestration", "worker-start"]) for c in d.orca())
+    assert d.go("--model", "claude-opus-5-5", "7").returncode == 2   # an override only makes sense for a relaunch
 
 
 def test_trust_dialog_is_dismissed_with_down_then_enter(d):
@@ -417,6 +423,20 @@ def test_retry_relaunches_through_the_same_two_step_path_and_reseeds_the_task(d)
                         "--terminal", "term_agent", "--task", "task_7", "--retry-of", "ctx_old", "--timeout-ms", "120000"]
     assert json.loads(r.stdout)["terminal"] == "term_agent" and ["issue", "edit", "7", "--add-label", "status:in-progress"] in d.stubs.calls("gh")
     assert (d.record / "ctx_2").read_text() == "7\n"   # the retry's own dispatch id, not the one it replaces
+
+
+def test_a_model_retry_overrides_the_footer_and_is_recorded_a_later_retry_inherits_it_and_a_model_retry_spends_no_relaunch(d):
+    d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": ISSUE["body"] + "Model: claude-sonnet-5-5 medium\n"}))
+    stale_worktree(d)
+    spool = d.record.parent
+    d.stubs.reply("orca.orchestration_worker_start", '{"result":{"dispatchId":"ctx_2","state":"ready"}}')
+    assert d.go("--retry-of", "ctx_1", "--task", "task_7", "--model", "claude-opus-5-5", "7").returncode == 0
+    d.stubs.reply("orca.orchestration_worker_start", '{"result":{"dispatchId":"ctx_3","state":"ready"}}')
+    assert d.go("--retry-of", "ctx_2", "--task", "task_7", "7").returncode == 0   # no --model: the retry keeps the model of the dispatch it replaces
+    cmds = [c[7] for c in d.orca() if c[:2] == ["terminal", "create"]]
+    assert [c.split("/bin/claude-spoke ")[1] for c in cmds] == ["--model claude-opus-5-5 --effort medium --dangerously-skip-permissions"] * 2
+    assert [(spool / "model" / x).read_text() for x in ("ctx_2", "ctx_3")] == ["claude-opus-5-5\n"] * 2
+    assert (spool / "failover/ctx_2").exists() and not (spool / "failover/ctx_3").exists()   # rounds() leaves a model relaunch out, as an account failover (#556)
 
 
 @pytest.mark.parametrize("args", [("--retry-of", "ctx_old", "--task", "task_7"), ("--address", "fix it")], ids=["retry", "address"])
