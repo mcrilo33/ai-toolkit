@@ -82,11 +82,14 @@ code is broken**, not on which repo you happen to be sitting in:
   `orca.yaml` (anything under `.claude/` or `.ai-toolkit/` in a host project, `shared/` in the toolkit
   repo) — is filed to `UPSTREAM_REPO` (`owner/repo`; `sync.sh` fills it from the toolkit's `origin`, and
   `.ai-toolkit/ai-toolkit.local.env` overrides it), even when discovered inside a host project. Otherwise
-  the toolkit's own bugs scatter across downstream trackers and never reach its maintainer.
+  the toolkit's own bugs scatter across downstream trackers and never reach its maintainer. Read it with
+  `grep -m1 '^UPSTREAM_REPO='` on the main checkout's `.ai-toolkit/ai-toolkit.local.env`, else on
+  `.ai-toolkit/ai-toolkit.env`. That local file holds per-machine secrets (`NOTIFY_WEBHOOK_URL`): read a key
+  with a single-key `grep`, never `Read` or `cat` the file.
 - **Empty `UPSTREAM_REPO` fails closed.** It means "file here" only in the toolkit's own checkout, which
   is the one holding `shared/`, `hooks/claude/` and `scripts/sync.sh` at its root (the test `land.sh` uses). Anywhere
   else it is a host project with no upstream configured: the scoper returns the draft, says plainly that
-  no upstream is set and that `UPSTREAM_REPO` goes in `.ai-toolkit/ai-toolkit.local.env` (or re-run
+  no upstream is set and that `UPSTREAM_REPO` goes in the local env file above (or re-run
   `sync.sh` from a toolkit checkout with an `origin`), and never files to the host repo.
 - **Synced copies are not edited in a host project.** There, the toolkit's files are synced copies; a
   defect or wish about one is filed upstream through the scoper, and the project picks the fix up at its
@@ -140,7 +143,7 @@ Both agents file with the `gh` CLI when no GitHub MCP is available. When neither
 draft instead, and report it loudly with the finding text preserved. If `hold` applies and
 the label is missing from the repo, create it first.
 
-When `DISPATCH_LABEL` is set (read like `UPSTREAM_REPO`: `.ai-toolkit/ai-toolkit.local.env`, then `ai-toolkit.env`), every
+When `DISPATCH_LABEL` is set (read it with `grep -m1 '^DISPATCH_LABEL='` on the main checkout's `.ai-toolkit/ai-toolkit.local.env`, else on `.ai-toolkit/ai-toolkit.env`), every
 issue filed to *this* repo carries that label too, because the loop dispatches only labelled issues. An issue filed
 upstream to `UPSTREAM_REPO` carries `ai-toolkit` (the shipped default, which the toolkit repo runs on), whatever the host's
 value, also when the host opted out: a host cannot read the target's setting. Either label is created first if the target

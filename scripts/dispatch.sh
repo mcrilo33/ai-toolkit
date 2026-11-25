@@ -11,6 +11,7 @@
 # --model <id>: with --retry-of/--address, the model the worker runs on instead of the issue's Model: footer (#551: the fallback after a usage limit); a --retry-of without it keeps the model recorded for the dispatch it retries. The model of
 # every dispatch is recorded in the Run's spool (model/<dispatch>), and a --model retry is marked failover/<dispatch> like an account failover: it only moved the task, so coordinator.sh's rounds() does not count it.
 # --next <issue>: the same pick restricted to that issue, so it starts only if it is ready (exit 3 and a message when it is not).
+# POST_DISPATCH_CMD (a project's own command, empty by default) runs once after a first dispatch of an issue with a Tracker: footer, never for --retry-of or --address: <cmd> <issue> <key>, BASE_BRANCH in its environment, output to stderr; a failure only warns.
 # Records the issue given to the dispatch (lib.sh spool_dir). Prints one JSON line {issue,dispatch,worktree,terminal} (--dry-run: just the picked number). Exit: 0 dispatched, 1 error, 2 usage, 3 --next: nothing ready, 4 Claude's folder-trust dialog blocks the start (still up after one answer, or a layout the keys are not known for): the repo root is not trusted, no issue is at fault.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -153,6 +154,8 @@ dispatch() {
   record_dispatch "$run" "$disp" "$n"   # what coordinator.sh's ctx() checks Orca's link against: the worker can relink its worktree, not rewrite this
   (umask 077; d="$(spool_dir "$run")"; mkdir -p "$d/model"; printf '%s\n' "$model" > "$d/model/$disp"   # the id passed record_dispatch's check just above
     [ -z "$model_opt" ] || [ -z "$retry_of" ] || [ -n "$named" ] || { mkdir -p "$d/failover"; : > "$d/failover/$disp"; })   # a --model retry only moved the task (a named account already marked it)
+  [ -z "$tracker" ] || [ -z "${POST_DISPATCH_CMD:-}" ] || [ -n "$retry_of$address" ] || {   # a first dispatch only: a review round must not run the project's start step again
+    BASE_BRANCH="$BASE_BRANCH" bash -c "$POST_DISPATCH_CMD \"\$@\"" post-dispatch "$n" "$tracker" >&2 || echo "dispatch: warning: POST_DISPATCH_CMD failed for $tracker (the worker is started)" >&2; }
   jq -nc --argjson issue "$n" --arg dispatch "$disp" --arg worktree "$wt" --arg terminal "$term" \
     '{issue: $issue, dispatch: $dispatch, worktree: $worktree, terminal: $terminal}'
 }

@@ -94,7 +94,7 @@ Always `bug`. Add, by heuristic:
   fail-open (a gate or guard that silently passes when it should block). These jump
   the queue.
 - **`hold`** — not by default, whatever the `Scope:`; only when the bar in the `bug-triage` rule is met, with a `Hold: <reason>` line in the body. Say in your report: no hold, or held with the reason.
-- **`DISPATCH_LABEL`** — when set, on every issue filed to this repo. An issue filed upstream always carries `ai-toolkit`, also when `DISPATCH_LABEL` is empty (`bug-triage` rule). Create the label first if missing.
+- **`DISPATCH_LABEL`** — when set (read it the same single-key way, `grep -m1 '^DISPATCH_LABEL='`), on every issue filed to this repo. An issue filed upstream always carries `ai-toolkit`, also when `DISPATCH_LABEL` is empty (`bug-triage` rule). Create the label first if missing.
 
 ## Phase 5: File or draft
 
@@ -110,8 +110,9 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
   fix touches an ai-toolkit-owned file (a synced rule, skill, agent, hook, script, or
   `orca.yaml`: anything under `.claude/` or `.ai-toolkit/`, or `shared/` in the toolkit repo itself) is an
   **ai-toolkit tooling** defect; anything else is a **host project** defect. File a tooling defect to
-  `UPSTREAM_REPO` (`owner/repo`): read it from the main checkout's `.ai-toolkit/ai-toolkit.local.env`
-  (`$ORCA_ROOT_PATH`), else from `.ai-toolkit/ai-toolkit.env`. Empty or unset means "the toolkit's own
+  `UPSTREAM_REPO` (`owner/repo`): read it with `grep -m1 '^UPSTREAM_REPO='` on the main checkout's
+  `.ai-toolkit/ai-toolkit.local.env` (`$ORCA_ROOT_PATH`), else on `.ai-toolkit/ai-toolkit.env`. That local file holds per-machine
+  secrets (`NOTIFY_WEBHOOK_URL`): read a key with a single-key `grep`, never `Read` or `cat` the file. Empty or unset means "the toolkit's own
   repo" only when this checkout has `shared/`, `hooks/claude/` and `scripts/sync.sh` at its root; otherwise it is a
   host project with no upstream: **never file to the host repo**, return the draft, and say plainly that no
   upstream is configured and how to set it (see `bug-triage.md`, which also says synced copies are never

@@ -191,8 +191,18 @@ def test_a_finished_land_human_round_is_presented_as_two_levels_with_a_three_opt
     ("skills/solo-cycle/SKILL.md", ["only the human can do", "never escalate", "restart the flow", "fresh URL or device code"]),
     ("rules/operational-gotchas.md", ["aws sso login", "aws sts get-caller-identity", "through its `ask`", "In a chat session, if the token", "a spoke restarts the flow"]),
     ("skills/coordinate/SKILL.md", ["never tells the worker to \"escalate\""]),
+    ("skills/solo-cycle/SKILL.md", ["grep -m1 '^SPEND_APPROVE_USD='", "never `Read` or `cat`"]),
+    ("agents/bug-scoper.md", ["grep -m1 '^UPSTREAM_REPO='", "grep -m1 '^DISPATCH_LABEL='", "never `Read` or `cat`"]),
+    ("agents/followup-scoper.md", ["grep -m1 '^UPSTREAM_REPO='", "grep -m1 '^DISPATCH_LABEL='", "never `Read` or `cat`"]),
     ("rules/on-demand/afk-answering.md", ["the human is away", "worker_done --outcome failed"]),
 ])
 def test_the_land_human_footer_is_taught_where_issues_are_filed_worked_and_documented(path, needles):
     text = (SHARED / path).read_text()
     assert all(n in text for n in needles), [n for n in needles if n not in text]
+
+
+@pytest.mark.parametrize("path", ["skills/solo-cycle/SKILL.md", "agents/bug-scoper.md", "agents/followup-scoper.md", "rules/on-demand/bug-triage.md"])
+def test_no_worker_text_tells_the_reader_to_open_the_whole_local_env_file(path):
+    text = (SHARED / path).read_text()
+    mentions = [m.start() for m in re.finditer(r"ai-toolkit\.local\.env", text)]
+    assert mentions and all("grep -m1" in text[max(0, i - 250):i + 250] for i in mentions)
