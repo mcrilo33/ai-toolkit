@@ -879,11 +879,11 @@ BLOCKED = issue_json(labels=["blocked"])
 DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed; one that cannot keeps its file with the reason on line 2 (only a closed issue and a plain request for an already running one are dropped)
     "plain": {}, "fresh-with-message": {"text": "do it test-first", "v7": BLOCKED, "why": "no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"},
     "kept-worktree-with-message": {"text": "do it test-first", "v7": BLOCKED, "kept": True, "expect": ("--address", "do it test-first", "--round", "7"), "label": True}, "kept-worktree-default-message": {"kept": True, "expect": "default"},
-    "cap": {"cap": 1, "why": "waiting for a free slot (cap 1)"}, "refused": {"refuses": True, "why": "dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"}, "closed": {"v7": issue_json(state="CLOSED"), "dropped": True},
+    "cap": {"cap": 1, "why": "waiting: for a free slot (cap 1)"}, "refused": {"refuses": True, "why": "waiting: dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"}, "closed": {"v7": issue_json(state="CLOSED"), "dropped": True},
     "hold": {"v7": issue_json(labels=["hold"]), "why": "on hold: remove the hold label to start it"}, "blocked-no-message": {"v7": BLOCKED, "why": "blocked: remove the label, or give a message to re-dispatch it"},
     "no-toolkit-label": {"v7": issue_json(labels=["bug"]), "env": {"DISPATCH_LABEL": "ai-toolkit"}, "why": "not a toolkit issue: it lacks the ai-toolkit label"},
     "toolkit-label": {"v7": issue_json(labels=["ai-toolkit"]), "env": {"DISPATCH_LABEL": "ai-toolkit"}},
-    "running": {"kept": True, "running": True, "dropped": True}, "running-with-message": {"text": "on another model", "kept": True, "running": True, "why": "a worker is still live on the worktree (dispatch ctx_7): it starts once that worker ends"}, "unreadable": {"unreadable": True, "why": "cannot read the issue (unknown, or GitHub did not answer)"},
+    "running": {"kept": True, "running": True, "dropped": True}, "running-with-message": {"text": "on another model", "kept": True, "running": True, "why": "waiting: a worker is still live on the worktree (dispatch ctx_7): it starts once that worker ends"}, "unreadable": {"unreadable": True, "why": "cannot read the issue (unknown, or GitHub did not answer)"},
     "worktrees": {"no_worktrees": True, "why": "cannot read the worktrees"}, "dispatch-fails": {"fails": True, "why": "dispatch failed: boom"},
 }
 
@@ -986,7 +986,7 @@ def test_replaying_the_incident_ends_with_the_issue_re_dispatched_never_a_silent
     C.stubs.reply("gh.issue_view", issue_json())
     C.stubs.reply("orca.orchestration_reply", json.dumps({"error": {"code": "bad_state"}}), rc=1)
     C.go("--answer", "attended", "--cap", "1")
-    assert not C.calls("orca orchestration reply") and not C.spooled("msg_p") and req.read_text().splitlines()[1].startswith("a worker is still live on the worktree (dispatch ctx_1)")   # kept with its reason, the stale reply dropped
+    assert not C.calls("orca orchestration reply") and not C.spooled("msg_p") and req.read_text().splitlines()[1].startswith("waiting: a worker is still live on the worktree (dispatch ctx_1)")   # kept with its reason, the stale reply dropped
     C.workers(C.row(st="failed", lv="exited"))   # the human abandoned the worker
     C.go("--answer", "attended", "--cap", "1")
     assert [a for a in C.stubs.calls("dispatch.sh") if a != ["--next", "--dry-run"]] == [["--address", "on another model", "--round", "1"]] and not req.exists()
@@ -1316,6 +1316,28 @@ def test_wait_wakes_for_a_dispatch_request_refused_after_it_started(C, tmp_path,
     link_script(tmp_path / "stubs/bin/sleep", f"#!/bin/bash\nprintf 'redo it\\nno free slot\\n' > {req}/7\n")   # the loop refuses it while the watcher sleeps
     r = watched(C, ([], []), ([], []))
     assert r.returncode == 0 and r.stdout.split() == ["7"]
+
+
+WAITING = ["waiting: for a free slot (cap 3)", "waiting: a worker is still live on the worktree (dispatch ctx_1): it starts once that worker ends", "waiting: dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"]
+
+
+@pytest.mark.parametrize("seen", ["", "7"])
+@pytest.mark.parametrize("why", WAITING)
+def test_wait_ignores_a_dispatch_request_that_only_waits(C, tmp_path, why, seen):   # nothing was refused: it starts on its own, so it is no decision, in --seen or not
+    req = tmp_path / "state/run_t/requests"
+    req.mkdir(parents=True)
+    (req / "7").write_text(f"redo it\n{why}\n")
+    r = watched(C, ([], []), ([], []), seen=seen)
+    assert r.returncode == 1 and r.stdout == ""
+
+
+@pytest.mark.parametrize("why", WAITING)
+def test_wait_still_wakes_for_a_new_plan_while_a_request_only_waits(C, tmp_path, why):   # the waiting request must not silence the next plan, whether or not it is in --seen
+    req = tmp_path / "state/run_t/requests"
+    req.mkdir(parents=True)
+    (req / "7").write_text(f"redo it\n{why}\n")
+    r = watched(C, ([], []), (["msg_a"], []), ([], []), seen="7")
+    assert r.returncode == 0 and r.stdout.split() == ["msg_a"]
 
 
 @pytest.mark.parametrize(("polls", "mode", "held"), [

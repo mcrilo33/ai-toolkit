@@ -13,7 +13,7 @@ Hub to spoke: the **issue is the contract**. The worker starts with a fresh cont
 Restate the task as a draft issue: **title**, **body** (problem, proposal, acceptance criteria drawn from the
 conversation). Get an OK before filing; do not invent scope. If the work falls into independent file groups,
 draft one issue per group (`issue-hygiene`, Split what does not collide) and tell the user. An external ticket key
-as the argument (e.g. `PM-17`): read the ticket with the project's own tool (e.g. the Atlassian connector), draft from
+as the argument (e.g. `PM-17`): read it with `bash .claude/skills/jira/scripts/read-ticket.sh <KEY>` when `JIRA_SITE` is set, else with the project's own tool, draft from
 it, and add `Tracker: <KEY>` to the footer. A spend cap in an issue is a priced estimate (units x the unit cost measured on the last comparable run x draws) plus about 50% headroom, with the arithmetic written next to it, never a round guess; with no comparable run, say so and leave the pricing to the PLAN.
 
 ## 2. File the issue

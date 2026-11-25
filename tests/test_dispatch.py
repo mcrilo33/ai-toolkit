@@ -116,6 +116,49 @@ def test_a_tracker_footer_puts_its_key_in_the_seed_for_every_commit_subject_and_
     assert seeds(d)[1] == tracked.replace(f" {sentence}.", "", 1)
 
 
+HOOK = '#!/bin/bash\nprintf "%s|%s\\n" "$*" "$BASE_BRANCH" >> "$HOOK_LOG"\n[ -z "$HOOK_FAIL" ] || { echo hook-boom >&2; exit 1; }\n'
+TRACKED = {**ISSUE, "body": ISSUE["body"] + "Tracker: PM-17\n"}
+
+
+@pytest.fixture
+def hook(d, tmp_path, link_script):   # run(*args, tracked=True, **env) -> (result, lines the POST_DISPATCH_CMD recorded)
+    script, log = link_script(tmp_path / "post-dispatch-hook", HOOK), tmp_path / "hook.log"
+
+    def run_hook(*args, tracked=True, cmd=None, **env):
+        d.stubs.reply("gh.issue_view", json.dumps(TRACKED if tracked else ISSUE))
+        r = d.go(*args, POST_DISPATCH_CMD=str(script) if cmd is None else cmd, **{"HOOK_LOG": log, "HOOK_FAIL": "", **env})
+        return r, log.read_text().splitlines() if log.exists() else []
+    return run_hook
+
+
+def test_post_dispatch_cmd_receives_the_issue_and_tracker_key_once_and_stdout_stays_one_json_line(hook):
+    r, calls = hook("7")
+    assert r.returncode == 0, r.stderr
+    assert calls == ["7 PM-17|main"]
+    assert len(r.stdout.splitlines()) == 1 and json.loads(r.stdout)["issue"] == 7
+
+
+@pytest.mark.parametrize("args,tracked,cmd", [
+    (("7",), False, None),
+    (("7",), True, ""),
+    (("--retry-of", "ctx_old", "--task", "task_7", "7"), True, None),
+    (("--address", "address: fix it", "7"), True, None),
+], ids=["no-tracker", "no-command", "retry-of", "address"])
+def test_post_dispatch_cmd_is_not_called_without_a_tracker_or_a_command_nor_for_a_retry_or_an_address_round(d, hook, args, tracked, cmd):
+    if args[0] != "7":
+        stale_worktree(d)
+    r, calls = hook(*args, tracked=tracked, cmd=cmd)
+    assert r.returncode == 0, r.stderr
+    assert calls == []
+
+
+def test_a_failing_post_dispatch_cmd_only_warns_the_worker_is_started_and_stdout_stays_one_json_line(d, hook):
+    r, _ = hook("7", HOOK_FAIL="1")
+    assert r.returncode == 0 and "hook-boom" in r.stderr and "POST_DISPATCH_CMD failed for PM-17" in r.stderr
+    assert len(r.stdout.splitlines()) == 1 and "hook-boom" not in r.stdout
+    assert any(c[:2] == ["orchestration", "worker-start"] for c in d.orca())
+
+
 @pytest.mark.parametrize("tail", ["\r", " "])
 def test_a_tracker_footer_with_a_trailing_cr_or_space_still_names_the_key(d, tail):   # a body edited in the GitHub web UI comes back with CRLF
     d.stubs.reply("gh.issue_view", json.dumps({**ISSUE, "body": f"x\nScope: a\nTracker: PM-17{tail}\n"}))
