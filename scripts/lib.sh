@@ -156,23 +156,41 @@ record_dispatch() {   # <run> <dispatch> <issue>
   _dispatch_id_ok "$2" || die "bad dispatch id '$2'"
   local d; d="$(spool_dir "$1")/dispatch"; (umask 077; mkdir -p "$d"; printf '%s\n' "$3" > "$d/$2")
 }
-# usage_limit_reset <escalation body>: rc 0 when the body reports a usage-limit stop (Orca's text: "Claude hit its usage limit ... resets 6pm (Europe/Paris)"); prints the reset text, empty when the body gives none.
+# usage_limit_reset <escalation body>: rc 0 when the body reports a usage-limit stop (Orca's text: "Claude hit its usage limit ... resets 6pm (Europe/Paris)", or "... resets Nov 28, 6pm (Europe/Paris)" when the reset is days away, as a weekly limit's is); prints the reset text, empty when the body gives none.
 # The one detection of this stop: the account failover (#556) and the model fallback (#551) both use it, so a change in Orca's wording is fixed in one place (until then the stop blocks the issue as any escalation does).
 usage_limit_reset() {
-  local re='resets ([0-9]{1,2}(:[0-9]{2})?[ap]m( \([A-Za-z0-9_/+-]+\))?)'
+  local re='resets (([A-Z][a-z]{2} [0-9]{1,2}, )?[0-9]{1,2}(:[0-9]{2})?[ap]m( \([A-Za-z0-9_/+-]+\))?)'
   [[ $1 == "Error: Claude hit its usage limit."* ]] || return 1   # Orca's own prefix: what follows ("Details from the agent: ...") is the agent's text, and a worker quoting the phrase must not move an account
   if [[ $1 =~ $re ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
   return 0
 }
-# reset_epoch <"6pm (Europe/Paris)">: the epoch of the next such time of day in that zone; a text it cannot read (or an unknown zone) is a one-hour hold, never an unbounded one. Arithmetic on the zone's own clock, no `date -j`/`-d`: BSD and GNU alike.
+# _civil_days <y> <m> <d>: days since 1970-01-01 of a Gregorian date, by arithmetic alone (no `date -j`/`-d`: BSD and GNU alike).
+_civil_days() {
+  local y=$1 m=$((10#$2)) d=$((10#$3)) era yoe doy
+  [ "$m" -gt 2 ] || y=$((y - 1))
+  era=$((y / 400)); yoe=$((y - era * 400)); doy=$(((153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1))
+  echo $((era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468))
+}
+# reset_epoch <"6pm (Europe/Paris)" | "Nov 28, 6pm (Europe/Paris)">: the epoch of the next such time of day in that zone, or of that date and time (the zone's own calendar: its days from today, next year's date when this year's is long past, as January named in December); a dated reset already passed is a short hold, a text it cannot read (or an unknown zone) a one-hour hold, never an unbounded one. Arithmetic on the zone's own clock, no `date -j`/`-d`.
 reset_epoch() {
-  local re='^([0-9]{1,2})(:([0-9]{2}))?([ap]m) \(([A-Za-z0-9_/+-]+)\)$' now h m z hh mm ss delta
+  local re='^(([A-Z][a-z]{2}) ([0-9]{1,2}), )?([0-9]{1,2})(:([0-9]{2}))?([ap]m) \(([A-Za-z0-9_/+-]+)\)$' now h m z hh mm ss delta mon md=0 i y cm cd today days
+  local -a names=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
   now="$(date +%s)"
-  if [[ $1 =~ $re ]] && [ -e "/usr/share/zoneinfo/${BASH_REMATCH[5]}" ] && [ "$((10#${BASH_REMATCH[1]}))" -ge 1 ] && [ "$((10#${BASH_REMATCH[1]}))" -le 12 ]; then
-    h=$((10#${BASH_REMATCH[1]} % 12)); m=$((10#${BASH_REMATCH[3]:-0})); z="${BASH_REMATCH[5]}"; [ "${BASH_REMATCH[4]}" != pm ] || h=$((h + 12))
+  if [[ $1 =~ $re ]] && [ -e "/usr/share/zoneinfo/${BASH_REMATCH[8]}" ] && [ "$((10#${BASH_REMATCH[4]}))" -ge 1 ] && [ "$((10#${BASH_REMATCH[4]}))" -le 12 ]; then
+    h=$((10#${BASH_REMATCH[4]} % 12)); m=$((10#${BASH_REMATCH[6]:-0})); z="${BASH_REMATCH[8]}"; [ "${BASH_REMATCH[7]}" != pm ] || h=$((h + 12))
+    mon="${BASH_REMATCH[2]}"; cd=$((10#${BASH_REMATCH[3]:-0}))
+    if [ -n "$mon" ]; then
+      for i in "${!names[@]}"; do if [ "${names[i]}" = "$mon" ]; then md=$((i + 1)); fi; done
+      if [ "$md" -eq 0 ] || [ "$cd" -lt 1 ] || [ "$cd" -gt 31 ]; then printf '%s' $((now + 3600)); return; fi
+    fi
     read -r hh mm ss <<< "$(TZ="$z" date '+%H %M %S')"   # the zone's time of day now
     delta=$((h * 3600 + m * 60 - (10#$hh * 3600 + 10#$mm * 60 + 10#$ss)))
-    if [ "$delta" -le -900 ]; then delta=$((delta + 86400)); elif [ "$delta" -le 0 ]; then delta=300; fi   # passed by under 15 minutes: the loop read the message late, the reset is now (a short hold), not tomorrow's
+    if [ -n "$mon" ]; then
+      read -r y cm today <<< "$(TZ="$z" date '+%Y %m %d')"   # the zone's date now
+      days=$(( $(_civil_days "$y" "$md" "$cd") - $(_civil_days "$y" "$cm" "$today") ))
+      [ "$days" -ge -180 ] || days=$(( $(_civil_days "$((y + 1))" "$md" "$cd") - $(_civil_days "$y" "$cm" "$today") ))
+      delta=$((days * 86400 + delta)); [ "$delta" -gt 0 ] || delta=300   # a date already passed: the reset is now (a short hold), the time of day's roll to tomorrow does not apply
+    elif [ "$delta" -le -900 ]; then delta=$((delta + 86400)); elif [ "$delta" -le 0 ]; then delta=300; fi   # passed by under 15 minutes: the loop read the message late, the reset is now (a short hold), not tomorrow's
     printf '%s' $((now + delta))
   else printf '%s' $((now + 3600)); fi
 }
@@ -196,7 +214,7 @@ free_account() {
     valid_account "$a" || continue
     f="$(spool_dir "$1")/exhausted/$a"
     e="$(head -n 1 "$f" 2> /dev/null)"; [[ $e =~ ^[0-9]+$ ]] || e=0   # a record that is no epoch is no hold
-    if [ "$e" -gt "$(date +%s)" ] && [ "$e" -le "$(($(date +%s) + 90000))" ]; then continue; fi   # a record more than 25 hours ahead is no reset of a session window: dropped
+    if [ "$e" -gt "$(date +%s)" ] && [ "$e" -le "$(($(date +%s) + 691200))" ]; then continue; fi   # a record more than 8 days ahead is no reset of a session or weekly window: dropped
     rm -f "$f"; printf '%s' "$a"; return 0
   done
   return 1
