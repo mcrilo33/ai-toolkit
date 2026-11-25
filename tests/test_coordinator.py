@@ -1264,13 +1264,15 @@ def test_attended_never_hands_over_a_blocked_issue_a_dispatch_request_re_dispatc
     r, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=1, AI_TOOLKIT_POLL=1)
     assert r.returncode == 0 and any("dispatched #1 on request" in ln for ln in (tmp_path / "state/run_t/loop.log").read_text().splitlines())   # the request did run
     assert bodies == [] and not (tmp_path / "state/run_t/handed").exists()
+    assert len(C.calls("gh issue view")) == 2   # the two reads of the request: the list was read again after it, so the hand-over had no stale entry to check
 
 
 def test_away_never_posts_a_blocked_issue_whose_label_was_removed_by_hand_since_it_was_listed(C, tmp_path):
-    C.stubs.reply("gh.issue_list", BLOCKED)   # the list is read only after a sweep or a block: it is stale until then
+    C.stubs.reply("gh.issue_list", BLOCKED, n=1)   # the list is read only after a sweep or a block: it is stale until then
+    C.stubs.reply("gh.issue_list", "[]")
     C.stubs.reply("gh.issue_view", issue_json())
-    r, bodies, _ = posted(C, tmp_path)
-    assert r.returncode == 0 and bodies == [] and C.calls("gh issue view")   # the label was read before the POST
+    r, bodies, _ = posted(C, tmp_path, COORD_MAX_TICKS=2)
+    assert r.returncode == 0 and bodies == [] and len(C.calls("gh issue view")) == 1   # the label was read before the POST, once: the dropped entry made the next wake read the list again
 
 
 def test_a_decision_handed_over_is_left_out_of_the_queue_the_session_presents(C, tmp_path):
