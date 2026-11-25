@@ -71,8 +71,8 @@ okread() {   # <jq options and program> -- <Orca read>: the program's output on 
   local o c j=() p rc=0
   while [ "$1" != -- ]; do j+=("$1"); shift; done; shift; p="${j[${#j[@]}-1]}"; unset "j[${#j[@]}-1]"
   if o="$(orca_json "$@" 2> /dev/null)"; then
-    jq ${j[@]+"${j[@]}"} 'if .result then . else ("" | halt_error(9)) end |
-'"$p" <<< "$o" 2> /dev/null && return 0 || rc=$?
+    jq -n ${j[@]+"${j[@]}"} 'input | if .result then . else ("" | halt_error(9)) end |
+'"$p" <<< "$o" 2> /dev/null && return 0 || rc=$?   # input: an empty reply fails (jq alone would run nothing and exit 0)
     [ "$rc" = 9 ] || ! jq -e .result <<< "$o" > /dev/null 2>&1 || { jq ${j[@]+"${j[@]}"} "$p" <<< "$o" > /dev/null; return "$rc"; }   # a good reply the program failed on: its own jq error, no warning (only this failure costs the extra spawns)
   fi
   c="$(jq -r '.error.code // empty' <<< "$o" 2> /dev/null || true)"; warn "orca $1 $2 failed: ${c:-no reply}"; return 1
