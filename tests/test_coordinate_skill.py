@@ -201,7 +201,7 @@ def test_the_land_human_footer_is_taught_where_issues_are_filed_worked_and_docum
     assert all(n in text for n in needles), [n for n in needles if n not in text]
 
 
-@pytest.mark.parametrize("path", ["skills/solo-cycle/SKILL.md", "agents/bug-scoper.md", "agents/followup-scoper.md"])
+@pytest.mark.parametrize("path", ["skills/solo-cycle/SKILL.md", "agents/bug-scoper.md", "agents/followup-scoper.md", "rules/on-demand/bug-triage.md"])
 def test_no_worker_text_tells_the_reader_to_open_the_whole_local_env_file(path):
     text = (SHARED / path).read_text()
     mentions = [m.start() for m in re.finditer(r"ai-toolkit\.local\.env", text)]
