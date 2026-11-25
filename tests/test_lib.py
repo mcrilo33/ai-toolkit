@@ -85,7 +85,7 @@ NOV25 = "2026 11 25"   # the zone's calendar date in the faked clock below (the 
     ("Foo 28, 6pm (Europe/Paris)", "12 00 00", HOLD, NOV25), ("Nov 40, 6pm (Europe/Paris)", "12 00 00", HOLD, NOV25),   # unreadable date: a one-hour hold
 ])
 def test_reset_epoch_is_the_next_reset_in_the_zone_and_never_an_unbounded_hold(run, text, hms, seconds, ymd):
-    fake = 'date() { case "$1" in +%s) echo 1000001;; "+%s %H %M %S %Y %m %d") echo "1000000 $HMS $YMD";; *) return 1;; esac; }'   # one call answers the instant, the zone's clock = $HMS on $YMD; a bare +%s is a second later: only the fallbacks read it
+    fake = 'date() { case "$1" in +%s) echo 1000001;; "+%s %H %M %S %Y %m %d") echo "1000000 $HMS $YMD";; *) return 1;; esac; }'   # the combined format answers now = 1000000 with the zone's clock = $HMS on $YMD; a bare +%s answers 1000001, one second later, so any readable case that reads the clock twice is off by one second (only the one-hour holds read it bare)
     r = lib(run, f'{fake}; echo $(( $(reset_epoch "$T") - 1000000 ))', T=text, HMS=hms, YMD=ymd)
     assert r.returncode == 0 and r.stdout.strip() == str(seconds), r.stderr
 
