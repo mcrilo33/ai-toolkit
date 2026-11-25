@@ -204,11 +204,17 @@ REPLY = f"bash {V2}/scripts/coordinator.sh --run run_t --reply msg_q approve"
 WHY = "human: the plan adds a mechanism the issue left open"
 
 
-@pytest.mark.parametrize("mode, rc, out", [("human", 0, ""), ("auto", 1, ""), ("attended", 3, WHY + "\n")])   # auto: the answerer found nothing usable; attended: it handed the plan over. Never a blind approve
-def test_a_question_for_the_human_is_flagged_with_the_exact_reply_command_and_acked_without_waiting(C, mode, rc, out, tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode, rc, out, finished", [("human", 0, "", False), ("auto", 1, "", False), ("attended", 3, WHY + "\n", False), ("attended", 3, WHY + "\n", True)])   # auto: the answerer found nothing usable; attended: it handed the plan over. Never a blind approve. finished: the worker's dispatch completed before the loop read its plan
+def test_a_question_for_the_human_is_flagged_with_the_exact_reply_command_and_acked_without_waiting(C, mode, rc, out, finished, tmp_path, monkeypatch):
     monkeypatch.delenv("STUB_NOENV")   # this test reads the answerer stub's env
     C.stubs.reply("answer.sh", out, rc=rc)
     C.mail([msg("question", "msg_q", question="PLAN?")])
+    if finished:   # a message to a completed dispatch makes Orca open an unrecorded follow-up dispatch (#571): the plan is neither held nor told to the worker, its worker_done decides
+        C.workers(C.row("ctx_1", st="completed"))
+        r = C.go("--answer", mode)
+        assert r.returncode == 0 and "finished before its plan msg_q was read" in r.stdout and C.calls("orca orchestration check ack")
+        assert not C.calls("orca orchestration send") and not C.calls("gh issue comment") and not C.calls("orca worktree set") and not (tmp_path / "state/run_t/held").exists()
+        return
     assert C.go("--answer", mode).returncode == 0
     assert not C.calls("orca orchestration reply") and C.calls("orca orchestration check ack") and (len(C.stubs.calls("answer.sh")) == 1) == (mode != "human")
     c = C.calls("gh issue comment")[0][-1]
@@ -604,12 +610,16 @@ def test_a_land_that_the_worker_cannot_fix_blocks_at_once(C, rc, out):
     assert C.blocked() and not C.stubs.calls("claude")   # nothing landed, nothing to route
 
 
-def test_a_worker_done_from_a_dispatch_that_another_live_one_replaced_is_ignored_not_landed_or_blocked(C):
-    C.workers(C.row("ctx_1", st="completed"), C.row("ctx_2"))
+@pytest.mark.parametrize("rec", [1, None])   # the replacement dispatch.sh recorded, or a follow-up Orca opened on its own (#571): nobody recorded it, only a human can sort it out
+def test_a_worker_done_from_a_dispatch_that_another_live_one_replaced_is_never_landed_and_blocks_only_an_unrecorded_replacement(C, rec):
+    C.workers(C.row("ctx_1", st="completed"), C.row("ctx_2", rec=rec))
     C.mail([msg("worker_done", dispatchId="ctx_1", outcome="succeeded")])
     r = C.go()
-    assert not C.stubs.calls("land.sh") and not C.calls("gh issue edit") and len(C.calls("orca orchestration check ack")) == 1
-    assert "ctx_1" in r.stderr and "ctx_2" in r.stderr and "ignored" in r.stderr
+    assert not C.stubs.calls("land.sh") and len(C.calls("orca orchestration check ack")) == 1 and bool(C.calls("gh issue edit")) == (rec is None)
+    assert "ctx_1" in r.stderr and "ctx_2" in r.stderr and ("ignored" in r.stderr) == (rec is not None)
+    if rec is None:
+        c = C.calls("gh issue comment")[0][-1]
+        assert C.blocked() and "ctx_1" in c and "ctx_2" in c
 
 
 @pytest.mark.parametrize("cleanup_rc, mode", [(0, "orca"), (6, "orca"), (6, "switched"), (6, "nobranch")])   # the branch is Orca's, never the worker's HEAD; none from Orca = block, not a guess
