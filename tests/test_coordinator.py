@@ -924,6 +924,7 @@ BLOCKED = issue_json(labels=["blocked"])
 DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed; one that cannot keeps its file with the reason on line 2 (only a closed issue and a plain request for an already running one are dropped)
     "plain": {}, "fresh-with-message": {"text": "do it test-first", "v7": BLOCKED, "why": "no worktree yet: a fresh worker reads only the issue body, put the message there and request again without one"},
     "kept-worktree-with-message": {"text": "do it test-first", "v7": BLOCKED, "kept": True, "expect": ("--address", "do it test-first", "--round", "7"), "label": True}, "kept-worktree-default-message": {"kept": True, "expect": "default"},
+    "kept-worktree-on-fallback": {"text": "do it test-first", "v7": BLOCKED, "kept": True, "fallback": True, "env": {"FALLBACK_MODEL": "claude-opus-5-5"}, "expect": ("--address", "do it test-first", "--round", "7"), "label": True},   # a human-requested round starts on the footer model whatever the earlier dispatch ran on (#566)
     "cap": {"cap": 1, "why": "waiting: for a free slot (cap 1)"}, "refused": {"refuses": True, "why": "waiting: dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"}, "closed": {"v7": issue_json(state="CLOSED"), "dropped": True},
     "hold": {"v7": issue_json(labels=["hold"]), "why": "on hold: remove the hold label to start it"}, "blocked-no-message": {"v7": BLOCKED, "why": "blocked: remove the label, or give a message to re-dispatch it"},
     "no-toolkit-label": {"v7": issue_json(labels=["bug"]), "env": {"DISPATCH_LABEL": "ai-toolkit"}, "why": "not a toolkit issue: it lacks the ai-toolkit label"},
@@ -936,6 +937,8 @@ DISPATCH_CASES = {   # a request that can run is run by dispatch.sh and consumed
 @pytest.mark.parametrize("case", DISPATCH_CASES.values(), ids=list(DISPATCH_CASES))
 def test_a_queued_dispatch_request_runs_ahead_of_the_automatic_pick_within_the_cap_and_the_scope_rule(C, tmp_path, case):
     c = {"text": "", "cap": 3, "v7": issue_json(), **case}
+    if c.get("fallback"):
+        spooled_model(tmp_path, "ctx_7", "claude-opus-5-5")
     req = tmp_path / "state/run_t/requests/7"
     req.parent.mkdir(parents=True)
     req.write_text(c["text"] + "\n")
@@ -2016,6 +2019,19 @@ def test_a_usage_limit_relaunches_the_same_task_once_on_the_fallback_model(C, tm
     assert "term_w" in [arg(a, "--terminal") for a in C.calls("orca terminal close")]
     assert "usage limit on claude-fable-5-2: relaunched on claude-opus-5-5" in C.calls("gh issue comment")[0][-1]
     assert ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
+
+
+@pytest.mark.parametrize("ran, want", [("claude-opus-5-5", ["--model", "claude-opus-5-5"]),   # the fallback is kept: the footer model is at its limit
+                                       ("claude-fable-5-2", []),   # the footer model: today's behaviour
+                                       (None, [])])   # no record of the model: never a guess
+def test_an_automatic_address_round_keeps_the_fallback_model_the_dispatch_ran_on(C, tmp_path, ran, want):
+    if ran:
+        spooled_model(tmp_path, "ctx_1", ran)
+    C.stubs.reply("land.sh", f"{W}x\nBLOCKER: a.py:3 - bug\n", rc=3)
+    C.mail([msg("worker_done", outcome="succeeded")])
+    assert C.go(**FALLBACK).returncode == 0
+    d = [a for a in C.stubs.calls("dispatch.sh") if a[0] == "--address"]
+    assert len(d) == 1 and d[0][1].startswith("address:") and d[0][2:] == [*want, "1"]
 
 
 @pytest.mark.parametrize("spool, ran_on, relaunch", [
