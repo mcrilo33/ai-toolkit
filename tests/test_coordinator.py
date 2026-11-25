@@ -1619,29 +1619,36 @@ def test_a_replayed_worker_done_of_an_issue_awaiting_main_is_not_landed_again(C)
     assert not C.stubs.calls("land.sh") and "#1 already awaiting its merge into main (replayed worker_done)" in r.stdout
 
 
-@pytest.mark.parametrize("pr, env, action", [
-    (pr_json(state="MERGED", mergeCommit={"oid": "abc"}), INT, "merged"),
-    (pr_json(state="CLOSED"), INT, "closed without merge"),
-    (pr_json(reviewDecision="CHANGES_REQUESTED"), PRMODE, "changes requested"),   # an issue's own PR: its worker can address it
-    (pr_json(reviewDecision="CHANGES_REQUESTED", reviewed="h0"), PRMODE, "left"),   # the worker already pushed past that review: blocking again would stop the address round before the reviewer looks
-    (pr_json(reviewDecision="CHANGES_REQUESTED", reviews=[{"author": {"login": "r"}, "state": "CHANGES_REQUESTED", "submittedAt": "2026-10-24T10:00:00Z", "commit": {"oid": "h1"}},
-                                                         {"author": {"login": "r"}, "state": "COMMENTED", "submittedAt": "2026-10-24T11:00:00Z", "commit": {"oid": "h1"}}]), PRMODE, "changes requested"),   # a later comment does not lift the request
-    (pr_json(reviewDecision="CHANGES_REQUESTED", reviews=[{"author": {"login": "r"}, "state": "CHANGES_REQUESTED", "submittedAt": "2026-10-24T10:00:00Z", "commit": {"oid": "h0"}},
-                                                         {"author": {"login": "r"}, "state": "COMMENTED", "submittedAt": "2026-10-24T11:00:00Z", "commit": {"oid": "h1"}}]), PRMODE, "left"),   # the request is on an older head
-    (pr_json(reviewDecision="CHANGES_REQUESTED"), INT, "left"),   # the rolling PR carries many issues: the human decides, --status shows it
-    (pr_json(reviewDecision="REVIEW_REQUIRED"), INT, "left"), ("[]", INT, "left"), ("boom", INT, "left")], ids=["merged", "closed", "changes-pr", "changes-addressed", "changes-after-comment", "changes-old-head", "changes-rolling", "open", "no-pr", "gh-fails"])
-def test_the_sweep_checks_the_pr_of_each_issue_awaiting_main(C, pr, env, action):
-    C.stubs.reply("gh.issue_list", json.dumps([{"number": 1, "title": "t", "state": "OPEN"}]))
-    C.stubs.reply("gh.pr_list", pr, rc=1 if pr == "boom" else 0)
+REVIEWS = lambda *heads: [{"author": {"login": "r"}, "state": st, "submittedAt": f"2026-10-24T1{i}:00:00Z", "commit": {"oid": h}} for i, (st, h) in enumerate(zip(("CHANGES_REQUESTED", "COMMENTED"), heads, strict=True))]  # noqa: E731
+PR_SWEEP = {   # one sweep per mode: issue n (1, 2, ...) awaits main with the PR of its case: PR fields, None = no PR closes it, "boom" = its gh read fails
+    "integration": (INT, [("closed", {"state": "CLOSED"}, "closed without merge"),
+                          ("changes-rolling", {"reviewDecision": "CHANGES_REQUESTED"}, "left"),   # the rolling PR carries many issues: the human decides, --status shows it
+                          ("open", {"reviewDecision": "REVIEW_REQUIRED"}, "left"), ("no-pr", None, "left"), ("gh-fails", "boom", "left"),
+                          ("merged", {"state": "MERGED", "mergeCommit": {"oid": "abc"}}, "merged")]),   # last: the land.sh stub reads its stdin, the rows the sweep has not read yet
+    "pr": (PRMODE, [("changes-pr", {"reviewDecision": "CHANGES_REQUESTED"}, "changes requested"),   # an issue's own PR: its worker can address it
+                    ("changes-addressed", {"reviewDecision": "CHANGES_REQUESTED", "reviewed": "h0"}, "left"),   # the worker already pushed past that review: blocking again would stop the address round before the reviewer looks
+                    ("changes-after-comment", {"reviewDecision": "CHANGES_REQUESTED", "reviews": REVIEWS("h1", "h1")}, "changes requested"),   # a later comment does not lift the request
+                    ("changes-old-head", {"reviewDecision": "CHANGES_REQUESTED", "reviews": REVIEWS("h0", "h1")}, "left")]),   # the request is on an older head
+}
+
+
+@pytest.mark.parametrize("env, cases", PR_SWEEP.values(), ids=list(PR_SWEEP))
+def test_the_sweep_checks_the_pr_of_each_issue_awaiting_main(C, env, cases):
+    prs = [{**json.loads(pr_json(**pr))[0], "number": 10 + n, "url": f"https://x/pull/{10 + n}", "body": f"Closes #{n}\n"} for n, (_, pr, _) in enumerate(cases, 1) if isinstance(pr, dict)]
+    C.stubs.reply("gh.issue_list", json.dumps([{"number": n, "title": "t", "state": "OPEN"} for n in range(1, len(cases) + 1)]))
+    C.stubs.reply("gh.pr_list", json.dumps(prs))   # every issue's read lists every PR: each issue keeps the one that closes it
+    for n in [n for n, (_, pr, _) in enumerate(cases, 1) if pr == "boom"]:
+        C.stubs.reply("gh.pr_list", "boom", rc=1, n=n)   # the sweep reads the PRs once per issue, in issue order
     C.go(COORD_SWEEP_EVERY=1, **env)
-    comments = [a[-1] for a in C.calls("gh issue comment")]
-    if action == "merged":
-        assert C.stubs.calls("land.sh") == [["--merged", "1"]] and not comments
-    elif action == "left":
-        assert not C.stubs.calls("land.sh") and not C.calls("gh issue edit") and not comments
-    else:
-        assert not C.stubs.calls("land.sh") and ["--add-label", "blocked"] in [a[3:] for a in C.calls("gh issue edit")]
-        assert ["--remove-label", AWAITING] in [a[3:] for a in C.calls("gh issue edit")] and comments == [f"blocked: https://x/pull/5: {action}"]
+    edits, comments = [(a[2], a[3:]) for a in C.calls("gh issue edit")], [(a[2], a[-1]) for a in C.calls("gh issue comment")]
+    assert len(C.calls("gh pr list")) == len(cases)   # every case was reached: none is left unchecked
+    assert C.stubs.calls("land.sh") == [["--merged", str(n)] for n, (_, _, action) in enumerate(cases, 1) if action == "merged"]
+    for n, (case, _, action) in enumerate(cases, 1):
+        mine = ([e for i, e in edits if i == str(n)], [c for i, c in comments if i == str(n)])
+        if action in ("merged", "left"):
+            assert mine == ([], []), case
+        else:
+            assert ["--add-label", "blocked"] in mine[0] and ["--remove-label", AWAITING] in mine[0] and mine[1] == [f"blocked: https://x/pull/{10 + n}: {action}"], case
 
 
 @pytest.mark.parametrize("rc, state, labels, blocks", [(5, "OPEN", [AWAITING], True), (5, "CLOSED", [AWAITING], True), (5, "CLOSED", [AWAITING, "blocked"], False), (6, "OPEN", [AWAITING], False)],
