@@ -1294,9 +1294,10 @@ def test_position_prints_the_one_word_of_the_loop_holding_the_run_without_a_run_
         r = C.go("--position", run_id=None, ORCA_TERMINAL_HANDLE="")
         assert (r.returncode, r.stdout) == (0, word + "\n")
         if mode == POSITIONS["attended"][0]:   # the holder is read before any loop record: checked once, with a live loop holding the Run
-            C.stubs.reply("orca.orchestration_run_show", "boom", rc=1)
-            r = C.go("--position", run_id=None, ORCA_TERMINAL_HANDLE="")
-            assert r.returncode == 1 and r.stdout == "" and r.stderr   # unknown is not "none": a sweep must not mistake a failed read for a project nobody attends
+            for reply, rc in (("boom", 1), ("", 0)):   # a failed call, and one that exits 0 with nothing on stdout: no reply is no answer either
+                C.stubs.reply("orca.orchestration_run_show", reply, rc=rc)
+                r = C.go("--position", run_id=None, ORCA_TERMINAL_HANDLE="")
+                assert r.returncode == 1 and r.stdout == "" and "no reply" in r.stderr   # unknown is not "none": a sweep must not mistake a failed read for a project nobody attends
     finally:
         if loop:
             loop.kill()
