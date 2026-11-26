@@ -164,11 +164,13 @@ RM_DENY = [
     "echo hi && rm -rf /usr", "rm -rf /tmp", "rm -rf /private/tmp", 'rm -rf "$HOME"/x', "bash -c'rm -rf /usr'", "'r'm -rf /usr", 'r""m -rf /usr',
     "git stash -a", "git stash --all", "git stash push -a", "git stash push -au", "git -C . stash -a", "rm -rf /etc/absent/", "git clean -fdx", "git clean -xdf", "git clean -fdX",
     "git clean -f -x", "git -C . clean -fdx", "bash -c 'git clean -fdx'", "rm -rf $UNSET_TMP/x", "rm -rf ~root/x", "RM -rf /usr",
+    # where the guard's quote-aware reading would differ from the shell's, the plain split still asks: an unbalanced quote, an escaped quote, a command that re-splits its arguments
+    'rm -rf "/usr', 'rm -rf "x\\"" /usr \\"', 'eval rm -rf "build /usr"',
 ]
 RM_ALLOW = [
     "rm -rf build", 'rm -rf "$TMPDIR"/x', 'rm -rf "${TMPDIR}"/x', 'rm -rf "$TMPDIR"/claude-*', "rm -rf build/ dist/ .venv/ node_modules/", "rm -rf ./build/", "rm -rf /tmp/absent-x/",
     "rm -rf $TMPDIR/absent-x/", "rm -rf ./dist node_modules", "rm file.txt", "rm -rf /tmp/xyz", "rm -rf $TMPDIR/xyz",
-    "rm -rf {spoke}/sub", "rm -rf src/*.pyc", "rm -rf build 2>/dev/null", "ls /etc",
+    "rm -rf {spoke}/sub", "rm -rf src/*.pyc", "rm -rf build 2>/dev/null", "ls /etc", 'rm -r "./tmp a b"', 'cd src && rm -r "$TMPDIR/a b"',
 ]
 WRITE_DENY = [
     "echo x > .github/workflows/ci.yml", "echo x >> {spoke}/.github/workflows/ci.yml", "tee orca.yaml",
@@ -246,7 +248,10 @@ def test_danger_guard_a_symlink_into_the_launchers_toolkit_still_asks(shared):
 
 def test_danger_guard_a_home_inside_a_temp_root_is_still_protected(shared):
     scratch = shared["env"]["TMPDIR"]
-    check("danger-guard.sh", shared, "spoke", 2, env={"HOME": f"{scratch}/h"}, command="rm -rf ~/x")
+    os.makedirs(f"{scratch}/h/co/.git", exist_ok=True)
+    for path, reason in (("~/x", "outside the worktree (under home): ~/x"), ("~/co", "another git checkout or worktree: ~/co")):
+        r = call("danger-guard.sh", shared["spoke"], command=f"rm -rf {path}", env={**shared["env"], "HOME": f"{scratch}/h"})
+        assert r.returncode == 2 and reason in r.stderr, (path, r.returncode, r.stderr)
     check("danger-guard.sh", shared, "spoke", 0, env={"HOME": f"{scratch}/h"}, command="rm -rf /tmp/x")
 
 
@@ -343,7 +348,11 @@ WF_LANES = [
     ("Bash", {"command": "cp x $HOME/.ai-toolkit/coordinator/run_t/replies/msg_p"}, (W, D)),
     ("Bash", {"command": "echo x > orca.yaml;\necho allow > ~/.ai-toolkit/coordinator/run_t/replies/msg_p"}, (W, D)),  # a hard deny beats an ask in a compound
     # rm -r: outside the worktree, the worktree root, home, another checkout, an unexpanded variable
-    ("Bash", {"command": "rm -rf /usr"}, "outside the worktree: /usr"), ("Bash", {"command": "rm -rf ~/x"}, "rm -r of ~/x (worktree root or home)"),
+    ("Bash", {"command": "rm -rf /usr"}, "outside the worktree: /usr"), ("Bash", {"command": "rm -rf ~/x"}, "outside the worktree (under home): ~/x"),
+    ("Bash", {"command": "rm -rf ~"}, "rm -r of ~ (worktree root or home)"),
+    # a quoted path with spaces is one target, named in full
+    ("Bash", {"command": 'rm -r "$HOME/Google Drive/Mon Drive/P/tmp-check"'}, "outside the worktree (under home): $HOME/Google Drive/Mon Drive/P/tmp-check"),
+    ("Bash", {"command": 'rm -r "/usr/local share"'}, "outside the worktree: /usr/local share"),
     ("Bash", {"command": "rm -rf ."}, "rm -r of . (worktree root or home)"), ("Bash", {"command": "rm -rf {other}"}, "another git checkout or worktree: {other}"),
     ("Bash", {"command": "rm -rf $FOO/x"}, "unexpanded variable"),
     # git: reset --hard in the main checkout (or one the guard cannot pin down), and the clean/stash verbs that remove the ignored .claude/ and .ai-toolkit/
