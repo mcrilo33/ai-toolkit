@@ -5,7 +5,8 @@
 # fires in bypass mode and an allow/deny from it dismisses the dialog, but a hook that hits its own timeout is killed with NO decision and the dialog stays
 # waiting, so the ask is bounded by a kill timer below the hook timeout (settings: 600 s) and every failure (no handle, no Run, orca erroring, timeout (the worker may ask again, up to 3 requests),
 # unparsable payload, no jq) answers deny. AskUserQuestion and ExitPlanMode are denied without asking: a hook allow does not resolve ExitPlanMode and
-# AskUserQuestion needs the user's answers, not a yes. A denied Bash `orca orchestration send --type worker_done` gets its own message (never resend it in any form, ask the coordinator): the generic one tells the worker to send worker_done again. The question's first line, PERMISSION REQUEST, is what coordinator.sh and the coordinate skill key on.
+# AskUserQuestion needs the user's answers, not a yes. `--wait` also returns, exit 0, on Orca's stopped-coordinator notice (seen on orca 1.4.277; with --json: .result.notice and no .result.answer). That is not an answer: the
+# relay resumes the same question for the rest of the budget (--resume does not repeat the notice). Only a reply (.result.answer) decides, and it settles the question for good, so any other word is a final deny; a notice is never read, since any message on the thread can show up as one. A denied Bash `orca orchestration send --type worker_done` gets its own message (never resend it in any form, ask the coordinator): the generic one tells the worker to send worker_done again. The question's first line, PERMISSION REQUEST, is what coordinator.sh and the coordinate skill key on.
 set -eo pipefail
 root="${CLAUDE_PROJECT_DIR:-$PWD}"
 [ -e "$root/.ai-toolkit/spoke-run-id" ] || exit 0
@@ -23,12 +24,19 @@ q="$(jq -r --arg root "$root" --arg issue "${issue:-unknown}" --arg reason "$rea
   "PERMISSION REQUEST (not a plan gate: reply allow or deny)", "issue: \($issue)", "worktree: \($root)", "tool: \(.tool_name)", "cwd: \(.cwd // "?")",
   "mode: \(.permission_mode // "?")", "reason: \($reason)",
   (.tool_input // {} | if type == "object" then to_entries[] else {key: "input", value: .} end | "\(.key | gsub("\n"; " ")):", (.value | if type == "string" then . else tojson end | show | split("\n") | map("  " + .) | join("\n")))' <<< "$in" | LC_ALL=C tr -d '\000-\010\013-\037\177')" # no control bytes (ESC, CR, BEL): the question must not rewrite the approver's terminal
-o="$(mktemp)"; orca orchestration ask --from "$h" --question "$q" --options allow,deny --wait --timeout-ms "${PERMISSION_RELAY_ASK_MS:-540000}" > "$o" 2> "$o.err" & p=$!
-{ sleep "${PERMISSION_RELAY_KILL_S:-570}" && touch "$o.killed" && kill -9 $p; } > /dev/null 2>&1 & w=$!   # && : a sleep killed on the normal path must not go on to kill
-rc=0; wait $p 2> /dev/null || rc=$?; pkill -P $w 2> /dev/null || :; kill $w 2> /dev/null || :; wait $w 2> /dev/null || :
-reply="$(cat "$o")"; killed=0; [ ! -e "$o.killed" ] || killed=1; late_ask=0; grep -q 'ask timeout after' "$o.err" 2> /dev/null && late_ask=1; rm -f "$o" "$o.killed" "$o.err" # measured on orca 1.4.246: a --wait ask that times out exits 1 with "error: ask_timeout: ask timeout after <n>ms; question <id> is still pending. ..." on stderr and a non-empty stdout (unanchored: the older bare line matches too)
-[ "$killed$late_ask" = 00 ] || deny "nobody answered in time" "$late"
-[ "$rc" = 0 ] || deny "the ask failed: no Run to ask, or orca erroring"
+ms="${PERMISSION_RELAY_ASK_MS:-540000}"; left="$ms"; ask=(--question "$q" --options "allow,deny"); SECONDS=0   # one ask budget and one kill deadline, shared by every round
+while :; do
+  o="$(mktemp)"; orca orchestration ask --from "$h" "${ask[@]}" --wait --json --timeout-ms "$left" > "$o" 2> "$o.err" & p=$!
+  k=$((${PERMISSION_RELAY_KILL_S:-570} - SECONDS)); { sleep $((k > 0 ? k : 0)) && touch "$o.killed" && kill -9 $p; } > /dev/null 2>&1 & w=$!   # && : a sleep killed on the normal path must not go on to kill
+  rc=0; wait $p 2> /dev/null || rc=$?; pkill -P $w 2> /dev/null || :; kill $w 2> /dev/null || :; wait $w 2> /dev/null || :
+  out="$(cat "$o")"; killed=0; [ ! -e "$o.killed" ] || killed=1; late_ask=0; grep -q 'ask timeout after' "$o.err" 2> /dev/null && late_ask=1; rm -f "$o" "$o.killed" "$o.err" # measured on orca 1.4.246: a --wait ask that times out exits 1 with "error: ask_timeout: ask timeout after <n>ms; question <id> is still pending. ..." on stderr and a non-empty stdout (unanchored: the older bare line matches too)
+  [ "$killed$late_ask" = 00 ] || deny "nobody answered in time" "$late"
+  [ "$rc" = 0 ] || deny "the ask failed: no Run to ask, or orca erroring"
+  ! jq -e '.result.answer | type == "string"' <<< "$out" > /dev/null 2>&1 || break
+  id="$(jq -er .result.messageId <<< "$out")"; ask=(--resume "$id"); left=$((ms - SECONDS * 1000))
+  [ "$left" -gt 0 ] || deny "nobody answered in time" "$late"
+done
+reply="$(jq -er .result.answer <<< "$out")"
 reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
 [ "$reply" = allow ] || deny "the Run did not answer allow" "$refused"
 printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}\n'
