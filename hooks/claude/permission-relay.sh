@@ -27,7 +27,7 @@ q="$(jq -r --arg root "$root" --arg issue "${issue:-unknown}" --arg reason "$rea
 ms="${PERMISSION_RELAY_ASK_MS:-540000}"; left="$ms"; ask=(--question "$q" --options "allow,deny"); SECONDS=0   # one ask budget and one kill deadline, shared by every round
 while :; do
   o="$(mktemp)"; orca orchestration ask --from "$h" "${ask[@]}" --wait --json --timeout-ms "$left" > "$o" 2> "$o.err" & p=$!
-  k=$((${PERMISSION_RELAY_KILL_S:-570} - SECONDS)); { sleep $((k > 0 ? k : 0)) && touch "$o.killed" && kill -9 $p; } > /dev/null 2>&1 & w=$!   # && : a sleep killed on the normal path must not go on to kill
+  k=$((${PERMISSION_RELAY_KILL_S:-570} - SECONDS)); { sleep $((k > 0 ? k : 1)) && touch "$o.killed" && kill -9 $p; } > /dev/null 2>&1 & w=$!   # && : a sleep killed on the normal path must not go on to kill; at least 1 s, whole-second SECONDS must not kill an ask that is only starting
   rc=0; wait $p 2> /dev/null || rc=$?; pkill -P $w 2> /dev/null || :; kill $w 2> /dev/null || :; wait $w 2> /dev/null || :
   out="$(cat "$o")"; killed=0; [ ! -e "$o.killed" ] || killed=1; late_ask=0; grep -q 'ask timeout after' "$o.err" 2> /dev/null && late_ask=1; rm -f "$o" "$o.killed" "$o.err" # measured on orca 1.4.246: a --wait ask that times out exits 1 with "error: ask_timeout: ask timeout after <n>ms; question <id> is still pending. ..." on stderr and a non-empty stdout (unanchored: the older bare line matches too)
   [ "$killed$late_ask" = 00 ] || deny "nobody answered in time" "$late"
