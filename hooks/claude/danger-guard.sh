@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2086  # `check $seg` splits a segment into words on purpose (globbing is off: set -f)
+# shellcheck disable=SC2086  # `check "$raw" $seg` and `set -- $d` split into words on purpose (globbing is off: set -f)
 # danger-guard: PreToolUse(Bash|Write|Edit|MultiEdit|NotebookEdit|AskUserQuestion). Yolo mode (D8) has no prompts of its own, so this is the brake.
 # The rule: everything is authorized except sensitive operations, which ASK the user when someone can answer and are DENIED when no one can.
 # Asks (exit 0 + a permissionDecision "ask" on stdout: the prompt shows even in yolo mode), one per call whose reason names every sensitive segment: writes
@@ -77,15 +77,15 @@ target() { # one `rm -r` target: inside the worktree, or strictly below a temp r
   local p="$1" v; for v in HOME TMPDIR; do p="${p/#\$$v/${!v:-}}"; p="${p/#\$\{$v\}/${!v:-}}"; done
   case "$p" in *\$* | \~[!/]*) sens "rm -r target $1 has an unexpanded variable: use a literal path"; return 0;; esac
   p="$(canon "$p")"
-  case "$p" in "$root"/?*) return 0;; "$root" | "$home" | "$home"/*) sens "rm -r of $1 (worktree root or home)"; return 0;; esac
+  case "$p" in "$root"/?*) return 0;; "$root" | "$home") sens "rm -r of $1 (worktree root or home)"; return 0;; esac
   if [ -e "$p/.git" ]; then sens "rm -r of another git checkout or worktree: $1"; return 0; fi
-  case "$p" in /tmp/?* | /private/tmp/?* | "$(phys "${TMPDIR:-/nonexistent}")"/?*) return 0;; esac
+  case "$p" in "$home"/*) sens "rm -r outside the worktree (under home): $1"; return 0;; /tmp/?* | /private/tmp/?* | "$(phys "${TMPDIR:-/nonexistent}")"/?*) return 0;; esac
   sens "rm -r outside the worktree: $1"
 }
-check() { # the words of one command segment
+check() { local raw="$1"; shift # one command segment: as written, then its words in this scan
   while [ $# -gt 0 ] && [[ ${1##*/} != rm && ${1##*/} != git ]]; do shift; done
   [ $# -gt 0 ] || return 0
-  local k="${1##*/}" d t="" rec="" a; shift
+  local k="${1##*/}" d rec="" a; shift
   if [[ $k == git ]]; then
     if [[ " $* " == *" clean "* || " $* " == *" stash "* ]]; then for a in "$@"; do [[ $a =~ ^(--all|-[a-zA-Z]*[xa][a-zA-Z]*)$ ]] && { sens "git clean -x / stash -a remove the ignored .claude/ and .ai-toolkit/: git $*"; break; }; done; fi
     case " $* " in *" reset "*"--hard "*) ;; *) return 0;; esac
@@ -95,12 +95,12 @@ check() { # the words of one command segment
     [ "$a" != "$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo y)" ] || sens "git reset --hard in the main checkout ($(phys "$d")): git $*"
     return 0
   fi
-  for a in "$@"; do case "$a" in --recursive | -[rR]* | -[!-]*[rR]*) rec=1;; -*) ;; *) t="$t $a";; esac; done
-  [ -z "$rec" ] || for a in $t; do target "$a"; done
-  return 0
+  if [[ $raw != *\\* ]] && d="$(trap - ERR; printf '%s\n' "$raw" | xargs printf '%s\n' 2> /dev/null)" && [[ ${d%%$'\n'*} == rm || ${d%%$'\n'*} == */rm ]]; then local IFS=$'\n'; set -- $d; IFS=$' \t\n'; shift; fi # rm's words as the shell reads them ("a b" is one target); the scan's words stay when xargs may read unlike the shell: unbalanced quotes (it fails), a backslash (\" in double quotes), a segment that does not start with rm (eval re-splits)
+  for a in "$@"; do case "$a" in --recursive | -[rR]* | -[!-]*[rR]*) rec=1;; esac; done
+  [ -z "$rec" ] || for a in "$@"; do case "$a" in -*) ;; *) target "$a";; esac; done; return 0
 }
 # quotes dropped (pu""sh, "$TMPDIR"/x), then quotes glued between a word and a letter turned into a space (bash -c'rm ..')
 for sc in "s/[\"'\\\\]//g" "s/([^[:space:]])[\"'\\\\]+([[:alnum:]])/\\1 \\2/g; s/[\"'\\\\]//g"; do
-  while IFS= read -r seg; do check $seg; done < <(printf '%s\n' "$cmd" | sed -E "$sc" | tr ';|&()`<>' '\n')
+  while IFS= read -r seg <&3 && IFS= read -r raw <&4; do check "$raw" $seg; done 3< <(printf '%s\n' "$cmd" | sed -E "$sc" | tr ';|&()`<>' '\n') 4< <(printf '%s\n' "$cmd" | tr ';|&()`<>' '\n') # the sed adds or removes no line and no separator, so the two streams stay in step
 done
 finish
