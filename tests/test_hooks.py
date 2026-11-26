@@ -165,7 +165,7 @@ RM_DENY = [
     "git stash -a", "git stash --all", "git stash push -a", "git stash push -au", "git -C . stash -a", "rm -rf /etc/absent/", "git clean -fdx", "git clean -xdf", "git clean -fdX",
     "git clean -f -x", "git -C . clean -fdx", "bash -c 'git clean -fdx'", "rm -rf $UNSET_TMP/x", "rm -rf ~root/x", "RM -rf /usr",
     # where the guard's quote-aware reading would differ from the shell's, the plain split still asks: an unbalanced quote, an escaped quote, a command that re-splits its arguments
-    'rm -rf "/usr', 'rm -rf "x\\"" /usr \\"', 'eval rm -rf "build /usr"',
+    'rm -rf "x\\"" /usr \\"', 'eval rm -rf "build /usr"',
 ]
 RM_ALLOW = [
     "rm -rf build", 'rm -rf "$TMPDIR"/x', 'rm -rf "${TMPDIR}"/x', 'rm -rf "$TMPDIR"/claude-*', "rm -rf build/ dist/ .venv/ node_modules/", "rm -rf ./build/", "rm -rf /tmp/absent-x/",
@@ -353,6 +353,7 @@ WF_LANES = [
     # a quoted path with spaces is one target, named in full
     ("Bash", {"command": 'rm -r "$HOME/Google Drive/Mon Drive/P/tmp-check"'}, "outside the worktree (under home): $HOME/Google Drive/Mon Drive/P/tmp-check"),
     ("Bash", {"command": 'rm -r "/usr/local share"'}, "outside the worktree: /usr/local share"),
+    ("Bash", {"command": 'rm -rf "/usr'}, "outside the worktree: /usr"),  # unbalanced quotes: the plain split still asks, with no parse failure
     ("Bash", {"command": "rm -rf ."}, "rm -r of . (worktree root or home)"), ("Bash", {"command": "rm -rf {other}"}, "another git checkout or worktree: {other}"),
     ("Bash", {"command": "rm -rf $FOO/x"}, "unexpanded variable"),
     # git: reset --hard in the main checkout (or one the guard cannot pin down), and the clean/stash verbs that remove the ignored .claude/ and .ai-toolkit/
