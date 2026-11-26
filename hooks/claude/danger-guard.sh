@@ -95,12 +95,12 @@ check() { local raw="$1"; shift # one command segment: as written, then its word
     [ "$a" != "$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo y)" ] || sens "git reset --hard in the main checkout ($(phys "$d")): git $*"
     return 0
   fi
-  if [[ $raw != *\\* ]] && d="$(trap - ERR; printf '%s\n' "$raw" | xargs printf '%s\n' 2> /dev/null)" && [[ ${d%%$'\n'*} == rm || ${d%%$'\n'*} == */rm ]]; then local IFS=$'\n'; set -- $d; IFS=$' \t\n'; shift; fi # rm's words as the shell reads them ("a b" is one target); the scan's words stay when xargs may read unlike the shell: unbalanced quotes (it fails), a backslash (\" in double quotes), a segment that does not start with rm (eval re-splits)
+  if [[ $left != *[\"\'\\]* ]] && d="$(trap - ERR; printf '%s\n' "$raw" | xargs printf '%s\n' 2> /dev/null)" && [[ ${d%%$'\n'*} == rm || ${d%%$'\n'*} == */rm ]]; then local IFS=$'\n'; set -- $d; IFS=$' \t\n'; shift; fi # rm's words as the shell reads them ("a b" is one target); else the scan's words (see left; eval re-splits)
   for a in "$@"; do case "$a" in --recursive | -[rR]* | -[!-]*[rR]*) rec=1;; esac; done
   [ -z "$rec" ] || for a in "$@"; do case "$a" in -*) ;; *) target "$a";; esac; done; return 0
 }
-# quotes dropped (pu""sh, "$TMPDIR"/x), then quotes glued between a word and a letter turned into a space (bash -c'rm ..')
-for sc in "s/[\"'\\\\]//g" "s/([^[:space:]])[\"'\\\\]+([[:alnum:]])/\\1 \\2/g; s/[\"'\\\\]//g"; do
-  while IFS= read -r seg <&3 && IFS= read -r raw <&4; do check "$raw" $seg; done 3< <(printf '%s\n' "$cmd" | sed -E "$sc" | tr ';|&()`<>' '\n') 4< <(printf '%s\n' "$cmd" | tr ';|&()`<>' '\n') # the sed adds or removes no line and no separator, so the two streams stay in step
+left="$(printf '%s' "$cmd" | sed -E "s/\"[^\"\\\\;|&()\`<>]*\"|'[^'\\\\;|&()\`<>]*'//g")" # less each quoted span with no separator or backslash: a quote or backslash left means xargs may read unlike the shell
+for sc in "s/[\"'\\\\]//g" "s/([^[:space:]])[\"'\\\\]+([[:alnum:]])/\\1 \\2/g; s/[\"'\\\\]//g"; do # quotes dropped (pu""sh, "$TMPDIR"/x), then glued between a word and a letter turned into a space (bash -c'rm ..')
+  while IFS= read -r seg <&3 && IFS= read -r raw <&4; do check "$raw" $seg; done 3< <(printf '%s\n' "$cmd" | sed -E "$sc" | tr ';|&()`<>' '\n') 4< <(printf '%s\n' "$cmd" | tr ';|&()`<>' '\n') # sed keeps lines and separators: the streams stay in step
 done
 finish
