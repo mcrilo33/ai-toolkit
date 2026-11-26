@@ -530,7 +530,7 @@ def relay(tmp_path, link_script):
         args, first = ((f.read_bytes().decode().split("\0")[:-1] if f.exists() else None) for f in (tmp_path / "args", tmp_path / "args.first"))
         out = json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
         return SimpleNamespace(rc=r.returncode, out=out, args=args, first=first, stderr=r.stderr, asks=len((tmp_path / "args.n").read_text().split()) if (tmp_path / "args.n").exists() else 0,
-                               behavior=out and out["decision"]["behavior"], question=args and args[args.index("--question") + 1])
+                               behavior=out and out["decision"]["behavior"], question=first and first[first.index("--question") + 1])
 
     return SimpleNamespace(run=run, dir=spoke, shim=shim, tmp=tmp_path)
 
