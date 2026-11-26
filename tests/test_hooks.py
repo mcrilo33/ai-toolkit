@@ -246,13 +246,13 @@ def test_danger_guard_a_symlink_into_the_launchers_toolkit_still_asks(shared):
     check("danger-guard.sh", shared, "spoke", 2, env={"AI_TOOLKIT_DIR": str(h / "m/.ai-toolkit")}, command=f"echo x > {h}/ml/.ai-toolkit/hooks/x")
 
 
-def test_danger_guard_a_home_inside_a_temp_root_is_still_protected(shared):
-    scratch = shared["env"]["TMPDIR"]
-    os.makedirs(f"{scratch}/h/co/.git", exist_ok=True)
+def test_danger_guard_a_home_inside_a_temp_root_is_still_protected(shared, tmp_path):
+    env = {**shared["env"], "TMPDIR": str(tmp_path), "HOME": f"{tmp_path}/h"}
+    (tmp_path / "h/co/.git").mkdir(parents=True)
     for path, reason in (("~/x", "outside the worktree (under home): ~/x"), ("~/co", "another git checkout or worktree: ~/co")):
-        r = call("danger-guard.sh", shared["spoke"], command=f"rm -rf {path}", env={**shared["env"], "HOME": f"{scratch}/h"})
+        r = call("danger-guard.sh", shared["spoke"], command=f"rm -rf {path}", env=env)
         assert r.returncode == 2 and reason in r.stderr, (path, r.returncode, r.stderr)
-    check("danger-guard.sh", shared, "spoke", 0, env={"HOME": f"{scratch}/h"}, command="rm -rf /tmp/x")
+    check("danger-guard.sh", shared, "spoke", 0, env=env, command="rm -rf /tmp/x")
 
 
 @pytest.mark.parametrize("where,cmd,asks", [
@@ -354,6 +354,7 @@ WF_LANES = [
     ("Bash", {"command": 'rm -r "$HOME/Google Drive/Mon Drive/P/tmp-check"'}, "outside the worktree (under home): $HOME/Google Drive/Mon Drive/P/tmp-check"),
     ("Bash", {"command": 'rm -r "/usr/local share"'}, "outside the worktree: /usr/local share"),
     ("Bash", {"command": 'rm -rf "/usr'}, "outside the worktree: /usr"),  # unbalanced quotes: the plain split still asks, with no parse failure
+    ("Bash", {"command": 'rm -rf "x;rm -rf " /usr ";y"'}, "outside the worktree: /usr"),  # a quoted separator: the next segment starts inside a quote, so its quotes do not pair as the shell's do
     ("Bash", {"command": "rm -rf ."}, "rm -r of . (worktree root or home)"), ("Bash", {"command": "rm -rf {other}"}, "another git checkout or worktree: {other}"),
     ("Bash", {"command": "rm -rf $FOO/x"}, "unexpanded variable"),
     # git: reset --hard in the main checkout (or one the guard cannot pin down), and the clean/stash verbs that remove the ignored .claude/ and .ai-toolkit/
