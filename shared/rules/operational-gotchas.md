@@ -56,7 +56,8 @@ force `LC_ALL=C`:
 
 Write probe output, repro scripts, and temp dirs under your own worktree (a fixed-name dir `./tmp.<name>/` such as `mkdir -p ./tmp.home`, a single file as
 `./tmp.<name>` such as `tmp.suite.out`, not the `/tmp` default) or in the session scratchpad the system prompt names, never a hard-coded `/tmp/<name>`, `$HOME/...`,
-or a sibling worktree. When removing a scratch dir with `rm -r`, write the path literally (`rm -r ./tmp.home`, or the scratchpad's path copied
+or a sibling worktree. A folder outside the worktree that receives the round's results (the human's Drive folder, for instance) is
+`$HOME/...` too: build and check under `./tmp.<name>/` and copy only the finished files there, so the cleanup `rm -r` never leaves the worktree. When removing a scratch dir with `rm -r`, write the path literally (`rm -r ./tmp.home`, or the scratchpad's path copied
 from the system prompt), never through a shell variable, `$(...)` or `$PWD/...` (`S=...; rm -rf "$S"`): `danger-guard` asks on an unexpanded
 `rm -r` target, and in auto mode that ask blocks the issue; removing a `./tmp.*` dir is optional, since `/tmp.*` is git-ignored and goes away with the worktree. In pytest, use the `tmp_path` fixture, not a hard-coded
 `/tmp/<name>` path.
