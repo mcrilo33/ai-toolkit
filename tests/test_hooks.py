@@ -496,16 +496,24 @@ def test_danger_guard_judge_clears_the_observed_false_positives_without_a_prompt
 # PermissionRequest fires for every tool-permission dialog a worker would show (a PreToolUse "ask", an `ask` rule, a prompt Claude Code raises itself
 # in bypass mode, a subagent's), measured on claude 2.1.289 in bypass mode. Its payload: tool_name, tool_input, cwd, permission_mode; no reason, no tool_use_id.
 # Models orca 1.4.246: an ask without --wait returns at once ("Question <id> sent.", exit 0); only --wait blocks for the reply.
+# Models orca 1.4.277 with --json: a reply is .result.answer; Orca's stopped-coordinator notice is .result.notice with no answer, returned once (SHIM_NOTICE), and --resume then waits for the reply.
 ASK_SHIM = """#!/bin/bash
 printf '%s\\0' "$@" > "$SHIM_ARGS"; echo x >> "$SHIM_ARGS.n"
 case " $* " in *" --wait "*) ;; *) echo "Question msg_x sent."; exit 0;; esac
+case " $* " in *" --resume "*) ;; *) cp "$SHIM_ARGS" "$SHIM_ARGS.first"; [ -z "${SHIM_NOTICE-}" ] || { printf '%s' "$SHIM_NOTICE"; exit 0; };; esac
 sleep "${SHIM_SLEEP:-0}"; printf '%s' "${SHIM_REPLY-}"; printf '%s' "${SHIM_ERR-}" >&2; exit "${SHIM_RC:-0}"
 """
+NOTICE = "Your coordinator stopped without answering your question and has no worker running for it. Decide it yourself."
+
+
+def ask_json(**result):
+    """What `orca orchestration ask --wait --json` prints for the question msg_x."""
+    return json.dumps({"ok": True, "result": {"messageId": "msg_x", **result}})
 
 
 @pytest.fixture
 def relay(tmp_path, link_script):
-    """A worker dir (marker + task.md), a shim `orca` that records its argv and prints SHIM_REPLY, and a runner returning (hook output, the ask argv or None)."""
+    """A worker dir (marker + task.md), a shim `orca` that records its argv and answers `reply` (after `notice`, when set), and a runner returning (hook output, the last and first ask argv or None)."""
     spoke, shim = tmp_path / "w", tmp_path / "shim"
     (spoke / ".ai-toolkit").mkdir(parents=True)
     shim.mkdir()
@@ -513,15 +521,15 @@ def relay(tmp_path, link_script):
     (spoke / ".ai-toolkit/task.md").write_text("# #394 feat(gate): relay every permission prompt\n\nbody\n")
     link_script(shim / "orca", ASK_SHIM)
 
-    def run(tool="Write", ti=None, reply="allow", rc=0, raw=None, env=None, where=None, **e):
+    def run(tool="Write", ti=None, reply="allow", rc=0, raw=None, env=None, where=None, notice=None, **e):
         payload = {"hook_event_name": "PermissionRequest", "tool_name": tool, "cwd": str(where or spoke), "permission_mode": "bypassPermissions",
                    "tool_input": {"file_path": ".github/workflows/ci.yml", "content": "x"} if ti is None else ti}
-        env = {"PATH": f"{shim}:{os.environ['PATH']}", "SHIM_ARGS": str(tmp_path / "args"), "SHIM_REPLY": reply, "SHIM_RC": str(rc), "ORCA_TERMINAL_HANDLE": "term_w",
-               **(env or {}), **{k: str(v) for k, v in e.items()}}
+        env = {"PATH": f"{shim}:{os.environ['PATH']}", "SHIM_ARGS": str(tmp_path / "args"), "SHIM_REPLY": ask_json(answer=reply), "SHIM_RC": str(rc), "ORCA_TERMINAL_HANDLE": "term_w",
+               "SHIM_NOTICE": "" if notice is None else ask_json(notice=notice, told="unanswered"), **(env or {}), **{k: str(v) for k, v in e.items()}}
         r = call("permission-relay.sh", where or spoke, raw=raw if raw is not None else json.dumps(payload), env=env)
-        args = (tmp_path / "args").read_bytes().decode().split("\0")[:-1] if (tmp_path / "args").exists() else None
+        args, first = ((f.read_bytes().decode().split("\0")[:-1] if f.exists() else None) for f in (tmp_path / "args", tmp_path / "args.first"))
         out = json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
-        return SimpleNamespace(rc=r.returncode, out=out, args=args, stderr=r.stderr, asks=len((tmp_path / "args.n").read_text().split()) if (tmp_path / "args.n").exists() else 0,
+        return SimpleNamespace(rc=r.returncode, out=out, args=args, first=first, stderr=r.stderr, asks=len((tmp_path / "args.n").read_text().split()) if (tmp_path / "args.n").exists() else 0,
                                behavior=out and out["decision"]["behavior"], question=args and args[args.index("--question") + 1])
 
     return SimpleNamespace(run=run, dir=spoke, shim=shim, tmp=tmp_path)
@@ -560,7 +568,7 @@ def test_relay_does_nothing_outside_a_worker(relay):
 def test_relay_asks_the_run_one_question_with_options_a_timeout_and_the_workers_handle(relay):
     r = relay.run("Bash", {"command": "cd wf && rm -rf *", "description": "wipe the dir"})
     assert r.asks == 1 and r.args[:2] == ["orchestration", "ask"] and r.args[r.args.index("--from") + 1] == "term_w"
-    assert "--wait" in r.args and r.args[r.args.index("--options") + 1] == "allow,deny" and 0 < int(r.args[r.args.index("--timeout-ms") + 1]) <= 560000
+    assert {"--wait", "--json"} <= set(r.args) and r.args[r.args.index("--options") + 1] == "allow,deny" and 0 < int(r.args[r.args.index("--timeout-ms") + 1]) <= 560000
     q = r.question
     assert q.startswith("PERMISSION REQUEST") and "not a plan gate" in q.splitlines()[0]  # what the loop and the coordinate skill key on
     assert "#394" in q and str(relay.dir) in q and "tool: Bash" in q and "cd wf && rm -rf *" in q and "wipe the dir" in q and "bypassPermissions" in q
@@ -615,12 +623,29 @@ def test_relay_denies_when_orca_is_missing(relay):
     final_deny(relay, env={"PATH": "/usr/bin:/bin"})  # no orca on the path at all
 
 
+@pytest.mark.parametrize("reply", ["allow", "deny"])
+def test_relay_waits_past_orcas_notice_for_the_reply_to_the_same_question(relay, reply):
+    r = relay.run(reply=reply, notice=NOTICE)
+    assert (r.rc, r.behavior, r.asks) == (0, reply, 2), r.stderr
+    assert r.args[r.args.index("--resume") + 1] == "msg_x" and {"--wait", "--json"} <= set(r.args) and r.args[r.args.index("--from") + 1] == "term_w"
+    assert "--question" not in r.args and "--options" not in r.args  # the same question: asking again would raise a second request
+    assert 0 < int(r.args[r.args.index("--timeout-ms") + 1]) <= int(r.first[r.first.index("--timeout-ms") + 1])  # the rest of one budget
+
+
 # measured on orca 1.4.246: a --wait ask whose --timeout-ms expires exits 1 with "error: ask_timeout: ask timeout after <n>ms; question <id> is still pending. ..." on stderr
-@pytest.mark.parametrize("kw", [{"SHIM_SLEEP": 3, "PERMISSION_RELAY_KILL_S": 1},   # measured: when the hook times out it is killed with NO decision and the local dialog stays
-                                {"rc": 1, "SHIM_ERR": "error: ask_timeout: ask timeout after 540000ms; question msg_x is still pending. Resume it with orca orchestration ask --resume msg_x"}], ids=["kill-timer", "orca-timeout"])
-def test_relay_denies_on_a_timeout_before_the_hook_does_but_lets_the_worker_ask_again(relay, kw):
-    m = fail_closed(relay, **kw).out["decision"]["message"]
-    assert "nobody answered in time" in m and "up to 3 requests in total" in m and "the ask failed" not in m and "Do not retry" not in m
+KILLED = {"SHIM_SLEEP": 3, "PERMISSION_RELAY_KILL_S": 1}   # measured: when the hook times out it is killed with NO decision and the local dialog stays
+TIMED_OUT = {"rc": 1, "SHIM_ERR": "error: ask_timeout: ask timeout after 540000ms; question msg_x is still pending. Resume it with orca orchestration ask --resume msg_x"}
+
+
+@pytest.mark.parametrize("kw, asks", [(KILLED, 1), (TIMED_OUT, 1), ({"SHIM_SLEEP": 4, "PERMISSION_RELAY_KILL_S": 2, "notice": NOTICE}, 2),   # 2 s: the relay counts whole seconds, the resume must still start
+                                      ({**TIMED_OUT, "notice": NOTICE}, 2),
+                                      ({**TIMED_OUT, "notice": "allow"}, 2),  # any thread message can show up as a notice: only a reply (.result.answer) allows
+                                      ({"notice": NOTICE, "PERMISSION_RELAY_ASK_MS": 0}, 1)],
+                         ids=["kill-timer", "orca-timeout", "notice-kill-timer", "notice-orca-timeout", "notice-saying-allow", "notice-budget-spent"])
+def test_relay_denies_on_a_timeout_before_the_hook_does_but_lets_the_worker_ask_again(relay, kw, asks):
+    r = fail_closed(relay, **kw)
+    m = r.out["decision"]["message"]
+    assert r.asks == asks and "nobody answered in time" in m and "up to 3 requests in total" in m and "the ask failed" not in m and "Do not retry" not in m
 
 
 @pytest.mark.parametrize("raw", ["not json", "", "{"])
