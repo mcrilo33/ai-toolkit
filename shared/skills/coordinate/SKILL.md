@@ -26,7 +26,7 @@ Then the model: a coordinator runs on Opus. Read this session's:
 tail -n 200 "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$CLAUDE_CODE_SESSION_ID".jsonl | jq -Rrn '[inputs | fromjson? | select(.type == "assistant" and .isSidechain != true) | .message.model | select(. != "<synthetic>")] | last // empty'
 ```
 
-A printed model that is not `claude-opus-*`: before starting or attaching to any loop, run **Handover**'s launch line (same `<kind>`) with `--prompt "/coordinate <the user's arguments> --restarted"` (`status` when they typed no command), then as there: `--retry-launch` on a lost reply, `TaskStop` a running `--wait` watcher, this session is finished; say "restarted on Opus" in one line and stop. Nothing printed or a failed read is unknown: proceed, never guess. A session whose prompt carries `--restarted` skips this check, and that flag goes to no script.
+A printed model that is not `claude-opus-*`, in a session about to start or attach to its first loop (never for `status` or a plain question, never once it attends one): instead run **Handover**'s launch line (same `<kind>`) with `--prompt "/coordinate <the user's arguments> --restarted"` (`--retry-launch` on a lost reply), say "restarted on Opus" in one line and stop: this session starts no loop. Nothing printed or a failed read is unknown: proceed, never guess. A session whose prompt carries `--restarted` skips this check, and that flag goes to no script.
 
 ## Start
 
