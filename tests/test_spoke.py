@@ -245,8 +245,8 @@ def test_no_account_kind_exports_a_token_and_every_inherited_login_variable_is_d
 def test_a_one_entry_list_naming_a_config_directory_account_runs_every_session_on_it_even_with_the_otel_opt_out(run, stubs, repo, tmp_path):
     synced(repo)   # the data boundary: a client-only project never falls back to the stored login
     env = accounts(tmp_path, "client")
-    for cwd in (in_spoke(repo), repo.root):
-        assert run([SPOKE], cwd=cwd, AI_TOOLKIT_OTEL=0, **env).returncode == 0
+    for cwd, otel in ((in_spoke(repo), 1), (repo.root, 0)):   # a worker with telemetry on, a coordinator opted out
+        assert run([SPOKE], cwd=cwd, AI_TOOLKIT_OTEL=otel, **env).returncode == 0
         assert f"CLAUDE_CONFIG_DIR={env['HOME']}/.claude-client\n" in stubs.env("claude") and "account=" not in stubs.env("claude")   # one entry: no failover, so no account tag
 
 

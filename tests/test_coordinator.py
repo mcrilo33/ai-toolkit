@@ -503,14 +503,18 @@ def test_a_background_wait_record_of_a_dispatch_that_ended_is_removed_by_the_swe
     assert (tmp_path / "state/run_t/bgwait/ctx_9").exists() != orca_up and (tmp_path / "state/run_t/bgwait/ctx_1").exists()
 
 
-def test_a_finished_escalation_batched_with_a_held_plan_blocks_and_abandons_nothing(C):   # the loop handed the plan over (exit 3): the #488 sequence
+@pytest.mark.parametrize("held", [True, False])   # the loop handed the plan over (exit 3), or answer.sh approved it: the #488 sequence
+def test_a_finished_escalation_batched_with_a_plan_the_loop_held_or_approved_blocks_and_abandons_nothing(C, held):
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question="PLAN: do X?"), "run_id": "run_t", "thread_id": "msg_q"}]}}))
-    C.stubs.reply("answer.sh", WHY + "\n", rc=3)
+    C.stubs.reply("answer.sh", WHY + "\n" if held else "approve\n", rc=3 if held else 0)
     C.mail([msg("question", "msg_q", question="PLAN: do X?"), msg("escalation", "msg_stop", stopReason="finished")])
     r = C.go("--answer", "attended")
     assert r.returncode == 0 and "(finished)" in r.stdout and C.calls("orca orchestration check ack")
     assert not C.calls("gh issue edit") and not any(k in C.kinds() for k in ("orca orchestration worker-stop", "orca orchestration worker-abandon", "orca orchestration worker-release"))
     sent = C.calls("orca orchestration send")
+    if not held:
+        assert [arg(a, "--body") for a in C.calls("orca orchestration reply")] == ["approve"] and not sent
+        return
     assert not C.calls("orca orchestration reply") and len(sent) == 1
     assert (arg(sent[0], "--to"), arg(sent[0], "--type"), arg(sent[0], "--from")) == ("dispatch:ctx_1", "status", "term_c") and "queued for the human" in arg(sent[0], "--body")
     assert "msg_q" in C.go("--status", ORCA_TERMINAL_HANDLE="").stdout and "PLAN: do X?" in C.go("--show", "msg_q", ORCA_TERMINAL_HANDLE="").stdout   # still open for the human
@@ -1206,7 +1210,7 @@ def test_away_retries_a_failed_post_at_the_next_wake_never_stops_the_loop_and_dr
 
 
 @pytest.mark.parametrize("mode", ["auto", "human"])   # attended posts nothing before its delay: the hand-over test below
-def test_outside_away_and_attended_nothing_is_posted_even_with_the_webhook_set(C, tmp_path, mode):
+def test_auto_and_human_post_nothing_even_with_the_webhook_set(C, tmp_path, mode):
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)
     C.stubs.reply("gh.repo_view", "o/r\n")   # a POST that was wrongly attempted would reach curl
     C.stubs.reply("gh.issue_list", BLOCKED)
