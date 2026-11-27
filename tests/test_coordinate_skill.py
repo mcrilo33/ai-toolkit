@@ -50,12 +50,14 @@ def test_the_handover_is_triggered_by_the_scripts_line_at_an_idle_point_and_neve
     assert re.search(r"presents `--status` while it runs", h)   # no silent window while a terminal successor waits out a land
 
 
-def test_a_session_not_on_opus_restarts_once_before_any_loop_and_an_unknown_model_proceeds():
+def test_a_session_not_on_opus_restarts_once_before_its_first_loop_and_an_unknown_model_proceeds():
     p = section("Preconditions")
     assert p.index("AI_TOOLKIT_DIR") < p.index("claude-opus-*")   # after the guards check
-    assert re.search(r"claude-opus-\*.{0,40}before starting or attaching to any loop.{0,80}\*\*Handover\*\*.s launch line", p, re.S)
-    assert re.search(r'--prompt "/coordinate <[^>]+> --restarted"', p) and "`status`" in p   # the user's own arguments, `status` for a plain question
-    assert "--retry-launch" in p and re.search(r"TaskStop.{0,40}watcher", p) and "restarted on Opus" in p and "finished" in p   # the old session presents nothing twice
+    assert re.search(r"claude-opus-\*.{0,60}about to start or attach to its first loop", p, re.S)
+    assert re.search(r"never for `status` or a plain question, never once it attends one", p)   # a read opens no chat; an attending session keeps its loop and watcher
+    assert re.search(r"\*\*Handover\*\*.s launch line", p) and "--retry-launch" in p
+    assert re.search(r'--prompt "/coordinate <[^>]+> --restarted"', p)   # the user's own arguments
+    assert re.search(r"restarted on Opus.{0,40}stop.{0,40}this session starts no loop", p)   # never a second loop beside the successor's
     assert re.search(r"unknown.{0,20}proceed.{0,20}never guess", p, re.S)
     assert re.search(r"`--restarted`.{0,40}skips this check", p)   # one restart at most: a successor still off Opus never opens another chat
     assert SKILL.count("claude-opus-5-5") == 1 and "--model claude-opus-5-5" in section("Handover")   # a model bump is a one-line edit
