@@ -1475,6 +1475,42 @@ def test_wait_reads_the_blocked_list_less_often_than_the_questions(C):
     assert r.returncode == 1 and len(C.calls("orca orchestration inbox")) == 6 and len(C.calls("gh issue list")) == 4   # two reads, each the blocked list and the finished rounds
 
 
+HANDOVER = "context: 222k tokens: hand over now (Handover)"   # transcript(2000): the three input counters are 111 times n
+
+
+def transcript(tmp_path, *turns, config="home/.claude", partial=""):   # the calling session's transcript: a turn is (n, sidechain); partial = a line still being written
+    d = tmp_path / config / "projects/p"
+    d.mkdir(parents=True)
+    rows = [json.dumps({"type": "assistant", "isSidechain": side, "message": {"usage": {"input_tokens": n, "cache_read_input_tokens": 10 * n, "cache_creation_input_tokens": 100 * n}}}) for n, side in turns]
+    (d / "sid.jsonl").write_text("\n".join([*rows, '{"type": "user"}', partial]))
+
+
+@pytest.mark.parametrize(("tokens", "said"), [pytest.param(2000, [HANDOVER], id="above"), pytest.param(1000, [], id="below")])
+def test_wait_and_status_tell_a_session_past_the_context_threshold_to_hand_over(C, tmp_path, tokens, said):   # #574: the trigger is in output the session reads at every wake
+    transcript(tmp_path, (tokens, False))
+    me = {"CLAUDE_CODE_SESSION_ID": "sid", "CLAUDE_CONFIG_DIR": ""}
+    r = watched(C, ([], []), (["msg_a"], []), **me)
+    assert r.returncode == 0 and r.stdout.splitlines() == ["msg_a", *said]   # the skill reads the id on the first line
+    r = C.go("--status", ORCA_TERMINAL_HANDLE="", **me)
+    assert r.returncode == 0 and [ln for ln in r.stdout.splitlines() if ln.startswith("context:")] == said
+
+
+@pytest.mark.parametrize(("turns", "kw", "env", "said"), [
+    pytest.param([(2000, False), (1, True)], {}, {}, [HANDOVER], id="a-later-sidechain-turn-is-not-the-session"),
+    pytest.param([(2000, False), (1, False)], {}, {}, [], id="the-last-turn-counts-after-a-compaction"),
+    pytest.param([(2000, False)], {}, {"COORD_HANDOVER_TOKENS": "300000"}, [], id="raised-threshold"),
+    pytest.param([(2000, False)], {"partial": '{"type": "assist'}, {}, [HANDOVER], id="half-written-last-line"),
+    pytest.param([(2000, False)], {"config": "acct"}, {"CLAUDE_CONFIG_DIR": "{tmp}/acct"}, [HANDOVER], id="config-directory-account"),
+    pytest.param([(2000, False)], {}, {"CLAUDE_CODE_SESSION_ID": "other"}, [], id="no-transcript"),
+    pytest.param([(2000, False)], {}, {"CLAUDE_CODE_SESSION_ID": ""}, [], id="no-session-id"),
+])
+def test_the_handover_line_reads_the_calling_sessions_main_thread_context_and_unknown_says_nothing(C, tmp_path, turns, kw, env, said):
+    transcript(tmp_path, *turns, **kw)
+    env = {"CLAUDE_CODE_SESSION_ID": "sid", "CLAUDE_CONFIG_DIR": "", **env}
+    r = C.go("--status", ORCA_TERMINAL_HANDLE="", **{k: v.format(tmp=tmp_path) for k, v in env.items()})
+    assert r.returncode == 0 and [ln for ln in r.stdout.splitlines() if ln.startswith("context:")] == said and "dispatch requests:" in r.stdout
+
+
 def test_status_shows_each_open_question_text_above_its_reply_command_and_show_prints_one_whole(C, tmp_path):
     plan = "PLAN: add hello.py first\n\x1b[2Jthen\n" + "\n".join(f"step {i}: do the thing" for i in range(300))
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question=plan), "run_id": "run_t", "thread_id": "msg_q"}, notice("msg_q")]}}))
