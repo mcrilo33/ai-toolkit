@@ -242,12 +242,11 @@ def test_no_account_kind_exports_a_token_and_every_inherited_login_variable_is_d
     assert (f"CLAUDE_CONFIG_DIR={env['HOME']}/.claude-client\n" in claude_env) == (account == "client") and f"account={account}\n" in claude_env + "\n"
 
 
-@pytest.mark.parametrize("otel", [1, 0])
-def test_a_one_entry_list_naming_a_config_directory_account_runs_every_session_on_it_even_with_the_otel_opt_out(run, stubs, repo, tmp_path, otel):
+def test_a_one_entry_list_naming_a_config_directory_account_runs_every_session_on_it_even_with_the_otel_opt_out(run, stubs, repo, tmp_path):
     synced(repo)   # the data boundary: a client-only project never falls back to the stored login
     env = accounts(tmp_path, "client")
     for cwd in (in_spoke(repo), repo.root):
-        assert run([SPOKE], cwd=cwd, AI_TOOLKIT_OTEL=otel, **env).returncode == 0
+        assert run([SPOKE], cwd=cwd, AI_TOOLKIT_OTEL=0, **env).returncode == 0
         assert f"CLAUDE_CONFIG_DIR={env['HOME']}/.claude-client\n" in stubs.env("claude") and "account=" not in stubs.env("claude")   # one entry: no failover, so no account tag
 
 
@@ -261,14 +260,10 @@ def test_a_coordinator_runs_on_the_account_it_names_else_on_the_first_listed(run
     assert stubs.calls("claude")[-1] == ["--settings", COORD_SETTINGS(tk)]
 
 
-@pytest.mark.parametrize("listing,args,logins,why", [
+@pytest.mark.parametrize("listing,args,logins,why", [   # the name shapes are test_lib's; here each check is wired into the launcher
     ("max client", ["--account", "other"], ("client",), "not listed"),            # an account the project does not list is never used
-    ("max client", ["--account", "cli ent"], ("client",), "not an account name"),
-    ("max client", ["--account=client;x"], ("client",), "not an account name"),
-    ("max Client", ["--account", "Client"], ("client",), "not an account name"),   # one name, one directory: lower case, digits and - only
-    ("max a_b", ["--account", "a_b"], ("client",), "not an account name"), ("max -x", ["--account=-x"], ("client",), "not an account name"),
+    ("max Client", ["--account=Client"], ("client",), "not an account name"),   # listed, and still refused for its shape
     ("max client", ["--account", "client"], (), "neither the stored login"),   # no ~/.claude-client: refused, no fallback to another account
-    (None, ["--account", "client"], ("client",), "not listed"),
 ])
 def test_an_unlisted_malformed_or_unusable_account_is_refused(run, stubs, repo, tmp_path, listing, args, logins, why):
     synced(repo)

@@ -102,10 +102,25 @@ def test_usage_limit_reset_prints_the_reset_text_with_its_date_when_it_has_one(r
     assert r.stdout == f"{want}|{rc}\n", r.stderr
 
 
-@pytest.mark.parametrize("days, kept", [(3, True), (7, True), (30, False)], ids=["3-days", "7-days", "30-days"])   # a weekly reset is kept, a record far beyond the cap is dropped
-def test_free_account_keeps_a_record_up_to_a_week_ahead_and_drops_one_beyond(run, tmp_path, days, kept):
+NOW = int(time.time())
+
+
+@pytest.mark.parametrize("record, kept", [(NOW + 3 * 86400, True), (NOW + 7 * 86400, True), (NOW + 30 * 86400, False), (1, False), ("garbage", False)],
+                         ids=["3-days", "7-days", "30-days", "passed", "not-an-epoch"])   # a weekly reset is kept; one far beyond the cap (forged), one passed or one unreadable is dropped
+def test_free_account_keeps_a_record_up_to_a_week_ahead_and_drops_one_beyond(run, tmp_path, record, kept):
     (tmp_path / "state/run_t/exhausted").mkdir(parents=True)
     f = tmp_path / "state/run_t/exhausted/max"
-    f.write_text(f"{int(time.time()) + days * 86400}\n")
+    f.write_text(f"{record}\n")
     r = lib(run, "free_account run_t || true", CLAUDE_ACCOUNTS="max client", AITK_STATE_DIR=tmp_path / "state")
-    assert (r.stdout, f.exists()) == (("client", True) if kept else ("max", False)), r.stderr
+    assert (r.stdout, f.exists()) == (("client", True) if kept else ("max", False)) and "integer" not in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("name, listing, valid, listed", [
+    ("max", "max client", True, True), ("a-1", "a-1", True, True),
+    ("other", "max client", True, False), ("cli", "max client", True, False), ("client", "", True, False),   # a whole entry of the list, never a part of one
+    ("a b", "max client", False, False), ("client;x", "max client", False, False), ("", "max client", False, False),
+    ("Client", "max Client", False, True), ("a_b", "max a_b", False, True), ("-x", "max -x", False, True),   # one name, one directory: lower case, digits and - only, listed or not
+])
+def test_an_account_name_is_lower_case_digits_and_dash_and_listed_only_as_a_whole_entry(run, name, listing, valid, listed):
+    r = lib(run, 'v=0; l=0; valid_account "$N" || v=$?; account_listed "$N" || l=$?; echo "$v $l"', N=name, CLAUDE_ACCOUNTS=listing)
+    assert r.stdout.split() == [str(int(not valid)), str(int(not listed))], r.stderr

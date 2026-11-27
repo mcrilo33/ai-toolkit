@@ -131,13 +131,6 @@ def hook(d, tmp_path, link_script):   # run(*args, tracked=True, **env) -> (resu
     return run_hook
 
 
-def test_post_dispatch_cmd_receives_the_issue_and_tracker_key_once_and_stdout_stays_one_json_line(hook):
-    r, calls = hook("7")
-    assert r.returncode == 0, r.stderr
-    assert calls == ["7 PM-17|main"]
-    assert len(r.stdout.splitlines()) == 1 and json.loads(r.stdout)["issue"] == 7
-
-
 @pytest.mark.parametrize("args,tracked,cmd", [
     (("7",), False, None),
     (("7",), True, ""),
@@ -152,10 +145,11 @@ def test_post_dispatch_cmd_is_not_called_without_a_tracker_or_a_command_nor_for_
     assert calls == []
 
 
-def test_a_failing_post_dispatch_cmd_only_warns_the_worker_is_started_and_stdout_stays_one_json_line(d, hook):
-    r, _ = hook("7", HOOK_FAIL="1")
+def test_post_dispatch_cmd_gets_the_issue_and_tracker_key_once_and_its_failure_only_warns_leaving_stdout_one_json_line(d, hook):
+    r, calls = hook("7", HOOK_FAIL="1")
     assert r.returncode == 0 and "hook-boom" in r.stderr and "POST_DISPATCH_CMD failed for PM-17" in r.stderr
-    assert len(r.stdout.splitlines()) == 1 and "hook-boom" not in r.stdout
+    assert calls == ["7 PM-17|main"]
+    assert len(r.stdout.splitlines()) == 1 and "hook-boom" not in r.stdout and json.loads(r.stdout)["issue"] == 7
     assert any(c[:2] == ["orchestration", "worker-start"] for c in d.orca())
 
 
@@ -534,7 +528,7 @@ def test_a_round_requested_on_a_land_human_issue_repeats_the_round_report_remind
     assert spec.startswith("address: try the second prompt") and "round report" in spec and "never marked DEFERRED" in spec and "absolute paths" in spec
 
 
-FUTURE, PAST, FAR = str(int(time.time()) + 3600), "1", str(int(time.time()) + 30 * 86400)   # an exhausted account's reset, as epoch seconds: an hour ahead, long gone, a month ahead (no message gives one: a forged record, dropped)
+FUTURE = str(int(time.time()) + 3600)   # an exhausted account's reset, as epoch seconds: an hour ahead
 
 
 def exhaust(d, account, until):
@@ -549,14 +543,14 @@ def launch_line(d):
     return next(c for c in d.orca() if c[:2] == ["terminal", "create"])[7]
 
 
-@pytest.mark.parametrize("exhausted,account", [({}, "max"), ({"max": FUTURE}, "client"), ({"max": PAST}, "max"), ({"max": FAR}, "max"), ({"max": "garbage"}, "max")])
+@pytest.mark.parametrize("exhausted,account", [({}, "max"), ({"max": FUTURE}, "client")])   # which records count is test_lib's free_account
 def test_a_fresh_dispatch_runs_on_the_first_listed_account_that_is_not_exhausted(d, exhausted, account):
     files = [exhaust(d, a, until) for a, until in exhausted.items()]
     r = d.go("7", CLAUDE_ACCOUNTS="max client")
     assert r.returncode == 0, r.stderr
     assert launch_line(d).endswith(f"--dangerously-skip-permissions --account {account}") and "integer" not in r.stderr
     assert (d.record.parent / "account/ctx_1").read_text() == f"{account}\n" and not (d.record.parent / "failover").exists()   # which account it ran on: the loop's record, never the worker's
-    assert [f.exists() for f in files] == [until == FUTURE for until in exhausted.values()]   # a record whose reset has passed is dropped
+    assert all(f.exists() for f in files)
 
 
 def test_a_dispatch_with_every_account_exhausted_starts_nothing(d):
@@ -579,9 +573,8 @@ def test_a_retry_with_an_account_is_a_failover_and_carries_that_account(d):
 
 
 @pytest.mark.parametrize("args,env,why", [
-    (["--account", "a b"], {"CLAUDE_ACCOUNTS": "max client"}, "not an account name"), (["--account", "Client"], {"CLAUDE_ACCOUNTS": "max Client"}, "not an account name"),
+    (["--account", "Client"], {"CLAUDE_ACCOUNTS": "max Client"}, "not an account name"),   # listed, and still refused for its shape (the shapes are test_lib's)
     (["--account", "other"], {"CLAUDE_ACCOUNTS": "max client"}, "not listed"),   # an account the project does not list is never launched
-    (["--account", "client"], {}, "not listed"),
     ([], {"CLAUDE_ACCOUNTS": "max client", "DISPATCH_LAUNCH": "override"}, "override"),   # Orca's own agent launch cannot carry an account
 ])
 def test_a_malformed_or_unlisted_account_and_an_override_launch_on_another_account_die(d, args, env, why):
