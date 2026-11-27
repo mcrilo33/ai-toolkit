@@ -304,14 +304,6 @@ def test_a_queued_allow_or_deny_is_sent_for_a_permission_question_and_commented_
     assert C.calls("gh issue comment")[0][-1] == f"Permission answered by the human: {body} (tool: Bash)"
 
 
-@pytest.mark.parametrize("permission, body", [(True, "approve"), (True, "approve with: x"), (True, "revise: x"), (False, "allow"), (False, "deny")])
-def test_a_queued_reply_of_the_wrong_kind_is_dropped_never_sent(C, permission, body):
-    {True: lambda: permission_inbox(C, ["msg_q"]), False: lambda: C.inbox(["msg_q"])}[permission]()   # a plan gate takes approve/revise, a permission question allow/deny
-    C.spool("msg_q", body)
-    r = C.go()
-    assert r.returncode == 0 and not C.calls("orca orchestration reply") and not C.spooled("msg_q") and "dropped" in r.stderr
-
-
 @pytest.mark.parametrize("given, queued", [("revise:  use tmp", "revise: use tmp"), ("approve with:   use tmp", "approve with: use tmp"),
                                           ("allow", "allow"), ("deny", "deny")])
 def test_reply_queues_a_one_line_request_in_a_private_spool_outside_any_worktree_and_needs_no_orca(C, tmp_path, given, queued):
@@ -331,13 +323,16 @@ def test_dispatch_queues_a_one_line_request_in_the_same_spool_and_reply_and_disp
     assert C.go("--reply", "msg_q", "approve", run_id=None).returncode == 2 and C.go("--dispatch", "7", run_id=None).returncode == 2   # no --run: refused
 
 
-@pytest.mark.parametrize("args", [["--reply", "msg_q", "maybe"], ["--reply", "msg_q", "revise:"], ["--reply", "../x", "approve"], ["--reply", "msg_q"],
-                                  ["--reply", "msg_q", "approve with:"], ["--reply", "msg_q", "approve with:  "], ["--reply", "msg_q", "approve with"],
-                                  ["--reply", "msg_q", "approve please"], ["--reply", "msg_q", "approve withdraw: x"],
-                                  ["--reply", "msg_q", "allow please"], ["--reply", "msg_q", "denied"], ["--reply", "msg_q", "ALLOW"],
-                                  ["--dispatch", "x"], ["--dispatch", "7;x"], ["--dispatch", "../7"], ["--dispatch"]])
-def test_reply_refuses_a_bad_message_id_or_body_and_a_missing_run(C, tmp_path, args):
-    assert C.go(*args).returncode == 2 and not C.spooled("msg_q") and not C.spooled("../x") and not (tmp_path / "state/run_t/requests").exists()
+BAD_ARGS = [["--reply", "msg_q", "maybe"], ["--reply", "msg_q", "revise:"], ["--reply", "../x", "approve"], ["--reply", "msg_q"],
+            ["--reply", "msg_q", "approve with:"], ["--reply", "msg_q", "approve with:  "], ["--reply", "msg_q", "approve with"],
+            ["--reply", "msg_q", "approve please"], ["--reply", "msg_q", "approve withdraw: x"],
+            ["--reply", "msg_q", "allow please"], ["--reply", "msg_q", "denied"], ["--reply", "msg_q", "ALLOW"],
+            ["--dispatch", "x"], ["--dispatch", "7;x"], ["--dispatch", "../7"], ["--dispatch"]]
+
+
+def test_reply_refuses_a_bad_message_id_or_body_and_a_missing_run(C, tmp_path):   # each is refused before anything is written, so one fixture serves them all
+    for args in BAD_ARGS:
+        assert C.go(*args).returncode == 2 and not C.spooled("msg_q") and not C.spooled("../x") and not (tmp_path / "state/run_t/requests").exists(), args
 
 
 @pytest.mark.parametrize("body", ["revise: use tmp", "approve with: use tmp"])
@@ -398,12 +393,20 @@ def test_a_queued_reply_is_only_dropped_when_its_question_is_seen_answered_or_th
     assert not C.spooled("msg_old")
 
 
-@pytest.mark.parametrize("body", ["rm -rf /", "revise:", "approve please", "", "approve with:", "approve with"])
-def test_a_spool_file_with_a_tampered_body_is_dropped_unsent(C, body):
-    C.inbox(["msg_q"])
-    C.spool("msg_q", body)
+BAD_REPLIES = {   # one queued reply each, all drained by one run: message id -> (its question is a permission request, the queued body)
+    "msg_a": (True, "approve"), "msg_b": (True, "approve with: x"), "msg_c": (True, "revise: x"), "msg_d": (False, "allow"), "msg_e": (False, "deny"),   # a plan gate takes approve/revise, a permission question allow/deny
+    "msg_f": (False, "rm -rf /"), "msg_g": (False, "revise:"), "msg_h": (False, "approve please"), "msg_i": (False, ""), "msg_j": (False, "approve with:"), "msg_k": (False, "approve with"),   # a tampered spool file
+}
+
+
+def test_a_queued_reply_that_is_tampered_with_or_of_the_wrong_kind_is_dropped_never_sent(C):
+    rows = [{**msg("question", i, question=PQ if perm else "PLAN?"), "run_id": "run_t", "thread_id": i} for i, (perm, _) in BAD_REPLIES.items()]
+    C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": rows}}))
+    for i, (_, body) in BAD_REPLIES.items():
+        C.spool(i, body)
     r = C.go()
-    assert not C.spooled("msg_q") and not C.calls("orca orchestration reply") and "dropped" in r.stderr
+    assert r.returncode == 0 and not C.calls("orca orchestration reply") and not [i for i in BAD_REPLIES if C.spooled(i)]
+    assert not [i for i in BAD_REPLIES if f"reply to {i} dropped: malformed body" not in r.stderr], r.stderr
 
 
 def test_worker_list_is_read_page_by_page_so_rounds_survive_more_than_a_page_of_dispatches(C):
