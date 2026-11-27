@@ -458,12 +458,13 @@ def test_cleanup_only_with_a_gone_worktree_still_refuses_an_unlanded_tip(L, gone
     assert not [t for t in L.trail()[gone:] if t[:3] == ("gh", "issue", "close")]
 
 
-@pytest.mark.parametrize("args, why", [(["--cleanup-only", "9"], "no Orca worktree"), (["--branch", BRANCH, "9"], "no Orca worktree"),
-                                        (["--cleanup-only", "--branch", BRANCH, "9"], "--tip"),
-                                        (["--cleanup-only", "--branch", "main", "--tip", "HEAD", "9"], "base branch")])
-def test_a_missing_worktree_is_refused_unless_cleanup_only_can_name_the_branch_and_tip(L, gone, args, why):
-    r = L.go(*args)   # the last case: origin/<branch> is gone too, so there is nothing to derive the tip from
-    assert r.returncode == 2 and why in r.stderr
+def test_a_missing_worktree_is_refused_unless_cleanup_only_can_name_the_branch_and_tip(L, gone):   # a refusal changes nothing, so one landed-then-gone state serves every case
+    refused = [(["--cleanup-only", "9"], "no Orca worktree"), (["--branch", BRANCH, "9"], "no Orca worktree"),
+               (["--cleanup-only", "--branch", BRANCH, "9"], "--tip"),   # origin/<branch> is gone too, so there is nothing to derive the tip from
+               (["--cleanup-only", "--branch", "main", "--tip", "HEAD", "9"], "base branch")]
+    for args, why in refused:
+        r = L.go(*args)
+        assert r.returncode == 2 and why in r.stderr, (args, r.stderr)
     assert not [t for t in L.trail()[gone:] if t[:3] == ("gh", "issue", "close")]
 
 
@@ -521,14 +522,6 @@ def test_post_land_cmd_runs_once_after_the_base_push_with_the_issue_the_key_and_
     assert t.index(("git", "push", "main")) < t.index(post_land_calls(L)[0]) < t.index(("gh", "issue", "close", "9", "-c", f"landed in {L.tip}"))
 
 
-@pytest.mark.parametrize("cmd,body", [(False, "Scope: a\nTracker: PM-17\n"), (True, "Scope: a\n")])
-def test_post_land_cmd_does_not_run_without_the_command_or_without_a_tracker_footer(L, tracked, cmd, body):
-    script = tracked(body)
-    r = L.go("9", **({"POST_LAND_CMD": script} if cmd else {}))
-    assert r.returncode == 0, r.stderr
-    assert post_land_calls(L) == [] and main_sha(L) == L.tip
-
-
 def test_post_land_cmd_does_not_run_again_on_the_cleanup_only_retry(L, tracked):
     script = tracked()
     L.stubs.reply("gh.issue_close", "boom", rc=1)
@@ -546,17 +539,23 @@ def test_a_failing_post_land_cmd_comments_on_the_issue_and_never_changes_the_exi
     assert ("gh", "issue", "close", "9", "-c", f"landed in {L.tip}") in t and ("orca", "worktree", "rm", "--worktree", f"path:{L.wt}", "--run-hooks") in t
 
 
-@pytest.mark.parametrize("tail", ["\r", " "])
-def test_a_tracker_footer_with_a_trailing_cr_or_space_still_runs_the_command_with_the_key(L, tracked, tail):
-    assert L.go("9", POST_LAND_CMD=tracked(f"Scope: a\nTracker: PM-17{tail}\n")).returncode == 0
-    assert [t[:3] for t in post_land_calls(L)] == [("post-land", "9", "PM-17")]
+TRACKER_STEP = """set -euo pipefail; . "$1/lib.sh"; eval "$(sed -n '/^post_land() {/,/^}/p' "$1/land.sh")"; BASE_BRANCH=main; MAIN_BRANCH=main; post_land 9 abc1234"""   # land.sh's tracker step alone, under the script's own shell options
 
 
-@pytest.mark.parametrize("key", ["PM 17", "PM-17;touch x", "PM-$(id)"])
-def test_a_tracker_key_that_is_not_one_token_is_refused_with_a_warning_and_no_call(L, tracked, key):
-    r = L.go("9", POST_LAND_CMD=tracked(f"Scope: a\nTracker: {key}\n"))
-    assert r.returncode == 0 and "warning" in r.stderr and "Tracker" in r.stderr
-    assert post_land_calls(L) == [] and main_sha(L) == L.tip
+@pytest.mark.parametrize("body, configured, key, warned", [
+    ("Scope: a\nTracker: PM-17\n", True, "PM-17", False),
+    ("Scope: a\nTracker: PM-17\r\n", True, "PM-17", False), ("Scope: a\nTracker: PM-17 \n", True, "PM-17", False),   # a body edited in the GitHub web UI comes back with CRLF
+    ("Scope: a\nTracker: PM-17\n", False, "", False), ("Scope: a\n", True, "", False),   # no command, or no footer: nothing runs
+    ("Scope: a\nTracker: PM 17\n", True, "", True), ("Scope: a\nTracker: PM-17;touch x\n", True, "", True), ("Scope: a\nTracker: PM-$(id)\n", True, "", True),   # not one token: refused with a warning
+], ids=["key", "trailing-cr", "trailing-space", "no-command", "no-footer", "space", "semicolon", "substitution"])
+def test_post_land_runs_the_command_only_with_a_one_token_tracker_key_and_never_fails_the_land(run, stubs, tmp_path, link_script, body, configured, key, warned):
+    stubs.reply("gh.issue_view", json.dumps({"number": 9, "title": "t", "body": body}))
+    script = link_script(tmp_path / "post-land.sh", POST_LAND)
+    r = run(["bash", "-c", TRACKER_STEP, "_", str(V2 / "scripts")], POST_LAND_CMD=script if configured else "")
+    log = (tmp_path / "stubs/calls.log")
+    ran = [ln.split("\x1f") for ln in (log.read_text().splitlines() if log.exists() else []) if ln.startswith("post-land")]
+    assert r.returncode == 0 and ran == ([["post-land", "9", key, "abc1234", "BASE_BRANCH=main"]] if key else []), r.stderr
+    assert ("warning" in r.stderr and "Tracker" in r.stderr) == warned
 
 
 # --- #507: an issue is done when merged into the true main branch (MAIN_BRANCH), not when BASE_BRANCH takes it
