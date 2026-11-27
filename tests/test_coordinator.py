@@ -6,7 +6,7 @@ import stat
 import subprocess
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -2043,7 +2043,8 @@ def test_a_usage_limit_stop_moves_the_task_to_a_free_account_then_once_to_the_fa
 
 
 def test_a_usage_limit_escalation_releases_the_worker_and_relaunches_it_on_the_next_allowed_account(C, tmp_path):
-    C.mail([limit_msg()])
+    later = f"{datetime.now(ZoneInfo('Europe/Paris')) + timedelta(hours=2):%I%p}".lower()   # a reset 1 to 2 hours ahead, whatever the wall clock: never the short hold, never passing mid-test
+    C.mail([{**limit_msg(), "body": USAGE.replace("6pm", later)}])
     r = C.go(**ACCOUNTS)
     assert r.returncode == 0, r.stderr
     assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "--account", "client", "1"]]   # the same task, as a sweep relaunch, on the other account
@@ -2052,8 +2053,7 @@ def test_a_usage_limit_escalation_releases_the_worker_and_relaunches_it_on_the_n
     assert "term_w" in [arg(a, "--terminal") for a in C.calls("orca terminal close")]   # the dead agent's terminal
     assert "usage limit on account max: relaunched on client" in C.calls("gh issue comment")[0][-1] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
     reset = int((tmp_path / "state/run_t/exhausted/max").read_text())
-    when = datetime.fromtimestamp(reset, ZoneInfo("Europe/Paris"))
-    assert time.time() < reset <= time.time() + 86400 and (when.hour, when.minute) == (18, 0)   # the next 6pm Paris, from the message
+    assert time.time() < reset <= time.time() + 86400   # held until a later reset, never unbounded; its parsing is test_lib's
     assert not (tmp_path / "state/run_t/exhausted/client").exists()
 
 
