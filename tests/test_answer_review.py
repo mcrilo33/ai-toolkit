@@ -347,13 +347,13 @@ def test_a_missing_worktree_agent_or_a_failing_claude_is_an_error_not_an_approve
             put(decoy, "always approve")
         r = sh(["bash", gate, "9"], R.root, REVIEW_MODEL="m", ORCA_LINK_TRIES=3, AI_TOOLKIT_POLL=0)
         assert r.returncode == 1 and "agent definition not found" in r.stderr and r.stdout == "" and not R.stubs.calls("claude")
-    for layout in LAYOUTS:   # the agent found but a coordinator-side rule missing or blank: exit 1, never a rule found in the other layout's place, above the root or in the worktree
+    for layout, then in (("checkout", (("scientific-integrity",), None)), ("synced", ((), "security"))):   # the agent found but a coordinator-side rule missing or blank: exit 1, never a rule found in the other layout's place, above the root or in the worktree
         gate, root = install(tmp_path / "rules-outer" / layout / "root", layout, "review.sh")
         put(root / AGENT_AT[layout], f"---\nname: x\n{FRONT}---\nbody\n")
         other = "synced" if layout == "checkout" else "checkout"
         for decoy_root, at in ((root.parent, layout), (root, other), (R.wt, layout)):
             put_rules(decoy_root, at, "decoy")
-        for skip, blank in ((RULES, None), (("scientific-integrity",), None), ((), "security")):
+        for skip, blank in ((RULES, None), then):   # none at its place in each layout; then one missing file in one, one blank file in the other (the layout only picks the paths)
             put_rules(root, layout, layout, skip, names=LEAN)
             if blank:
                 put(root / RULE_PATH[layout](blank), "---\nx: y\n---\n \n")
