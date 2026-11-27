@@ -30,7 +30,7 @@ orca terminal create --worktree path:$PWD --title coordinator \
   --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended --session $ORCA_TERMINAL_HANDLE [--until HH:MM] [--cap N]"
 # attended, chat session: no --session (its warning is expected), then arm the watcher: ONE Bash call with run_in_background and timeout: 7200000 (the background maximum)
 orca terminal create --worktree path:$PWD --title coordinator --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer attended [--cap N]"
-.ai-toolkit/scripts/coordinator.sh --run <run> --wait [--seen '<ids still waiting>']   # exits 0 printing the id of a new decision; polls every COORD_WATCH_SEC (5) s
+.ai-toolkit/scripts/coordinator.sh --run <run> --wait [--seen '<ids still waiting>']   # exits 0 printing the id of a new decision first (a `context:` line may follow: **Handover**); polls every COORD_WATCH_SEC (5) s
 # away: no --session, no --wait watcher; refused without NOTIFY_WEBHOOK_URL
 orca terminal create --worktree path:$PWD --title coordinator \
   --command "bash .ai-toolkit/scripts/coordinator.sh [--run <run>] --answer away [--until HH:MM] [--drain] [--cap N]"
@@ -98,12 +98,8 @@ Nothing is lost: state lives in Orca, git and the issue labels, live workers kee
 
 ## Handover
 
-Every request re-reads this whole chat, so a long one costs more per decision and the loop needs none of it: the Run's state lives in Orca, git and the issue labels, not in the chat. Past about 200k tokens of context, hand the Run to a fresh session at the next idle point (no decision on screen or open card, no `--stop` in flight). Measure it when you present a decision and when the `--wait` watcher returns, from this chat's transcript:
+Every request re-reads this whole chat, so a long one costs more per decision and the loop needs none of it: the Run's state lives in Orca, git and the issue labels, not in the chat. When `coordinator.sh --wait` or `--status` prints `context: <N>k tokens: hand over now (Handover)` (this session is past `COORD_HANDOVER_TOKENS`, 200k), hand the Run to a fresh session at the next idle point (no decision on screen or open card, no `--stop` in flight). That line is the only trigger: never measure the context yourself, and no line is no handover.
 
-```bash
-tail -n 200 ~/.claude/projects/*/$CLAUDE_CODE_SESSION_ID.jsonl | jq -s '[.[] | select(.type=="assistant" and .isSidechain!=true and .message.usage)] | last | .message.usage | .input_tokens + .cache_read_input_tokens + .cache_creation_input_tokens'
-```
-
-An empty, `null` or failed read is unknown: no handover, never a guess. To hand over, open the successor with the run id (and `--cap N` if it is not the default): `orca agent launch --agent claude --worktree path:$PWD --surface <kind> --prompt "/coordinate attended --run <run> [--cap N]"`, `<kind>` = `terminal` when `$ORCA_TERMINAL_HANDLE` is set, else `chat` (the loop types only into a terminal; the prompt is the whole brief, a chat cannot be messaged later). Once the launch succeeded (a lost reply: `--retry-launch <operationId>`, never a fresh launch), `TaskStop` the running `--wait` watcher, which would otherwise present every decision twice. Say the run id and "handed over to a fresh session" in one line. This session is finished: it never re-arms `--wait` and never presents again, and answers any later turn (a typed loop line, a task notification, a user message) only with that line; the user may close it.
+To hand over, open the successor with the run id (and `--cap N` if it is not the default): `orca agent launch --agent claude --worktree path:$PWD --surface <kind> --prompt "/coordinate attended --run <run> [--cap N]"`, `<kind>` = `terminal` when `$ORCA_TERMINAL_HANDLE` is set, else `chat` (the loop types only into a terminal; the prompt is the whole brief, a chat cannot be messaged later). Once the launch succeeded (a lost reply: `--retry-launch <operationId>`, never a fresh launch), `TaskStop` the running `--wait` watcher, which would otherwise present every decision twice. Say the run id and "handed over to a fresh session" in one line. This session is finished: it never re-arms `--wait` and never presents again, and answers any later turn (a typed loop line, a task notification, a user message) only with that line; the user may close it.
 
 The successor started with `/coordinate attended --run <run>` and `--status` showing `held by: coordinator.sh (attended ...)` attaches, never a second loop: a chat arms `--wait`; a terminal session runs the `--stop` of **Switching** and presents `--status` while it runs, then restarts the loop with its own `--session`. It presents `--status` from the top: the queue lives in Orca, so nothing queued is lost.

@@ -16,6 +16,7 @@
 # Hand-over (#546, attended with a valid NOTIFY_WEBHOOK_URL): a decision still unanswered after HANDOVER_PERMISSION_S (a permission request) or HANDOVER_PLAN_S (a plan, a blocked issue) is POSTed like away's, with position attended and handed_over true, and listed in the spool file `handed`: --status shows it on one line, --wait and the typed line skip it. --until then switches to away on the same Run (without a valid webhook it ends the loop).
 # `Land: human` issue (#511): each worker_done is a round report, never landed: the issue gets a "Round finished" comment carrying it, the worktree stays, and while no worker runs on it the round is a decision (--status, --wait). --dispatch <n> '<guidance>' starts the next round (a task titled "#<n> round", which rounds() counts from); the land is the footer set to `Land: auto` and --dispatch <n> 'address: send worker_done again'.
 # --run R --wait [--seen '<ids>'] (a chat session, #473): read-only, needs no terminal; polls every COORD_WATCH_SEC (5) and exits 0 printing the id of a decision that was not waiting when it started (nor in --seen), by notify_queue's rule; a failed read retries.
+# Context hand-over (#574): after that id, and in --status, one line `context: <N>k tokens: hand over now (Handover)` once the calling Claude session ($CLAUDE_CODE_SESSION_ID, its transcript's last main-thread usage) is past COORD_HANDOVER_TOKENS (200000); unknown prints nothing.
 # Hand-over (/coordinate skill): run-use from another terminal always succeeds and FENCES the old holder, whose blocked `check --wait` returns
 # consumer_fenced at once: the loop exits 0 ("taken back by <handle>"), never retries or acks (the batch replays to the new holder). --stop = take
 # the Run from this terminal, then wait until the loop is gone. Without a terminal handle (a chat session) --stop runs itself in a coordinator-stop terminal and exits with that run's status.
@@ -168,9 +169,19 @@ if [ "$position" = 1 ]; then   # #543: the position of the loop holding this pro
   valid_run "$run" || exit 1; h="$(okread -r '.result.run.coordinator_handle // empty' -- orchestration run-show --id "$run" --full)" || exit 1
   m="$(live_hold eq "$h")" && m="${m%% *}" || m=none; [ "$m" != human ] || m=attended; echo "$m"; exit 0
 fi
+handover_line() {   # #574: past the threshold, the calling session's one cue to hand over (the /coordinate skill's Handover); no id, transcript or usage = unknown = nothing. fromjson?: the transcript may be mid-write
+  local f n=""; [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || return 0
+  for f in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$CLAUDE_CODE_SESSION_ID".jsonl; do
+    [ ! -f "$f" ] || n="$(tail -n 200 "$f" | jq -Rn '[inputs | fromjson? | select(.type == "assistant" and .isSidechain != true and .message.usage)] | last // empty
+      | .message.usage | .input_tokens + .cache_read_input_tokens + .cache_creation_input_tokens' 2> /dev/null)" || n=""
+  done
+  [[ $n =~ ^[0-9]+$ ]] && [ "$n" -gt "${COORD_HANDOVER_TOKENS:-200000}" ] || return 0
+  echo "context: $((n / 1000))k tokens: hand over now (Handover)"
+}
 if [ "$status" = 1 ] || [ -n "$show_id" ]; then   # read-only: the Run, its live workers, and the questions nobody has replied to; --show: one of them whole
   [ -n "$run" ] || run="$(orca_json orchestration run-current --full | jq -r '.result.run.id // empty')"; if [ -n "$show_id" ]; then m="$(open_q | jq -c --arg i "$show_id" 'select(.id == $i)')" && [ -n "$m" ] || die "no open question $show_id on run $run"; show_q "$(question_of "$m")" 1000000; exit 0; fi
   log "run: $run"; h="$(holder)"; echo "held by: $(if m="$(live_hold eq "$h")"; then echo "coordinator.sh ($m), terminal $h"; elif [ -n "$h" ]; then echo "a session ($h)"; else echo nobody; fi)"
+  handover_line   # near the top: a long output is cut from the end
   lm="$(live_hold ne "")" || { echo "no coordinator.sh loop is running for this Run"; [ ! -s "$(spool_dir "$run")/loop.log" ] || { echo "its last log lines:"; tail -n 3 "$(spool_dir "$run")/loop.log" | LC_ALL=C tr -d '\000-\010\013-\037\177' | sed 's/^/  /'; }; }; q=""; for f in "$(spool_dir "$run")/replies"/*; do [ ! -f "$f" ] || q="$q${f##*/} "; done; [ -z "$q" ] || echo "replies queued in the spool: $q"
   if ! t="$(telemetry)"; then echo "telemetry: $t"; fi
   echo "live workers:"   # verdict, the agent's activity and the silence: `unverifiable` for a long run tells a stuck worker from a working one
@@ -222,7 +233,7 @@ watch_queue() {   # $1 poll number: one look at the queue (#473). Sets $found to
 }
 if [ "$watch" = 1 ]; then   # read-only, no terminal handle, never binds the Run: a chat session has no terminal to type into, so its background watcher exits (printing the id) when a decision arrives
   started=""; seen=""; found=""; bids=""; bok=0
-  for ((n = 0; n < ${COORD_WATCH_MAX:-100000000}; n++)); do ! watch_queue "$n" || { echo "$found"; exit 0; }; sleep "${COORD_WATCH_SEC:-5}"; done; exit 1
+  for ((n = 0; n < ${COORD_WATCH_MAX:-100000000}; n++)); do ! watch_queue "$n" || { echo "$found"; handover_line; exit 0; }; sleep "${COORD_WATCH_SEC:-5}"; done; exit 1
 fi
 
 if [ "$stop" = 1 ] && [ -z "${ORCA_TERMINAL_HANDLE:-}" ]; then   # a chat session has no terminal to fence the loop from: run --stop in one that has a handle. Its shell stays open and Orca gives no exit status, so the status comes back through a file
