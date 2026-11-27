@@ -1504,11 +1504,12 @@ def test_wait_and_status_tell_a_session_past_the_context_threshold_to_hand_over(
     pytest.param([(2000, False)], {}, {"CLAUDE_CODE_SESSION_ID": "other"}, [], id="no-transcript"),
     pytest.param([(2000, False)], {}, {"CLAUDE_CODE_SESSION_ID": ""}, [], id="no-session-id"),
 ])
-def test_the_handover_line_reads_the_calling_sessions_main_thread_context_and_unknown_says_nothing(C, tmp_path, turns, kw, env, said):
+def test_the_handover_line_reads_the_calling_sessions_main_thread_context_and_unknown_says_nothing(run, tmp_path, turns, kw, env, said):
     transcript(tmp_path, *turns, **kw)
     env = {"CLAUDE_CODE_SESSION_ID": "sid", "CLAUDE_CONFIG_DIR": "", **env}
-    r = C.go("--status", ORCA_TERMINAL_HANDLE="", **{k: v.format(tmp=tmp_path) for k, v in env.items()})
-    assert r.returncode == 0 and [ln for ln in r.stdout.splitlines() if ln.startswith("context:")] == said and "dispatch requests:" in r.stdout
+    probe = 'set -euo pipefail; eval "$(sed -n "/^handover_line()/,/^}/p" "$1")"; handover_line'   # the function alone: --wait and --status call it above
+    r = run(["bash", "-c", probe, "_", CO], **{k: v.format(tmp=tmp_path) for k, v in env.items()})
+    assert r.returncode == 0 and r.stdout.splitlines() == said
 
 
 def test_status_shows_each_open_question_text_above_its_reply_command_and_show_prints_one_whole(C, tmp_path):
