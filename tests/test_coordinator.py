@@ -468,9 +468,10 @@ def test_a_needs_input_escalation_batched_with_its_permission_request_neither_bl
 @pytest.mark.parametrize("reason, line", [("needs-input", "worker ctx_1 is at a prompt (needs-input)"), ("finished", "worker ctx_1 ended a turn without worker_done (finished)"),
                                          ("background-wait", "worker ctx_1 waits on its background task")])   # a finished turn is a worker idle between turns: the sweep owns it (#553); so is one waiting on its own background task (#555)
 def test_a_needs_input_finished_or_background_wait_escalation_alone_is_logged_and_blocks_nothing_at_once(C, reason, line, tmp_path):
-    C.mail([msg("escalation", "msg_stop", stopReason=reason)])
-    r = C.go()
+    C.mail([{**msg("escalation", "msg_stop", stopReason=reason), "body": USAGE}])   # the stop reason decides first: a usage-limit text in the body moves nothing
+    r = C.go(**ACCOUNTS)
     assert r.returncode == 0 and left_alive(C) and f"#1: {line}" in r.stdout and not C.calls("gh issue comment")
+    assert not relaunches(C) and not (tmp_path / "state/run_t/exhausted").exists()
     assert (tmp_path / "state/run_t/bgwait/ctx_1").exists() == (reason == "background-wait")   # recorded for the sweep, which bounds the wait
 
 
@@ -502,18 +503,14 @@ def test_a_background_wait_record_of_a_dispatch_that_ended_is_removed_by_the_swe
     assert (tmp_path / "state/run_t/bgwait/ctx_9").exists() != orca_up and (tmp_path / "state/run_t/bgwait/ctx_1").exists()
 
 
-@pytest.mark.parametrize("held", [True, False])   # the loop handed the plan over (exit 3), or answer.sh approved it: the #488 sequence
-def test_a_finished_escalation_batched_with_a_plan_the_loop_held_or_approved_blocks_and_abandons_nothing(C, held):
+def test_a_finished_escalation_batched_with_a_held_plan_blocks_and_abandons_nothing(C):   # the loop handed the plan over (exit 3): the #488 sequence
     C.stubs.reply("orca.orchestration_inbox", json.dumps({"result": {"messages": [{**msg("question", "msg_q", question="PLAN: do X?"), "run_id": "run_t", "thread_id": "msg_q"}]}}))
-    C.stubs.reply("answer.sh", WHY + "\n" if held else "approve\n", rc=3 if held else 0)
+    C.stubs.reply("answer.sh", WHY + "\n", rc=3)
     C.mail([msg("question", "msg_q", question="PLAN: do X?"), msg("escalation", "msg_stop", stopReason="finished")])
     r = C.go("--answer", "attended")
     assert r.returncode == 0 and "(finished)" in r.stdout and C.calls("orca orchestration check ack")
     assert not C.calls("gh issue edit") and not any(k in C.kinds() for k in ("orca orchestration worker-stop", "orca orchestration worker-abandon", "orca orchestration worker-release"))
     sent = C.calls("orca orchestration send")
-    if not held:
-        assert [arg(a, "--body") for a in C.calls("orca orchestration reply")] == ["approve"] and not sent
-        return
     assert not C.calls("orca orchestration reply") and len(sent) == 1
     assert (arg(sent[0], "--to"), arg(sent[0], "--type"), arg(sent[0], "--from")) == ("dispatch:ctx_1", "status", "term_c") and "queued for the human" in arg(sent[0], "--body")
     assert "msg_q" in C.go("--status", ORCA_TERMINAL_HANDLE="").stdout and "PLAN: do X?" in C.go("--show", "msg_q", ORCA_TERMINAL_HANDLE="").stdout   # still open for the human
@@ -671,32 +668,44 @@ def relaunches(C):
     return [a for a in C.stubs.calls("dispatch.sh") if a[0] == "--retry-of"]
 
 
-@pytest.mark.parametrize("idle, shown", [
-    (False, {}),   # the process exited
-    (True, {}),   # the agent is alive but silent past the 21-minute bound after a failed turn
-    (True, {"silent": 21}),   # silent exactly at the bound, no bgwait record, no tool call: the first minute a sweep may judge it idle
-    (True, {"beat": 25, "frac": True}),   # the same, the heartbeat carrying fractional seconds
-    (True, {"born": 25, "frac": True}),   # ... or dispatchedAt
-    (True, {"tool": 25, "ended": True}),   # the newest transcript message is a tool result, not a call in flight: silence alone decides
-    (True, {"tool": 200}),   # a tool call running past the 90-minute bound shields nothing: no unbounded shield
-    (True, {"silent": 95, "bg": 95}),   # a background wait past the 90-minute bound shields nothing either (#555)
-    (True, {"bg": 60}),   # the worker showed life 25 minutes ago, after its turn ended 60 minutes ago: the record is stale, silence alone decides
-])
-def test_a_worker_that_exited_or_went_idle_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C, idle, shown):
+def test_a_worker_that_exited_without_worker_done_is_relaunched_once_on_the_nth_empty_wait(C):
     assert re.search(r"COORD_SWEEP_EVERY:-2\}", (V2 / "scripts/coordinator.sh").read_text())   # the defaults, read rather than waited for: a sweep every 2nd empty wait (~10 min), the idle bound 21 minutes
     assert re.search(r"BGWAIT_DELAY_MIN=20\b", (V2 / "scripts/coordinator.sh").read_text()) and "COORD_IDLE_MIN:-$((BGWAIT_DELAY_MIN + 1))}" in (V2 / "scripts/coordinator.sh").read_text()   # the idle bound is Orca's escalation delay + 1: the bgwait record exists before a sweep may judge a worker idle (#561)
-    C.workers(C.row(lv="live" if idle else "exited"), C.unstarted()); C.show(**{"silent": 25, **shown})   # a failed-start row with no resource is in the Run: rounds() skips it, it is neither fatal nor a spent round
-    if not idle:   # no sweep at the first empty wait: a property of the loop, not of the worker, proved once here
-        C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)
-        assert not C.stubs.calls("dispatch.sh")
-        C.go("--cap", "1", **SWEEP)
-        assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]]
-        return
-    r = C.go("--cap", "1", **SWEEP)
-    assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and C.stubs.calls("dispatch.sh")[0][-1] == "1" and "continue from the pushed branch" in C.stubs.calls("dispatch.sh")[0][1].replace("Continue", "continue") and "after an error" not in C.stubs.calls("dispatch.sh")[0][1] and re.search(r"silent for (2[0-5]|9[45])m", C.stubs.calls("dispatch.sh")[0][1])
-    in_order(C.kinds(), "orca orchestration worker-release", "dispatch.sh", "orca terminal close")   # the live dispatch is stopped before its replacement starts
-    assert [arg(a, "--terminal") for a in C.calls("orca terminal close")] == ["term_w", "term_c"]   # the old worker's terminal, then the loop's own pane
-    assert re.search(r"silent for (2[0-5]|9[45])m, relaunching", r.stdout) and "round 1" in C.calls("gh issue comment")[0][-1]
+    C.workers(C.row(lv="exited"), C.unstarted())   # a failed-start row with no resource is in the Run: rounds() skips it, it is neither fatal nor a spent round
+    C.go("--cap", "1", COORD_MAX_TICKS=1, COORD_SWEEP_EVERY=2)   # no sweep at the first empty wait
+    assert not C.stubs.calls("dispatch.sh")
+    C.go("--cap", "1", **SWEEP)
+    assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "1"]]
+
+
+IDLE = [   # (case, its worker-show): alive, silent past COORD_IDLE_MIN with nothing that shows life
+    ("failed-turn", {}),   # silent past the 21-minute bound after a failed turn
+    ("at-the-bound", {"silent": 21}),   # silent exactly at the bound, no bgwait record, no tool call: the first minute a sweep may judge it idle
+    ("heartbeat-frac", {"beat": 25, "frac": True}),   # the same, the heartbeat carrying fractional seconds
+    ("dispatched-frac", {"born": 25, "frac": True}),   # ... or dispatchedAt
+    ("tool-result", {"tool": 25, "ended": True}),   # the newest transcript message is a tool result, not a call in flight: silence alone decides
+    ("tool-past-bound", {"tool": 200}),   # a tool call running past the 90-minute bound shields nothing: no unbounded shield
+    ("bgwait-past-bound", {"silent": 95, "bg": 95}),   # a background wait past the 90-minute bound shields nothing either (#555)
+    ("bgwait-stale", {"bg": 60}),   # the worker showed life 25 minutes ago, after its turn ended 60 minutes ago: the record is stale, silence alone decides
+]
+
+
+@pytest.mark.parametrize("cases", [IDLE[:4], IDLE[4:]], ids=["first-half", "second-half"])   # one sweep over worker ctx_<k>_0 of issue k on /w<k>; two halves, each under the per-test time limit
+def test_a_worker_idle_without_worker_done_is_released_then_relaunched_once(C, cases):
+    ks = range(1, len(cases) + 1)
+    for k, (_, shown) in zip(ks, cases, strict=True):   # every worker is past the bound: worker-show call k and worker-read call k are its own
+        C.show(**{"silent": 25, **shown}, d=f"ctx_{k}_0", n=k, rn=k)
+    C.workers(*[{**C.row(f"ctx_{k}_0", rec=k), "resource": {"worktreeId": f"r::/w{k}"}} for k in ks], C.unstarted())
+    C.stubs.reply("orca.worktree_list", json.dumps({"result": {"worktrees": [{"path": f"/w{k}", "linkedIssue": k, "branch": f"refs/heads/{k}-x"} for k in ks]}}))
+    r = C.go("--cap", "0", **SWEEP)
+    sent = C.stubs.calls("dispatch.sh")
+    assert [(a[0], a[-1]) for a in sent] == [("--address", str(k)) for k in ks], r.stderr
+    assert all("continue from the pushed branch" in a[1].lower() and "after an error" not in a[1] and re.search(r"silent for (2[0-5]|9[45])m", a[1]) for a in sent)
+    steps = [k for k in C.kinds() if k in ("orca orchestration worker-release", "dispatch.sh", "orca terminal close")]
+    assert steps == ["orca orchestration worker-release", "dispatch.sh", "orca terminal close"] * len(cases) + ["orca terminal close"]   # each live dispatch is stopped before its replacement starts
+    assert [arg(a, "--terminal") for a in C.calls("orca terminal close")] == ["term_w"] * len(cases) + ["term_c"]   # the old workers' terminals, then the loop's own pane
+    assert len(re.findall(r"silent for (?:2[0-5]|9[45])m, relaunching", r.stdout)) == len(cases)
+    assert [(a[2], "round 1" in a[-1]) for a in C.calls("gh issue comment")] == [(str(k), True) for k in ks]
 
 
 HEALTHY = [   # (case, its workers' rows, its live worker's worker-show; past = silent past COORD_IDLE_MIN with nothing else to show life, so the sweep reads its transcript): one sweep per half, case k on its own worktree /w<k> linked to issue k
@@ -1192,17 +1201,18 @@ def test_away_retries_a_failed_post_at_the_next_wake_never_stops_the_loop_and_dr
     assert r.returncode == 0 and not [b for b in bodies if b["issue"] == 42]
     ticks([], ["msg_a"], [])   # answered before the retry: not sent again
     C.mail([msg("question", "msg_a", question="PLAN?")])
-    r, bodies, _ = posted(C, tmp_path, rcs=(22,), COORD_MAX_TICKS=3)
+    r, bodies, _ = posted(C, tmp_path, rcs=(22,), COORD_MAX_TICKS=2)
     assert r.returncode == 0 and len(bodies) == 1
 
 
-@pytest.mark.parametrize("mode", ["attended", "auto", "human"])
-def test_outside_away_nothing_is_posted_even_with_the_webhook_set_and_attended_not_before_a_delay(C, tmp_path, mode):
+@pytest.mark.parametrize("mode", ["auto", "human"])   # attended posts nothing before its delay: the hand-over test below
+def test_outside_away_and_attended_nothing_is_posted_even_with_the_webhook_set(C, tmp_path, mode):
     C.stubs.reply("answer.sh", WHY + "\n", rc=3)
+    C.stubs.reply("gh.repo_view", "o/r\n")   # a POST that was wrongly attempted would reach curl
     C.stubs.reply("gh.issue_list", BLOCKED)
     ticks([], ["msg_a", "msg_pb"])
     C.mail([msg("question", "msg_a", question="PLAN?"), msg("question", "msg_pb", question=PQ)])
-    r = C.go("--answer", mode, "--session", "", NOTIFY_WEBHOOK_URL=URL, COORD_MAX_TICKS=2, COORD_SWEEP_EVERY=99)
+    r = C.go("--answer", mode, "--session", "", NOTIFY_WEBHOOK_URL=URL, COORD_SWEEP_EVERY=99)
     assert r.returncode == 0 and C.calls("orca orchestration check ack") and not C.calls("curl")
 
 
@@ -1217,11 +1227,10 @@ def handed(**kw):
 
 
 HANDOVER = {   # one run per settings: (the open decisions and their age in seconds, the settings, the POSTs they are handed over with, once each)
-    "default-delays": ({"msg_a": 700, "msg_b": 400, "msg_pc": 400, "msg_pd": 200}, {"BLOCKED": 1},   # a plan past its delay, one before it; a permission request past its shorter delay, one before it; a blocked issue before the plan delay
+    "default-delays": ({"msg_a": 700, "msg_b": 400, "msg_pc": 400, "msg_pd": 200, "msg_e": 700}, {"BLOCKED": 1, "QUEUED": "msg_e"},   # a plan past its delay, one before it; a permission request past its shorter delay, one before it; a blocked issue before the plan delay; a plan past its delay whose reply is queued
                        [{"event": "plan", "message_id": "msg_a"}, {"event": "permission_request", "message_id": "msg_pc"}]),
     "delays-overridden": ({"msg_a": 400, "msg_pb": 200}, {"HANDOVER_PLAN_S": 300, "HANDOVER_PERMISSION_S": 100},
                           [{"event": "plan", "message_id": "msg_a"}, {"event": "permission_request", "message_id": "msg_pb"}]),
-    "blocked-issue-after-the-plan-delay": ({}, {"HANDOVER_PLAN_S": 0, "BLOCKED": 1}, [{"event": "blocked"}]),
     "no-webhook": ({"msg_a": 700}, {"NOTIFY_WEBHOOK_URL": ""}, []),
 }
 
@@ -1231,7 +1240,11 @@ def test_attended_hands_an_unanswered_decision_over_to_the_webhook_once_after_it
     aged(C, **open_)
     C.stubs.reply("gh.issue_list", BLOCKED if settings.pop("BLOCKED", 0) else "[]")
     C.stubs.reply("gh.issue_view", issue_json(labels=["blocked"]))
-    r, bodies, seen = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=3, **settings)   # three wakes: handed over once, not at each
+    if queued_reply := settings.pop("QUEUED", ""):   # it cannot be sent yet: it stays queued, the question stays open in Orca, and it is never handed over
+        C.stubs.reply("orca.orchestration_reply", "boom", rc=1)
+        C.spool(queued_reply, "approve")
+    r, bodies, seen = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, **settings)   # two wakes: handed over once, not at each
+    assert not queued_reply or C.spooled(queued_reply)
     by_id = lambda b: b.get("message_id", "")  # noqa: E731
     assert r.returncode == 0 and sorted(bodies, key=by_id) == sorted([handed(**p) for p in posts], key=by_id) and URL not in seen
     handed_ids = (tmp_path / "state/run_t/handed").read_text().split() if posts else []
@@ -1242,14 +1255,6 @@ def test_a_decision_that_leaves_the_queue_is_no_longer_listed_as_handed_over(C, 
     ticks(["msg_a"], ["msg_a"], [])
     r, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=0)
     assert r.returncode == 0 and len(bodies) == 1 and (tmp_path / "state/run_t/handed").read_text() == ""
-
-
-def test_a_decision_whose_reply_is_queued_in_the_spool_is_never_handed_over(C, tmp_path):
-    aged(C, msg_a=700)
-    C.stubs.reply("orca.orchestration_reply", "boom", rc=1)   # the reply cannot be sent yet: it stays queued and the question stays open in Orca
-    C.spool("msg_a", "approve")
-    r, bodies, _ = posted(C, tmp_path, pos="attended")
-    assert r.returncode == 0 and C.spooled("msg_a") and bodies == []
 
 
 def test_attended_never_hands_over_a_blocked_issue_a_dispatch_request_re_dispatched_before_its_delay(C, tmp_path):   # #564: the label removed by the request must reach the list the hand-over reads, whatever else the loop is busy with
@@ -1283,7 +1288,7 @@ def test_a_decision_handed_over_is_left_out_of_the_queue_the_session_presents(C,
     C.stubs.reply("gh.issue_list", BLOCKED)
     C.stubs.reply("gh.issue_view", issue_json(labels=["blocked"]))
     _, bodies, _ = posted(C, tmp_path, pos="attended", COORD_MAX_TICKS=2, HANDOVER_PLAN_S=0)   # the plan and the blocked issue are both handed over
-    assert [b["event"] for b in bodies] == ["plan", "blocked"] and not C.calls("orca terminal send")   # and the session is told nothing about them
+    assert bodies == [handed(event="plan", message_id="msg_a"), handed(event="blocked")] and not C.calls("orca terminal send")   # and the session is told nothing about them
     assert (tmp_path / "state/run_t/handed").read_text().split() == ["q:msg_a", "b:1"]
     (Path(os.environ["STUB_DIR"]) / "calls.log").unlink(missing_ok=True)   # what follows is read-only: the loop's own calls are behind us
     C.inbox(["msg_a"])
@@ -1304,24 +1309,29 @@ def test_attended_until_switches_to_away_on_the_same_run_only_when_hand_over_is_
     assert bodies == ([{"event": "plan", "repo": "o/r", "issue": 1, "run": "run_t", "message_id": "msg_a", "position": "away", "handed_over": False}] if switches else [])
 
 
+REFUSED = [   # (arguments, the webhook, settings)
+    (["--answer", "away"], "", {}), (["--answer", "away"], "ftp://x y", {}),
+    (["--answer", "away", "--session", "term_s"], URL, {}),   # away types nothing into a session
+    (["--answer", "attended", "--session", "term_s"], URL, {"HANDOVER_PLAN_S": "soon"}),
+]
 START_RULES = {   # (arguments, the webhook, what the start does)
-    "away-without-webhook": (["--answer", "away"], "", "refused"), "away-with-a-bad-webhook": (["--answer", "away"], "ftp://x y", "refused"),
-    "away-types-nothing-into-a-session": (["--answer", "away", "--session", "term_s"], URL, "refused"),
     "no-position-with-webhook": ([], URL, "cap 3, answer away"), "no-position-without-webhook": ([], "", "cap 3, answer auto"), "explicit-auto-with-webhook": (["--answer", "auto"], URL, "cap 3, answer auto"),
     "a-bad-webhook-leaves-the-one-shot-commands-alone": (["--status"], "ftp://x y", "run: run_t"),
-    "attended-handover-delay-not-a-number": (["--answer", "attended", "--session", "term_s"], URL, "refused", {"HANDOVER_PLAN_S": "soon"}),
     "attended-handover-delays-are-not-read-without-a-webhook": (["--answer", "attended"], "", "cap 3, answer attended", {"HANDOVER_PLAN_S": "soon"}),
 }
+
+
+def test_a_start_that_cannot_hand_over_is_refused_in_one_line_before_the_loop(C):
+    for args, url, env in REFUSED:
+        r = C.go("--session", "", *args, NOTIFY_WEBHOOK_URL=url, **env)
+        assert r.returncode == 2 and len(r.stderr.splitlines()) == 1 and (not url or url not in r.stderr) and r.stdout == "", (args, url, r.stderr)
 
 
 @pytest.mark.parametrize("case", START_RULES.values(), ids=list(START_RULES))
 def test_a_loop_started_with_no_position_is_away_only_when_a_webhook_is_set_and_away_needs_one_and_no_session(C, case):
     args, url, outcome, *env = case
     r = C.go("--session", "", *args, NOTIFY_WEBHOOK_URL=url, **(env[0] if env else {}))
-    if outcome == "refused":
-        assert r.returncode == 2 and len(r.stderr.splitlines()) == 1 and (not url or url not in r.stderr) and r.stdout == ""   # refused before the loop starts
-    else:
-        assert r.returncode == 0 and outcome in r.stdout
+    assert r.returncode == 0 and outcome in r.stdout
 
 
 POSITIONS = {"no-loop": (None, "term_c", "none"), "attended": ("attended until 23:00", "term_c", "attended"), "away": ("away", "term_c", "away"), "auto": ("auto drain", "term_c", "auto"),
@@ -1402,22 +1412,13 @@ def test_wait_wakes_for_a_dispatch_request_refused_after_it_started(C, tmp_path,
 WAITING = ["waiting: for a free slot (cap 3)", "waiting: a worker is still live on the worktree (dispatch ctx_1): it starts once that worker ends", "waiting: dispatch: #7 is not ready: Scope overlaps #1 (dispatch.sh exit 3)"]
 
 
-@pytest.mark.parametrize("seen", ["", "7"])
-@pytest.mark.parametrize("why", WAITING)
-def test_wait_ignores_a_dispatch_request_that_only_waits(C, tmp_path, why, seen):   # nothing was refused: it starts on its own, so it is no decision, in --seen or not
+@pytest.mark.parametrize("seen", ["", "7 8 9"], ids=["not-in-seen", "in-seen"])
+def test_wait_ignores_a_dispatch_request_that_only_waits_and_still_wakes_for_a_new_plan(C, tmp_path, seen):   # nothing was refused: it starts on its own, so it is no decision, and it must not silence the next plan
     req = tmp_path / "state/run_t/requests"
     req.mkdir(parents=True)
-    (req / "7").write_text(f"redo it\n{why}\n")
-    r = watched(C, ([], []), ([], []), seen=seen)
-    assert r.returncode == 1 and r.stdout == ""
-
-
-@pytest.mark.parametrize("why", WAITING)
-def test_wait_still_wakes_for_a_new_plan_while_a_request_only_waits(C, tmp_path, why):   # the waiting request must not silence the next plan, whether or not it is in --seen
-    req = tmp_path / "state/run_t/requests"
-    req.mkdir(parents=True)
-    (req / "7").write_text(f"redo it\n{why}\n")
-    r = watched(C, ([], []), (["msg_a"], []), ([], []), seen="7")
+    for n, why in enumerate(WAITING, 7):
+        (req / str(n)).write_text(f"redo it\n{why}\n")
+    r = watched(C, ([], []), (["msg_a"], []), ([], []), seen=seen)
     assert r.returncode == 0 and r.stdout.split() == ["msg_a"]
 
 
@@ -1485,14 +1486,13 @@ def transcript(tmp_path, *turns, config="home/.claude", partial=""):   # the cal
     (d / "sid.jsonl").write_text("\n".join([*rows, '{"type": "user"}', partial]))
 
 
-@pytest.mark.parametrize(("tokens", "said"), [pytest.param(2000, [HANDOVER], id="above"), pytest.param(1000, [], id="below")])
-def test_wait_and_status_tell_a_session_past_the_context_threshold_to_hand_over(C, tmp_path, tokens, said):   # #574: the trigger is in output the session reads at every wake
-    transcript(tmp_path, (tokens, False))
+def test_wait_and_status_tell_a_session_past_the_context_threshold_to_hand_over(C, tmp_path):   # #574: the trigger is in output the session reads at every wake
+    transcript(tmp_path, (2000, False))
     me = {"CLAUDE_CODE_SESSION_ID": "sid", "CLAUDE_CONFIG_DIR": ""}
     r = watched(C, ([], []), (["msg_a"], []), **me)
-    assert r.returncode == 0 and r.stdout.splitlines() == ["msg_a", *said]   # the skill reads the id on the first line
+    assert r.returncode == 0 and r.stdout.splitlines() == ["msg_a", HANDOVER]   # the skill reads the id on the first line
     r = C.go("--status", ORCA_TERMINAL_HANDLE="", **me)
-    assert r.returncode == 0 and [ln for ln in r.stdout.splitlines() if ln.startswith("context:")] == said
+    assert r.returncode == 0 and [ln for ln in r.stdout.splitlines() if ln.startswith("context:")] == [HANDOVER]
 
 
 @pytest.mark.parametrize(("turns", "kw", "env", "said"), [
@@ -1973,50 +1973,90 @@ def spooled_account(tmp_path, kind, name, text=None):   # the loop's own records
     return f
 
 
-@pytest.mark.parametrize("ran_on, to", [(None, "client"), ("client", "max")])
-def test_a_usage_limit_escalation_releases_the_worker_and_relaunches_it_on_the_next_allowed_account(C, tmp_path, ran_on, to):
-    if ran_on:
-        spooled_account(tmp_path, "account", "ctx_1", ran_on + "\n")   # a dispatch with no record ran on the first listed account
+STOP = "usage limit on account max, resets 6pm (Europe/Paris)"
+BARE = f"usage limit, resets 6pm (Europe/Paris): {USAGE}"   # a project with no account list: the block carries Orca's text
+RETRY = "dispatch run_t --retry-of ctx_1 --task task_ctx_1"
+STOPPED = ["release ctx_1", "orca terminal close --terminal term_w --json"]   # the dispatch and the dead agent's terminal go before the replacement starts
+FABLE, OPUS = {"model/ctx_1": "claude-fable-5-2"}, "claude-opus-5-5"
+FAILED_OVER = {"failover/ctx_7": "", "dispatch/ctx_7": "1"}   # this issue was already moved to another account once
+BOTH = {**ACCOUNTS, "FALLBACK_MODEL": OPUS}
+LATER = str(int(time.time()) + 3600)   # an exhausted account's reset
+
+
+def relaunched_on(frm, to):
+    return [*STOPPED, f"{RETRY} --account {to} 1", f"comment #1 usage limit on account {frm}: relaunched on {to}"]
+
+
+def fell_back(account=""):
+    return [*STOPPED, f"{RETRY} --model {OPUS}{account} 1", f"comment #1 usage limit on claude-fable-5-2: relaunched on {OPUS}"]
+
+
+def decides(records, env, events, exhausted, rc=0):
+    return records, env, rc, events, exhausted
+
+
+USAGE_CASES = {   # (the loop's spool records, the settings, dispatch.sh's exit status, what the loop does in order, the accounts then held exhausted)
+    "the-first-listed-account": decides({}, ACCOUNTS, relaunched_on("max", "client"), "max"),   # a dispatch with no record ran on it
+    "the-recorded-account": decides({"account/ctx_1": "client"}, ACCOUNTS, relaunched_on("client", "max"), "client"),
+    "failover-budget-spent": decides(FAILED_OVER, ACCOUNTS, [f"block {STOP}: failover budget spent: this issue was already failed over once"], ""),   # a second stop (a faked or looping one) holds no second account
+    "no-account-list": decides({}, {}, [f"block {BARE}"], ""),
+    "one-account": decides({}, {"CLAUDE_ACCOUNTS": "max"}, [f"block {STOP}: {USAGE}"], ""),   # never fails over, and writes no record
+    "every-other-account-at-its-limit": decides({"exhausted/client": LATER}, ACCOUNTS, [f"block {STOP}: every other allowed account is at its limit too"], "client max"),
+    "failover-relaunch-fails": decides({}, ACCOUNTS, [*STOPPED, f"{RETRY} --account client 1", f"block {STOP}: failover relaunch failed"], "max", rc=1),
+    "fallback-model": decides(FABLE, {"FALLBACK_MODEL": OPUS}, fell_back(), ""),
+    "fallback-off": decides(FABLE, {}, [f"block {BARE}"], ""),
+    "stopped-on-the-fallback": decides({"model/ctx_1": OPUS}, {"FALLBACK_MODEL": OPUS}, [f"block {BARE}"], ""),
+    "the-issue-already-fell-back": decides({**FABLE, "model/ctx_7": OPUS, "dispatch/ctx_7": "1"}, {"FALLBACK_MODEL": OPUS}, [f"block {BARE}"], ""),   # an earlier dispatch ran on it, this one is back on the footer model
+    "another-issue-fell-back": decides({**FABLE, "model/ctx_7": OPUS, "dispatch/ctx_7": "2"}, {"FALLBACK_MODEL": OPUS}, fell_back(), ""),
+    "no-model-record": decides({}, {"FALLBACK_MODEL": OPUS}, [f"block {BARE}"], ""),   # never relaunched on a guess
+    "fallback-relaunch-fails": decides(FABLE, {"FALLBACK_MODEL": OPUS}, [*STOPPED, f"{RETRY} --model {OPUS} 1", f"block usage limit, resets 6pm (Europe/Paris): fallback relaunch on {OPUS} failed"], "", rc=1),
+    "accounts-before-the-model": decides(FABLE, BOTH, relaunched_on("max", "client"), "max"),
+    "budget-spent-then-the-model-keeps-the-account": decides({**FABLE, **FAILED_OVER, "account/ctx_1": "client"}, BOTH, fell_back(" --account client"), ""),
+    "no-account-free-then-the-model-keeps-the-account": decides({**FABLE, "exhausted/client": LATER}, BOTH, fell_back(" --account max"), "client max"),   # still the account the worker ran on, just marked exhausted
+}
+USAGE_PROBE = """set -euo pipefail; . "$1/lib.sh"; eval "$(sed -n -e '/^model_fallback()/,/^}/p' -e '/^usage_limit()/,/^}/p' "$1/coordinator.sh")"
+exec 3>&1; ev() { printf '%s\\n' "$*" >&3; }; release() { ev "release $1"; }; orca() { ev "orca $*"; }; block() { ev "block $1"; }; comment() { ev "comment #$1 $2"; }; log() { :; }
+dispatched() { ev "dispatch $RUN $*"; return "$DRC"; }; reset_epoch() { [ "$1" = "6pm (Europe/Paris)" ] && echo "$RESET_AT"; }
+run=run_t; disp=ctx_1; issue=1; task=task_ctx_1; term=term_w; DISPATCH_CMD=dispatched; sd="$(spool_dir "$run")"
+usage_limit "$(usage_limit_reset "$B")" "$B" || ev "failed $?"
+"""   # the two decision functions alone, called as the loop calls them (errexit off), with their actions printed in order and the reset time fixed (its parsing is test_lib's)
+
+
+@pytest.mark.parametrize("case", USAGE_CASES.values(), ids=list(USAGE_CASES))
+def test_a_usage_limit_stop_moves_the_task_to_a_free_account_then_once_to_the_fallback_model_else_blocks(run, tmp_path, case):
+    records, env, rc, events, exhausted = case
+    for rel, text in {"dispatch/ctx_1": "1", **records}.items():   # dispatch.sh recorded the stopped dispatch's issue
+        kind, name = rel.split("/")
+        spooled_account(tmp_path, kind, name, f"{text}\n" if text else "")
+    r = run(["bash", "-c", USAGE_PROBE, "_", str(V2 / "scripts")], B=USAGE, DRC=rc, RESET_AT=int(LATER) + 60, AITK_STATE_DIR=tmp_path / "state",
+            **{"CLAUDE_ACCOUNTS": "", "FALLBACK_MODEL": "", **env})
+    assert r.returncode == 0 and r.stdout.splitlines() == events, r.stderr
+    held = {f.name: f.read_text() for f in (tmp_path / "state/run_t/exhausted").glob("*")}
+    assert held == {a: records[f"exhausted/{a}"] + "\n" if f"exhausted/{a}" in records else f"{int(LATER) + 60}\n" for a in exhausted.split()}   # held until the message's reset
+
+
+def test_a_usage_limit_escalation_releases_the_worker_and_relaunches_it_on_the_next_allowed_account(C, tmp_path):
     C.mail([limit_msg()])
     r = C.go(**ACCOUNTS)
     assert r.returncode == 0, r.stderr
-    assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "--account", to, "1"]]   # the same task, as a sweep relaunch, on the other account
+    assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "--account", "client", "1"]]   # the same task, as a sweep relaunch, on the other account
     kinds = C.kinds()
     assert kinds.index("orca orchestration worker-release") < max(i for i, k in enumerate(kinds) if k == "dispatch.sh")   # the dispatch is stopped before its replacement starts (the last dispatch.sh call; the first is the pick)
     assert "term_w" in [arg(a, "--terminal") for a in C.calls("orca terminal close")]   # the dead agent's terminal
-    assert f"usage limit on account {ran_on or 'max'}: relaunched on {to}" in C.calls("gh issue comment")[0][-1] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
-    reset = int((tmp_path / "state/run_t/exhausted" / (ran_on or "max")).read_text())
+    assert "usage limit on account max: relaunched on client" in C.calls("gh issue comment")[0][-1] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
+    reset = int((tmp_path / "state/run_t/exhausted/max").read_text())
     when = datetime.fromtimestamp(reset, ZoneInfo("Europe/Paris"))
     assert time.time() < reset <= time.time() + 86400 and (when.hour, when.minute) == (18, 0)   # the next 6pm Paris, from the message
-    assert not (tmp_path / "state/run_t/exhausted" / to).exists()
+    assert not (tmp_path / "state/run_t/exhausted/client").exists()
 
 
-@pytest.mark.parametrize("env, other_exhausted, dispatch_rc, why, tried, recorded", [
-    (ACCOUNTS, "budget", 0, "failover budget", False, False),   # this issue was already failed over once: a second stop (a faked or looping one) blocks the issue and holds no second account
-    ({}, False, 0, "", False, False), ({"CLAUDE_ACCOUNTS": "max"}, False, 0, "", False, False),   # a project that lists no or one account never fails over, and writes no record
-    (ACCOUNTS, True, 0, "", False, True),   # the other account is at its limit too
-    (ACCOUNTS, False, 1, "failover relaunch failed", True, True),
-])
-def test_a_usage_limit_with_no_account_to_move_to_blocks_with_the_reset_time(C, tmp_path, env, other_exhausted, dispatch_rc, why, tried, recorded):
-    if other_exhausted == "budget":
-        spooled_account(tmp_path, "failover", "ctx_7", "")
-        spooled_account(tmp_path, "dispatch", "ctx_7", "1\n")
-    elif other_exhausted:
-        spooled_account(tmp_path, "exhausted", "client")
-    C.stubs.reply("dispatch.sh", "boom", rc=dispatch_rc)
+def test_a_usage_limit_with_no_account_to_move_to_blocks_with_the_reset_time(C, tmp_path):
+    spooled_account(tmp_path, "exhausted", "client")
     C.mail([limit_msg()])
-    C.go(**env)
-    comment = C.calls("gh issue comment")[0][-1]
-    assert C.blocked() and "usage limit" in comment and "resets 6pm (Europe/Paris)" in comment and why in comment
-    assert bool(relaunches(C)) == tried and (tmp_path / "state/run_t/exhausted/max").exists() == recorded
-
-
-@pytest.mark.parametrize("body, extra, blocks", [("the body", {}, True), (USAGE, {"stopReason": "needs-input"}, False),
-                                                 (f"Error: the worker said: {USAGE}", {}, True)])   # Orca's own prefix is what counts: the agent's text can quote the phrase
-def test_an_ordinary_escalation_and_needs_input_behave_as_before_on_a_project_with_two_accounts(C, tmp_path, body, extra, blocks):
-    C.mail([{**msg("escalation", "msg_e", **extra), "body": body}])
     C.go(**ACCOUNTS)
-    assert (C.blocked() if blocks else left_alive(C)) and not relaunches(C) and not (tmp_path / "state/run_t/exhausted").exists()
+    comment = C.calls("gh issue comment")[0][-1]
+    assert C.blocked() and "usage limit" in comment and "resets 6pm (Europe/Paris)" in comment and "every other allowed account" in comment
+    assert not relaunches(C) and (tmp_path / "state/run_t/exhausted/max").exists()
 
 
 FALLBACK = {"FALLBACK_MODEL": "claude-opus-5-5"}
@@ -2026,44 +2066,20 @@ def spooled_model(tmp_path, dispatch, model):   # the model a dispatch ran with:
     spooled_account(tmp_path, "model", dispatch, model + "\n")
 
 
-@pytest.mark.parametrize("env, ran, prior, dispatch_rc, why", [
-    (FALLBACK, "claude-fable-5-2", None, 0, ""),   # relaunched on the fallback
-    ({"FALLBACK_MODEL": ""}, "claude-fable-5-2", None, 0, "resets 6pm"),   # off: blocks as today
-    (FALLBACK, "claude-opus-5-5", None, 0, "resets 6pm"),   # a second stop, or a stop on the fallback itself: one fallback per issue
-    (FALLBACK, "claude-fable-5-2", "claude-opus-5-5", 0, "resets 6pm"),   # an earlier dispatch of this issue already ran on the fallback, this one (a human-requested round, named()) is back on the footer model
-    (FALLBACK, "claude-fable-5-2", ("claude-opus-5-5", "2"), 0, ""),   # another issue's fallback in the same Run spends nothing of this one's
-    (FALLBACK, None, None, 0, "resets 6pm"),   # no record of the model: never relaunched on a guess
-    (FALLBACK, "claude-fable-5-2", None, 1, "fallback relaunch on claude-opus-5-5 failed"),
-])
-def test_a_usage_limit_relaunches_the_same_task_once_on_the_fallback_model(C, tmp_path, env, ran, prior, dispatch_rc, why):
-    if ran:
-        spooled_model(tmp_path, "ctx_1", ran)
-    if prior:
-        prior, other = (prior, "1") if isinstance(prior, str) else prior
-        spooled_model(tmp_path, "ctx_7", prior)
-        spooled_account(tmp_path, "dispatch", "ctx_7", other + "\n")
-    C.stubs.reply("dispatch.sh", "boom", rc=dispatch_rc)
+def test_a_usage_limit_relaunches_the_same_task_once_on_the_fallback_model(C, tmp_path):
+    spooled_model(tmp_path, "ctx_1", "claude-fable-5-2")
     C.mail([limit_msg()])
-    r = C.go(**env)
+    r = C.go(**FALLBACK)
     assert r.returncode == 0, r.stderr
-    if why:
-        assert C.blocked() and why in C.calls("gh issue comment")[0][-1]
-        assert bool(relaunches(C)) == (dispatch_rc == 1)
-        return
     assert relaunches(C) == [["--retry-of", "ctx_1", "--task", "task_ctx_1", "--model", "claude-opus-5-5", "1"]]
-    kinds = C.kinds()
-    assert kinds.index("orca orchestration worker-release") < max(i for i, k in enumerate(kinds) if k == "dispatch.sh")   # stopped before its replacement starts
-    assert "term_w" in [arg(a, "--terminal") for a in C.calls("orca terminal close")]
     assert "usage limit on claude-fable-5-2: relaunched on claude-opus-5-5" in C.calls("gh issue comment")[0][-1]
     assert ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
 
 
 @pytest.mark.parametrize("ran, want", [("claude-opus-5-5", ["--model", "claude-opus-5-5"]),   # the fallback is kept: the footer model is at its limit
-                                       ("claude-fable-5-2", []),   # the footer model: today's behaviour
-                                       (None, [])])   # no record of the model: never a guess
+                                       ("claude-fable-5-2", [])])   # the footer model: no override (nor with no record: test_a_rejected_land_re_dispatches...)
 def test_an_automatic_address_round_keeps_the_fallback_model_the_dispatch_ran_on(C, tmp_path, ran, want):
-    if ran:
-        spooled_model(tmp_path, "ctx_1", ran)
+    spooled_model(tmp_path, "ctx_1", ran)
     C.stubs.reply("land.sh", f"{W}x\nBLOCKER: a.py:3 - bug\n", rc=3)
     C.mail([msg("worker_done", outcome="succeeded")])
     assert C.go(**FALLBACK).returncode == 0
@@ -2071,38 +2087,11 @@ def test_an_automatic_address_round_keeps_the_fallback_model_the_dispatch_ran_on
     assert len(d) == 1 and d[0][1].startswith("address:") and d[0][2:] == [*want, "1"]
 
 
-@pytest.mark.parametrize("spool, ran_on, relaunch", [
-    ({}, None, ["--retry-of", "ctx_1", "--task", "task_ctx_1", "--account", "client", "1"]),   # the accounts first: the same model on the other one
-    ({"failover": "ctx_7"}, "client", ["--retry-of", "ctx_1", "--task", "task_ctx_1", "--model", "claude-opus-5-5", "--account", "client", "1"]),   # budget spent: the fallback keeps the account
-    ({"exhausted": "client"}, None, ["--retry-of", "ctx_1", "--task", "task_ctx_1", "--model", "claude-opus-5-5", "--account", "max", "1"]),   # no account free: still the account the worker ran on, just marked exhausted
-])
-def test_the_account_failover_comes_first_and_the_model_fallback_keeps_the_account(C, tmp_path, spool, ran_on, relaunch):
-    spooled_model(tmp_path, "ctx_1", "claude-fable-5-2")
-    if ran_on:
-        spooled_account(tmp_path, "account", "ctx_1", ran_on + "\n")
-    for kind, name in spool.items():
-        spooled_account(tmp_path, kind, name, "" if kind == "failover" else None)
-        if kind == "failover":
-            spooled_account(tmp_path, "dispatch", name, "1\n")
-    C.mail([limit_msg()])
-    assert C.go(**ACCOUNTS, **FALLBACK).returncode == 0
-    assert relaunches(C) == [relaunch] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
-
-
 def test_an_idle_worker_after_a_failover_still_gets_its_one_relaunch(C, tmp_path):
     spooled_account(tmp_path, "failover", "ctx_2", "")   # ctx_2 only moved ctx_1's task to the other account: it is not a spent relaunch
     C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2")); C.show(silent=22)
     C.go("--cap", "1", **SWEEP)
     assert [a[0] for a in C.stubs.calls("dispatch.sh")] == ["--address"] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
-
-
-def test_a_ci_refusal_after_a_failover_still_gets_its_round(C, tmp_path):
-    spooled_account(tmp_path, "failover", "ctx_2", "")
-    C.stubs.reply("land.sh", "land.sh: CI is red for abc\n", rc=4)
-    C.workers(C.row("ctx_1", st="failed", lv="exited"), C.row("ctx_2"))
-    C.mail([msg("worker_done", dispatchId="ctx_2", outcome="succeeded")])
-    C.go()
-    assert [a[0] for a in C.stubs.calls("dispatch.sh") if a != ["--next", "--dry-run"]] == ["--address"] and ["--add-label", "blocked"] not in [a[3:] for a in C.calls("gh issue edit")]
 
 
 def test_no_issue_is_dispatched_while_every_allowed_account_is_exhausted(C, tmp_path):
