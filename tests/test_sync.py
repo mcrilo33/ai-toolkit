@@ -576,16 +576,31 @@ def test_the_base_configs_are_proposed_once_to_a_python_host_that_has_none(sync,
     assert not list(target.rglob("*.bak")) and not list(target.rglob("*.new.*"))
 
 
+PROPOSE = """TARGET="$2"; V2="$3"; tg() { git -C "$TARGET" "$@"; }; eval "$(sed -n '/^has() /,/^fi$/p' "$1")" """   # sync.sh's proposal block alone: the detection, then the copy
+
+
+def keeps_its_own_and_gets_the_missing_half(target, toolkit, own, proposed):
+    assert all((target / rel).read_text() == t for rel, t in own.items())
+    assert {c for c in CONFIGS if (target / c).is_file() and c not in own} == proposed
+    assert all((target / c).read_bytes() == (toolkit / c).read_bytes() for c in proposed)
+    assert not list(target.rglob("*.bak")) and not list(target.rglob("*.new.*"))
+
+
 @pytest.mark.parametrize("case", OWN)
-def test_a_hosts_own_lint_or_typecheck_config_is_kept_byte_for_byte_and_only_the_missing_half_is_proposed(sync, src, target, case):
+def test_a_hosts_own_lint_or_typecheck_config_is_kept_byte_for_byte_and_only_the_missing_half_is_proposed(run, target, case):
     own, proposed = OWN[case]
+    python_host(target, **own)
+    r = run(["bash", "-euo", "pipefail", "-c", PROPOSE, "_", str(V2 / "scripts" / "sync.sh"), str(target), str(V2)])
+    assert r.returncode == 0, r.stderr
+    keeps_its_own_and_gets_the_missing_half(target, V2, own, proposed)
+
+
+def test_a_sync_keeps_the_hosts_own_config_and_proposes_only_the_missing_half(sync, src, target):
+    own, proposed = OWN["ruff.toml"]
     python_host(target, **own)
     r = sync()
     assert r.returncode == 0, r.stderr
-    assert all((target / rel).read_text() == t for rel, t in own.items())
-    assert {c for c in CONFIGS if (target / c).is_file() and c not in own} == proposed
-    assert all((target / c).read_bytes() == (src / "v2" / c).read_bytes() for c in proposed)
-    assert not list(target.rglob("*.bak")) and not list(target.rglob("*.new.*"))
+    keeps_its_own_and_gets_the_missing_half(target, src / "v2", own, proposed)
 
 
 def test_a_second_sync_never_rewrites_a_proposed_file_the_project_edited(sync, src, target):
